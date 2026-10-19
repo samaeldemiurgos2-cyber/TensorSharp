@@ -6,6 +6,59 @@ dirty or unavailable dependency checkouts. Put outputs in ignored `artifacts/`
 or `docs/validation/`. A structural media pass does not establish perceptual
 quality or benchmark parity.
 
+## 2026-10-17 exact RoPE/view rewrite and CUDA read-ahead
+
+Evidence is in ignored `artifacts/perf/local/final-h3-ab/` (M5 Pro) and in
+`/workspace/perf/final-h3-ab/` on the A40 pod. Dependencies were unchanged: ggml
+a05c9922613c6a2230dbb1d0de679519ecafb4f0 on the M5 Pro, and
+03f0267bd56f096ae4ae6fdf7c043e7ede1a1bfd on the A40. Upstream master after
+e02d4bfc and 1160710c changed `ggml_cuda_mmq_get_config` and removed
+`ggml_cuda_mmq_get_J_max`, so it no longer builds TensorSharp's DSV4
+quant-strip and precision CUDA code. The baseline on each host is a frozen
+build of the previous commit (3f422687), and the candidate is built from the
+same ggml.
+
+**Gates.** The first-step video and audio velocities
+(`TS_H3_DUMP_VEL_V`/`TS_H3_DUMP_VEL_A`) were byte-identical. Then:
+
+```sh
+python3 eng/validation/minimax-h3-ab.py --baseline-cli <base>/TensorSharp.Cli.dll \
+  --candidate-cli <final>/TensorSharp.Cli.dll --models <models> --output <fresh dir> \
+  --backend ggml_metal|ggml_cuda --rounds 4 --expected-ggml-revision <revision>
+```
+
+**Results.** FL2VA Q4_K t2v, 640×384×22, 20 steps, seed 42. All 4 pairs on each
+host had exact decoded RGB and audio.
+
+| Host | Baseline median | Candidate median | Median step |
+|---|---:|---:|---:|
+| M5 Pro `ggml_metal` | 117.920 s | 105.697 s | 5.44 → 4.85 s |
+| A40 `ggml_cuda` | 69.363 s | 58.864 s | 1.39 → 1.31 s |
+
+On the A40, the median trunk went from 13.3 to 6.4 s and the median first step
+from 11.5 to 7.6 s.
+
+**Profiling.** `TS_GGML_NODE_PROFILE=1 TS_GGML_NODE_PROFILE_TAG=dit-forward`
+shows CONT dropping from 614 to 59 nodes per step (7,724 → 7,073 nodes in all).
+Subtract about 0.14 ms per node (the no-op VIEW time) as profiler
+synchronization.
+
+**Tests.**
+
+- **M5 Pro:** with `TS_MINIMAX_H3_DIR=models TS_TEST_GGML_BACKEND=metal`,
+  677 MiniMax-H3 tests passed, including the 17 VAE oracle tests that cover the
+  rewritten ViT RoPE. 22 were skipped because they need CUDA.
+- **A40:** 1,051 tests passed (LTX, H3, read-ahead and Safetensors filters;
+  131 of them CUDA or read-ahead). 35 were skipped: MLX-only tests, Turbo
+  adapters, DiffusionGemma vision and the unavailable LTX fixtures. Skipped
+  tests are not coverage.
+
+**Limitations.** This round covered one t2v recipe only. It did not run
+keyframe, Ref2VA, 1280×768 or Turbo generations, and it did not benchmark the
+MLX or direct `cuda` backends. Those backends do not run these ggml graphs, so
+the RoPE change does not apply to them, but their denoiser prefault now uses the
+new reader. File caches were uncontrolled.
+
 ## 2026-10-17 1280×768 speed and Turbo plug-in validation
 
 Evidence is under ignored `artifacts/minimax-h3/speed/` (attention benchmarks and

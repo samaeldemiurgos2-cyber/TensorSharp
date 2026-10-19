@@ -50,6 +50,15 @@ public sealed class StudioHostBoundary
         return path;
     }
 
+    /// <summary>The thumbnail route's <c>frame</c> query: absent for a video's opening, <c>last</c> for the frame a chain
+    /// continues from. Any other value is refused rather than ignored.</summary>
+    public static bool ThumbnailOfLastFrame(string frame) => frame switch
+    {
+        "" => false,
+        "last" => true,
+        _ => throw new StudioException("invalid_request", "The thumbnail frame must be omitted or \"last\"."),
+    };
+
     public static int Status(Exception error) => error switch
     {
         StudioException e when e.Code.Contains("revision", StringComparison.Ordinal) || e.Code.Contains("conflict", StringComparison.Ordinal) => 409,

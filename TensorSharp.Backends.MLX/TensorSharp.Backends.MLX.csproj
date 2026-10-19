@@ -21,6 +21,9 @@
          METAL_PATH baked in at compile time that points into the build tree,
          which does not exist on a machine that just consumes the binaries. -->
     <MlxNativeMetallibName Condition="$([MSBuild]::IsOSPlatform('OSX'))">mlx.metallib</MlxNativeMetallibName>
+    <MlxNativeBuildStamp>$(MlxNativeInstallDir)/.tensorsharp-native-build.stamp</MlxNativeBuildStamp>
+    <MlxNativeBuildOutput>$(MlxNativeBuildStamp)</MlxNativeBuildOutput>
+    <MlxNativeBuildOutput Condition="'$(TensorSharpBuildMlxNative)' == 'true' Or '$(TENSORSHARP_MLX_NATIVE_BUILD)' == 'true'">$(MlxNativeInstallDir)/force-rebuild</MlxNativeBuildOutput>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
@@ -28,12 +31,16 @@
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />
+    <MlxNativeBuildInput Include="$(MlxNativeSourceDir)/*.cpp;$(MlxNativeSourceDir)/*.h;$(MlxNativeSourceDir)/CMakeLists.txt;$(MlxNativeSourceDir)/MLX_C_VERSION;$(MSBuildProjectDirectory)/$(MlxNativeBuildScript);$(MSBuildProjectDirectory)/../eng/ensure-metal-toolchain.sh" />
   </ItemGroup>
   <Target Name="BuildMlxNative"
           BeforeTargets="BeforeBuild"
-          Condition="'$(MlxNativeBuildScript)' != '' And '$(TensorSharpSkipMlxNative)' != 'true' And '$(TENSORSHARP_MLX_NATIVE_SKIP)' != 'true' And '$(TargetPlatformIdentifier)' != 'ios' And ('$(TensorSharpBuildMlxNative)' == 'true' Or '$(TENSORSHARP_MLX_NATIVE_BUILD)' == 'true' Or !Exists('$(MlxNativeInstallDir)/$(MlxNativeBinaryName)'))">
+          Condition="'$(MlxNativeBuildScript)' != '' And '$(TensorSharpSkipMlxNative)' != 'true' And '$(TENSORSHARP_MLX_NATIVE_SKIP)' != 'true' And '$(TargetPlatformIdentifier)' != 'ios'"
+          Inputs="@(MlxNativeBuildInput)"
+          Outputs="$(MlxNativeBuildOutput);$(MlxNativeInstallDir)/$(MlxNativeBinaryName);$(MlxNativeInstallDir)/$(MlxNativeDependencyName)">
     <Message Importance="high" Text="Building MLX native library via $(MlxNativeBuildScript) (this may take several minutes on first build; set TENSORSHARP_MLX_NATIVE_SKIP=true to skip)..." />
     <Exec Command="bash &quot;$(MSBuildProjectDirectory)/$(MlxNativeBuildScript)&quot;" />
+    <Touch Files="$(MlxNativeBuildStamp)" AlwaysCreate="true" />
   </Target>
   <!-- MLX is a macOS-only backend; an iOS build must never shell out to the
        macOS native build script (nor copy its dylibs into the app bundle). -->

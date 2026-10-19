@@ -39,6 +39,16 @@ public static class StudioCommands
             StudioPaths.FileName(asset.FileName);
             if (asset.Generation is { } provenance && (provenance.Request is null || provenance.EffectiveParameters is null || provenance.ModelVersion is null))
                 throw new StudioException("invalid_asset", "Generation provenance must include a request, model identity, and effective parameters.");
+            // Package metadata is untrusted: a still's source record must be one Studio could have written.
+            if (asset.DerivedFrom is { } derived)
+            {
+                if (asset.Kind != "image" || asset.Generation != null || derived.Frame < StudioFrameSource.LastFrame || derived.Frame > options.MaxTimelineFrames ||
+                    (derived.Frame == StudioFrameSource.LastFrame) != (derived.FrameRate is null) ||
+                    derived.Method is not (StudioFrameSource.GenerationMethod or StudioFrameSource.DecodeMethod) ||
+                    derived.Name is null || derived.Name.Length > 200 || derived.Sha256 is null || derived.Sha256.Length != 64 || !derived.Sha256.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f'))
+                    throw new StudioException("invalid_asset", "A still's source-frame record is invalid.");
+                StudioPaths.Id(derived.AssetId); derived.FrameRate?.Validate();
+            }
             if (asset.Bytes < 0 || asset.Bytes > options.MaxImportBytes || string.IsNullOrWhiteSpace(asset.Name) || asset.Name.Length > 200 || asset.Width < 0 || asset.Height < 0 || asset.Width > 16384 || asset.Height > 16384 ||
                 asset.Sha256 is null || asset.Sha256.Length != 64 || !asset.Sha256.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f'))
                 throw new StudioException("invalid_asset", "Asset sizes, dimensions, name, or content hash are invalid.");

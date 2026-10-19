@@ -70,7 +70,46 @@ public sealed class StudioAsset
     public bool VariableFrameRate { get; set; }
     public bool Missing { get; set; }
     public StudioGenerationProvenance? Generation { get; set; }
+    /// <summary>For a still taken from a video in this library (to start the next segment of a chain on it): which video
+    /// and which of its frames. Null for imported and generated media.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public StudioFrameSource? DerivedFrom { get; set; }
 }
+
+/// <summary>Where a still came from: one frame of a video asset. Recorded when the frame is taken, so the still keeps
+/// its meaning after the video is renamed in a package or deleted from the library.</summary>
+public sealed class StudioFrameSource
+{
+    /// <summary><see cref="Frame"/> value for the video's last frame.</summary>
+    public const long LastFrame = -1;
+    /// <summary>The frame came from the take's own last frame, saved losslessly before its video was encoded.</summary>
+    public const string GenerationMethod = "generation";
+    /// <summary>The frame was decoded from the video file.</summary>
+    public const string DecodeMethod = "decode";
+    public string AssetId { get; set; } = "";
+    /// <summary>The video's name and content hash when the frame was taken.</summary>
+    public string Name { get; set; } = "";
+    public string Sha256 { get; set; } = "";
+    /// <summary><see cref="LastFrame"/>, or frame N on the project clock, sampled as the timeline shows the video
+    /// (the unit of <see cref="StudioClip.SourceStartFrame"/>; a clip ends on SourceStartFrame + DurationFrames - 1).</summary>
+    public long Frame { get; set; } = LastFrame;
+    /// <summary>The project frame rate that counts <see cref="Frame"/>; null for the last frame.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public StudioFrameRate? FrameRate { get; set; }
+    /// <summary><see cref="GenerationMethod"/> or <see cref="DecodeMethod"/>.</summary>
+    public string Method { get; set; } = DecodeMethod;
+}
+
+/// <summary>A frame of a video asset to start a generation on: <see cref="StudioFrameSource.LastFrame"/> or a
+/// project frame N (see <see cref="StudioFrameSource.Frame"/>).</summary>
+public sealed class StudioFrameSelector
+{
+    public string AssetId { get; set; } = "";
+    public long Frame { get; set; } = StudioFrameSource.LastFrame;
+}
+
+/// <summary>The still <see cref="StudioService.ExtractFrameAsync"/> put in the library (or found there already).</summary>
+public sealed record StudioFrameExtraction(StudioProject Project, string AssetId, bool Reused);
 
 public sealed class StudioTrack
 {
@@ -182,7 +221,9 @@ public sealed class StudioGenerationRequest
     /// Null infers the mode from the supplied inputs, as requests saved before explicit modes did.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Mode { get; set; }
-    /// <summary>The pinned first frame (i2v, optionally fl2v and keyframes). Optional in fl2v.</summary>
+    /// <summary>The pinned first frame (i2v, optionally fl2v and keyframes). Optional in fl2v, and in ref on a checkpoint
+    /// that keeps identity references while starting on a first frame (<see cref="StudioModelCapability.ReferencesWithFirstFrame"/>).
+    /// To continue a video, it is a still taken from that video (<see cref="StudioAsset.DerivedFrom"/>).</summary>
     public string? ConditioningAssetId { get; set; }
     /// <summary>The pinned last frame (fl2v, optionally keyframes). A last frame alone is fl2v.</summary>
     public string? EndConditioningAssetId { get; set; }
@@ -215,6 +256,18 @@ public sealed class StudioModelCapability
     public bool TemporalGuidance { get; set; }
     public bool IdentityReferences { get; set; }
     public int MaxReferences { get; set; }
+    /// <summary>Whether ref mode can also pin the first frame: keep a character from reference photos while starting on a
+    /// frame, for example the last frame of the previous segment of a chain.</summary>
+    public bool ReferencesWithFirstFrame { get; set; }
+    /// <summary>Why <see cref="ReferencesWithFirstFrame"/> is false for a checkpoint that pins frames or takes references.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReferencesWithFirstFrameUnavailableReason { get; set; }
+    /// <summary>The size ref mode is trained at, when it differs from <see cref="DefaultWidth"/>/<see cref="DefaultHeight"/>
+    /// (LTX Ingredients: 768 × 448); null when ref uses the model's default size.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ReferenceDefaultWidth { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ReferenceDefaultHeight { get; set; }
     /// <summary>The generation modes this checkpoint runs, derived from the conditioning flags above.</summary>
     public string[] Modes => StudioGenerationModes.For(this);
     /// <summary>Modes of this model family that the loaded checkpoint or host cannot run, with the reason
@@ -266,6 +319,15 @@ public sealed class StudioModelCapability
     public int MaxFrames { get; set; } = 257;
     public int MaxDimension { get; set; } = 2048;
 
+    /// <summary>Refuse a ref request that also starts on a first frame unless this checkpoint keeps references with one
+    /// (<c>unsupported_conditioning</c>, with its reason). Neither input is ever dropped to make the request fit.</summary>
+    public void RequireReferencesWithFirstFrame(StudioGenerationRequest request, string mode)
+    {
+        if (mode != StudioGenerationModes.Reference || request.ConditioningAssetId == null || ReferencesWithFirstFrame) return;
+        throw new StudioException("unsupported_conditioning", ReferencesWithFirstFrameUnavailableReason
+            ?? "The selected model cannot keep identity references while starting on a first frame. Start on the frame alone, or make a ref take without it.");
+    }
+
     /// <summary>Why a step count other than <see cref="FixedSteps"/> is refused, naming what fixes it.</summary>
     public string FixedStepsRefusal() =>
         $"This model samples exactly {FixedSteps} steps ({SamplingRecipeName ?? "fixed by the checkpoint"}); leave steps 0 for its default.";
@@ -281,7 +343,10 @@ public sealed class StudioModelCapability
     }
 }
 
-public sealed record StudioGenerationResult(string FilePath, string ModelVersion, Dictionary<string, string> EffectiveParameters);
+/// <param name="LastFramePath">The take's last frame as a lossless PNG of the pixels its video was encoded from, inside
+/// the output directory, so the next segment of a chain can start exactly on it; null when the adapter keeps none.</param>
+public sealed record StudioGenerationResult(string FilePath, string ModelVersion, Dictionary<string, string> EffectiveParameters,
+    string? LastFramePath = null);
 public sealed record StudioProgress(string Stage, double Fraction, string? Detail = null)
 {
     /// <summary>Denoising steps finished so far (never the step still running) and the steps planned; both 0 for a
@@ -388,6 +453,13 @@ public sealed class StudioOptions
     public int MaxHistory { get; set; } = 40;
     public long MaxTimelineFrames { get; set; } = 24 * 60 * 60;
     public long MinimumFreeDiskBytes { get; set; } = 256L * 1024 * 1024;
-    public bool EnableExternalProcesses { get; set; } = !OperatingSystem.IsIOS() && !OperatingSystem.IsTvOS() && !OperatingSystem.IsAndroid();
+    // .NET also reports the Mac Catalyst desktop app as iOS. It runs ordinary
+    // desktop media tools; only the mobile Apple hosts prohibit subprocesses.
+    public bool EnableExternalProcesses { get; set; } =
+        (!OperatingSystem.IsIOS() || OperatingSystem.IsMacCatalyst()) && !OperatingSystem.IsTvOS() && !OperatingSystem.IsAndroid();
     public string? CaptionFontPath { get; set; }
+    /// <summary>Receives failed-job identifiers, stages, exception types and stack traces. Generation requests,
+    /// progress details and exception messages are omitted because they can contain private prompts or media names.
+    /// A diagnostic sink's failure does not stop the job worker.</summary>
+    public Action<string>? LogJobFailure { get; set; }
 }

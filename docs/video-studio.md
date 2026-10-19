@@ -15,6 +15,14 @@ these tools or install models. Review the
 [dependency notes](video-studio-design.md#dependency-and-licensing-decisions)
 before redistributing a media-tool build.
 
+The TensorAgent Mac Catalyst app supports the same local media pipeline as the
+desktop server. Finder launches also discover installed tools in
+`/opt/homebrew/bin` and `/usr/local/bin`; `TS_FFMPEG` and `TS_FFPROBE` can select
+explicit executables. Studio verifies a small H.264/AAC MP4 before enabling
+generation and export. On Mac desktop it prefers VideoToolbox and falls back to
+libx264 when the installed hardware encoder cannot start. Successful checks are
+cached; failed checks can recover after the tools become available.
+
 ```sh
 dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj
 TS_STUDIO_DIRECTORY="$PWD/artifacts/my-studio" \
@@ -149,34 +157,48 @@ The **Generate** tab reads top to bottom:
 2. **Describe this shot.** The placeholder changes with the photos you chose.
 3. **Start or end on a photo (optional).** Two slots, **First frame** and
    **Last frame**. Leave both empty to make the take from the description
-   alone. Fill a slot in any of three ways:
+   alone. Fill a slot in any of these ways:
    - tap it and choose a photo from the library's thumbnails, or **Import a
      photo…** (PNG, JPEG or WebP) to add one and use it at once;
    - drag a library photo onto it (desktop);
    - choose **As first frame** or **As last frame** on a library photo. This
-     opens Generate with the photo in place.
+     opens Generate with the photo in place;
+   - for the first frame only, continue a video: choose it under **Or continue
+     a video from its last frame** in the picker, or drop it on the slot
+     (desktop). See [Make a long video as a chain](#make-a-long-video-as-a-chain).
 
    A filled slot shows the photo cropped to the take's shape, as the model will
-   crop it, with **Change** and **Remove**. **Swap first and last frames**
+   crop it, with **Change** and **Remove**. A frame taken from a video says
+   which ("Last frame of “shot.mp4”"). **Swap first and last frames**
    exchanges them. A line under the slots says what the take will do ("The take
    ends on the last frame."). A slot the loaded model cannot use stays visible
    and says why (Wan, for example, cannot pin a last frame).
-4. **Other ways to use photos** (only when the model offers more than one):
+4. **Keep a character the same (optional).** Reference photos of who or what
+   should look the same, each with **Remove**. **+ Add reference photo** adds
+   one, as does **As character reference** on a library photo. With reference
+   photos the take is a `ref` take: a new scene with that character. Starting on
+   a first frame as well needs a model that keeps references with one, which no
+   installed model does; the section says why for the loaded one. A last frame
+   cannot join reference photos. See
+   [Keep a character across segments](#keep-a-character-across-segments).
+5. **Other ways to use photos** (only when the model offers more than one):
    **Hit photos at set moments** (timed keyframes) and **Keep someone or
-   something the same** (identity references). Photos chosen for one use are
-   kept when you switch to another, but only the active use's photos are sent.
-5. **Length** (in seconds, only the lengths the model's frame grid makes),
+   something the same** (identity references, the same list of photos as
+   step 4). Photos chosen for one use are kept when you switch to another, but
+   only the active use's photos are sent.
+6. **Length** (in seconds, only the lengths the model's frame grid makes),
    **Size**, **Generate audio**, and under **Advanced settings** the negative
    prompt (when the model's guidance runs one), steps, guidance, seed and frame
    rate.
-6. **Reset to model defaults.** It re-reads the loaded model and its plug-ins
+7. **Reset to model defaults.** It re-reads the loaded model and its plug-ins
    from the host, then puts length, size, frame rate, steps, guidance and sound
-   back to that model's defaults. Your description, photos and seed stay. This
+   back to that model's defaults; a chain segment keeps the size of the video it
+   continues. Your description, photos and seed stay. This
    one button replaces the earlier **Refresh model capabilities** and **Use
    model defaults** buttons: the first only re-read the host and redrew the
    form, the second only reset the fields from the values the form already
    held, so it could apply stale defaults.
-7. **Generate take**, with a one-line summary above it ("Ends on beach.jpg ·
+8. **Generate take**, with a one-line summary above it ("Ends on beach.jpg ·
    0.9 s (22 frames) · 768 × 1152 · with sound"). A problem shows next to the
    button in plain words; the host's own message is under **Details**. A refusal
    about the model (it changed, or a plug-in did) also re-reads the model.
@@ -184,12 +206,13 @@ The **Generate** tab reads top to bottom:
 The form is kept per project, so editing the timeline, a finished job or a model
 refresh never clears it. After you generate, Jobs shows the progress. The finished
 take appears in the library named after its prompt ("Waves roll in at sunrise.mp4",
-then "… · take 2.mp4" for the next take of the same shot), marked, and announced.
+then "… · take 2.mp4" for the next take of the same shot, and "… · part 2.mp4"
+for a segment that continues a video), marked, and announced.
 
 ### Generation modes
 
-The mode says what the photos *mean*. Studio derives it from the slots you
-fill and sends only the photos that mode uses. The host refuses a request whose
+The mode says what the photos *mean*. Studio derives it from the slots and
+reference photos you fill and sends only the photos that mode uses. The host refuses a request whose
 images do not match its mode, so an image is never quietly reinterpreted.
 
 | You fill | Mode sent | What happens |
@@ -200,6 +223,7 @@ images do not match its mode, so an image is never quietly reinterpreted.
 | First and last frame | **fl2v** | The clip starts on one photo and ends on the other. |
 | Timed keyframes | **keyframes** | Each photo guides a chosen output frame at a chosen strength; first and last frames stay optional. |
 | Reference photos | **ref** | Identity/appearance references for a new scene. They are not frames; the first frame need not resemble them. |
+| Reference photos and a first frame | **ref** | The take starts on the first frame and keeps who or what the references show. Only a model that keeps references with a first frame runs it. A last frame or timed keyframes never join references. |
 
 First and last frames are each optional, as on MiniMax-H3's FL2VA checkpoint:
 its model card accepts zero, one or two images (one image is the first *or* the
@@ -214,20 +238,22 @@ LTX 2.5 appends it as an image guide at the final frame. A last frame alone,
 or with a first, is `fl2v`; a first frame alone stays `i2v`.
 
 Use **i2v** to animate a photo and **ref** to put the person or product from a
-photo somewhere new. Studio keeps references in the order you select them and
+photo somewhere new. **ref** may also carry a first frame on a checkpoint that
+keeps references while starting on one (none installed here; see
+[Keep a character across segments](#keep-a-character-across-segments)). Studio keeps references in the order you select them and
 shows that order. MiniMax-H3 names them `<Picture 1>`, `<Picture 2>`… in the
 prompt, and LTX lays them out in that order.
 
 What each loaded checkpoint runs:
 
-| Model | Text only | First frame | Last frame only | First + last | Keyframes | References |
-|---|---|---|---|---|---|---|
-| MiniMax-H3 FL2VA (`minimax_h3_fl2va_*`) | Yes | Yes | Yes | Yes | No | Needs the Ref2VA file |
-| MiniMax-H3 Ref2VA (`minimax_h3_ref2va_*`) | Yes | Needs the FL2VA file | Needs the FL2VA file | Needs the FL2VA file | No | Yes, up to 9 images |
-| LTX 2.5 Distilled | Yes | Yes | Yes | Yes | Yes, up to 16 images | With the Ingredients IC-LoRA: up to 16 images, at least 121 frames |
-| Wan2.2 TI2V-5B | Yes | Yes | No | No | No | No |
-| Wan2.2 I2V-A14B | No (a first frame is required) | Yes | No | No | No | No |
-| Wan 2.1 / Wan2.2 T2V | Yes | No | No | No | No | No |
+| Model | Text only | First frame | Last frame only | First + last | Keyframes | References | References + first frame |
+|---|---|---|---|---|---|---|---|
+| MiniMax-H3 FL2VA (`minimax_h3_fl2va_*`) | Yes | Yes | Yes | Yes | No | Needs the Ref2VA file | No |
+| MiniMax-H3 Ref2VA (`minimax_h3_ref2va_*`) | Yes | Needs the FL2VA file | Needs the FL2VA file | Needs the FL2VA file | No | Yes, up to 9 images | No |
+| LTX 2.5 Distilled | Yes | Yes | Yes | Yes | Yes, up to 16 images | With the Ingredients IC-LoRA: up to 16 images, at least 121 frames | No (the pipeline composes it, but validation cut to the reference photos) |
+| Wan2.2 TI2V-5B | Yes | Yes | No | No | No | No | No |
+| Wan2.2 I2V-A14B | No (a first frame is required) | Yes | No | No | No | No | No |
+| Wan 2.1 / Wan2.2 T2V | Yes | No | No | No | No | No | No |
 
 The slots and uses come from the loaded checkpoint. One it cannot use stays
 visible with the reason underneath. MiniMax-H3's FL2VA and Ref2VA are separate
@@ -239,11 +265,13 @@ also need the desktop FFmpeg/libx264 image transform. Wan never reads a last
 frame: through the server, the CLI and the API, an end image on Wan is refused
 instead of being dropped.
 
-Recipes depend on the mode. LTX's ref mode is one full-size pass rather than
-the two-stage recipe, and choosing references raises the length to 121 frames
-when it is lower, saying so. Studio references are still images: MiniMax-H3
-reference video clips and soundtracks remain available through chat, the CLI and
-the HTTP API.
+Recipes depend on the mode. LTX's ref mode, with or without a first frame, is
+one full-size pass rather than the two-stage recipe, and choosing references
+raises the length to 121 frames when it is lower, saying so. Studio references
+and frames are still images. A frame taken from a video is one too: Studio puts
+it in the library as a still that records the video and frame it came from.
+MiniMax-H3 reference video clips and soundtracks remain available through chat,
+the CLI and the HTTP API.
 
 Takes made before modes were explicit reopen in the mode their inputs imply and
 run unchanged. Shot plans saved by the Studio assistant may name a `mode`. Studio
@@ -286,6 +314,105 @@ Replace the selected clip with this** to swap a selected clip's take while
 keeping its placement. Original assets stay in the library for comparison and
 undo; a replacement must fit the requested source range.
 
+### Make a long video as a chain
+
+A take is short, so a longer video is made as a chain of takes: each segment
+starts on the frame the one before it ends on, and the segments play one after
+another on the timeline. Each of these opens Generate with that frame as the
+**First frame**:
+
+- **Continue from last frame** on a video's library card.
+- **Continue after this clip** in **Properties** for a selected video clip. The
+  take starts on the frame the clip ends on: its out point when the clip is
+  trimmed, or the video's last frame when the clip reaches the end.
+- **Continue from this take** on a finished generation in **Jobs**.
+- In the first-frame picker, a video under **Or continue a video from its last
+  frame** (its tile shows that frame), or a video dropped on the first slot.
+
+Your description and reference photos stay, so a character carries on, and a
+last frame chosen for the previous shot is cleared. Describe what happens next.
+The frame becomes a still in the library ("shot · last frame.png" or "shot ·
+frame 48.png"), whose card and slot say which video and frame it came from.
+Taking the same frame again reuses that still. Like an import, adding it is not
+an undo step; delete it as any other asset.
+
+For a take generated on this host, the last frame is the take's own last frame,
+saved losslessly before its video was encoded, so the next segment is
+conditioned on exactly those pixels rather than on a decoded copy. Its own first
+frame is the model's reconstruction of them: close, not bit-identical. Any other
+frame is decoded from the video file: an imported video, a take from a project
+package (packages omit job history), or a trimmed clip's out point. The slot
+then adds "from the encoded video". A frame number is counted on the project
+clock, and the frame is the one the timeline shows there. Decoding refuses HDR
+(PQ or HLG) and interlaced video rather than tone-mapping or deinterlacing it;
+export an SDR or progressive version and continue from that. Non-square pixels
+are widened to square, as a player shows them.
+
+A segment is made at the size of the video it continues when the loaded model
+can make that size ("Size matches the video this take continues"), so the
+segments join without a crop or a jump. Otherwise the hint says the frame is
+fitted to the take's size. The size is set once, when the frame is placed; you
+can change it afterwards, and **Reset to model defaults** keeps it. Sound is
+made per segment: it does not carry on across the join. For one continuous
+soundtrack, put it on an audio track under the segments.
+
+A segment's take is named after its prompt with " · part N". Continuing an
+imported video gives part 2, and continuing a part 2 take gives part 3.
+
+When the take is ready, **Add after “shot.mp4”** on its Jobs card or library
+card puts it right after the clip it continues, on the same track. The button
+appears when a clip of that video ending on that frame is on a video track. The
+new clip starts one frame in (its **Source in**), because the take's first frame
+repeats the last frame of the clip before it, which would otherwise show twice.
+When the project frame rate is higher than the take's, it skips the matching
+number of project frames: two at 48 fps for a 24 fps take. The status line says
+how many, and warns when the new clip overlaps another clip on the track. It is
+an ordinary undoable edit. **Add take to timeline** still adds the whole take.
+
+Taking a frame needs the desktop media decoder (FFmpeg), as generation does.
+Where Studio runs without media subprocesses (iOS, and the TensorAgent app on
+Mac Catalyst), the continue actions are unavailable with generation, and a frame
+request is refused with that reason. The assistant can also
+[plan a segment](#the-assistant) that continues a video.
+
+### Keep a character across segments
+
+A first frame carries a character into a segment, but the look can drift over
+many segments. Reference photos under **Keep a character the same (optional)**
+ask the model to keep that person or object the same. They are listed in the
+order sent to the model (MiniMax-H3 calls them Picture 1, 2, …). Reference photos
+cannot be combined with a last frame.
+
+With no first frame, the photos make a new shot that keeps the character
+(MiniMax-H3 Ref2VA, or LTX 2.5 with the Ingredients IC-LoRA): a fresh framing, so
+the join to the previous segment is a cut. Starting on the previous segment's
+frame **and** keeping reference photos needs a checkpoint that does both in one
+take (`referencesWithFirstFrame`). None of the installed families does, and the
+section says why for the loaded one instead of dropping either input:
+
+- **MiniMax-H3.** FL2VA pins frames but takes no reference photos; Ref2VA keeps a
+  character but pins no frames. MiniMax's own pipeline, stable-diffusion.cpp and
+  vllm-omni refuse keyframes and references in one request. On FL2VA, continue
+  from the frame alone: it already shows the character. On Ref2VA, MiniMax's
+  prompt guide lets a reference photo describe "the first frame of [Shot 1]". In
+  validation that kept the character but framed a new shot rather than continuing
+  the frame.
+- **LTX 2.5.** Its pipeline composes a frame-0 image guide with the Ingredients
+  sheet as the publisher's IC-LoRA pipeline does
+  ([LTX 2.5 card](models/ltx-2.5.md#starting-on-a-first-frame)), but the
+  publisher trained Ingredients without a pinned first frame, and in validation
+  every such take cut from the frame to the reference photos at its second frame.
+  Studio therefore does not offer it.
+- **Wan** has no identity references. Its image-to-video checkpoints (TI2V-5B,
+  I2V-A14B) continue from the frame alone.
+
+A model that does advertise `referencesWithFirstFrame` gets the same section
+enabled, and its **Keep someone or something the same** view shows an optional
+first-frame slot. Ingredients is trained at 768 × 448 and 121 frames: choosing
+references raises a shorter length to 121 frames, saying so, and when the size
+differs the section offers **Use 768 × 448** (unless the host pins one size for
+every mode).
+
 ### The assistant
 
 The **Assistant** tab is a chat agent scoped to this project. It runs on the
@@ -307,6 +434,14 @@ What it does with them:
 - **Shot plans.** `studio_generate` saves a plan (prompt, mode, photos, size,
   length); it never makes footage. Open a plan in Generate to review it, or run
   it with a loaded video model.
+- **Chain segments.** A plan can continue a video: `continueFromAssetId` names
+  the video, and the optional `continueFromFrame` names `last` (the default) or
+  a frame number on the project clock. The plan stores this as `firstFrameFrom`
+  and its card reads "Continues “shot.mp4”". The frame is taken when you start
+  the plan or choose **Open in Generate**, so planning never changes the
+  library. `studio_inspect` and `studio_assets` show which video and frame a
+  still came from (`derivedFrom`) and a short summary of each take (mode, first
+  frame, reference count, length and shot), so the assistant can follow a chain.
 - **Exports and imports.** `studio_render` starts a local preview/export job and
   `studio_import_chat` imports a chat upload into the library. Neither waits for
   an Apply step.
@@ -414,7 +549,8 @@ settings, then retry explicitly. The queue is bounded; Studio does not silently
 lower quality after out-of-memory or disk errors.
 
 Mobile can review and edit imported project packages. Desktop subprocess-based
-probing, thumbnails, waveforms and export are unavailable on iOS/Android. Studio
+probing, thumbnails, waveforms, frame stills and export are unavailable on
+iOS/Android. Studio
 generation is also disabled there because the required output validation and
 rendering pipeline is unavailable; a loaded native model does not bypass this
 gate. No desktop-equivalent mobile validation is claimed. There is no automatic remote
@@ -438,6 +574,15 @@ python3 eng/studio/validate.py --connection artifacts/studio-agent/connection.js
 # With a real video model already loaded; no test double or download is used.
 python3 eng/studio/validate.py --url http://127.0.0.1:8187 \
   --generate --output artifacts/studio-native-check
+
+# Against an actual Mac Catalyst app launched with TENSORAGENT_VALIDATION_ROOT,
+# with the pinned LTX catalog assets in its isolated Cache/models directory.
+# Exercises native model selection, Studio import, real 1024x1024 joint video/audio
+# generation, thumbnails/waveforms, timeline insertion and fully decoded export.
+python3 eng/studio/validate_maui.py \
+  --connection artifacts/studio-mac-app/connection.json \
+  --app TensorAgent/src/TensorAgent.Maui/bin/Release/net10.0-maccatalyst/maccatalyst-arm64/TensorAgent.app \
+  --output artifacts/studio-mac-check
 ```
 
 After stopping/restarting the same host against the same data root, pass

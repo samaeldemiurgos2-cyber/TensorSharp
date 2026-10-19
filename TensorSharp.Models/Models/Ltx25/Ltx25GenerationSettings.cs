@@ -33,6 +33,8 @@ public sealed record Ltx25GenerationSettings(int Width, int Height, int Frames, 
     public const int RefinementSteps = 3;
     /// <summary>Default output size when a request leaves width and height unset.</summary>
     public const int DefaultSize = 1024;
+    /// <summary>The Ingredients IC-LoRA's trained bucket ("768×448, 121 frames, 24 fps"), the identity default size.</summary>
+    public const int ReferenceWidth = 768, ReferenceHeight = 448;
 
     public static Ltx25GenerationSettings Resolve(VideoGenerationParams parameters, bool supportsIdentityReferences = false)
     {
@@ -56,8 +58,8 @@ public sealed record Ltx25GenerationSettings(int Width, int Height, int Frames, 
                 $"{EulerSampler} selects deterministic Euler for diagnostics.");
         if (parameters.FlowShift != 0)
             throw new ArgumentException("LTX 2.5 Distilled uses fixed sigmas and does not accept a flow-shift override.");
-        int width = parameters.Width == 0 ? identity ? 768 : DefaultSize : parameters.Width;
-        int height = parameters.Height == 0 ? identity ? 448 : DefaultSize : parameters.Height;
+        int width = parameters.Width == 0 ? identity ? ReferenceWidth : DefaultSize : parameters.Width;
+        int height = parameters.Height == 0 ? identity ? ReferenceHeight : DefaultSize : parameters.Height;
         // The half-size first pass keeps the 32-pixel latent grid only for 64-pixel multiples.
         if (!identity && (width <= 0 || height <= 0 || width % 64 != 0 || height % 64 != 0))
             throw new ArgumentException("LTX 2.5 generates at half size before upscaling, so width and height must be positive multiples of 64.");
@@ -70,6 +72,7 @@ public sealed record Ltx25GenerationSettings(int Width, int Height, int Frames, 
             if (frames < Ltx25ReferenceConditioning.MinimumFrames)
                 throw new ArgumentException("Ingredients identity generation requires at least 121 frames on the 8n+1 temporal grid.");
             _ = Ltx25ReferenceConditioning.ResolveSources(parameters);
+            _ = Ltx25ReferenceConditioning.ResolveFirstFrameGuide(parameters);
         }
         else _ = Ltx25ImageConditioning.Resolve(parameters, frames);
         // Original AudioLatentShape.from_duration uses Python's ties-to-even

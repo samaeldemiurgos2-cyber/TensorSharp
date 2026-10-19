@@ -132,10 +132,38 @@ separately trained eight-step FastH3 checkpoints must not be conflated.
 
 ## Performance and precision
 
-The latest before/after comparison uses FL2VA Q4_K, 640×384×22 at 24 fps,
-20 Euler steps, seed 42, CFG 1 and shift 12. Two alternating rounds include
-model loading, generation and codecs. Both frozen binaries use the unchanged
-ggml revision above; file/JIT caches remain uncontrolled.
+The latest before/after comparison (2026-10-17) uses FL2VA Q4_K at 640×384×22
+and 24 fps, with 20 Euler steps, seed 42, CFG 1 and shift 12. It ran four
+alternating rounds per host with `eng/validation/minimax-h3-ab.py`; each run
+includes model loading, generation and codecs. Every pair kept the decoded RGB
+and audio identical. Both frozen binaries on a host were built from the same
+unchanged ggml revision: a05c9922 on the M5 Pro and 03f0267b on the A40. The
+newer upstream ggml no longer builds TensorSharp's DSV4 CUDA kernels. File
+caches were not controlled.
+
+| Backend / host | Baseline median | Candidate median | Preserved output |
+|---|---:|---:|---|
+| M5 Pro `ggml_metal` | 117.920 s | 105.697 s | Exact RGB/audio, 4 pairs; 10.4% lower latency |
+| A40 `ggml_cuda` | 69.363 s | 58.864 s | Exact RGB/audio, 4 pairs; 15.1% lower latency |
+
+Two exact changes account for these results:
+
+- **RoPE rewrite.** In the DiT, text encoder, vision tower and video VAE, RoPE
+  now reads the half-swapped head straight out of the projection. It multiplies
+  that head by a sine table with the sign folded in, built once per graph, because
+  (−a)·b and a·(−b) round identically. A rotation therefore takes five
+  elementwise passes instead of ten, and q, k and v stay views of the fused
+  projection. The median Metal step went from 5.44 to 4.85 s and the median A40
+  step from 1.39 to 1.31 s.
+- **Read-ahead on `ggml_cuda`.** The text-encoder and denoiser files are read
+  ahead by sixteen concurrent 8 MiB readers (`TS_VIDEO_READAHEAD`,
+  `TS_H3_PREFAULT_THREADS`). The upload previously warmed their pages one fault
+  at a time, at ~1 GB/s on the A40 pod's network volume. With the read-ahead,
+  the median encoder trunk went from 13.3 to 6.4 s and the median first denoise
+  step from 11.5 to 7.6 s.
+
+The 2026-10-15 before/after comparison below uses the same recipe with two
+alternating rounds and the ggml revision recorded above.
 
 | Backend / host | Baseline median | Candidate median | Preserved output / scope |
 |---|---:|---:|---|
@@ -821,7 +849,9 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_TRACE=1` | Latent/velocity magnitude diagnostics |
 | `TS_H3_DIT_TRACE_DIR` / `TS_H3_LINEAR_TRACE_FILE` | Synchronizing boundary/projection diagnostics; exclude from formal timings |
 | `TS_H3_PREFAULT` | Denoiser file reading: 0 off, 1 serial, 2 early overlap, 3 default pipelined |
-| `TS_H3_PREFAULT_THREADS` | Prefault streams; default 1 |
+| `TS_H3_PREFAULT_THREADS` | Denoiser-read readers; default 1 on macOS, 16 on Linux (concurrent 8 MiB reads of one sweep, which network volumes need) |
+| `TS_VIDEO_READAHEAD=0` | Disables the `ggml_cuda` text-encoder read-ahead (concurrent reads ahead of the upload's page warming); shared with LTX 2.5 |
+| `TS_VIDEO_READAHEAD_WORKERS` | Readers for that read-ahead, 1–32; default 16 on Linux, 1 elsewhere |
 | `TS_H3_TE_GROUP` | Optional grouped native text-encoder trunk; off by default |
 | `TS_H3_KEEP_RESIDENT=1` | Optional Metal residency policy between clips |
 | `TS_METAL_FLASH_KV_PAD=0` | Turns off the key padding that puts long `ggml_metal` flash attention on the tensor-API kernel ([above](#long-sequence-attention-on-metal)); for A/B runs |

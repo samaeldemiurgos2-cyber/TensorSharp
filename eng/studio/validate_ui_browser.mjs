@@ -12,6 +12,9 @@
 //   node eng/studio/validate_ui_browser.mjs --url ... --submit --size 640x384 --output ...
 //   node eng/studio/validate_ui_browser.mjs --entry "<TensorAgentHost entryUrl>" --screens-only --output ...   (TensorAgent's page)
 //   node eng/studio/validate_ui_browser.mjs --url ... --assistant --output ...   (a tool-capable chat model loaded)
+//   node eng/studio/validate_ui_browser.mjs --url ... --chain --image imgs/banner_1.png --character face.png --size 640x384 --output ...
+//     (a long video as a chain: a take, "Continue from last frame" on it, a character photo beside the first frame, the
+//      second take, "Add after" on its job card, and a rendered preview of both)
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -205,6 +208,117 @@ async function assistantScenario() {
   writeFileSync(path.join(output, 'ui.json'), JSON.stringify(report, null, 2));
 }
 
+// A long video made as a chain, entirely through the page: take 1 from a photo, its last frame continued into take 2
+// (with a character photo beside the frame where the loaded model keeps both, else the model's refusal is shown and the
+// photo removed), take 2 placed right after take 1 from its job card, and the two rendered as one preview.
+async function chainScenario() {
+  const image = path.resolve(String(args.image || path.join(repository, 'imgs/banner_1.png')));
+  const files = [image]; if (args.character) files.push(path.resolve(String(args.character)));
+  const imageName = path.basename(image), characterName = args.character ? path.basename(String(args.character)) : null;
+  const input = await cdp('Runtime.evaluate', { expression: `document.querySelector('.ts-studio > input[type=file]')` });
+  await cdp('DOM.setFileInputFiles', { files, objectId: input.result.objectId });
+  await until(`document.querySelectorAll('.ts-studio-library .ts-asset').length >= ${files.length}`, 'the imported photos', 60000);
+  const setSize = async () => {
+    if (!args.size) return; const [w, h] = String(args.size).split('x');
+    await evaluate(`(() => { const s = Array.from(document.querySelectorAll('.ts-studio-inspector label')).find(l => l.firstChild && l.firstChild.textContent === 'Size'); if (s) { const n = s.querySelector('select'); n.value = 'custom'; n.dispatchEvent(new Event('change', { bubbles: true })); } return true; })()`);
+    await evaluate(`(() => { const field = name => Array.from(document.querySelectorAll('.ts-studio-inspector label')).find(l => l.firstChild && l.firstChild.textContent === name).querySelector('input');
+      for (const [name, value] of [['Width', ${JSON.stringify(w)}], ['Height', ${JSON.stringify(h)}]]) { const n = field(name); n.value = value; n.dispatchEvent(new Event('input', { bubbles: true })); } return true; })()`);
+  };
+  const describe = text => evaluate(`(() => { const t = document.querySelector('.ts-studio-inspector textarea'); t.focus(); t.value = ${JSON.stringify(text)}; t.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  const generateAndWait = async (label) => {
+    const before = await evaluate(`document.querySelectorAll('.ts-studio-library .ts-asset').length`);
+    await click('Generate take', '.ts-studio-inspector');
+    await until(`!!document.querySelector('.ts-studio-inspector .ts-job') || !!document.querySelector('.ts-studio-inspector .ts-form-error p')`, label + ' queued or refused', 60000);
+    const refused = await texts('.ts-studio-inspector .ts-form-error p'); if (refused.length) throw new Error(label + ' refused: ' + refused.join(' | '));
+    await until(`document.querySelectorAll('.ts-studio-library .ts-asset').length > ${before} && !!document.querySelector('.ts-studio-library .ts-asset[data-highlight=true]')`, label, Number(args.timeout || 3600) * 1000);
+    return (await texts('.ts-studio-library .ts-asset[data-highlight=true] strong'))[0];
+  };
+
+  // Take 1 starts on the photo.
+  await click('As first frame: ' + imageName, '.ts-studio-library');
+  await until(`!!document.querySelector('.ts-studio-inspector .ts-slot[data-slot=first][data-state=filled]')`, 'the first frame');
+  await describe(String(args.prompt1 || 'The woman sits on a glowing ribbon of light in space, smiling, her hair drifting as she slowly turns her head toward the camera.'));
+  await setSize();
+  const take1 = await generateAndWait('take 1');
+  step('take 1 made from the photo', { take1 });
+  await click('Add to timeline: ' + take1, '.ts-studio-library');
+  await until(`document.querySelectorAll('.ts-studio-timeline .ts-clip').length >= 1`, 'take 1 on the timeline');
+
+  // Continue: Generate opens on a still of take 1's last frame, at take 1's size.
+  await click('Continue from the last frame of ' + take1, '.ts-studio-library');
+  await until(`!!document.querySelector('.ts-studio-inspector .ts-slot[data-slot=first][data-state=filled]') && document.querySelector('.ts-studio-inspector .ts-slot-name').textContent.includes('last frame')`, 'the continued first frame', 60000);
+  const slot = await texts('.ts-studio-inspector .ts-slot[data-slot=first] p');
+  const size = await evaluate(`(() => { const field = name => Array.from(document.querySelectorAll('.ts-studio-inspector label')).find(l => l.firstChild && l.firstChild.textContent === name).querySelector('input').value; return field('Width') + 'x' + field('Height'); })()`);
+  if (!slot.some(t => t.startsWith('Last frame of “' + take1 + '”'))) throw new Error('First slot: ' + slot.join(' | '));
+  if (args.size && size !== String(args.size)) throw new Error('Continued size ' + size + ' is not take 1\'s ' + args.size);
+  await describe(String(args.prompt2 || 'She keeps smiling, lifts her hand from her knee and waves gently at the camera while the glowing cubes float around her.'));
+  const summary = (await texts('.ts-studio-inspector .ts-gen-summary'))[0];
+  if (!summary.startsWith('Continues “' + take1 + '”')) throw new Error('Summary: ' + summary);
+  step('continue from last frame opens Generate on take 1\'s last frame', { slot, size, summary, focus: await evaluate(`document.activeElement && document.activeElement.dataset.focusKey`) });
+  await shot('c1-continue-from-last-frame');
+
+  // The first-frame picker offers every video's last frame too.
+  await click('Change first frame (' + (await texts('.ts-studio-inspector .ts-slot[data-slot=first] .ts-slot-name'))[0] + ')', '.ts-studio-inspector');
+  await until(`!!document.querySelector('.ts-studio-inspector .ts-picker .ts-picker-sub')`, 'the video group in the picker');
+  const videoTiles = await evaluate(`Array.from(document.querySelectorAll('.ts-studio-inspector .ts-picker button[data-focus-key^=video-]')).map(b => ({ label: b.getAttribute('aria-label'), thumbnail: (b.querySelector('img') || {}).src || null }))`);
+  if (!videoTiles.length || videoTiles.some(t => t.thumbnail && !t.thumbnail.endsWith('?frame=last'))) throw new Error('Video tiles: ' + JSON.stringify(videoTiles));
+  step('the first-frame picker lists videos by their last frame', { videoTiles });
+  await shot('c2-picker-video-group');
+  await cdp('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  await cdp('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  await until(`!document.querySelector('.ts-studio-inspector .ts-picker')`, 'the picker to close');
+
+  // A character photo beside the frame: kept where the model can, otherwise its reason, shown before anything runs.
+  if (characterName) {
+    // A model that keeps both offers "+ Add reference photo"; any other says why in the section, and the library's
+    // "As character reference" still puts the photo there, where Generate then refuses it with that reason.
+    const offered = await evaluate(`!!Array.from(document.querySelectorAll('.ts-studio-inspector button')).find(b => b.getClientRects().length && b.textContent === '+ Add reference photo')`);
+    const reason = (await texts('.ts-studio-inspector .ts-gen-refs p'))[0];
+    if (offered) {
+      await click('+ Add reference photo', '.ts-studio-inspector');
+      await until(`!!document.querySelector('.ts-studio-inspector .ts-picker')`, 'the reference picker');
+      await click(characterName, '.ts-studio-inspector .ts-picker');
+    } else await click('As character reference: ' + characterName, '.ts-studio-library');
+    await until(`!!document.querySelector('.ts-studio-inspector .ts-ref-item')`, 'the chosen reference');
+    const section = await texts('.ts-studio-inspector .ts-gen-refs p');
+    step('character photo beside the continued frame', { offered, reasonBefore: reason, section });
+    await shot('c3-character-reference');
+    await click('Generate take', '.ts-studio-inspector');
+    await new Promise(r => setTimeout(r, 800));
+    const refused = await texts('.ts-studio-inspector .ts-form-error p');
+    if (refused.length) {
+      step('the loaded model refuses a character with a first frame, before any job', { refused: refused[0] });
+      await shot('c4-character-refused');
+      await click('Remove reference photo (' + characterName + ')', '.ts-studio-inspector');
+      await until(`!document.querySelector('.ts-studio-inspector .ts-ref-item')`, 'the reference removed');
+    } else {
+      // Queued with the character: wait for it as take 2.
+      report.characterKept = true;
+    }
+  }
+  const take2 = report.characterKept
+    ? (await until(`!!document.querySelector('.ts-studio-library .ts-asset[data-highlight=true]') && document.querySelectorAll('.ts-studio-library .ts-asset').length >= ${files.length + 3}`, 'take 2', Number(args.timeout || 3600) * 1000), (await texts('.ts-studio-library .ts-asset[data-highlight=true] strong'))[0])
+    : await generateAndWait('take 2');
+  if (!/· part 2/.test(take2)) throw new Error('Take 2 is not named as part 2: ' + take2);
+  step('take 2 made from take 1\'s last frame', { take2 });
+
+  // Its job card places it right after take 1, one frame in.
+  await click('Jobs', '.ts-studio-inspector .ts-tabbar');
+  await click('Add after “' + take1 + '”', '.ts-studio-inspector');
+  await until(`document.querySelectorAll('.ts-studio-timeline .ts-clip').length >= 2`, 'take 2 on the timeline');
+  const placed = (await texts('.ts-status'))[0];
+  const clips = await evaluate(`Array.from(document.querySelectorAll('.ts-studio-timeline .ts-clip')).map(c => ({ name: c.firstChild && c.firstChild.textContent, left: c.style.left, width: c.style.width, title: c.title }))`);
+  if (!/starts 1 frame\(s\) in/.test(placed || '')) throw new Error('Status: ' + placed);
+  step('take 2 placed right after take 1', { placed, clips });
+  await shot('c5-placed-after');
+
+  // Both render as one video.
+  await click('Render preview', '.ts-studio-preview');
+  await until(`!!Array.from(document.querySelectorAll('.ts-studio-inspector .ts-job')).find(j => j.dataset.state === 'completed' && j.textContent.includes('Render'))`, 'the rendered preview', 600000);
+  step('the chain rendered as one preview', { preview: (await texts('.ts-studio-preview > p.ts-hint'))[0] });
+  await shot('c6-rendered');
+}
+
 try {
   let port;
   for (let i = 0; i < 100 && !port; i++) {
@@ -223,7 +337,7 @@ try {
   if (args.lang) await cdp('Emulation.setLocaleOverride', { locale: String(args.lang) });
   await cdp('Page.navigate', { url: (args.entry ? String(args.entry).split('#')[0] : base + '/') + '#studio' });
   await until(`!!document.querySelector('.ts-studio:not([hidden]) .ts-guide')`, 'the Studio guide');
-  if (args.assistant) await assistantScenario(); else if (args['screens-only']) await screensScenario(); else await uiScenario();
+  if (args.assistant) await assistantScenario(); else if (args.chain) await chainScenario(); else if (args['screens-only']) await screensScenario(); else await uiScenario();
   writeFileSync(path.join(output, 'ui.json'), JSON.stringify(report, null, 2));
   console.log('UI PASSED', report.steps.length, 'steps; screenshots in', output);
 } catch (error) {

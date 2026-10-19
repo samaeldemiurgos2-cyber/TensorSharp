@@ -67,6 +67,47 @@ public static class Ltx25ImageConditioning
         return images;
     }
 
+    /// <summary>Pin canvas latent frame 0 of an already-conditioned sequence (Ingredients identity references appended
+    /// after the canvas) to <paramref name="image"/>, as upstream VideoConditionByLatentIndex does: frame 0's tokens take the
+    /// clean latent with denoise mask 1 - strength, and their noised value blends toward it. Positions, markers and every
+    /// other token are unchanged, so the result equals applying the image before the references, upstream's order.</summary>
+    public static Ltx25DenoiserInput ApplyFirstFrame(Ltx25DenoiserInput conditioned, Ltx25GenerationSettings settings, Ltx25EncodedImage image)
+    {
+        ArgumentNullException.ThrowIfNull(conditioned); ArgumentNullException.ThrowIfNull(settings); ArgumentNullException.ThrowIfNull(image);
+        int spatial = checked(settings.LatentHeight * settings.LatentWidth);
+        if (image.FrameIndex != 0 || !float.IsFinite(image.Strength) || image.Strength < 0 || image.Strength > 1 ||
+            image.Latent == null || image.Latent.Length != checked(spatial * 128) || image.Latent.Any(value => !float.IsFinite(value)))
+            throw new ArgumentException("Invalid encoded LTX first-frame guide.");
+        if (conditioned.CleanVideo == null || conditioned.VideoDenoiseMask == null || conditioned.VideoTokens < settings.VideoTokens ||
+            conditioned.CleanVideo.Length != conditioned.Video.Length || conditioned.VideoDenoiseMask.Length != conditioned.VideoTokens)
+            throw new ArgumentException("A first-frame guide is applied to a sequence that already carries clean latents and a denoise mask.");
+        var video = (float[])conditioned.Video.Clone();
+        var clean = (float[])conditioned.CleanVideo.Clone();
+        var mask = (float[])conditioned.VideoDenoiseMask.Clone();
+        Ltx25Geometry.PackVideo(image.Latent, spatial, 128).CopyTo(clean, 0);
+        float denoise = 1 - image.Strength;
+        for (int token = 0; token < spatial; ++token)
+        {
+            mask[token] = denoise;
+            for (int c = 0; c < 128; ++c)
+            {
+                int offset = token * 128 + c;
+                video[offset] = denoise == 0 ? clean[offset] : denoise == 1 ? video[offset] : clean[offset] + (video[offset] - clean[offset]) * denoise;
+            }
+        }
+        return new()
+        {
+            Video = video, VideoTokens = conditioned.VideoTokens, Audio = conditioned.Audio, AudioTokens = conditioned.AudioTokens,
+            VideoContext = conditioned.VideoContext, VideoContextTokens = conditioned.VideoContextTokens,
+            AudioContext = conditioned.AudioContext, AudioContextTokens = conditioned.AudioContextTokens,
+            VideoPositions = conditioned.VideoPositions, AudioPositions = conditioned.AudioPositions,
+            VideoSigma = conditioned.VideoSigma, AudioSigma = conditioned.AudioSigma, FrequencyPrecision = conditioned.FrequencyPrecision,
+            VideoTimesteps = conditioned.VideoTimesteps, AudioTimesteps = conditioned.AudioTimesteps,
+            VideoDenoiseMask = mask, CleanVideo = clean, KeyframeMask = conditioned.KeyframeMask, UseReferenceLora = conditioned.UseReferenceLora,
+            CancellationToken = conditioned.CancellationToken,
+        };
+    }
+
     /// <summary>Noise already includes storage for all appended guides. Audio is
     /// unchanged. Encoded image storage is [channel,height,width], not token-major.
     /// A refinement pass supplies its token-major <paramref name="rawNoise"/> and

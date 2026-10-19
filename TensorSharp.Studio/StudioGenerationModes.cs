@@ -9,7 +9,10 @@ namespace TensorSharp.Studio;
 /// <para>First and last frames are each optional, as on MiniMax-H3's FL2VA checkpoint
 /// ("zero, one or two images"; sglang's fl2va signatures [0], [-1], [0,-1]): none is t2v,
 /// a first frame alone is i2v, and a last frame, alone or with a first, is fl2v. No mode
-/// substitutes a blank image for a missing frame; the frame is simply not pinned.</para></summary>
+/// substitutes a blank image for a missing frame; the frame is simply not pinned.</para>
+/// <para>ref may also start on a first frame, to keep a character the same while continuing a video from its last
+/// frame. Few checkpoints run that (<see cref="StudioModelCapability.ReferencesWithFirstFrame"/>); admission checks it.
+/// A reference is still never a last or timed frame.</para></summary>
 public static class StudioGenerationModes
 {
     /// <summary>Text only.</summary>
@@ -20,7 +23,8 @@ public static class StudioGenerationModes
     public const string FirstLastFrame = "fl2v";
     /// <summary>Images guide explicit output frames (optionally with pinned first/last frames).</summary>
     public const string Keyframes = "keyframes";
-    /// <summary>The images are identity/appearance references for a new scene, not frames.</summary>
+    /// <summary>The images are identity/appearance references for a new scene, not frames; optionally the take also
+    /// starts on a pinned first frame.</summary>
     public const string Reference = "ref";
 
     public static readonly IReadOnlyList<string> All = [TextToVideo, ImageToVideo, FirstLastFrame, Keyframes, Reference];
@@ -68,15 +72,16 @@ public static class StudioGenerationModes
                 "Text-to-video (t2v) takes no images. Choose i2v, fl2v, keyframes or ref to use them.",
             ImageToVideo when !first => "Image-to-video (i2v) needs a first-frame image to animate.",
             ImageToVideo when last || guides > 0 || references > 0 =>
-                "Image-to-video (i2v) uses only a first-frame image. Choose fl2v to pin the last frame, or ref for identity references.",
+                "Image-to-video (i2v) uses only a first-frame image. Choose fl2v to pin the last frame, or ref for identity references " +
+                "(ref can also start on the first frame on a checkpoint that keeps references with a first frame).",
             FirstLastFrame when !last => "First-and-last-frame (fl2v) pins a last-frame image; with only a first frame, choose i2v.",
             FirstLastFrame when guides > 0 || references > 0 =>
                 "First-and-last-frame (fl2v) pins only the first and last frames. Choose keyframes for timed guides, or ref for identity references.",
             Keyframes when guides == 0 => "Keyframes mode needs at least one timed image guide.",
             Keyframes when references > 0 => "Identity references cannot be combined with temporal image guidance.",
             Reference when references == 0 => "Reference mode (ref) needs at least one identity/appearance reference image.",
-            Reference when first || last || guides > 0 =>
-                "Reference images are not frames: ref mode cannot also pin a first, last or timed frame.",
+            Reference when last || guides > 0 =>
+                "Reference images are not frames: ref mode can start on a first frame, but cannot also pin a last or timed frame.",
             _ => null,
         };
         if (error != null) throw new StudioException("invalid_mode_inputs", error);

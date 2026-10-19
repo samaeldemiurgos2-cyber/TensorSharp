@@ -47,8 +47,7 @@ internal static class StudioChatScope
                     tracks = current.Tracks.Take(32).Select(t => new { t.Id, name = Truncate(t.Name, 80), t.Kind, t.Muted, t.Visible, t.Volume, clipCount = current.Clips.Count(c => c.TrackId == t.Id) }),
                     clips = current.Clips.OrderByDescending(c => selected.Contains(c.Id)).ThenBy(c => c.StartFrame).Take(50)
                         .Select(c => new { c.Id, c.AssetId, c.TrackId, c.StartFrame, c.SourceStartFrame, c.DurationFrames, c.Volume, c.FadeInFrames, c.FadeOutFrames, c.AudioFadeOutFrames, c.LinkGroup, c.Fit }),
-                    assets = current.Assets.OrderByDescending(a => current.Clips.Any(c => selected.Contains(c.Id) && c.AssetId == a.Id)).Take(40)
-                        .Select(a => new { a.Id, name = Truncate(a.Name, 120), a.Kind, a.DurationSeconds, a.Width, a.Height, a.HasAudio, a.Missing }),
+                    assets = current.Assets.OrderByDescending(a => current.Clips.Any(c => selected.Contains(c.Id) && c.AssetId == a.Id)).Take(40).Select(AssetSummary),
                     captions = current.Captions.Take(20).Select(c => new { c.Id, text = Truncate(c.Text, 160), c.StartFrame, c.DurationFrames }),
                     truncated = current.Clips.Count > 50 || current.Assets.Count > 40 || current.Captions.Count > 20,
                     commandFormat = StudioTools.CommandShapeHelp,
@@ -67,15 +66,24 @@ internal static class StudioChatScope
                 if (query.Length > 200 || offset is < 0 or > 2000) throw new ArgumentException("Search exceeds the supported bounds.");
                 var matching = current.Assets.Where(a => a.Id == query || a.Name.Contains(query, StringComparison.OrdinalIgnoreCase)).ToArray();
                 result = JsonSerializer.SerializeToElement(new { projectId, currentRevision = current.Revision, offset, total = matching.Length,
-                    assets = matching.Skip(offset).Take(40).Select(a => new { a.Id, name = Truncate(a.Name, 120), a.Kind, a.DurationSeconds, a.Width, a.Height, a.HasAudio, a.Missing }) }, StudioJson.Options);
+                    assets = matching.Skip(offset).Take(40).Select(AssetSummary) }, StudioJson.Options);
             }
             else if (call.Name == "studio_generate")
             {
                 string summary = Text(call, "summary"), requestText = Text(call, "request");
                 if (requestText.Length > 32000) throw new ArgumentException("Shot request exceeds the bounded tool budget.");
                 using var requestDoc = JsonDocument.Parse(requestText);
+                // A shot that continues a video names it; the frame is taken when the user starts the plan.
+                // Null or empty arguments are absent; a frame may be "last", digits or a whole number.
+                object firstFrameFrom = null;
+                string continueFrom = OptionalArgument(call, "continueFromAssetId"), frame = OptionalArgument(call, "continueFromFrame");
+                if (continueFrom != null)
+                    firstFrameFrom = new { assetId = continueFrom, frame = frame is null or "last" ? (object)"last"
+                        : long.TryParse(frame, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long n) ? n
+                        : throw new ArgumentException("continueFromFrame must be \"last\" or a frame number from 0.") };
+                else if (frame != null) throw new ArgumentException("continueFromFrame needs continueFromAssetId.");
                 result = api.DispatchAsync("generation-drafts/create", JsonSerializer.SerializeToElement(new
-                { projectId, expectedRevision, summary, request = requestDoc.RootElement }), ct).GetAwaiter().GetResult();
+                { projectId, expectedRevision, summary, request = requestDoc.RootElement, firstFrameFrom }), ct).GetAwaiter().GetResult();
                 result = JsonSerializer.SerializeToElement(new { executionState = "awaiting_user_start", message = "Plan saved. No footage was generated. User must explicitly load a video model and start this plan in Studio.", draft = result });
             }
             else if (call.Name == "studio_render")
@@ -106,6 +114,39 @@ internal static class StudioChatScope
             if (content.Length > 48000) return new SkillToolResult(false, "Project inspection exceeded the bounded result budget. Select fewer clips.", null, null);
             return new SkillToolResult(true, content, null, null);
         });
+    }
+    // What the planner needs to tell takes apart and follow a chain: a take's shot, length and first frame, and the video
+    // and frame a still was taken from. Bounded: names are truncated and requests are summarized, never returned whole.
+    private static object AssetSummary(StudioAsset a)
+    {
+        var r = a.Generation?.Request;
+        return new
+        {
+            a.Id, name = Truncate(a.Name, 120), a.Kind, a.DurationSeconds, a.Width, a.Height, a.HasAudio, a.Missing,
+            derivedFrom = a.DerivedFrom is { } d ? new { videoAssetId = d.AssetId, frame = d.Frame == StudioFrameSource.LastFrame ? (object)"last" : d.Frame } : null,
+            // Package metadata is untrusted: lists may be missing and identifiers long.
+            take = r == null ? null : new
+            {
+                mode = r.Mode != null ? Truncate(r.Mode, 16) : r.ReferenceAssetIds != null && r.TemporalConditions != null ? StudioGenerationModes.Infer(r) : null,
+                firstFrameAssetId = r.ConditioningAssetId == null ? null : Truncate(r.ConditioningAssetId, 64), referenceCount = r.ReferenceAssetIds?.Count ?? 0,
+                r.FrameCount, r.Fps, shotId = r.ShotId == null ? null : Truncate(r.ShotId, 64),
+            },
+        };
+    }
+    /// <summary>An optional tool argument as text: null when absent, null or blank; a number as written.</summary>
+    private static string OptionalArgument(ToolCall call, string key)
+    {
+        if (call.Arguments == null || !call.Arguments.TryGetValue(key, out object value) || value == null) return null;
+        if (value is JsonElement element)
+            value = element.ValueKind switch
+            {
+                JsonValueKind.Null or JsonValueKind.Undefined => null,
+                JsonValueKind.String => element.GetString(),
+                JsonValueKind.Number => element.GetRawText(),
+                _ => throw new ArgumentException(key + " must be a string or a number."),
+            };
+        string text = value as string ?? Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture);
+        return string.IsNullOrWhiteSpace(text) ? null : text.Trim();
     }
     private static string Truncate(string value, int length) => value.Length <= length ? value : value[..length] + "…";
     private static string Text(ToolCall call, string key)

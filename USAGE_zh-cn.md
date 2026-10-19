@@ -459,7 +459,7 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--qwen-image-vae <path>` | 覆盖解析到的 Qwen-Image-2.1 VAE 伴随文件（默认：DiT GGUF 旁的 `qwen_image_2.1_vae*.safetensors` 文件）。环境变量：`TS_QWEN_IMAGE_VAE`。 |
 | `--qwen-image-vl <path>` | 覆盖解析到的 Qwen3-VL-8B 文本编码器 GGUF（默认：DiT 旁的 `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF）。环境变量：`TS_QWEN_IMAGE_TE`。 |
 | `--qwen-image-mmproj <path>` | 覆盖解析到的 Qwen3-VL-8B mmproj（编辑时的视觉接地）GGUF（默认：DiT 旁匹配的 `mmproj` GGUF）。环境变量：`TS_QWEN_IMAGE_MMPROJ`。 |
-| `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点。GGUF 不带元数据，Turbo 的张量又与基础检查点相同，所以由宿主声明：`turbo` 按 Qwen-Image-2.1-Turbo 公布的 8 步调度、CFG 1 采样，拒绝其他步数，也拒绝步数蒸馏 `--lora` 插件。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定；其他文件为 `base`。用于其他模型时被拒绝。环境变量：`TS_QWEN_IMAGE_VARIANT`。见 [Qwen-Image-2.1-Turbo](docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo)。 |
+| `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点。GGUF 至多标注架构，Turbo 的张量又与基础检查点相同，所以由宿主声明：`turbo` 按 Qwen-Image-2.1-Turbo 公布的 8 步调度、CFG 1 采样，拒绝其他步数，也拒绝步数蒸馏 `--lora` 插件。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定；其他文件为 `base`。用于其他模型时被拒绝。环境变量：`TS_QWEN_IMAGE_VARIANT`。见 [Qwen-Image-2.1-Turbo](docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo)。 |
 | `--lora <path>` | Qwen-Image-2.1 或 MiniMax-H3（FL2VA）的 LoRA 插件。Qwen-Image-2.1：LoRA `.safetensors` 文件，或 TensorSharp 插件配置 `.json`（见 [`config/lora/`](config/lora/)）；重复该参数可叠加多个 LoRA。MiniMax-H3：只接受一个 `minimax-h3-lora` 配置，即 `config/lora/minimax-h3-fl2v-turbo-8step.json` 或 `-4step.json`，它把 `--diffusion-steps`、`--flow-shift`、`--sampler` 与 `--cfg` 锁定为其配方，并在 Ref2VA 检查点上被拒绝。以不合并的方式叠加在量化 Transformer 之上。模型不接受的插件会在启动时、插件下载之前被拒绝；若 `--config` 仍需下载模型，模型家族会在该下载完成后立即检查（冲突的采样参数在下载之前就被拒绝）。默认：无。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)与 [MiniMax-H3 Turbo 插件](#minimax-h3-turbo-插件)。 |
 | `--lora-scale <f>` | 前一个 `--lora` 的强度（乘以 alpha / rank）。默认：插件配置中的 `"scale"`，否则为 `1.0`。MiniMax-H3 拒绝负强度：其 Turbo 调度在强度 1 下蒸馏，0 则保留适配器各项而上投影因子为零。 |
 | `--lora-config <path>` | 前一个 `--lora` 的伴随配置：TensorSharp LoRA 配置、PEFT `adapter_config.json` 或 VideoX-Fun `pdd_config.json`。放在这里的 MiniMax-H3 插件配置必须在其 `"weights"` 中写明前一个 `--lora` 的权重文件，其配方仍然锁定。默认：无（PDD 包的 `pdd_config.json`，以及与 `adapter_model.safetensors` 同目录的 PEFT `adapter_config.json`，会在权重旁自动找到）。 |
@@ -1000,7 +1000,7 @@ Qwen-Image-2.1-Turbo（`--qwen-image-variant turbo`）本身已经过步数蒸�
 （下表中的四个步数蒸馏插件，或任何带 `"sampling"` 的配置）在加载时被拒绝并说明原因；不带
 配方的插件可以加载。TensorAgent 为 Turbo 提供 Film Stills、Grainscape、Casual Phone Photo
 与 Voxel Style，均保留 Turbo 的 8 步与 CFG 1；风格变化可能重画部分场景。新增两个适配器的
-实际图像验证仅覆盖 AD-Q4_K；Q8 的目录与规划测试不代表其图像质量或延迟已验证。见
+已在 Unsloth Q5_K_S 上验证实际图像与 TensorAgent 的生成、插件及编辑路径；Q8 的插件图像质量与延迟尚未单独验证。见
 [Turbo 上的 LoRA 插件](docs/models/qwenimage21_zh-cn.md#turbo-上的-lora-插件)。
 
 ```bash
@@ -1146,8 +1146,8 @@ sigma 网格、适配器的应用方式、后端与验证情况见
 ## 音视频生成（LTX 2.5 Distilled）
 
 LTX 2.5 从文本、首尾帧或带时间位置的图像关键帧联合生成视频与 48 kHz 立体声音频。
-使用固定版本与哈希的五文件预设（44.76 GB）；官方伴随文件需要获批 Hugging Face
-访问权限，并配置 `HF_TOKEN`、`HUGGING_FACE_HUB_TOKEN` 或 Hugging Face CLI token 缓存。
+固定版本与哈希的五文件预设使用 Unsloth 的蒸馏 UD-Q4_K_XL 与逐字节相同的伴随文件镜像
+（43.08 GB），无需账号或 token。可选 Ingredients 适配器与扩散解码器仍需官方访问权限。
 
 ```bash
 # NVIDIA；Apple Silicon 改用 --backend mlx，并在启动时设置 MLX_ENABLE_TF32=0。
@@ -1903,7 +1903,8 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 |---|---|---|---|
 | 视频 VAE 加载前先交还去噪器的设备驻留 | 两者放不进空闲显存时开启（16 GB 卡上解码峰值 16 041 → 约 5 600 MiB，640×384 上值 22 秒） | —（按实测空闲显存自动判断） | — |
 | 第一次上传前预读去噪器 GGUF | `3` —— 预读与上传流水线并行 | `TS_H3_PREFAULT`：`0` 关闭，`1` 串行，`2` 与文本条件编码重叠（更差——编码器自己的 17 GB 会流过同一份页缓存，把刚放进去的页挤掉），`3` 默认 | — |
-| 预读使用的读取流数 | `1` | `TS_H3_PREFAULT_THREADS=N` —— 这里流越多越慢，因为这次读取是与它要预热的拆卸和上传并发进行的（16 GB RTX 3080 Laptop、640×384、三次取最好：1 流 63.9 s，4 流 64.9 s，16 流 66.6 s） | — |
+| 预读使用的读取线程 | macOS `1`，Linux `16` | `TS_H3_PREFAULT_THREADS=N`。各线程领取同一遍扫描中相邻的 8 MiB 块，并跳过已缓存的块。本地 SSD 一个流就能跑满；按线程把文件切成独立区间在那里更慢（16 GB RTX 3080 Laptop、640×384、三次取最好：1 流 63.9 s，4 流 64.9 s，16 流 66.6 s）。网络卷则需要并发：A40 pod 单线程 0.31 GiB/s，16 线程 2.3 GiB/s | — |
+| `ggml_cuda` 文本编码器预读 | 开启 | `TS_VIDEO_READAHEAD=0` 关闭；`TS_VIDEO_READAHEAD_WORKERS=N`（1–32）设置读取线程。上传按缺页逐页预热编码器 GGUF 时，它并发地提前读取文件（A40 pod、640×384×22、四次中位数：主干 13.3 → 6.4 s，输出一致） | — |
 | 文本编码器主干分组运行，每组用完即释放其设备副本 | 关闭 | `TS_H3_TE_GROUP=N` 指定每组层数 —— 能消掉编码器自身的溢出（峰值 16 041 → 12 981 MiB）且逐位一致，但在 16 GB RTX 3080 Laptop 上实测慢约 3 秒：一次性 prefill 每个权重只读一遍，分组照样要搬完 17 GB，还多出分配/失效的开销 | — |
 | 分阶段耗时（编码器打开 / 主干 / 拆卸、预读、每个去噪步、VAE 打开 / 解码） | 关闭 | `TS_H3_PHASE=1` | — |
 | 每步的潜变量 / 速度幅值 | 关闭 | `TS_H3_TRACE=1` | — |

@@ -39,6 +39,8 @@ var report = new Dictionary<string, object?> { ["completed"] = false, ["stage"] 
     ["TS_LTX25_DEVICE_PROMPT_MATH"] = Environment.GetEnvironmentVariable("TS_LTX25_DEVICE_PROMPT_MATH"),
     ["TS_LTX25_CUDA_BF16_GEMM"] = Environment.GetEnvironmentVariable("TS_LTX25_CUDA_BF16_GEMM"),
     ["TS_LTX25_CUDA_PREFAULT"] = Environment.GetEnvironmentVariable("TS_LTX25_CUDA_PREFAULT"),
+    ["TS_VIDEO_READAHEAD"] = Environment.GetEnvironmentVariable("TS_VIDEO_READAHEAD"),
+    ["TS_VIDEO_READAHEAD_WORKERS"] = Environment.GetEnvironmentVariable("TS_VIDEO_READAHEAD_WORKERS"),
     ["TS_LTX25_CUDA_PREFAULT_WORKERS"] = Environment.GetEnvironmentVariable("TS_LTX25_CUDA_PREFAULT_WORKERS"),
     ["scope"] = "Native prompt conditioning only; excludes denoising, VAEs and media output." };
 void Save() => File.WriteAllText(output, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }) + "\n");
@@ -96,6 +98,7 @@ try
                     report["audio_context"] = Store("audio_context", result.AudioContext);
                     report["phases_ms"] = new { gemma = encoder.LastGemmaMilliseconds,
                         aggregation = encoder.LastAggregationMilliseconds, connectors = encoder.LastConnectorMilliseconds };
+                    report["readahead"] = encoder.LastReadAhead;
                 }
                 else
                 {
@@ -128,6 +131,7 @@ try
                                 prefault_ms = round == 0 ? prefaultMs : 0,
                                 phases_ms = new { gemma = encoder.LastGemmaMilliseconds,
                                     aggregation = encoder.LastAggregationMilliseconds, connectors = encoder.LastConnectorMilliseconds },
+                                readahead = encoder.LastReadAhead,
                                 cuda_bf16_projections = encoder.CudaBf16Projections - count,
                                 mapped_prefault = new { read_bytes = encoder.CudaPrefaultReadBytes - read,
                                     resident_bytes = encoder.CudaPrefaultResidentBytes - resident,

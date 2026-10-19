@@ -271,41 +271,22 @@ namespace TensorSharp.Models.MiniMaxH3
                 if (!fi.Exists || fi.Length <= 0) return -1;
                 if (availableBytes > 0 && fi.Length > availableBytes) return -1;
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                // ONE stream by default, which is the opposite of
-                // GgufReader.PrefaultFileCache and is deliberate. That one runs before any
-                // other work and has the machine to itself, so sixteen streams are free
-                // speed. This one runs CONCURRENTLY with the encoder teardown and with the
-                // denoiser upload it is warming, and aggressive parallel reads take I/O away
-                // from the very copy they exist to help. Measured at 640x384, best of three:
-                // 1 stream 63.9 s, 4 streams 64.9 s, 16 streams 66.6 s - and the encoder
-                // teardown alone went from 2.2 s to 4.0 s at sixteen. Raise it only on a host
-                // where storage is not the contended resource.
-                int threads = 1;
+                // One stream on macOS, which is the opposite of GgufReader.PrefaultFileCache
+                // and is deliberate: this read runs CONCURRENTLY with the encoder teardown and
+                // the denoiser upload it is warming, and one stream already saturates an Apple
+                // SSD. Splitting the file into one region per thread measured worse on a local
+                // disk (640x384, best of three: 1 stream 63.9 s, 4 streams 64.9 s, 16 streams
+                // 66.6 s). Linux model storage is often a network volume that needs concurrency
+                // instead (an A40 pod's: 0.31 GiB/s for one 8 MiB reader, 2.3 GiB/s for sixteen),
+                // so there sixteen readers take consecutive chunks of ONE sweep, staying near the
+                // same position, and skip chunks that are already cached. TS_H3_PREFAULT_THREADS
+                // overrides the reader count.
                 string tenv = Environment.GetEnvironmentVariable("TS_H3_PREFAULT_THREADS");
-                if (!string.IsNullOrEmpty(tenv) && int.TryParse(tenv, out int tset) && tset > 0)
-                    threads = tset;
-                long length = fi.Length;
-                long regionBytes = (length + threads - 1) / threads;
-                System.Threading.Tasks.Parallel.For(0, threads,
-                    new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads },
-                    () => new byte[8 << 20],
-                    (region, _, buffer) =>
-                    {
-                        using var handle = File.OpenHandle(
-                            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                        long offset = (long)region * regionBytes;
-                        long end = Math.Min(offset + regionBytes, length);
-                        while (offset < end)
-                        {
-                            int want = (int)Math.Min(buffer.Length, end - offset);
-                            int read = System.IO.RandomAccess.Read(
-                                handle, buffer.AsSpan(0, want), offset);
-                            if (read <= 0) break;
-                            offset += read;
-                        }
-                        return buffer;
-                    },
-                    _ => { });
+                int? threads = !string.IsNullOrEmpty(tenv) && int.TryParse(tenv, out int tset) && tset > 0 ? tset : null;
+                using var read = Video.MappedFileReadAhead.TryStart(path, Video.MappedFileReadAhead.WholeFile(path),
+                    windowBytes: long.MaxValue, workers: threads, honorSwitch: false);
+                if (read == null) return -1;
+                read.Wait();
                 return sw.Elapsed.TotalSeconds;
             }
             catch (IOException) { return -1; }
@@ -314,6 +295,9 @@ namespace TensorSharp.Models.MiniMaxH3
 
         /// <summary>The denoiser GGUF, for prefaulting.</summary>
         internal string DiTPath => _ditPath;
+
+        /// <summary>The text-encoder GGUF, for reading ahead.</summary>
+        internal string TextEncoderPath => _tePath;
 
         /// <summary>The video VAE file, for prefaulting.</summary>
         internal string VideoVaePath => _vaePath;

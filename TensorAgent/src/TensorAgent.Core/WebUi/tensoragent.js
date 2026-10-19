@@ -1032,7 +1032,14 @@
       // The answer a previous page left running here. Attached to, not restarted:
       // the tokens it produced while nobody was reading arrive first, then the rest
       // as they come.
-      if (s && s.activeTurn && s.activeTurn.running) attachTurn(s.activeTurn.id);
+      if (s && s.activeTurn) {
+        if (s.activeTurn.running) attachTurn(s.activeTurn.id);
+        // The host publishes a finished turn after recording its answer. Its
+        // transcript is already on screen; a later native resume/pageshow must
+        // not append the retained stream as another answer. A question-only
+        // snapshot still needs replay if completion raced with session binding.
+        else if (msgs.length && msgs[msgs.length - 1].role === 'assistant') rememberTurn(s.activeTurn.id);
+      }
       return s;
     }).catch(function (e) {
       // The transcript is no longer cleared before this succeeds, so the chat still

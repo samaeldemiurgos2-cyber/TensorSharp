@@ -129,43 +129,54 @@ internal sealed class Ltx25VideoVaeOps
             // Fill the backend's owned host weight buffer directly. This avoids
             // large temporary managed arrays, a second per-element copy and
             // first-call tier-zero conversion loops during every convolution.
-            // New storage has no device contents to read back; PtrAtElement
-            // marks its host data dirty for the next native projection upload.
-            float* target = (float*)tensor.Storage.PtrAtElement(0);
+            // Every element is written, so a CUDA storage skips reading its
+            // never-written device buffer back first (3.1 s of a 1024x1024 CUDA run).
+            // Rows are independent: the conversion splits across cores, element for
+            // element the same (11.1 s single-threaded on an A40 pod's 8 cores).
+            if (info.Dtype is not (SafetensorDtype.BF16 or SafetensorDtype.F16 or SafetensorDtype.F32))
+                throw new NotSupportedException("Unsupported LTX VAE weight dtype.");
+            float* targetBase = (float*)tensor.Storage.PtrAtElementForOverwrite(0);
             long rows = (long)output * input;
-            switch (info.Dtype)
+            const long RowsPerBlock = 4096;
+            long blocks = (rows + RowsPerBlock - 1) / RowsPerBlock;
+            var dtype = info.Dtype;
+            Parallel.For(0, blocks, block =>
             {
-                case SafetensorDtype.BF16:
+                long begin = block * RowsPerBlock, end = Math.Min(rows, begin + RowsPerBlock);
+                float* target = targetBase + begin * 9;
+                switch (dtype)
                 {
-                    ushort* source = (ushort*)pointer + Math.Max(0, temporalTap) * 9;
-                    for (long row = 0; row < rows; ++row, source += stride, target += 9)
-                        for (int tap = 0; tap < 9; ++tap)
-                            target[tap] = temporalTap < 0
-                                ? BitConverter.Int32BitsToSingle(source[tap] << 16) + BitConverter.Int32BitsToSingle(source[tap + 9] << 16) + BitConverter.Int32BitsToSingle(source[tap + 18] << 16)
-                                : BitConverter.Int32BitsToSingle(source[tap] << 16);
-                    break;
+                    case SafetensorDtype.BF16:
+                    {
+                        ushort* source = (ushort*)pointer + Math.Max(0, temporalTap) * 9 + begin * stride;
+                        for (long row = begin; row < end; ++row, source += stride, target += 9)
+                            for (int tap = 0; tap < 9; ++tap)
+                                target[tap] = temporalTap < 0
+                                    ? BitConverter.Int32BitsToSingle(source[tap] << 16) + BitConverter.Int32BitsToSingle(source[tap + 9] << 16) + BitConverter.Int32BitsToSingle(source[tap + 18] << 16)
+                                    : BitConverter.Int32BitsToSingle(source[tap] << 16);
+                        break;
+                    }
+                    case SafetensorDtype.F16:
+                    {
+                        ushort* source = (ushort*)pointer + Math.Max(0, temporalTap) * 9 + begin * stride;
+                        for (long row = begin; row < end; ++row, source += stride, target += 9)
+                            for (int tap = 0; tap < 9; ++tap)
+                                target[tap] = temporalTap < 0
+                                    ? (float)BitConverter.UInt16BitsToHalf(source[tap]) + (float)BitConverter.UInt16BitsToHalf(source[tap + 9]) + (float)BitConverter.UInt16BitsToHalf(source[tap + 18])
+                                    : (float)BitConverter.UInt16BitsToHalf(source[tap]);
+                        break;
+                    }
+                    default:
+                    {
+                        float* source = (float*)pointer + Math.Max(0, temporalTap) * 9 + begin * stride;
+                        for (long row = begin; row < end; ++row, source += stride, target += 9)
+                            if (temporalTap < 0)
+                                for (int tap = 0; tap < 9; ++tap) target[tap] = source[tap] + source[tap + 9] + source[tap + 18];
+                            else Buffer.MemoryCopy(source, target, 9 * sizeof(float), 9 * sizeof(float));
+                        break;
+                    }
                 }
-                case SafetensorDtype.F16:
-                {
-                    ushort* source = (ushort*)pointer + Math.Max(0, temporalTap) * 9;
-                    for (long row = 0; row < rows; ++row, source += stride, target += 9)
-                        for (int tap = 0; tap < 9; ++tap)
-                            target[tap] = temporalTap < 0
-                                ? (float)BitConverter.UInt16BitsToHalf(source[tap]) + (float)BitConverter.UInt16BitsToHalf(source[tap + 9]) + (float)BitConverter.UInt16BitsToHalf(source[tap + 18])
-                                : (float)BitConverter.UInt16BitsToHalf(source[tap]);
-                    break;
-                }
-                case SafetensorDtype.F32:
-                {
-                    float* source = (float*)pointer + Math.Max(0, temporalTap) * 9;
-                    for (long row = 0; row < rows; ++row, source += stride, target += 9)
-                        if (temporalTap < 0)
-                            for (int tap = 0; tap < 9; ++tap) target[tap] = source[tap] + source[tap + 9] + source[tap + 18];
-                        else Buffer.MemoryCopy(source, target, 9 * sizeof(float), 9 * sizeof(float));
-                    break;
-                }
-                default: throw new NotSupportedException("Unsupported LTX VAE weight dtype.");
-            }
+            });
             return tensor;
         }
         catch { tensor.Dispose(); throw; }

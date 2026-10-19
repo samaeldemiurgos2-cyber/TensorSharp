@@ -214,8 +214,8 @@ public sealed class LoraCatalogTests : IDisposable
     }
 
     [Theory]
-    [InlineData("qwen-image-2.1-turbo-adq4k")]
-    [InlineData("qwen-image-2.1-turbo-q8")]
+    [InlineData("qwen-image-2.1-turbo-q5ks")]
+    [InlineData("qwen-image-2.1-turbo-q8-0")]
     public void NewTurboAdaptersKeepTheirStrengthsAndVoxelRequiresAPhoto(string modelId)
     {
         LoraStore store = StoreWith(Casual, Voxel);
@@ -320,7 +320,7 @@ public sealed class LoraCatalogTests : IDisposable
         Assert.Equal(new[] { H3Turbo8, H3Turbo4 },
             LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.MiniMaxH3Keyframes), ModelCatalog.BuiltIn).Select(l => l.Id));
         Assert.Empty(LoraCatalog.Offered(ModelCatalog.Find(H3References), ModelCatalog.BuiltIn));
-        Assert.Empty(LoraCatalog.Offered(ModelCatalog.Find("ltx-2.5-distilled-q4km"), ModelCatalog.BuiltIn));
+        Assert.Empty(LoraCatalog.Offered(ModelCatalog.Find("ltx-2.5-distilled-q4kxl"), ModelCatalog.BuiltIn));
         Assert.DoesNotContain(LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.QwenImage), ModelCatalog.BuiltIn), l => l.Id.StartsWith("minimax-h3", StringComparison.Ordinal));
         Assert.All(new[] { H3Turbo8, H3Turbo4 }, id =>
         {
@@ -385,7 +385,7 @@ public sealed class LoraCatalogTests : IDisposable
         Assert.Empty(references.Specs);
         Assert.Equal("LightX2V Turbo 8-Step sits out: made for MiniMax-H3's keyframes checkpoint", references.SatOut);
 
-        Assert.Same(LoraPlan.None, LoraSelection.Plan(choices, "ltx-2.5-distilled-q4km", store, editing: false, out _));
+        Assert.Same(LoraPlan.None, LoraSelection.Plan(choices, "ltx-2.5-distilled-q4kxl", store, editing: false, out _));
         LoraPlan picture = LoraSelection.Plan(choices, LoraCatalog.QwenImage, store, editing: false, out _)!;
         Assert.Equal(new[] { "Viggle Turbo", "Film Stills" }, picture.Names);
         Assert.Null(picture.SatOut);

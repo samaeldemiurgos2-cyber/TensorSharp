@@ -98,6 +98,14 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
                 if (ltx.SupportsReferenceConditioning) capability.ReferenceMinFrames = Ltx25ReferenceConditioning.MinimumFrames;
                 else capability.UnavailableModes[StudioGenerationModes.Reference] = "LTX identity/appearance references need the Ingredients IC-LoRA " +
                     "(loras/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors beside the checkpoint, or TS_LTX25_INGREDIENTS_LORA). Install it and reload the model.";
+                // The pipeline composes a frame-0 guide with the Ingredients sheet as upstream ICLoraPipeline does, but Studio
+                // does not offer it: the publisher trained Ingredients with first_frame_conditioning_p 0.0, and in validation
+                // (768x448x121, MLX) every take that started on the frame cut to the reference sheet at its second frame.
+                capability.ReferencesWithFirstFrameUnavailableReason =
+                    "LTX 2.5 cannot keep a character from reference photos while starting on a frame: its Ingredients IC-LoRA was trained " +
+                    "without a pinned first frame, and such a take cuts to the reference photos at its second frame." +
+                    (ltx.SupportsImageConditioning ? " Continue from the frame alone" : " Starting on a frame also needs the desktop FFmpeg/libx264 image transform") +
+                    (ltx.SupportsReferenceConditioning ? ", or make a ref take without the frame." : "; a ref take without the frame needs the Ingredients IC-LoRA.");
                 break;
             case MiniMaxH3Model h3:
                 capability.SpatialMultiple = 32; capability.TemporalMultiple = 17; capability.TemporalOffset = 5;
@@ -117,6 +125,14 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
                 }
                 else capability.UnavailableModes[StudioGenerationModes.Reference] = "MiniMax-H3 identity/appearance references need the Ref2VA checkpoint " +
                     "(minimax_h3_ref2va_pruned-*.gguf); the loaded FL2VA checkpoint pins frames. Load the Ref2VA file to use references.";
+                // MiniMax's own pipeline, stable-diffusion.cpp and vllm-omni all refuse keyframes with references in one request.
+                capability.ReferencesWithFirstFrameUnavailableReason = h3.Partition == MiniMaxH3Partition.Reference
+                    ? "MiniMax-H3 Ref2VA keeps a character from reference photos but cannot pin a first frame, and the FL2VA checkpoint, which pins " +
+                      "frames, takes no references; MiniMax's pipeline, stable-diffusion.cpp and vllm-omni refuse both in one request. Continue from the " +
+                      "frame on FL2VA, or remove the frame here for a new shot that keeps the character (it starts a new framing, so the join is a cut)."
+                    : "MiniMax-H3 FL2VA starts on a frame but takes no reference photos, and the Ref2VA checkpoint, which keeps a character, pins no " +
+                      "frames; MiniMax's pipeline, stable-diffusion.cpp and vllm-omni refuse both in one request. Continue from the frame alone (it already " +
+                      "shows the character), or load Ref2VA for a take that keeps the character without starting exactly on the frame.";
                 break;
             case WanVideoModel wan:
                 capability.SpatialMultiple = wan.Variant == WanVariant.TI2V ? 32 : 16;
@@ -131,6 +147,10 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
                 capability.UnavailableModes[StudioGenerationModes.FirstLastFrame] = "Wan takes at most a first-frame image; it cannot pin a last frame, alone or with a first. " +
                     "MiniMax-H3 FL2VA or LTX 2.5 can end a clip on an image.";
                 capability.UnavailableModes[StudioGenerationModes.Reference] = "Wan has no identity-reference conditioning. MiniMax-H3 Ref2VA or LTX 2.5 with the Ingredients IC-LoRA supports ref.";
+                capability.ReferencesWithFirstFrameUnavailableReason = wan.SupportsImage
+                    ? "Wan has no identity-reference conditioning; it can continue from the frame alone."
+                    : "Wan has no identity-reference conditioning, and this checkpoint is text-to-video only, so it cannot start on a frame either. " +
+                      "Wan2.2-TI2V-5B or Wan2.2-I2V-A14B continues from a frame.";
                 break;
             default:
                 capability.Available = false;
@@ -142,6 +162,9 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
         // denoising pass to 256 pixels, destroying fine face and hand detail.
         if (defaults.Width > 0) capability.DefaultWidth = defaults.Width;
         if (defaults.Height > 0) capability.DefaultHeight = defaults.Height;
+        // The Ingredients IC-LoRA's trained bucket ("768×448, 121 frames, 24 fps"), unless the host pins one size for every mode.
+        if (video is Ltx25Model { SupportsReferenceConditioning: true } && defaults.Width <= 0 && defaults.Height <= 0)
+            (capability.ReferenceDefaultWidth, capability.ReferenceDefaultHeight) = (Ltx25GenerationSettings.ReferenceWidth, Ltx25GenerationSettings.ReferenceHeight);
         // These families accept arbitrary host dimensions and align them inside
         // native generation. Advertise that effective canvas so Studio's stricter
         // admission accepts its own defaults. LTX deliberately rejects off-grid sizes.
@@ -235,12 +258,14 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             throw new StudioException("invalid_generation", $"Frames must follow {capability.TemporalMultiple}n+{capability.TemporalOffset}, at most {capability.MaxFrames}.");
         if (request.Fps is < 1 or > 240 || capability.FixedFps is int fps && request.Fps != fps || request.Steps is < 1 or > 100 || !float.IsFinite(request.CfgScale) || request.CfgScale is < 1 or > 30)
             throw new StudioException("invalid_generation", "Unsupported frame rate, sampling steps, or guidance.");
+        capability.RequireReferencesWithFirstFrame(request, mode);
         if (!capability.Modes.Contains(mode))
             throw new StudioException("unsupported_mode", capability.UnavailableModes.TryGetValue(mode, out var reason) ? reason
                 : $"The loaded checkpoint does not support {mode} generation. Supported: {string.Join(", ", capability.Modes)}.");
         if (mode == StudioGenerationModes.Reference && capability.ReferenceMinFrames is int minimumFrames && request.FrameCount < minimumFrames)
             throw new StudioException("invalid_generation", $"This model's reference workflow requires at least {minimumFrames} frames.");
-        if (conditioningPath != null && !capability.ImageConditioning || endConditioningPath != null && !capability.LastFrameConditioning || request.GenerateAudio == true && !capability.AudioOutput)
+        if (conditioningPath != null && !capability.ImageConditioning && !(mode == StudioGenerationModes.Reference && capability.ReferencesWithFirstFrame)
+            || endConditioningPath != null && !capability.LastFrameConditioning || request.GenerateAudio == true && !capability.AudioOutput)
             throw new StudioException("unsupported_conditioning", "The loaded checkpoint does not support the requested conditioning or audio output.");
         if (request.CfgScale == 1 && !string.IsNullOrWhiteSpace(request.NegativePrompt))
             throw new StudioException("unsupported_negative_prompt", "Negative prompts do not run at CFG 1. Clear the negative prompt rather than silently ignoring it.");
@@ -344,7 +369,9 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             }
             await HashPluginsAsync(fetched: false, 0).ConfigureAwait(false);
             var parameters = Parameters(request, conditioningAssets, progress, cancellationToken);
-            var result = await _chat.GenerateVideoAsync(request.Prompt, parameters, expectedModel, loras, request.SamplingRecipe).ConfigureAwait(false);
+            // The exact last frame, before the video encoder rounds it, so the next segment of a chain starts on it.
+            string lastFrame = Path.Combine(outputDirectory, "last-frame.png");
+            var result = await _chat.GenerateVideoAsync(request.Prompt, parameters, expectedModel, loras, request.SamplingRecipe, lastFrame).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             if (result.Width != request.Width || result.Height != request.Height || result.Frames != request.FrameCount || result.Fps != request.Fps)
                 throw new StudioException("unexpected_output_geometry", "Native generation returned different dimensions, frame count, or frame rate. The output was not accepted into the project; inspect model capabilities before retrying.");
@@ -369,7 +396,7 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             if (expectedModel is MiniMaxH3Model)
                 foreach (var (key, value) in MiniMaxH3Sampling(h3Recipe, request.Steps)) effective[key] = value;
             if (plugins.Count > 0) effective["lora"] = string.Join(", ", plugins.Select(PluginLabel));
-            return new StudioGenerationResult(path, identity, effective);
+            return new StudioGenerationResult(path, identity, effective, result.LastFramePath);
         }
         finally { if (_compute != null) _compute.Changed -= ForegroundChanged; }
     }
@@ -439,15 +466,21 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             string stage = p.Phase == "done" ? "encoding" : p.Phase ?? "inference";
             progress.Report(new StudioProgress(stage, p.TotalSteps > 0 ? Math.Min(.95, .1 + .8 * done / p.TotalSteps) : 0, p.Detail) { Step = done, TotalSteps = p.TotalSteps });
         }
+        string mode = r.Mode ?? StudioGenerationModes.Infer(r);
+        // ref with a first frame is a frame-0 image guide beside the references, as LTX Ingredients takes it (upstream
+        // ICLoraPipeline's images + video_conditioning); a plain image in ref mode would itself be an identity image.
+        bool referenceFirstFrame = mode == StudioGenerationModes.Reference && r.ConditioningAssetId != null;
+        var guides = r.TemporalConditions.Select(c => new VideoImageCondition { ImagePath = Resolve(assets, c.AssetId), FrameIndex = c.FrameIndex, Strength = c.Strength }).ToList();
+        if (referenceFirstFrame) guides.Insert(0, new VideoImageCondition { ImagePath = Resolve(assets, r.ConditioningAssetId), FrameIndex = 0, Strength = 1 });
         return new()
         {
             Width = r.Width, Height = r.Height, Frames = r.FrameCount, Fps = r.Fps, Steps = r.Steps,
             CfgScale = r.CfgScale, Seed = r.Seed, NegativePrompt = r.NegativePrompt,
-            ImagePath = Resolve(assets, r.ConditioningAssetId), EndImagePath = Resolve(assets, r.EndConditioningAssetId),
+            ImagePath = referenceFirstFrame ? null : Resolve(assets, r.ConditioningAssetId), EndImagePath = Resolve(assets, r.EndConditioningAssetId),
             // Studio's mode names are the native mode names for every family that reads one; Wan infers from the image.
-            Mode = r.Mode ?? StudioGenerationModes.Infer(r),
+            Mode = mode,
             ReferenceImagePaths = r.ReferenceAssetIds.Select(id => Resolve(assets, id)).ToList(),
-            ImageConditions = r.TemporalConditions.Select(c => new VideoImageCondition { ImagePath = Resolve(assets, c.AssetId), FrameIndex = c.FrameIndex, Strength = c.Strength }).ToList(),
+            ImageConditions = guides,
             GenerateAudio = r.GenerateAudio ?? true, CancellationToken = ct,
             // Every video pipeline follows a finished step with a progress report, which carries the new count.
             OnStep = (step, total) => Volatile.Write(ref completed, step),

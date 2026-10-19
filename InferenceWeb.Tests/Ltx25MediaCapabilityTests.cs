@@ -9,6 +9,7 @@ using TensorSharp.Studio;
 namespace InferenceWeb.Tests;
 
 /// <summary>Metadata admission only: no model weights, codec process, or device is used.</summary>
+[Collection(MediaCodecSwaps.Name)]
 public sealed class Ltx25MediaCapabilityTests
 {
     [Theory]

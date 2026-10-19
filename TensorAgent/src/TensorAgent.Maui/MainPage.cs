@@ -34,6 +34,10 @@ public sealed class MainPage : ContentPage
     private readonly LoopbackWebHost _host;
     private readonly Label _status;
     private readonly WebView _webView;
+#if IOS || MACCATALYST
+    private Services.ChatWebViewNavigationDelegate? _chatNavigationDelegate;
+    private bool _chatRendererNeedsReload;
+#endif
     private Services.Dictation? _dictation;
 
     /// <summary>
@@ -84,6 +88,16 @@ public sealed class MainPage : ContentPage
             HorizontalOptions = LayoutOptions.Fill,
             VerticalOptions = LayoutOptions.Fill,
         };
+#if IOS || MACCATALYST
+        _webView.HandlerChanged += (_, _) =>
+        {
+            if (_webView.Handler is Microsoft.Maui.Handlers.WebViewHandler handler)
+            {
+                _chatNavigationDelegate = new Services.ChatWebViewNavigationDelegate(handler, OnChatRendererTerminated);
+                handler.PlatformView.NavigationDelegate = _chatNavigationDelegate;
+            }
+        };
+#endif
 
         var grid = new Grid
         {
@@ -1586,6 +1600,13 @@ public sealed class MainPage : ContentPage
         _chatVisible = true;
         try
         {
+#if IOS || MACCATALYST
+            if (_chatRendererNeedsReload)
+            {
+                ReloadTerminatedChatRenderer();
+                return;
+            }
+#endif
             if (_languageReloadPending && await ReloadLanguageAsync())
                 return;
             // First, because everything after it is pointless if the answer is no. iOS
@@ -1593,8 +1614,8 @@ public sealed class MainPage : ContentPage
             // window -- which every other screen in this app does -- and a suspended
             // process holding a phone with a multi-gigabyte model resident is the first
             // thing the system reclaims under pressure. When that happens the WebView
-            // comes back BLANK and stays blank: MAUI does not implement
-            // webViewWebContentProcessDidTerminate, so nothing reloads it. Asking the
+            // can come back blank if termination happened while detached. The Apple
+            // delegate handles termination while connected; asking the
             // page whether it is still there costs one round trip and is the difference
             // between a chat and a black rectangle.
             if (_pageReady && !await PageIsAliveAsync())
@@ -1633,6 +1654,33 @@ public sealed class MainPage : ContentPage
         _chatVisible = false;
         base.OnDisappearing();
     }
+
+#if IOS || MACCATALYST
+    private void OnChatRendererTerminated()
+    {
+        // This is only the WebKit renderer. Leave the native host, active turn and
+        // downloads alive; the page restores its selected conversation and attaches
+        // to an active turn through its ordinary ready/resume path after loading.
+        MainThread.BeginInvokeOnMainThread(() =>
+        {
+            Console.WriteLine("TensorAgent: the chat renderer terminated");
+            _chatRendererNeedsReload = true;
+            _pageReady = false;
+            // A covered renderer may be reclaimed repeatedly under GPU memory
+            // pressure. Defer recreation until this page is visible again.
+            if (_chatVisible)
+                ReloadTerminatedChatRenderer();
+        });
+    }
+
+    private void ReloadTerminatedChatRenderer()
+    {
+        Console.WriteLine("TensorAgent: reloading the terminated chat renderer");
+        _chatRendererNeedsReload = false;
+        _pageReady = false;
+        _webView.Source = new UrlWebViewSource { Url = _host.EntryUrl };
+    }
+#endif
 
     private async Task<bool> ReloadLanguageAsync()
     {

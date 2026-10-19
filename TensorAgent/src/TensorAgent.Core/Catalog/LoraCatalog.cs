@@ -124,7 +124,7 @@ public static class LoraCatalog
 
     /// <summary>The same-architecture Qwen-Image 2.1 Turbo entries. Style/edit adapters apply
     /// to both, with image-validation scope recorded separately; speed adapters never do.</summary>
-    public static readonly IReadOnlyList<string> QwenImageTurbo = new[] { "qwen-image-2.1-turbo-adq4k", "qwen-image-2.1-turbo-q8" };
+    public static readonly IReadOnlyList<string> QwenImageTurbo = new[] { "qwen-image-2.1-turbo-q5ks", "qwen-image-2.1-turbo-q8-0" };
 
     /// <summary>MiniMax-H3's first-and-last-frame (FL2VA) entry, the one checkpoint its Turbo
     /// plug-ins are for: the references (Ref2VA) entry has the same tensor shapes, and the engine

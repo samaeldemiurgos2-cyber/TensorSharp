@@ -32,10 +32,46 @@ public sealed class StudioJobTests : IDisposable
             finally { await Task.Delay(40); Active = false; }
         }
     }
+    sealed class FailingAdapter : IStudioGenerationAdapter
+    {
+        public Task<IReadOnlyList<StudioModelCapability>> GetCapabilitiesAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<StudioModelCapability>>([new() { ModelId = "fixture-test-double", Available = true, TextToVideo = true }]);
+        public Task ValidateAsync(StudioGenerationRequest request, IReadOnlyDictionary<string, string> assets, CancellationToken ct) => Task.CompletedTask;
+        public async Task<StudioGenerationResult> GenerateAsync(StudioGenerationRequest request, string directory, IReadOnlyDictionary<string, string> assets, IProgress<StudioProgress> progress, CancellationToken ct)
+        {
+            progress.Report(new("encoding", .99, "private progress detail"));
+            await Task.Yield();
+            throw new InvalidOperationException(request.Prompt, new ArgumentException("private inner exception message"));
+        }
+    }
     static async Task RequireMediaAsync(StudioService service)
     {
         var capability = await service.Media.GetCapabilitiesAsync();
         Skip.IfNot(capability.Available && capability.ProbeAvailable, "Generation lifecycle admission requires installed ffprobe and FFmpeg H.264/AAC: " + capability.Reason);
+    }
+    [SkippableFact]
+    public async Task FailedJobsLogTheirStageAndStackWithoutPrivateContentAndASinkFailureDoesNotStopTheWorker()
+    {
+        var diagnostics = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        await using var service = new StudioService(root, new FailingAdapter(), new()
+        {
+            LogJobFailure = diagnostic => { diagnostics.Enqueue(diagnostic); throw new IOException("Diagnostic sink unavailable"); }
+        });
+        await RequireMediaAsync(service); var project = await service.CreateProjectAsync();
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            var request = Request(project.Id); request.Prompt = "private generation prompt";
+            var queued = await service.StartGenerationAsync(request);
+            var failed = await Wait(service, project.Id, queued.Id, "failed");
+            Assert.Equal(request.Prompt, failed.Error); Assert.Null(failed.OutputAssetId);
+            Assert.Equal("encoding", failed.Stages[^1].Stage); Assert.True(failed.Progress < 1);
+            Assert.True(diagnostics.TryDequeue(out var diagnostic));
+            Assert.Contains(queued.Id, diagnostic); Assert.Contains("failed during encoding", diagnostic);
+            Assert.Contains(typeof(InvalidOperationException).FullName!, diagnostic); Assert.Contains(typeof(ArgumentException).FullName!, diagnostic);
+            Assert.Contains(nameof(FailingAdapter.GenerateAsync), diagnostic);
+            Assert.DoesNotContain(request.Prompt, diagnostic); Assert.DoesNotContain("private progress detail", diagnostic);
+            Assert.DoesNotContain("private inner exception message", diagnostic);
+        }
     }
     [Theory]
     [InlineData("mobile")]

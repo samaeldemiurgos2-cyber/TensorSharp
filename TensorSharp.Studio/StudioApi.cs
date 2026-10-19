@@ -35,9 +35,16 @@ public sealed class StudioApi(StudioService service)
             case "proposals/apply":
                 Fields(payload, "projectId", "proposalId", "commandId");
                 result = await service.ApplyProposalAsync(Text(payload, "projectId"), Text(payload, "proposalId"), Text(payload, "commandId"), cancellationToken); break;
+            case "assets/extract-frame":
+            {
+                Fields(payload, "projectId", "assetId", "frame");
+                var extracted = await service.ExtractFrameAsync(Text(payload, "projectId"), Text(payload, "assetId"), Frame(payload, "frame"), cancellationToken);
+                result = new { project = extracted.Project, assetId = extracted.AssetId, reused = extracted.Reused }; break;
+            }
             case "generation-drafts/create":
-                Fields(payload, "projectId", "expectedRevision", "request", "summary");
-                result = await service.CreateGenerationDraftAsync(Text(payload, "projectId"), Long(payload, "expectedRevision"), Deserialize<StudioGenerationRequest>(payload.GetProperty("request")), Text(payload, "summary"), cancellationToken); break;
+                Fields(payload, "projectId", "expectedRevision", "request", "summary", "firstFrameFrom");
+                result = await service.CreateGenerationDraftAsync(Text(payload, "projectId"), Long(payload, "expectedRevision"), Deserialize<StudioGenerationRequest>(payload.GetProperty("request")), Text(payload, "summary"),
+                    FrameSelector(payload, "firstFrameFrom"), cancellationToken); break;
             case "generation-drafts/list":
                 Fields(payload, "projectId"); result = await service.ListGenerationDraftsAsync(Text(payload, "projectId"), cancellationToken); break;
             case "generation-drafts/start":
@@ -88,6 +95,21 @@ public sealed class StudioApi(StudioService service)
         if (!payload.TryGetProperty(name, out var value) || value.ValueKind == JsonValueKind.Null) return null;
         if (value.ValueKind != JsonValueKind.String) throw new StudioException("invalid_request", $"{name} must be text.");
         return value.GetString();
+    }
+    /// <summary>A video frame: "last", or a frame number from 0 on the project clock.</summary>
+    static long Frame(JsonElement payload, string name)
+    {
+        if (!payload.TryGetProperty(name, out var value)) throw new StudioException("missing_parameter", $"{name} is required: \"last\" or a frame number.");
+        if (value.ValueKind == JsonValueKind.String && value.GetString() == "last") return StudioFrameSource.LastFrame;
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var frame) && frame >= 0) return frame;
+        throw new StudioException("invalid_request", $"{name} must be \"last\" or a frame number from 0.");
+    }
+    static StudioFrameSelector? FrameSelector(JsonElement payload, string name)
+    {
+        if (!payload.TryGetProperty(name, out var value) || value.ValueKind == JsonValueKind.Null) return null;
+        if (value.ValueKind != JsonValueKind.Object) throw new StudioException("invalid_request", $"{name} must be an object with assetId and frame.");
+        Fields(value, "assetId", "frame");
+        return new() { AssetId = Text(value, "assetId"), Frame = value.TryGetProperty("frame", out _) ? Frame(value, "frame") : StudioFrameSource.LastFrame };
     }
     static int Int(JsonElement payload, string name, int fallback) => payload.TryGetProperty(name, out var v) ? v.TryGetInt32(out var n) ? n : throw new StudioException("invalid_request", $"{name} must be an integer.") : fallback;
     static long Long(JsonElement payload, string name) => payload.TryGetProperty(name, out var v) && v.TryGetInt64(out var n) ? n : throw new StudioException("missing_parameter", $"{name} must be an integer.");

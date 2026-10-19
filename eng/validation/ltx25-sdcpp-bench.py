@@ -98,6 +98,8 @@ def main():
     parser.add_argument("--source-manifest", type=Path, required=True)
     parser.add_argument("--build-manifest", type=Path, required=True)
     parser.add_argument("--models", type=Path, required=True)
+    parser.add_argument("--denoiser", default="ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf",
+                        help="Distilled denoiser GGUF under --models (config/ltx-2.5-distilled.json's file by default)")
     parser.add_argument("--model-manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--width", type=int, default=256)
@@ -154,7 +156,7 @@ def main():
             raise RuntimeError("GPU benchmark lane is occupied")
         for index in range(args.rounds):
             output = (args.output / ("sdcpp-" + str(index) + ".webm")).resolve()
-            command = [str(args.cli.resolve()), "-M", "vid_gen", "--diffusion-model", str(args.models / "LTX-2.5-Distilled-Q4_K_M.gguf"),
+            command = [str(args.cli.resolve()), "-M", "vid_gen", "--diffusion-model", str(args.models / args.denoiser),
                        "--llm", str(args.models / "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
                        "--vae", str(args.models / "vae/ltx-2.5-video-vae-conv-bf16.safetensors"),
                        "--audio-vae", str(args.models / "vae/ltx-2.5-audio-vae-bf16.safetensors"),

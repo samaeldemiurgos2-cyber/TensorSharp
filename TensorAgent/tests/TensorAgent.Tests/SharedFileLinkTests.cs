@@ -163,6 +163,178 @@ public sealed class SharedFileLinkTests : IDisposable
         Assert.Equal(pair.Shared.Body, await File.ReadAllBytesAsync(store.PathFor(pair.B, pair.SharedOfB)));
     }
 
+    /// <summary>
+    /// An entry re-pointed at another file of its model retires its id, and the sweep reclaims
+    /// the old folder. Its successor takes over first what it can still use: LTX 2.5's move to
+    /// another denoiser kept 29.1 GB of companions, and a user's Ingredients adapter in loras/
+    /// that no download in the app can replace.
+    /// </summary>
+    [Fact]
+    public async Task ARetiredEntryHandsItsSuccessorTheCompanionsAndWhatTheUserAdded()
+    {
+        Pair pair = NewPair();
+        ModelStore store = Store(pair);
+        await store.DownloadAsync(pair.A, null, CancellationToken.None);
+        string adapter = Path.Combine(store.DirectoryFor(pair.A), "loras", "adapter.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(adapter)!);
+        byte[] adapterBytes = Body(4096, seed: 9);
+        await File.WriteAllBytesAsync(adapter, adapterBytes);
+        await File.WriteAllBytesAsync(ResumableDownloader.PartPath(store.PathFor(pair.A, pair.SharedOfA)), Body(16, seed: 10));
+
+        store.SweepOrphanedModels(new[] { pair.B }, retired: new[] { pair.A.Id },
+            successors: new Dictionary<string, string> { [pair.A.Id] = pair.B.Id });
+
+        Assert.False(Directory.Exists(store.DirectoryFor(pair.A)));
+        string successor = store.DirectoryFor(pair.B);
+        Assert.Equal(adapterBytes, await File.ReadAllBytesAsync(Path.Combine(successor, "loras", "adapter.safetensors")));
+        Assert.Equal(pair.Shared.Body, await File.ReadAllBytesAsync(store.PathFor(pair.B, pair.SharedOfB)));
+        // The superseded weights and the part file went with the folder.
+        Assert.Equal(new[] { pair.SharedOfB.FileName },
+            Directory.EnumerateFiles(successor).Select(Path.GetFileName).ToArray());
+        Assert.Equal(InstallState.Partial, store.StateOf(pair.B));
+
+        // Installing the successor fetches only the file that changed.
+        await store.DownloadAsync(pair.B, null, CancellationToken.None);
+        Assert.Equal(1, pair.Shared.Requests);
+        Assert.Equal(1, pair.BOnly.Requests);
+        Assert.Equal(InstallState.Installed, store.StateOf(pair.B));
+    }
+
+    [Theory]
+    [InlineData("a complete copy")]
+    [InlineData("a wrong-sized file")]
+    [InlineData("its own adapter")]
+    public async Task TheCarryOverNeverReplacesWhatTheSuccessorAlreadyHolds(string successorHolds)
+    {
+        Pair pair = NewPair();
+        ModelStore store = Store(pair);
+        await store.DownloadAsync(pair.A, null, CancellationToken.None);
+        string oldAdapter = Path.Combine(store.DirectoryFor(pair.A), "loras", "adapter.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(oldAdapter)!);
+        await File.WriteAllBytesAsync(oldAdapter, Body(4096, seed: 9));
+
+        string shared = store.PathFor(pair.B, pair.SharedOfB);
+        string newAdapter = Path.Combine(store.DirectoryFor(pair.B), "loras", "adapter.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(newAdapter)!);
+        byte[] ownAdapter = Body(2048, seed: 11);
+        // A complete copy of its own: the same size (all the store checks) and other bytes, so a
+        // replacement would show.
+        byte[] ownCopy = Body(pair.Shared.Body.Length, seed: 12);
+        if (successorHolds == "a complete copy")
+            await File.WriteAllBytesAsync(shared, ownCopy);
+        else if (successorHolds == "a wrong-sized file")
+            await File.WriteAllBytesAsync(shared, pair.Shared.Body[..1000]);
+        else
+            await File.WriteAllBytesAsync(newAdapter, ownAdapter);
+
+        store.SweepOrphanedModels(new[] { pair.B }, retired: new[] { pair.A.Id },
+            successors: new Dictionary<string, string> { [pair.A.Id] = pair.B.Id });
+
+        Assert.False(Directory.Exists(store.DirectoryFor(pair.A)));
+        // Its own complete copy stays; a broken download under a listed name is replaced.
+        Assert.Equal(successorHolds == "a complete copy" ? ownCopy : pair.Shared.Body, await File.ReadAllBytesAsync(shared));
+        if (successorHolds == "its own adapter")
+            Assert.Equal(ownAdapter, await File.ReadAllBytesAsync(newAdapter));
+        else
+            Assert.Equal(Body(4096, seed: 9), await File.ReadAllBytesAsync(newAdapter));
+    }
+
+    /// <summary>
+    /// The sweep's delete only unlinks a link, and the carry-over never follows one: a loras/
+    /// that points at the user's shared library moves as the link, with every file behind it left
+    /// where it is, and a retired folder that is itself a link (moved to another disk) is not
+    /// copied back onto this one.
+    /// </summary>
+    [SkippableFact]
+    public async Task TheCarryOverMovesLinksAsLinksAndNeverEmptiesWhatTheyPointAt()
+    {
+        Pair pair = NewPair();
+        ModelStore store = Store(pair);
+        await store.DownloadAsync(pair.A, null, CancellationToken.None);
+        string library = Path.Combine(_root, "shared-library");
+        Directory.CreateDirectory(library);
+        byte[] lora = Body(2048, seed: 13);
+        await File.WriteAllBytesAsync(Path.Combine(library, "someone-elses.safetensors"), lora);
+        TestPlatforms.CreateDirectorySymlink(Path.Combine(store.DirectoryFor(pair.A), "loras"), library);
+
+        store.SweepOrphanedModels(new[] { pair.B }, retired: new[] { pair.A.Id },
+            successors: new Dictionary<string, string> { [pair.A.Id] = pair.B.Id });
+
+        Assert.Equal(lora, await File.ReadAllBytesAsync(Path.Combine(library, "someone-elses.safetensors")));
+        var moved = new DirectoryInfo(Path.Combine(store.DirectoryFor(pair.B), "loras"));
+        Assert.NotNull(moved.LinkTarget);
+        Assert.Equal(lora, await File.ReadAllBytesAsync(Path.Combine(moved.FullName, "someone-elses.safetensors")));
+
+        // Deleting the successor removes its names, never the library behind the link.
+        store.Delete(pair.B);
+        Assert.Equal(lora, await File.ReadAllBytesAsync(Path.Combine(library, "someone-elses.safetensors")));
+
+        // A retired folder that is a link elsewhere: nothing is carried out of it.
+        Pair other = NewPair();
+        ModelStore second = Store(other);
+        string elsewhere = Path.Combine(_root, "external-disk", other.A.Id);
+        Directory.CreateDirectory(Path.GetDirectoryName(elsewhere)!);
+        await second.DownloadAsync(other.A, null, CancellationToken.None);
+        Directory.Move(second.DirectoryFor(other.A), elsewhere);
+        TestPlatforms.CreateDirectorySymlink(second.DirectoryFor(other.A), elsewhere);
+        second.SweepOrphanedModels(new[] { other.B }, retired: new[] { other.A.Id },
+            successors: new Dictionary<string, string> { [other.A.Id] = other.B.Id });
+        Assert.False(File.Exists(second.PathFor(other.B, other.SharedOfB)));
+        Assert.Equal(other.Shared.Body, await File.ReadAllBytesAsync(Path.Combine(elsewhere, other.SharedOfA.FileName)));
+    }
+
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TheCarryOverNeverWritesThroughAnExistingSuccessorLink(bool wholeFolder)
+    {
+        Pair pair = NewPair();
+        ModelStore store = Store(pair);
+        await store.DownloadAsync(pair.A, null, CancellationToken.None);
+        string oldAdapter = Path.Combine(store.DirectoryFor(pair.A), "loras", "adapter.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(oldAdapter)!);
+        byte[] adapter = Body(4096, seed: 19);
+        await File.WriteAllBytesAsync(oldAdapter, adapter);
+        string library = Path.Combine(_root, "successor-library");
+        Directory.CreateDirectory(library);
+        string destination = wholeFolder ? store.DirectoryFor(pair.B) : Path.Combine(store.DirectoryFor(pair.B), "loras");
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        TestPlatforms.CreateDirectorySymlink(destination, library);
+
+        store.SweepOrphanedModels(new[] { pair.B }, retired: new[] { pair.A.Id },
+            successors: new Dictionary<string, string> { [pair.A.Id] = pair.B.Id });
+
+        Assert.Empty(Directory.EnumerateFileSystemEntries(library));
+        Assert.NotNull(new DirectoryInfo(destination).LinkTarget);
+        Assert.Equal(adapter, await File.ReadAllBytesAsync(oldAdapter));
+    }
+
+    [Fact]
+    public async Task AFailedAdapterMoveKeepsTheRetiredFolderForARetry()
+    {
+        Pair pair = NewPair();
+        ModelStore store = Store(pair);
+        await store.DownloadAsync(pair.A, null, CancellationToken.None);
+        string oldAdapter = Path.Combine(store.DirectoryFor(pair.A), "loras", "adapter.safetensors");
+        Directory.CreateDirectory(Path.GetDirectoryName(oldAdapter)!);
+        byte[] adapter = Body(4096, seed: 23);
+        await File.WriteAllBytesAsync(oldAdapter, adapter);
+        Directory.CreateDirectory(store.DirectoryFor(pair.B));
+        string blocked = Path.Combine(store.DirectoryFor(pair.B), "loras");
+        await File.WriteAllTextAsync(blocked, "This is a file, so the adapter cannot move into it.");
+
+        void Sweep() => store.SweepOrphanedModels(new[] { pair.B }, retired: new[] { pair.A.Id },
+            successors: new Dictionary<string, string> { [pair.A.Id] = pair.B.Id });
+        Sweep();
+        Assert.Equal(adapter, await File.ReadAllBytesAsync(oldAdapter));
+        Assert.True(File.Exists(blocked));
+
+        File.Delete(blocked);
+        Sweep();
+        Assert.False(Directory.Exists(store.DirectoryFor(pair.A)));
+        Assert.Equal(adapter, await File.ReadAllBytesAsync(Path.Combine(store.DirectoryFor(pair.B), "loras", "adapter.safetensors")));
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

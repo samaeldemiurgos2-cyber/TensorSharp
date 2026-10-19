@@ -10,18 +10,37 @@
 
 Current source covers text and reasoning, multimodal input, embeddings, image generation/editing, video with audio, personal knowledge collections, and Agent Skills with code tools. TensorSharp also powers [TensorAgent](TensorAgent/README.md), the local app for iPhone, iPad, Mac and Windows. Start below, or check the [project status](docs/PROJECT_STATUS.md) for capabilities and validation limits; LTX 2.5, EmbeddingGemma 2 and native skill discovery require source newer than `v2026.10.11`.
 
+<p align="center">
+  <a href="https://trendshift.io/repositories/51351#achievements"><img src="https://trendshift.io/api/badge/repositories/51351" alt="TensorSharp on GitHub Trending: #2 Repository Of The Day" width="250" height="55"></a>
+  <a href="https://trendshift.io/repositories/51351#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/51351/daily?language=C%23" alt="TensorSharp on Trendshift: #5 C# Repository Of The Day" width="250" height="55"></a>
+</p>
+
 ## Highlights
 
 - **Local models, several interfaces.** One engine for CLI use, browser chat and Ollama/OpenAI-compatible APIs, across managed CPU and native accelerator backends.
 - **Text and multimodal models.** Dense and MoE GGUF models, reasoning, image/audio input and document questions. See [Supported models](docs/supported_models.md) for each family's capabilities.
 - **Embeddings and media generation.** [EmbeddingGemma 2](docs/embeddings.md) provides text/code embeddings and optional image, audio and video inputs. Generate and edit images with [Qwen-Image-2.1 and Turbo](docs/models/qwenimage21.md), or generate video with stereo audio using [LTX 2.5 Distilled](docs/models/ltx-2.5.md) (48 kHz) and [MiniMax-H3](docs/models/minimax-h3.md) (32 kHz).
-- **Editable video projects.** [Video Studio](docs/video-studio.md) in WebUX Chat and TensorAgent shares a persistent multitrack editor, native generation jobs, reviewed agent proposals, undo/redo and local FFmpeg export. See the [validation matrix](docs/video-studio-validation.md) for tested models and platform limits.
+- **Editable video projects.** [Video Studio](docs/video-studio.md) in WebUX Chat and TensorAgent shares a persistent multitrack editor, native generation jobs, reviewed agent proposals, undo/redo and local FFmpeg export. Long videos are made as chains of takes, each starting on the previous segment's last frame; reference photos keep a character in new shots. See the [validation matrix](docs/video-studio-validation.md) for tested models and platform limits.
 - **Efficient serving.** Continuous batching and a paged, Radix prefix-shared KV cache are on by default. Speculative decoding and multi-GPU placement are available for supported models. See [Features](FEATURES.md).
 - **Agent Skills and code tools.** `TensorSharp.AgentHost` adds file, shell and document workflows. The [17 bundled skills](docs/agent_skills.md) include research, documents, TDD, design interviews and handoff; `find-skills` searches, inspects and installs additional skills when network access is enabled. Server and TensorAgent chats also support [bounded sub-agent delegation](docs/multi_agent.md) with private workspaces and read-only defaults.
 - **Personal knowledge collections.** [Upload files or nested folders, and import saved chats with their attachments and artifacts](docs/knowledge-system.md). Select collections per chat, retrieve cited excerpts with page/row/time locations, preview originals, or let code agents open full datasets. Local BM25 works by default; optional GGUF embeddings add semantic search, and compatible media models index images, audio and sampled video. Extraction status and warnings show coverage limits.
 - **Steer an active response.** Submit a new instruction while the CLI, server Web UI or TensorAgent is reasoning or answering. The next response uses the conversation, partial output and your guidance; Stop remains available.
 - **Recorded comparisons.** Benchmarks against `llama.cpp` use identical GGUF files and hardware; results apply to the measured model, backend and workload. See [Benchmarks](docs/benchmarks.md).
 - **TensorAgent apps.** Local chat, attachments, skills and saved work on phones and desktops. See the [Mac/Windows installation guide](docs/tensoragent_desktop.md) and [app coverage notes](TensorAgent/README.md).
+
+## Learn with the books
+
+| Qwen inference and agentic runtimes | Gemma 4 and multimodal inference |
+|---|---|
+| <a href="https://www.amazon.com/dp/B0HJQ4VQ31"><img src="website/assets/building-llm-inference-engines-cover.jpg" alt="Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent" width="190"></a> | <a href="https://www.amazon.com/dp/B0H9P44QZZ"><img src="website/assets/from-tensors-to-tokens-cover.jpg" alt="From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B" width="190"></a> |
+| **[Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent](https://www.amazon.com/dp/B0HJQ4VQ31)** | **[From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B](https://www.amazon.com/dp/B0H9P44QZZ)** |
+| Build Qwen dense/MoE inference and controlled agent workflows in C#. Follow tensors, tokenization, attention, expert routing, quantization, and caching through GPU acceleration, multimodal execution, tools, skills, sandboxed code, and desktop/mobile deployment with TensorSharp and TensorAgent. | Build a multimodal inference engine in C#/.NET with Gemma 4 E4B, from tensors, GGUF model loading, quantization, and tokenization to text, image, video, and audio execution. Connect correctness checks and serving optimizations to the running TensorSharp code. |
+| **[Buy on Amazon](https://www.amazon.com/dp/B0HJQ4VQ31)** | **[Buy on Amazon](https://www.amazon.com/dp/B0H9P44QZZ)** |
+
+**[Explore both books and their repository reading paths](docs/BOOK.md)**
+
+<p align="center"><a href="https://buymeacoffee.com/zhongkaifu"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
+<sub>TensorSharp/TensorAgent is free. If you like it, a coffee keeps the work on it going.</sub></p>
 
 ## Quick Start
 
@@ -176,17 +195,3 @@ Zhongkai Fu
 ## License
 
 See [LICENSE](LICENSE) for details.
-
-## Learn with the books
-
-| Qwen inference and agentic runtimes | Gemma 4 and multimodal inference |
-|---|---|
-| <a href="https://www.amazon.com/dp/B0HJQ4VQ31"><img src="website/assets/building-llm-inference-engines-cover.jpg" alt="Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent" width="190"></a> | <a href="https://www.amazon.com/dp/B0H9P44QZZ"><img src="website/assets/from-tensors-to-tokens-cover.jpg" alt="From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B" width="190"></a> |
-| **[Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent](https://www.amazon.com/dp/B0HJQ4VQ31)** | **[From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B](https://www.amazon.com/dp/B0H9P44QZZ)** |
-| Build Qwen dense/MoE inference and controlled agent workflows in C#. Follow tensors, tokenization, attention, expert routing, quantization, and caching through GPU acceleration, multimodal execution, tools, skills, sandboxed code, and desktop/mobile deployment with TensorSharp and TensorAgent. | Build a multimodal inference engine in C#/.NET with Gemma 4 E4B, from tensors, GGUF model loading, quantization, and tokenization to text, image, video, and audio execution. Connect correctness checks and serving optimizations to the running TensorSharp code. |
-| **[Buy on Amazon](https://www.amazon.com/dp/B0HJQ4VQ31)** | **[Buy on Amazon](https://www.amazon.com/dp/B0H9P44QZZ)** |
-
-**[Explore both books and their repository reading paths](docs/BOOK.md)**
-
-<p align="center"><a href="https://buymeacoffee.com/zhongkaifu"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>TensorSharp/TensorAgent is free. If you like it, a coffee keeps the work on it going.</sub></p>

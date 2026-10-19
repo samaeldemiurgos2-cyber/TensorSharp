@@ -14,28 +14,83 @@ public sealed record StudioRenderPlan(long Revision, long DurationFrames, string
 public sealed class StudioMedia(StudioOptions options)
 {
     const string Formats = "mov,matroska,avi,wav,mp3,flac,ogg,image2,png_pipe,jpeg_pipe,webp_pipe,gif,aiff";
+    readonly SemaphoreSlim capabilityGate = new(1, 1);
     StudioRenderCapabilities? cachedCapabilities;
+    string? cachedFfmpegPath, cachedFfprobePath;
     static string N(double n) => n.ToString("0.#########", CultureInfo.InvariantCulture);
 
     public async Task<StudioRenderCapabilities> GetCapabilitiesAsync(CancellationToken ct = default)
     {
         if (!options.EnableExternalProcesses) return new(false, "Local media probing and rendering require desktop subprocess support on this host.", null, false);
-        if (cachedCapabilities != null) return cachedCapabilities;
-        bool probed = false;
+        await capabilityGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            await RunAsync(options.FfprobePath, ["-version"], null, ct, TimeSpan.FromSeconds(10));
-            probed = true;
-            var encoders = await RunAsync(options.FfmpegPath, ["-hide_banner", "-encoders"], null, ct, TimeSpan.FromSeconds(10));
-            var filters = await RunAsync(options.FfmpegPath, ["-hide_banner", "-filters"], null, ct, TimeSpan.FromSeconds(10));
-            // Prefer native platform H.264 where present, then the separately installed x264 implementation.
-            var codec = OperatingSystem.IsMacOS() && encoders.Contains(" h264_videotoolbox ", StringComparison.Ordinal) ? "h264_videotoolbox" :
-                encoders.Contains(" libx264 ", StringComparison.Ordinal) ? "libx264" : null;
-            if (codec == null || !encoders.Contains(" aac ", StringComparison.Ordinal)) return cachedCapabilities = new(false, "The installed FFmpeg needs an H.264 encoder (VideoToolbox or libx264) and AAC encoder. No codec substitution is performed.", null, filters.Contains(" drawtext ", StringComparison.Ordinal), true);
-            return cachedCapabilities = new(true, null, codec, filters.Contains(" drawtext ", StringComparison.Ordinal), true);
+            string ffmpeg = options.FfmpegPath, ffprobe = options.FfprobePath;
+            if (cachedCapabilities != null && cachedFfmpegPath == ffmpeg && cachedFfprobePath == ffprobe) return cachedCapabilities;
+            cachedCapabilities = null;
+            bool probed = false, drawText = false;
+            try
+            {
+                await RunAsync(ffprobe, ["-version"], null, ct, TimeSpan.FromSeconds(10));
+                probed = true;
+                var encoders = await RunAsync(ffmpeg, ["-hide_banner", "-encoders"], null, ct, TimeSpan.FromSeconds(10));
+                var filters = await RunAsync(ffmpeg, ["-hide_banner", "-filters"], null, ct, TimeSpan.FromSeconds(10));
+                drawText = filters.Contains(" drawtext ", StringComparison.Ordinal);
+                List<string> candidates = [];
+                if ((OperatingSystem.IsMacOS() || OperatingSystem.IsMacCatalyst()) && encoders.Contains(" h264_videotoolbox ", StringComparison.Ordinal)) candidates.Add("h264_videotoolbox");
+                if (encoders.Contains(" libx264 ", StringComparison.Ordinal)) candidates.Add("libx264");
+                if (candidates.Count == 0 || !encoders.Contains(" aac ", StringComparison.Ordinal)) return new(false, "The installed FFmpeg needs an H.264 encoder (VideoToolbox or libx264) and AAC encoder. No codec substitution is performed.", null, drawText, true);
+                // Being compiled into FFmpeg does not mean an encoder can start on this host. In particular,
+                // VideoToolbox can be listed in a headless/restricted session where no encoding session opens.
+                // Verify the actual MP4/AAC path before admitting native inference, trying software H.264 if needed.
+                var failures = new List<string>();
+                foreach (var codec in candidates)
+                {
+                    try { await VerifyEncoderAsync(ffmpeg, ffprobe, codec, ct).ConfigureAwait(false); }
+                    catch (Exception e) when (e is not OperationCanceledException) { failures.Add($"{codec}: {e.Message}"); continue; }
+                    cachedFfmpegPath = ffmpeg; cachedFfprobePath = ffprobe;
+                    return cachedCapabilities = new(true, null, codec, drawText, true);
+                }
+                return new(false, "FFmpeg could not encode and probe an H.264/AAC MP4: " + string.Join("; ", failures), null, drawText, true);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            { return new(false, $"FFmpeg/ffprobe could not be used: {e.Message}", null, drawText, probed); }
         }
-        catch (Exception e) when (e is not OperationCanceledException)
-        { return cachedCapabilities = new(false, $"FFmpeg/ffprobe could not be used: {e.Message}", null, false, probed); }
+        finally { capabilityGate.Release(); }
+    }
+
+    static async Task VerifyEncoderAsync(string ffmpeg, string ffprobe, string codec, CancellationToken ct)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "tensorstudio-media-check-" + StudioJson.NewId());
+        Directory.CreateDirectory(directory);
+        try
+        {
+            string output = Path.Combine(directory, "check.mp4");
+            List<string> arguments = ["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=24:d=0.125",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.125", "-pix_fmt", "yuv420p", "-c:v", codec];
+            AddVideoEncodingArguments(arguments, codec, 64, 64, 24);
+            arguments.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", output]);
+            await RunAsync(ffmpeg, arguments, directory, ct, TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            var json = await RunAsync(ffprobe, ["-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov",
+                "-show_entries", "stream=codec_name,codec_type", "-of", "json", output], directory, ct, TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("streams", out var streams) ||
+                !streams.EnumerateArray().Any(s => S(s, "codec_type") == "video" && S(s, "codec_name") == "h264") ||
+                !streams.EnumerateArray().Any(s => S(s, "codec_type") == "audio" && S(s, "codec_name") == "aac"))
+                throw new StudioException("media_encode_validation_failed", "The encoder test did not produce H.264 video and AAC audio.");
+        }
+        finally { try { Directory.Delete(directory, true); } catch (IOException) { } catch (UnauthorizedAccessException) { } }
+    }
+
+    static void AddVideoEncodingArguments(List<string> arguments, string codec, int width, int height, double fps)
+    {
+        if (codec == "libx264") arguments.AddRange(["-preset", "veryfast", "-crf", "20"]);
+        else
+        {
+            // Keep the existing quality budget for small projects, scaling it with pixels and frame rate for HD/4K.
+            long bitrate = Math.Max(6_000_000, (long)Math.Ceiling(width * (double)height * fps * .12));
+            arguments.AddRange(["-b:v", bitrate.ToString(CultureInfo.InvariantCulture), "-allow_sw", "1"]);
+        }
     }
 
     public async Task<StudioAsset> ProbeAsync(string path, string displayName, CancellationToken ct)
@@ -116,7 +171,7 @@ public sealed class StudioMedia(StudioOptions options)
             args.AddRange(["-protocol_whitelist", "file,pipe", "-format_whitelist", Formats]);
             if (asset.Kind == "image") args.AddRange(["-loop", "1", "-framerate", fps]);
             args.AddRange(["-i", path]);
-            var d = N(p.FrameRate.Seconds(clip.DurationFrames)); var start = N(p.FrameRate.Seconds(clip.StartFrame)); var source = N(p.FrameRate.Seconds(clip.SourceStartFrame));
+            var d = N(p.FrameRate.Seconds(clip.DurationFrames)); var source = N(p.FrameRate.Seconds(clip.SourceStartFrame));
             var fadeIn = N(p.FrameRate.Seconds(clip.FadeInFrames)); var fadeOut = N(p.FrameRate.Seconds(clip.FadeOutFrames)); var fadeStart = N(p.FrameRate.Seconds(clip.DurationFrames - clip.FadeOutFrames));
             if (show)
             {
@@ -129,7 +184,13 @@ public sealed class StudioMedia(StudioOptions options)
                 graph.Append($"[{input}:v]fps=fps={fps}:start_time=0:round=near,trim=start_frame={clip.SourceStartFrame}:end_frame={checked(clip.SourceStartFrame + clip.DurationFrames)},setpts=PTS-STARTPTS,{scale},setsar=1,format=yuva420p");
                 if (clip.FadeInFrames > 0) graph.Append($",fade=t=in:st=0:d={fadeIn}:alpha=1");
                 if (clip.FadeOutFrames > 0) graph.Append($",fade=t=out:st={fadeStart}:d={fadeOut}:alpha=1");
-                graph.Append($",setpts=PTS+{start}/TB[v{input}];[base{visual}][v{input}]overlay=eof_action=pass:repeatlast=0:enable='gte(t,{start})*lt(t,{N(p.FrameRate.Seconds(clip.StartFrame + clip.DurationFrames))})'[base{visual + 1}];");
+                // Frame-exact placement. Seconds printed to nine decimals round: 22/24 s became 0.916666667, later than the
+                // base frame at 22/24 s, so a clip starting there lost its first frame to the black base, and 8/24 s became
+                // 0.333333333, which truncated the offset a frame early and skipped the clip's first source frame. The offset
+                // is rounded to whole ticks, and the overlay is bounded half a frame either side of its first and last frames.
+                // Not by frame number: before FFmpeg 7.0 a timeline expression also ran on the overlay input's own frames,
+                // whose n restarts at 0, which dropped a clip that does not start at frame 0 after its first frame.
+                graph.Append($",setpts=PTS+round({clip.StartFrame}*{p.FrameRate.Denominator}/{p.FrameRate.Numerator}/TB)[v{input}];[base{visual}][v{input}]overlay=eof_action=pass:repeatlast=0:enable='{FrameWindow(p.FrameRate, clip.StartFrame, clip.DurationFrames)}'[base{visual + 1}];");
                 visual++;
             }
             if (hear)
@@ -149,8 +210,7 @@ public sealed class StudioMedia(StudioOptions options)
             var name = $"caption_{input}.png";
             StudioCaptionBitmap.Write(Path.Combine(workDirectory, name), caption.Text, p.Width, p.Height);
             args.AddRange(["-loop", "1", "-framerate", fps, "-i", Path.Combine(workDirectory, name)]);
-            var start = N(p.FrameRate.Seconds(caption.StartFrame)); var end = N(p.FrameRate.Seconds(caption.StartFrame + caption.DurationFrames));
-            graph.Append($"[base{visual}][{input}:v]overlay=enable='gte(t,{start})*lt(t,{end})':eof_action=pass[base{visual + 1}];");
+            graph.Append($"[base{visual}][{input}:v]overlay=enable='{FrameWindow(p.FrameRate, caption.StartFrame, caption.DurationFrames)}':eof_action=pass[base{visual + 1}];");
             visual++; input++;
         }
         graph.Append($"[base{visual}]trim=duration={duration},format=yuv420p[outv];");
@@ -158,11 +218,15 @@ public sealed class StudioMedia(StudioOptions options)
             graph.Append($"{string.Join("", audioLabels)}amix=inputs={audioLabels.Count}:duration=longest:normalize=0,alimiter=limit=0.95:latency=1,apad,atrim=duration={duration}[outa]");
         else graph.Append($"anullsrc=r=48000:cl=stereo,atrim=duration={duration}[outa]");
         args.AddRange(["-filter_complex", graph.ToString(), "-map", "[outv]", "-map", "[outa]", "-c:v", codec]);
-        if (codec == "libx264") args.AddRange(["-preset", "veryfast", "-crf", "20"]);
-        else args.AddRange(["-b:v", "6000k", "-allow_sw", "1"]);
+        AddVideoEncodingArguments(args, codec, p.Width, p.Height, p.FrameRate.Value);
         args.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-frames:v", p.DurationFrames.ToString(CultureInfo.InvariantCulture), "-t", duration, "-movflags", "+faststart", "-fs", options.MaxImportBytes.ToString(CultureInfo.InvariantCulture), "-progress", "pipe:1", "-nostats", Path.Combine(workDirectory, "output.mp4")]);
         return new StudioRenderPlan(p.Revision, p.DurationFrames, graph.ToString(), args);
     }
+
+    /// <summary>A timeline enable expression true on frames start..start+duration-1 of the project clock: half a frame
+    /// either side, in exact rational seconds, so no rounding of either bound can drop or add a frame.</summary>
+    static string FrameWindow(StudioFrameRate rate, long start, long duration) =>
+        $"gte(t,({start}-0.5)*{rate.Denominator}/{rate.Numerator})*lt(t,({checked(start + duration)}-0.5)*{rate.Denominator}/{rate.Numerator})";
 
     public async Task<string> RenderAsync(StudioProject p, Func<string, string> assetPath, string workDirectory, IProgress<StudioProgress> progress, CancellationToken ct)
     {

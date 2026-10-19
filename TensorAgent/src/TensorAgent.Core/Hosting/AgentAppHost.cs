@@ -323,7 +323,8 @@ public sealed class AgentAppHost : IDisposable
             {
                 ImageTurns.Preparation p = forClip ? PrepareVideoTurn() : PlanClipLoras();
                 return p.Error is null ? p.Specs : throw new InvalidOperationException(p.Error);
-            }), TensorSharp.Chat.Studio.StudioHostOptions.Create(Options.UploadMaxFileBytes));
+            }), TensorSharp.Chat.Studio.StudioHostOptions.Create(Options.UploadMaxFileBytes,
+                diagnostic => _loggerFactory.CreateLogger("TensorAgent.Studio").LogError("{Diagnostic}", diagnostic)));
         Chat.Studio = Studio;
         ImagePlanner = ImageTurns.Planner.For(Chat, Options.UploadDirectory);
 

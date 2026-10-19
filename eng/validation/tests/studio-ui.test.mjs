@@ -43,7 +43,7 @@ function harness() {
     }
   });
   // Expose private helpers only in this VM, leaving the production public API small.
-  const instrumented = source.replace('  function renderProject() {', '  function renderProject() { if (window.__skipRender) return;').replace('  window.TensorSharpStudio = Object.freeze', '  window.__test = { S, ui, api, change, receiveProject, localMediaUrl, frames, seconds, snapped, renderAllowed, history, response, boundedMessages, restoreAssistantHistory, deleteAsset, confirmAssetDeletion, renderLibrary, generationForm, keydown, removeTrack, renderTimeline, jobsPanel, jobsTabText, renderInspector, renderGuide };\n  window.TensorSharpStudio = Object.freeze');
+  const instrumented = source.replace('  function renderProject() {', '  function renderProject() { if (window.__skipRender) return;').replace('  window.TensorSharpStudio = Object.freeze', '  window.__test = { S, ui, api, change, receiveProject, localMediaUrl, frames, seconds, snapped, renderAllowed, history, response, boundedMessages, restoreAssistantHistory, deleteAsset, confirmAssetDeletion, renderLibrary, generationForm, keydown, removeTrack, renderTimeline, jobsPanel, jobsTabText, renderInspector, renderGuide, continueFrom, placeAfter, chainPlacement, properties, useReference, extractFrame, shotRequest, shotProblem, shotText, newShotForm };\n  window.TensorSharpStudio = Object.freeze');
   vm.runInContext(instrumented, context, { filename: 'studio.js' });
   const api = context.window.__test;
   api.ui.save = { textContent: '' }; api.ui.status = { textContent: '', dataset: {} };
@@ -901,4 +901,459 @@ test('a proposal reads as plain changes, and a stale one says why it cannot be a
   assert.ok(lines.includes('You changed the timeline after this was suggested, so it can’t be applied as is.'));
   assert.equal(g.buttons().find(b => b.textContent === 'Apply proposal').disabled, true);
   assert.ok(!JSON.stringify(lines).includes('"startFrame": null'), 'The exact commands omit nulls.');
+});
+
+// ---- Chains: a long video made segment by segment, and a character kept the same across them ----------------------
+// LTX 2.5 with the Ingredients IC-LoRA (and desktop FFmpeg): references alone or while starting on a frame, trained at 768 x 448.
+const INGREDIENTS = { modes: ['t2v', 'i2v', 'fl2v', 'keyframes', 'ref'], unavailableModes: {}, identityReferences: true, maxReferences: 3, referenceMinFrames: 121,
+  referencesWithFirstFrame: true, referenceDefaultWidth: 768, referenceDefaultHeight: 448 };
+// The FL2VA checkpoint pins frames but takes no references, and says why the two cannot be combined.
+const H3_FRAMES_ONLY = { ...H3, referencesWithFirstFrame: false, referencesWithFirstFrameUnavailableReason: 'MiniMax-H3 FL2VA starts on a frame but takes no reference photos; ' +
+  'MiniMax’s pipeline, stable-diffusion.cpp and vllm-omni refuse both in one request. Continue from the frame alone.' };
+// The still the host puts in the library for assets/extract-frame on shot.mp4.
+const lastStill = (overrides = {}) => ({ id: 'still', kind: 'image', name: 'shot · last frame.png', width: 1024, height: 576,
+  derivedFrom: { assetId: 'shot', name: 'shot.mp4', sha256: 'ab'.repeat(32), frame: -1, method: 'decode' }, ...overrides });
+const frameStill = (frame, frameRate = { numerator: 24, denominator: 1 }) => lastStill({ id: 'still-' + frame, name: 'shot · frame ' + frame + '.png',
+  derivedFrom: { ...lastStill().derivedFrom, frame, frameRate } });
+const take = (id, name, request, durationSeconds) => ({ id, kind: 'video', name, durationSeconds, width: 1024, height: 576,
+  generation: { request: { modelId: 'ltx-test', prompt: 'She keeps walking.', mode: 'i2v', fps: 24, temporalConditions: [], referenceAssetIds: [], ...request } } });
+const takeSummary = { modelId: 'ltx-test', prompt: 'She keeps walking.', mode: 'i2v', width: 1024, height: 576, frameCount: 121, fps: 24, steps: 8, seed: 3, generateAudio: false };
+const doneJob = (id, outputAssetId, summary = takeSummary) => ({ id, kind: 'generate', state: 'completed', stage: 'completed', progress: 1, step: 8, totalSteps: 8,
+  createdAt: '2026-10-17T12:00:00Z', outputAssetId, summary, timing: {} });
+// Values made inside the page's VM compare by content, not by realm.
+const plain = value => JSON.parse(JSON.stringify(value));
+
+// The Generate form on a 24 fps project whose timeline holds all of shot.mp4 (4 s, 96 frames) on a video track.
+function chainHarness(overrides = {}, previous = null) {
+  const g = generationHarness(previous, overrides), { api, project, document } = g;
+  project.frameRate = { numerator: 24, denominator: 1 }; project.durationFrames = 96;
+  project.tracks.push({ id: 'v1', name: 'Video 1', kind: 'video', muted: false, visible: true });
+  project.assets.push({ id: 'shot', kind: 'video', name: 'shot.mp4', durationSeconds: 4, width: 1024, height: 576 });
+  project.clips.push({ id: 'clip-shot', assetId: 'shot', trackId: 'v1', startFrame: 0, durationFrames: 96, sourceStartFrame: 0 });
+  api.ui.library = document.createElement('aside'); api.ui.timeline = document.createElement('section');
+  // The host's answer to assets/extract-frame: the project with the still in its library.
+  const extracted = still => response({ project: { ...api.S.project, revision: api.S.project.revision + 1, assets: [...api.S.project.assets, still] }, assetId: still.id, reused: false });
+  const form = () => api.S.shotForms.get(project.id);
+  const extractCalls = () => g.calls.filter(c => c.body?.action === 'assets/extract-frame').map(c => c.body.payload);
+  const generateCalls = () => g.calls.filter(c => c.body?.action === 'jobs/generate');
+  const card = name => { api.renderLibrary(); return api.ui.library.querySelectorAll('article').find(c => c.children.some(n => n.textContent === name)); };
+  const labelled = (node, label) => node.querySelectorAll('button').find(b => b.attributes['aria-label'] === label || b.textContent === label);
+  const jobCards = jobs => { api.S.jobs = jobs; const body = document.createElement('div'); api.jobsPanel(body); return body.querySelectorAll('article'); };
+  const refs = () => g.view().querySelector('.ts-gen-refs');
+  return { ...g, extracted, form, extractCalls, generateCalls, card, labelled, jobCards, refs };
+}
+
+test('a library video continues in one tap: its last frame starts the next take, which keeps the description, the character and the video’s size', async () => {
+  const g = chainHarness(INGREDIENTS);
+  g.project.assets.push({ id: 'lost', kind: 'video', name: 'lost.mp4', durationSeconds: 2, missing: true });
+  const continueButton = name => g.labelled(g.card(name), 'Continue from the last frame of ' + name);
+  assert.equal(continueButton('shot.mp4')?.textContent, 'Continue from last frame');
+  assert.equal(continueButton('lost.mp4'), undefined, 'A missing video has no frame to take.');
+  // The shot so far: a description, a character to keep and a last frame chosen for the previous shot.
+  g.describe('She keeps walking toward the lighthouse.');
+  await g.labelled(g.card('cat.png'), 'As character reference: cat.png').click();
+  await g.pick('last', 'banner');
+  g.handlers.push(g.extracted(lastStill()));
+  await continueButton('shot.mp4').click();
+  assert.deepEqual(g.extractCalls(), [{ projectId: g.project.id, assetId: 'shot', frame: 'last' }]);
+  assert.equal(g.form().first, 'still'); assert.equal(g.form().last, '', 'The previous shot’s last frame does not carry over.'); assert.deepEqual([...g.form().refs], ['cat']);
+  assert.equal(g.api.S.tab, 'generate'); assert.equal(g.field('Describe this shot').value, 'She keeps walking toward the lighthouse.');
+  assert.equal(g.slot('first').dataset.state, 'filled'); assert.equal(g.slot('last').dataset.state, 'empty');
+  assert.ok(g.text(g.slot('first')).includes('Last frame of “shot.mp4” · from the encoded video'), g.text(g.slot('first')).join(' | '));
+  assert.equal(Number(g.field('Width').value), 1024); assert.equal(Number(g.field('Height').value), 576);
+  assert.ok(g.hints().includes('Size matches the video this take continues (1024 × 576), so the segments join.'), g.hints().join(' | '));
+  assert.ok(g.hints().includes('This take continues “shot.mp4”. When it is ready, Add after “shot.mp4” places it right after that clip on the timeline.'));
+  assert.ok(g.hints().includes('Each segment makes its own sound; it does not carry on across the join.'));
+  assert.ok(g.text(g.view()).some(l => l.startsWith('Continues “shot.mp4” · Uses 1 reference photo(s) · 6.0 s (145 frames) · 1024 × 576')), g.text(g.view()).join(' | '));
+  assert.equal(g.api.ui.status.textContent, 'The next take starts on the last frame of “shot.mp4”. Describe what happens next.');
+  const request = await g.submit();
+  assert.equal(request.mode, 'ref'); assert.equal(request.conditioningAssetId, 'still'); assert.equal(request.endConditioningAssetId, null);
+  assert.deepEqual(request.referenceAssetIds, ['cat']); assert.equal(request.width, 1024); assert.equal(request.height, 576);
+  g.api.S.capabilities.generationUnavailableReason = 'This host does not permit the required media subprocesses.';
+  assert.equal(continueButton('shot.mp4'), undefined, 'A host that cannot generate offers no way to continue.');
+});
+
+test('a chain segment takes its video’s size only when the model can make that size, and says which', async () => {
+  for (const [size, shown, note] of [
+    [[1280, 704], [1280, 704], 'Size matches the video this take continues (1280 × 704), so the segments join.'],
+    [[1000, 562], [1024, 1024], 'The video this take continues is 1000 × 562, a size this model can’t make, so its frame is fitted to the take’s size.']]) {
+    const g = chainHarness();
+    g.handlers.push(g.extracted(lastStill({ width: size[0], height: size[1] })));
+    await g.labelled(g.card('shot.mp4'), 'Continue from the last frame of shot.mp4').click();
+    assert.equal(Number(g.field('Width').value), shown[0]); assert.equal(Number(g.field('Height').value), shown[1]);
+    assert.ok(g.hints().includes(note), g.hints().join(' | '));
+    g.describe('The tide comes in.');
+    const request = await g.submit();
+    assert.equal(request.mode, 'i2v'); assert.equal(request.conditioningAssetId, 'still');
+    assert.equal(request.width, shown[0]); assert.equal(request.height, shown[1]);
+  }
+});
+
+test('a size typed after continuing stays the person’s, and the page stops saying it matches the video', async () => {
+  const g = chainHarness();
+  g.handlers.push(g.extracted(lastStill()));
+  await g.labelled(g.card('shot.mp4'), 'Continue from the last frame of shot.mp4').click();
+  g.field('Width').value = '768'; g.field('Width').dispatch('input'); g.field('Height').value = '448'; g.field('Height').dispatch('input');
+  g.api.renderInspector();
+  assert.equal(Number(g.field('Width').value), 768); assert.equal(Number(g.field('Height').value), 448, 'The video’s size is applied once, when the frame is taken.');
+  assert.ok(!g.hints().some(t => t.startsWith('Size matches the video')), g.hints().join(' | '));
+  assert.ok(g.hints().some(t => t.startsWith('This take continues “shot.mp4”.')), 'The take still continues the video.');
+});
+
+test('a MiniMax-H3 segment keeps the size of the video it continues instead of sizing a canvas from the frame', async () => {
+  const g = chainHarness(H3);
+  g.handlers.push(g.extracted(lastStill({ width: 640, height: 384, derivedFrom: { ...lastStill().derivedFrom, method: 'generation' } })));
+  await g.labelled(g.card('shot.mp4'), 'Continue from the last frame of shot.mp4').click();
+  assert.equal(g.field('Size').value, 'custom'); assert.equal(g.field('Width').disabled, false);
+  assert.equal(Number(g.field('Width').value), 640); assert.equal(Number(g.field('Height').value), 384, 'The recipe canvas would make the frame 1280 × 768.');
+  assert.ok(g.hints().includes('Size matches the video this take continues (640 × 384), so the segments join.'), g.hints().join(' | '));
+  assert.ok(g.text(g.slot('first')).includes('Last frame of “shot.mp4”'), 'The take’s own lossless frame is not called a decode.');
+  // Sized from the photo instead, the take no longer matches its video, and the page stops saying it does.
+  g.field('Size').value = 'image'; g.field('Size').dispatch('change');
+  assert.equal(Number(g.field('Width').value), 1280); assert.ok(!g.hints().some(t => t.startsWith('Size matches the video')), g.hints().join(' | '));
+  g.field('Size').value = 'custom'; g.field('Size').dispatch('change');
+  assert.equal(Number(g.field('Width').value), 640); assert.ok(g.hints().includes('Size matches the video this take continues (640 × 384), so the segments join.'));
+  g.describe('The kite climbs higher.');
+  const request = await g.submit();
+  assert.equal(request.mode, 'i2v'); assert.equal(request.conditioningAssetId, 'still'); assert.equal(request.width, 640); assert.equal(request.height, 384);
+});
+
+test('Continue after this clip starts on the frame the clip ends on: a trimmed out point, else the video’s last frame', async () => {
+  for (const [trim, frame, help] of [
+    [{ sourceStartFrame: 10, durationFrames: 48 }, 57, 'Makes a new take that starts on frame 57, where this trimmed clip ends, so the video can go on from here.'],
+    [{ sourceStartFrame: 0, durationFrames: 96 }, 'last', 'Makes a new take that starts on the frame this clip ends on, so the video can go on from here.'],
+    [{ sourceStartFrame: 10, durationFrames: 86 }, 'last', 'Makes a new take that starts on the frame this clip ends on, so the video can go on from here.']]) {
+    const g = chainHarness(); Object.assign(g.project.clips[0], trim);
+    g.api.S.selected = 'clip-shot'; g.api.S.tab = 'clip'; g.api.renderInspector();
+    const lines = g.text(g.api.ui.inspector); assert.ok(lines.includes(help), lines.join(' | '));
+    const still = frame === 'last' ? lastStill() : frameStill(frame);
+    g.handlers.push(g.extracted(still));
+    await g.labelled(g.api.ui.inspector, 'Continue after this clip').click();
+    assert.deepEqual(g.extractCalls(), [{ projectId: g.project.id, assetId: 'shot', frame }], JSON.stringify(trim));
+    assert.equal(g.api.S.tab, 'generate'); assert.equal(g.form().first, still.id); assert.equal(g.slot('first').dataset.state, 'filled');
+    assert.equal(g.api.ui.status.textContent, frame === 'last' ? 'The next take starts on the last frame of “shot.mp4”. Describe what happens next.'
+      : 'The next take starts on frame 57 of “shot.mp4”. Describe what happens next.');
+  }
+  const gated = chainHarness(); gated.api.S.capabilities.generationUnavailableReason = 'No media subprocesses here.';
+  gated.api.S.selected = 'clip-shot'; gated.api.S.tab = 'clip'; gated.api.renderInspector();
+  assert.equal(gated.labelled(gated.api.ui.inspector, 'Continue after this clip'), undefined);
+});
+
+test('the first-frame picker can continue a library video from its last frame; the last-frame picker lists photos only', async () => {
+  const g = chainHarness(); g.api.S.capabilities.externalProcesses = true;
+  g.project.assets.push({ id: 'lost', kind: 'video', name: 'lost.mp4', durationSeconds: 2, missing: true });
+  const panel = () => g.view().querySelector('.ts-picker'), tiles = () => panel().querySelectorAll('.ts-picker-tile');
+  await g.slotButton('first', 'choose').click();
+  assert.ok(g.text(panel()).includes('Or continue a video from its last frame'), g.text(panel()).join(' | '));
+  const video = tiles().find(t => t.dataset.assetId === 'shot');
+  assert.equal(video.attributes['aria-label'], 'Continue from the last frame of shot.mp4');
+  assert.equal(video.querySelector('img').src, '/api/studio/thumbnail/' + g.project.id + '/shot?frame=last');
+  assert.equal(tiles().find(t => t.dataset.assetId === 'cat').querySelector('img').src, '/api/studio/thumbnail/' + g.project.id + '/cat', 'A photo tile shows the photo.');
+  assert.ok(!tiles().some(t => t.dataset.assetId === 'lost'), 'A missing video is not offered.');
+  g.handlers.push(g.extracted(lastStill()));
+  await video.click();
+  assert.deepEqual(g.extractCalls(), [{ projectId: g.project.id, assetId: 'shot', frame: 'last' }]);
+  assert.equal(g.form().first, 'still'); assert.equal(g.slot('first').dataset.state, 'filled'); assert.equal(g.api.S.picker, null);
+  assert.equal(Number(g.field('Height').value), 576, 'A frame picked from a video sets the chain size too.');
+  await g.slotButton('last', 'choose').click();
+  assert.ok(!g.text(panel()).includes('Or continue a video from its last frame'));
+  assert.ok(!tiles().some(t => t.dataset.assetId === 'shot'), 'A take never ends on a video.');
+  // Without a desktop media decoder there is no frame thumbnail to show; the tile is still offered by name.
+  const bare = chainHarness(); await bare.slotButton('first', 'choose').click();
+  const tile = bare.view().querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === 'shot');
+  assert.equal(tile.querySelector('img'), null); assert.ok(bare.text(tile).includes('shot.mp4'));
+});
+
+test('a video dropped on the first frame continues from its last frame; the last frame takes only a photo', async () => {
+  const g = chainHarness();
+  const drop = (target, assetId) => { target.dispatch('drop', { dataTransfer: { types: ['application/x-tensorsharp-asset'], getData: () => assetId } }); return new Promise(resolve => setTimeout(resolve, 0)); };
+  await drop(g.slotButton('last', 'choose'), 'shot');
+  assert.equal(g.api.ui.status.textContent, 'Only a photo can go here.'); assert.equal(g.calls.length, 0); assert.equal(g.form().last, '');
+  g.handlers.push(g.extracted(lastStill()));
+  await drop(g.slotButton('first', 'choose'), 'shot');
+  assert.deepEqual(g.extractCalls(), [{ projectId: g.project.id, assetId: 'shot', frame: 'last' }]);
+  assert.equal(g.form().first, 'still'); assert.equal(g.slot('first').dataset.state, 'filled');
+});
+
+test('a character kept beside the frame slots makes the take ref, starting on the first frame on a model that keeps both', async () => {
+  const g = chainHarness(INGREDIENTS), m = g.api.S.capabilities.models[0];
+  assert.ok(g.text(g.refs()).includes('Keep a character the same (optional)'));
+  assert.ok(g.text(g.view()).includes('Makes takes from a description, and can start and/or end on a photo, hit photos at set moments, keep a person or object from reference photos, keep a character while continuing a video, make sound.'));
+  await g.named('+ Add reference photo').click();
+  assert.ok(g.text(g.refs()).includes('Choose a reference photo'));
+  assert.ok(!g.text(g.refs()).includes('Or continue a video from its last frame'), 'A reference is a photo, never a video.');
+  await g.refs().querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === 'cat').click();
+  assert.deepEqual([...g.form().refs], ['cat']); assert.ok(g.text(g.refs()).includes('cat.png, picture 1'));
+  assert.ok(g.labelled(g.refs(), 'Remove reference photo (cat.png)'));
+  assert.ok(g.hints().includes('The take is a new scene with who or what your reference photos show.'));
+  const alone = plain(g.api.shotRequest(g.form(), m));
+  assert.equal(alone.mode, 'ref'); assert.equal(alone.conditioningAssetId, null); assert.deepEqual(alone.referenceAssetIds, ['cat'], 'References with no frames are plain ref.');
+  await g.pick('first', 'banner');
+  assert.ok(g.hints().includes('The take starts on the first frame and keeps who or what your reference photos show.'), g.hints().join(' | '));
+  g.describe('She turns to the camera.');
+  const request = await g.submit();
+  assert.equal(request.mode, 'ref'); assert.equal(request.conditioningAssetId, 'banner'); assert.equal(request.endConditioningAssetId, null);
+  assert.deepEqual(request.referenceAssetIds, ['cat']); assert.deepEqual(request.temporalConditions, []);
+});
+
+test('references and a last frame are refused together, and neither is dropped', async () => {
+  const g = chainHarness(INGREDIENTS);
+  await g.labelled(g.card('cat.png'), 'As character reference: cat.png').click();
+  await g.pick('last', 'banner'); g.describe('She arrives.');
+  const refusal = 'A character reference can’t be combined with a last frame. Remove the last frame or the reference photos.';
+  assert.equal(g.api.shotProblem(g.form(), g.api.S.capabilities.models[0]).message, refusal);
+  await g.generate().click();
+  assert.equal(g.generateCalls().length, 0); assert.equal(g.api.ui.status.textContent, refusal); assert.ok(g.text(g.view()).includes(refusal));
+  assert.ok(g.text(g.refs()).includes('Reference photos can’t be combined with a last frame.'), g.text(g.refs()).join(' | '));
+  assert.ok(g.labelled(g.refs(), 'Remove reference photo (cat.png)'), 'The reference stays, with Remove.');
+  assert.equal(g.named('+ Add reference photo'), undefined);
+  assert.equal(g.form().last, 'banner'); assert.deepEqual([...g.form().refs], ['cat']);
+});
+
+test('on a model that cannot keep a character while starting on a frame, the references stay, say why, and the shot is refused with the model’s reason', async () => {
+  const g = chainHarness(H3_FRAMES_ONLY), reason = H3_FRAMES_ONLY.referencesWithFirstFrameUnavailableReason;
+  assert.ok(g.text(g.refs()).includes(H3.unavailableModes.ref), g.text(g.refs()).join(' | '));
+  assert.equal(g.named('+ Add reference photo'), undefined, 'No way to add what the model cannot use.');
+  await g.labelled(g.card('cat.png'), 'As character reference: cat.png').click();
+  await g.pick('first', 'banner'); g.describe('She keeps walking.');
+  assert.ok(g.labelled(g.refs(), 'Remove reference photo (cat.png)'), 'A reference set from the library is shown, with Remove.');
+  assert.equal(g.api.shotProblem(g.form(), g.api.S.capabilities.models[0]).message, reason);
+  await g.generate().click();
+  assert.equal(g.generateCalls().length, 0); assert.equal(g.api.ui.status.textContent, reason); assert.ok(g.text(g.view()).includes(reason));
+  assert.equal(g.form().first, 'banner'); assert.deepEqual([...g.form().refs], ['cat'], 'Nothing is dropped to make the shot fit.');
+  // Without the frame the shot is plain ref, which this checkpoint refuses for its own reason.
+  await g.clear('first'); await g.generate().click();
+  assert.equal(g.generateCalls().length, 0); assert.equal(g.api.ui.status.textContent, H3.unavailableModes.ref);
+});
+
+test('the reference view shows a first frame only for a model that keeps both, and never sends a frame it does not show', async () => {
+  const g = chainHarness(INGREDIENTS); g.use('ref');
+  const refTile = (h, id) => h.view().querySelector('.ts-refs').querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === id);
+  assert.ok(g.slot('first'), 'Ingredients can start on a frame while keeping a character.'); assert.equal(g.slot('last'), undefined);
+  await g.pick('first', 'banner'); await refTile(g, 'cat').click(); g.describe('She walks on.');
+  assert.ok(g.text(g.view()).some(l => l.startsWith('Starts on banner_1.png · Uses 1 reference photo(s) · ')), g.text(g.view()).join(' | '));
+  const request = await g.submit();
+  assert.equal(request.mode, 'ref'); assert.equal(request.conditioningAssetId, 'banner'); assert.deepEqual(request.referenceAssetIds, ['cat']);
+
+  const other = chainHarness({ ...INGREDIENTS, referencesWithFirstFrame: false, referencesWithFirstFrameUnavailableReason: 'LTX cannot pin a first frame on this host.' });
+  await other.pick('first', 'banner'); other.use('ref');
+  assert.equal(other.view().querySelectorAll('.ts-slot').length, 0, 'No first-frame slot where the model cannot keep both.');
+  await refTile(other, 'cat').click(); other.describe('She walks on.');
+  assert.ok(other.text(other.view()).some(l => l.startsWith('Uses 1 reference photo(s) · ')), 'The summary says what is sent.');
+  const sent = await other.submit();
+  assert.equal(sent.mode, 'ref'); assert.equal(sent.conditioningAssetId, null); assert.deepEqual(sent.referenceAssetIds, ['cat']);
+  assert.equal(other.form().first, 'banner', 'The frame is kept for the frames view, not sent from this one.');
+});
+
+test('an LTX character shot off its trained size says so, and Use 768 × 448 sets it', async () => {
+  const g = chainHarness(INGREDIENTS);
+  await g.labelled(g.card('cat.png'), 'As character reference: cat.png').click();
+  const trained = 'LTX 2.5 keeps characters best at 768 × 448, the size its reference workflow was trained at.';
+  assert.ok(g.hints().includes(trained), g.hints().join(' | '));
+  await g.named('Use 768 × 448').click();
+  assert.equal(Number(g.field('Width').value), 768); assert.equal(Number(g.field('Height').value), 448);
+  assert.ok(!g.hints().includes(trained)); assert.equal(g.named('Use 768 × 448'), undefined);
+  g.describe('A new scene with her.');
+  const request = await g.submit();
+  assert.equal(request.mode, 'ref'); assert.equal(request.width, 768); assert.equal(request.height, 448);
+});
+
+test('a finished take that continues a clip goes right after it on that track, starting past the repeated frame', async () => {
+  // Project and take at 24 fps: one repeated frame. A 16 fps take on the 24 fps project: its first frame lasts round(24 / 16) = 2.
+  for (const [takeFps, takeFrames, skip] of [[24, 120, 1], [16, 81, 2]]) {
+    const g = chainHarness();
+    g.project.assets.push(lastStill(), take('part2', 'She keeps walking · part 2.mp4', { conditioningAssetId: 'still', fps: takeFps }, takeFrames / takeFps));
+    const [card] = g.jobCards([doneJob('j', 'part2')]);
+    assert.ok(g.labelled(g.card('She keeps walking · part 2.mp4'), 'Add after “shot.mp4”'), 'The library card offers it too.');
+    g.handlers.push(response({ ...g.api.S.project, revision: 5 }));
+    await g.labelled(card, 'Add after “shot.mp4”').click();
+    const apply = g.calls.find(c => c.body?.action === 'commands/apply').body.payload;
+    assert.equal(apply.expectedRevision, 4);
+    assert.deepEqual(apply.commands, [{ type: 'insertClip', clipId: '11111111222243338444555555555555', assetId: 'part2', trackId: 'v1', startFrame: 96,
+      durationFrames: Math.floor(takeFrames / takeFps * 24) - skip, sourceStartFrame: skip }], 'take at ' + takeFps + ' fps');
+    assert.equal(g.api.ui.status.textContent, 'Added “She keeps walking · part 2.mp4” after “shot.mp4”. It starts ' + skip + ' frame(s) in, because its first frame repeats the last frame of “shot.mp4”.');
+  }
+});
+
+test('a take placed after the clip it continues says when it overlaps the next clip on that track', async () => {
+  const g = chainHarness();
+  g.project.assets.push(lastStill(), take('part2', 'Part 2.mp4', { conditioningAssetId: 'still' }, 5));
+  g.project.clips.push({ id: 'clip-cat', assetId: 'cat', trackId: 'v1', startFrame: 150, durationFrames: 120, sourceStartFrame: 0 });
+  const [card] = g.jobCards([doneJob('j', 'part2')]);
+  g.handlers.push(response({ ...g.api.S.project, revision: 5 }));
+  await g.labelled(card, 'Add after “shot.mp4”').click();
+  assert.ok(g.api.ui.status.textContent.endsWith(' It overlaps “cat.png” on that track; move one of them if that isn’t what you want.'), g.api.ui.status.textContent);
+});
+
+test('a take continued from a trimmed clip’s out point goes after that clip, counted on the same project clock', async () => {
+  const g = chainHarness(); Object.assign(g.project.clips[0], { sourceStartFrame: 10, durationFrames: 48 });
+  g.project.clips.push({ id: 'clip-full', assetId: 'shot', trackId: 'v1', startFrame: 300, durationFrames: 96, sourceStartFrame: 0 });
+  g.project.assets.push(frameStill(57), frameStill(58), { ...frameStill(57, { numerator: 30, denominator: 1 }), id: 'still-57-30' },
+    take('at57', 'At 57.mp4', { conditioningAssetId: 'still-57' }, 5), take('at58', 'At 58.mp4', { conditioningAssetId: 'still-58' }, 5),
+    take('other-clock', 'Other clock.mp4', { conditioningAssetId: 'still-57-30' }, 5));
+  assert.equal(g.api.chainPlacement(g.project.assets.find(a => a.id === 'at57')).clip.id, 'clip-shot');
+  assert.equal(g.api.chainPlacement(g.project.assets.find(a => a.id === 'at58')), null, 'No clip ends on frame 58.');
+  assert.equal(g.api.chainPlacement(g.project.assets.find(a => a.id === 'other-clock')), null, 'Frame 57 at 30 fps is another moment.');
+  const cards = g.jobCards([doneJob('a', 'at57'), doneJob('b', 'at58'), doneJob('c', 'other-clock')]);
+  assert.deepEqual(cards.map(c => !!g.labelled(c, 'Add after “shot.mp4”')), [true, false, false]);
+  g.handlers.push(response({ ...g.api.S.project, revision: 5 }));
+  await g.labelled(cards[0], 'Add after “shot.mp4”').click();
+  const insert = g.calls.find(c => c.body?.action === 'commands/apply').body.payload.commands[0];
+  assert.equal(insert.startFrame, 48); assert.equal(insert.trackId, 'v1'); assert.equal(insert.sourceStartFrame, 1);
+});
+
+test('every finished take can start the next segment, and only a take that continues a clip on the timeline offers Add after', async () => {
+  const g = chainHarness();
+  g.project.assets.push({ id: 'unused', kind: 'video', name: 'unused.mp4', durationSeconds: 2 }, lastStill({ id: 'still-unused', derivedFrom: { ...lastStill().derivedFrom, assetId: 'unused', name: 'unused.mp4' } }),
+    take('plain', 'Waves.mp4', { mode: 't2v' }, 5), take('photo', 'Cat walks.mp4', { conditioningAssetId: 'cat' }, 5), take('unplaced', 'Unplaced · part 2.mp4', { conditioningAssetId: 'still-unused' }, 5));
+  const cards = g.jobCards([doneJob('a', 'plain'), doneJob('b', 'photo'), doneJob('c', 'unplaced')]);
+  for (const card of cards) {
+    assert.equal(card.querySelectorAll('button').filter(b => b.textContent.startsWith('Add after')).length, 0, g.text(card).join(' | '));
+    assert.ok(g.labelled(card, 'Add take to timeline') && g.labelled(card, 'Continue from this take'));
+  }
+  g.handlers.push(g.extracted(lastStill({ id: 'still-waves', name: 'Waves · last frame.png', derivedFrom: { assetId: 'plain', name: 'Waves.mp4', sha256: 'cd'.repeat(32), frame: -1, method: 'generation' } })));
+  await g.labelled(cards[0], 'Continue from this take').click();
+  assert.deepEqual(g.extractCalls(), [{ projectId: g.project.id, assetId: 'plain', frame: 'last' }]);
+  assert.equal(g.api.S.tab, 'generate'); assert.equal(g.form().first, 'still-waves');
+  assert.ok(g.text(g.slot('first')).includes('Last frame of “Waves.mp4”') && !g.text(g.slot('first')).some(l => l.includes('from the encoded video')), g.text(g.slot('first')).join(' | '));
+  const gated = chainHarness(); gated.project.assets.push(take('plain', 'Waves.mp4', { mode: 't2v' }, 5));
+  gated.api.S.capabilities.generationUnavailableReason = 'No media subprocesses here.';
+  assert.equal(gated.labelled(gated.jobCards([doneJob('a', 'plain')])[0], 'Continue from this take'), undefined);
+});
+
+test('a job whose first frame was taken from a video says which video it continues, even after that video left the library', () => {
+  const g = chainHarness();
+  g.project.assets.push(lastStill(), lastStill({ id: 'orphan', derivedFrom: { ...lastStill().derivedFrom, assetId: 'deleted', name: 'deleted.mp4' } }));
+  const cards = g.jobCards([doneJob('a', null, { ...takeSummary, firstFrameAssetId: 'still' }),
+    { ...doneJob('b', null, { ...takeSummary, mode: 'ref', firstFrameAssetId: 'still', referenceCount: 2 }), createdAt: '2026-10-17T11:00:00Z' },
+    { ...doneJob('c', null, { ...takeSummary, firstFrameAssetId: 'orphan' }), createdAt: '2026-10-17T10:00:00Z' },
+    { ...doneJob('d', null, { ...takeSummary, firstFrameAssetId: 'cat' }), createdAt: '2026-10-17T09:00:00Z' }]);
+  const line = card => g.text(card).find(l => l.startsWith('LTX 2.5 · '));
+  assert.equal(line(cards[0]), 'LTX 2.5 · Continues “shot.mp4” · 1024×576 · 121 frames (5.0 s) at 24 fps · 8 steps · seed 3');
+  assert.ok(line(cards[1]).startsWith('LTX 2.5 · Continues “shot.mp4” · Uses 2 reference photo(s) · 1024×576'), line(cards[1]));
+  assert.ok(line(cards[2]).startsWith('LTX 2.5 · Continues “deleted.mp4” · '), line(cards[2]));
+  assert.ok(line(cards[3]).startsWith('LTX 2.5 · Starts on cat.png · '), 'A photo that is no video’s frame still starts the take.');
+  assert.equal(g.api.shotText({ mode: 'fl2v', lastFrameAssetId: 'cat', firstFrameFrom: { assetId: 'shot', frame: -1 } }), 'Continues “shot.mp4” · Ends on cat.png');
+});
+
+test('a planned shot that continues a video says so; Open in Generate changes nothing and Generate takes that frame', async () => {
+  for (const [frame, sent, label] of [[-1, 'last', 'Last frame of “shot.mp4”'], [48, 48, 'Frame 48 of “shot.mp4”']]) {
+    const g = chainHarness();
+    const plan = { prompt: 'She reaches the lighthouse.', mode: 'i2v', width: 0, height: 0, frameCount: 0, fps: 0, steps: 0, cfgScale: 0, seed: -1, temporalConditions: [], referenceAssetIds: [] };
+    g.api.S.generationDrafts = [{ id: 'draft', summary: 'Part 2', request: plan, firstFrameFrom: { assetId: 'shot', frame } }];
+    g.api.S.tab = 'assistant'; g.api.renderInspector();
+    const lines = g.text(g.api.ui.inspector);
+    assert.ok(lines.includes('Continues “shot.mp4”'), lines.join(' | '));
+    // Opening the plan reads it into the form: the library, the revision and any proposal stay as they are.
+    await g.labelled(g.api.ui.inspector, 'Open in Generate').click();
+    assert.equal(g.calls.length, 0);
+    assert.equal(g.api.S.tab, 'generate'); assert.equal(g.field('Describe this shot').value, plan.prompt);
+    assert.equal(g.form().first, ''); assert.equal(JSON.stringify(g.form().firstFrom), JSON.stringify({ assetId: 'shot', frame }));
+    assert.equal(g.slot('first').dataset.state, 'pending');
+    const slot = g.text(g.slot('first'));
+    assert.ok(slot.includes(label) && slot.includes('Taken from the video when you generate.'), slot.join(' | '));
+    assert.equal(Number(g.field('Width').value), 1024); assert.equal(Number(g.field('Height').value), 576, 'The plan follows the size of the video it continues.');
+    assert.ok(g.text(g.view()).some(t => t.startsWith('Continues “shot.mp4”')), 'the summary names the video it continues');
+    // Generate takes the frame, then sends the take starting on it.
+    const still = frame === -1 ? lastStill() : { ...frameStill(48), id: 'still' };
+    g.handlers.push(g.extracted(still), response({ id: 'job' }), response([]));
+    await g.generate().click();
+    assert.equal(JSON.stringify(g.extractCalls()), JSON.stringify([{ projectId: g.project.id, assetId: 'shot', frame: sent }]));
+    const request = g.generateCalls()[0].body.payload;
+    assert.equal(request.mode, 'i2v'); assert.equal(request.conditioningAssetId, 'still'); assert.equal(request.width, 1024); assert.equal(request.height, 576);
+    assert.equal(g.form().first, 'still'); assert.equal(g.form().firstFrom, null);
+    assert.equal(plan.conditioningAssetId, undefined, 'The saved plan is unchanged.');
+  }
+  // A plan whose frame was already taken opens on it without asking the host again.
+  const g = chainHarness(); g.project.assets.push(lastStill());
+  g.api.S.generationDrafts = [{ id: 'draft', summary: 'Part 2', request: { prompt: 'p', mode: 'i2v', conditioningAssetId: 'still', temporalConditions: [], referenceAssetIds: [] }, firstFrameFrom: { assetId: 'shot', frame: -1 } }];
+  g.api.S.tab = 'assistant'; g.api.renderInspector();
+  await g.labelled(g.api.ui.inspector, 'Open in Generate').click();
+  assert.equal(g.calls.length, 0); assert.equal(g.form().first, 'still'); assert.equal(g.form().firstFrom, null);
+  // Removing a pending frame removes it; choosing a photo replaces it.
+  const p = chainHarness();
+  p.api.S.generationDrafts = [{ id: 'draft', summary: 'Part 2', request: { prompt: 'p', mode: 'i2v', temporalConditions: [], referenceAssetIds: [] }, firstFrameFrom: { assetId: 'shot', frame: -1 } }];
+  p.api.S.tab = 'assistant'; p.api.renderInspector(); await p.labelled(p.api.ui.inspector, 'Open in Generate').click();
+  await p.pick('first', 'cat'); assert.equal(p.form().first, 'cat'); assert.equal(p.form().firstFrom, null);
+});
+
+test('a take that kept a character while starting on a frame reopens beside the frame slots with its references', async () => {
+  const previous = { modelId: 'ltx-test', prompt: 'She keeps walking.', mode: 'ref', conditioningAssetId: 'banner', referenceAssetIds: ['cat'], width: 768, height: 448, frameCount: 121,
+    fps: 24, steps: 8, cfgScale: 1, generateAudio: true, seed: 5, temporalConditions: [], shotId: 'walk' };
+  const g = chainHarness(INGREDIENTS, previous);
+  assert.equal(g.api.newShotForm(g.api.S.capabilities.models[0], { generation: { request: previous } }).use, 'frames');
+  assert.equal(g.view().querySelectorAll('input').find(i => i.type === 'radio' && i.checked).value, 'frames');
+  assert.equal(g.slot('first').dataset.state, 'filled'); assert.ok(g.text(g.refs()).includes('cat.png, picture 1'), g.text(g.refs()).join(' | '));
+  const request = await g.submit();
+  assert.equal(request.mode, 'ref'); assert.equal(request.conditioningAssetId, 'banner'); assert.deepEqual(request.referenceAssetIds, ['cat']);
+  assert.equal(request.width, 768); assert.equal(request.height, 448); assert.equal(request.seed, 5); assert.equal(request.shotId, 'walk');
+});
+
+// A plan that continues shot.mp4, opened in Generate (nothing is taken until Generate).
+async function openContinuingPlan(g, request = {}, frame = -1) {
+  g.api.S.generationDrafts = [{ id: 'draft', summary: 'Part 2', request: { prompt: 'She reaches the lighthouse.', mode: 'i2v', temporalConditions: [], referenceAssetIds: [], ...request },
+    firstFrameFrom: { assetId: 'shot', frame } }];
+  g.api.S.tab = 'assistant'; g.api.renderInspector();
+  await g.labelled(g.api.ui.inspector, 'Open in Generate').click();
+}
+
+test('a pending frame keeps its plan\'s shot id, shows the chain hints, and cannot be swapped away', async () => {
+  const g = chainHarness();
+  await openContinuingPlan(g, { shotId: 'planned-shot' });
+  const lines = g.text(g.view());
+  assert.ok(lines.some(t => t.startsWith('This take continues “shot.mp4”.')), lines.join(' | '));
+  assert.equal(g.field('Describe this shot').placeholder, 'What happens next, picking up from the frame the video ends on');
+  assert.ok(!g.view().querySelectorAll('button').some(b => b.dataset.focusKey === 'swap'), 'no swap while the frame is pending');
+  g.handlers.push(g.extracted(lastStill()), response({ id: 'job' }), response([]));
+  await g.generate().click();
+  assert.equal(g.generateCalls()[0].body.payload.shotId, 'planned-shot');
+});
+
+test('a pending frame on a model that cannot use the first slot is shown and can be removed', async () => {
+  const g = chainHarness({ modes: ['t2v'], imageConditioning: false, lastFrameConditioning: false, unavailableModes: { i2v: 'This Wan checkpoint is text-to-video only.' } });
+  await openContinuingPlan(g);
+  assert.equal(g.slot('first').dataset.state, 'disabled');
+  assert.ok(g.text(g.slot('first')).includes('Last frame of “shot.mp4”'), g.text(g.slot('first')).join(' | '));
+  await g.slot('first').querySelectorAll('button').find(b => b.textContent === 'Remove').click();
+  assert.equal(g.form().firstFrom, null);
+  g.describe('A lighthouse at dusk.'); const request = await g.submit();
+  assert.equal(request.mode, 't2v'); assert.equal(g.extractCalls().length, 0);
+});
+
+test('a pending frame the take would not use is not taken', async () => {
+  const g = chainHarness({ ...REF2VA, referencesWithFirstFrame: false });
+  await openContinuingPlan(g, { mode: 'ref', referenceAssetIds: ['cat'] });
+  if (g.form().use !== 'ref') g.use('ref');
+  g.handlers.push(response({ id: 'job' }), response([]));
+  await g.generate().click();
+  assert.equal(g.extractCalls().length, 0, 'the reference view of a model that keeps no first frame sends none');
+  assert.equal(g.generateCalls()[0].body.payload.conditioningAssetId, null);
+});
+
+test('a frame whose size differs from its video\'s stored size stops Generate and shows the new size', async () => {
+  // A rotated phone video is stored 1024×576; its frame is taken upright, 576×1024.
+  const g = chainHarness();
+  await openContinuingPlan(g);
+  assert.equal(Number(g.field('Width').value), 1024);
+  g.handlers.push(g.extracted(lastStill({ width: 576, height: 1024 })));
+  await g.generate().click();
+  assert.equal(g.generateCalls().length, 0, 'nothing is sent at a size the person has not seen');
+  assert.equal(Number(g.field('Width').value), 576); assert.equal(Number(g.field('Height').value), 1024);
+  assert.match(g.api.ui.status.textContent, /is 576 × 1024, so the take’s size now follows it/);
+  assert.equal(g.slot('first').dataset.state, 'filled');
+  g.handlers.push(response({ id: 'job' }), response([]));
+  await g.generate().click();
+  const request = g.generateCalls()[0].body.payload;
+  assert.equal(request.conditioningAssetId, 'still'); assert.equal(request.width, 576); assert.equal(request.height, 1024);
+});
+
+test('a refusal after a pending frame was taken is shown in the redrawn form', async () => {
+  const g = chainHarness();
+  await openContinuingPlan(g);
+  g.handlers.push(g.extracted(lastStill()), response({ error: 'Frames must follow 8n+1.', code: 'invalid_frame_count' }, 400));
+  await g.generate().click();
+  assert.equal(g.slot('first').dataset.state, 'filled', 'the taken still replaces the pending frame');
+  const shown = g.text(g.view().querySelectorAll('div').find(n => n.className === 'ts-form-error') || g.view());
+  assert.ok(shown.some(t => t.includes('can’t make a take of that length')), shown.join(' | '));
+  assert.ok(!g.generate().disabled, 'Generate is available again');
 });

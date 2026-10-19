@@ -178,6 +178,32 @@ public sealed class StudioRenderTests : IAsyncLifetime
         service = new(root, adapter); var recovered = Assert.Single(await service.ListJobsAsync(p.Id)); Assert.Equal("completed", recovered.State); Assert.Equal(asset.Id, recovered.OutputAssetId);
         Assert.Equal(1, adapter.Calls); Assert.Single((await service.GetProjectAsync(p.Id)).Clips);
     }
+    [StudioMediaFact] public async Task EveryClipShowsItsFirstFrameOnItsStartFrameWhereverItsStartTimeRounds()
+    {
+        // Back to back, as a chain's segments are placed: 8/24 s and 22/24 s print as 0.333333333 (early) and 0.916666667
+        // (late). A clip there must still show its own first frame (red) on its first frame, with no black frame between.
+        var redFirst = Path.Combine(root, "red-first.mp4");
+        await Run("-v", "error", "-f", "lavfi", "-i", "color=c=red:s=160x96:r=24:d=1", "-f", "lavfi", "-i", "color=c=blue:s=160x96:r=24:d=1",
+            "-filter_complex", "[0]trim=end_frame=1[a];[1]trim=end_frame=23,setpts=PTS-STARTPTS[b];[a][b]concat=n=2:v=1:a=0", "-c:v", "libx264", "-pix_fmt", "yuv420p", redFirst);
+        var p = await service.CreateProjectAsync("Exact starts", 160, 96); p = await Import(p, "green", false);
+        await using (var input = File.OpenRead(redFirst)) p = await service.ImportAssetAsync(p.Id, input, "red-first.mp4");
+        string green = p.Assets[0].Id, chain = p.Assets[1].Id, track = p.Tracks[0].Id;
+        p = await service.ApplyCommandsAsync(p.Id, p.Revision, StudioJson.NewId(), [
+            new() { Type = "insertClip", AssetId = green, TrackId = track, StartFrame = 0, DurationFrames = 8 },
+            new() { Type = "insertClip", AssetId = chain, TrackId = track, StartFrame = 8, DurationFrames = 14 },
+            new() { Type = "insertClip", AssetId = chain, TrackId = track, StartFrame = 22, DurationFrames = 10 }]);
+        var job = await Complete(p.Id, (await service.StartRenderAsync(p.Id, p.Revision, StudioJson.NewId())).Id);
+        string output = service.GetJobOutputPath(p.Id, job.Id);
+        async Task<byte[]> At(int frame)
+        {
+            var raw = Path.Combine(root, StudioJson.NewId() + ".rgb");
+            await Run("-v", "error", "-i", output, "-vf", $"select=eq(n\\,{frame}),crop=2:2:79:47,scale=1:1", "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", raw);
+            return await File.ReadAllBytesAsync(raw);
+        }
+        static string Color(byte[] rgb) => rgb[0] > 150 && rgb[2] < 90 ? "red" : rgb[2] > 150 && rgb[0] < 90 ? "blue" : rgb[1] > 90 && rgb[0] < 90 && rgb[2] < 90 ? "green" : rgb.Max() < 40 ? "black" : "other";
+        var colors = new List<string>(); for (int frame = 0; frame < 32; frame++) colors.Add(Color(await At(frame)));
+        Assert.Equal(Enumerable.Repeat("green", 8).Append("red").Concat(Enumerable.Repeat("blue", 13)).Append("red").Concat(Enumerable.Repeat("blue", 9)), colors);
+    }
     [StudioMediaFact] public async Task AudioTracksMixAtRequestedVolumesWithoutImplicitNormalization()
     {
         var p = await service.CreateProjectAsync("Audio mix", 160, 96); p = await Import(p, "black", true); var a = p.Assets.Single(); var secondTrack = StudioJson.NewId();

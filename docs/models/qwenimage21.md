@@ -342,20 +342,57 @@ Previews decode the estimated clean latent from the current flow prediction.
 accelerated checkpoint of the same 7B transformer, distilled to **8 Euler steps at
 CFG 1** on one fixed schedule. Its VAE, Qwen3-VL-8B text encoder and vision projector
 are the 2.1 files above, byte for byte. TensorSharp runs the
-[AtomicChat GGUFs](https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF)
-(revision `bb25d06`), which carry no metadata:
+[Unsloth GGUFs](https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF),
+revision `5d1f9f759ea877ae556cda88dbec958b62ad3809`:
 
-| File | Size | LPIPS against BF16 (the card's) | Use |
+| File | Size | LPIPS against BF16 (publisher's) | Use |
 |---|---:|---:|---|
-| `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf` | 4,201,694,944 bytes | 0.147 | The fast default of [`config/qwen-image-2.1-turbo.json`](../../config/qwen-image-2.1-turbo.json) |
-| `Qwen-Image-2.1-Turbo-Q8_0.gguf` | 7,591,554,784 bytes | 0.037 | The transformer closest to full precision |
+| `qwen-image-2.1-turbo-Q5_K_S.gguf` | 4,501,948,224 bytes | 0.103 | Default preset and 24 GB TensorAgent entry |
+| `qwen-image-2.1-turbo-Q8_0.gguf` | 7,640,860,480 bytes | 0.036 | Closest to full precision; 32 GB TensorAgent entry |
 
-The card's other files (AD-Q6_K, AD-Q5_K, AD-Q3_K, AD-Q2_K, BF16) have the same tensor
-names; only the two above were run here. The card also measures the text encoder: a
-Q4_K_M encoder moves the pictures about as far from a BF16 encoder (LPIPS about 0.17) as
-AD-Q4_K moves them from the BF16 transformer, and a Q8_0 encoder by 0.037. The
-configuration keeps the Q4_K_M encoder of the 2.1 layout above, under its published file
-name, so one folder holding both models downloads it once.
+The preset chooses Q5_K_S over the card's recommended Q4_K_M: 0.3 GB more storage,
+essentially the same speed, and closer to F16 on the four prompts tested here.
+The shared official Q4_K_M text encoder stays. Unsloth's suggested UD-Q4_K_XL
+encoder did not consistently improve fidelity against a BF16 encoder in three
+matched-prompt comparisons, and would require another 5 GB download.
+
+**Validation on 2026-10-18:** M5 Pro, 48 GB, `ggml_metal`, 1024×1024, eight steps,
+CFG 1, seed 42. Median of two rotated fresh-process runs; fixed prompt and companions:
+
+| Transformer | Steady seconds/step | Process wall | Mean PSNR vs F16, four prompts |
+|---|---:|---:|---:|
+| Unsloth Q5_K_S | 7.97 | 70.1 s | 22.4 dB |
+| Unsloth Q4_K_M | 7.94 | 69.8 s | 20.3 dB |
+| Unsloth Q8_0 | 7.69 | 67.7 s | 39.4 dB |
+| Previous AtomicChat AD-Q4_K | 7.93 | 69.9 s | 23.8 dB |
+
+The fidelity prompts cover a neon sign, a Chinese tea-house sign, a fisherman
+portrait and a ramen shop. Pixel similarity also measures composition drift;
+this small set does not establish a general semantic-quality ranking. Q8_0 is the
+choice when fidelity matters most. Repeated speed runs reproduced their PNGs byte
+for byte. Two edits at 1248×832 peaked at 14.43 GB with Q5_K_S and 15.14 GB with Q8_0.
+The shipped config also completed its native 2048×2048 default at seed 42 in
+498.8 seconds, including 30.0 seconds for VAE decode, with a 39.9 GB peak footprint.
+The 24/32 GB catalog tiers describe the 1024-class interactive/edit workloads above,
+not arbitrary native-resolution requests.
+Film Stills and Grainscape were rerun on Q5_K_S at seeds 42 and 7. The real
+TensorAgent catalog path also passed text-to-image, Casual Phone Photo and a Voxel
+Style edit, including uploads and saved conversations.
+
+Matched Unsloth Q4_K_M output agrees with unchanged stable-diffusion.cpp `d637cfb`
+at 53.3–60.7 dB RGBA PSNR for text-to-image and 35.2 dB for a 1728×608 yacht edit;
+Q8_0 neon is 54.9 dB. TensorSharp used about 7.93 seconds/step against 8.94–8.95
+for sd.cpp on the text prompts. A final Q5_K_S comparison reached 58.5 dB RGB PSNR
+for the neon prompt and 33.0 dB for the yacht edit (59.7/34.3 dB over RGBA).
+These measurements cover one Metal device;
+CUDA, Vulkan, iOS and arbitrary resolutions were not revalidated in this update.
+Generated evidence is under ignored `docs/validation/unsloth-repoint-20261018/`.
+
+TensorAgent ids are `qwen-image-2.1-turbo-q5ks` and
+`qwen-image-2.1-turbo-q8-0`; retired AtomicChat entries hand over their companions
+during launch migration of the default model cache.
+For a manual Q8_0 config change, remove any cached AtomicChat Q8_0 copy first:
+its name differs only in case, and existing config files are reused without rehashing.
 
 ```bash
 dotnet run --project TensorSharp.Cli -c Release --no-build -- \
@@ -368,8 +405,8 @@ dotnet run --project TensorSharp.Server.Host -c Release --no-build -- \
 
 ### Declaring the checkpoint
 
-Turbo's tensors have the base checkpoint's names and shapes, and the GGUFs have no
-metadata, so nothing in the file tells the two apart. The host declares it:
+Turbo's tensors have the base checkpoint's names and shapes, and Unsloth's GGUFs
+identify only their architecture (`qwen_image`), so the file does not distinguish the two. The host declares it:
 
 - `--qwen-image-variant turbo` (or `base`) on the CLI and the server, or
   `"qwen-image-variant": "turbo"` in a config file; the Turbo config sets it. The hosts
@@ -438,9 +475,13 @@ identified. A plug-in without a recipe loads. A bare LoRA `.safetensors`
 passed without its plug-in config carries no recipe either, so the engine cannot tell a
 speed adapter from a style one; pass the `config/lora/` plug-in.
 
+The examples and timings in the following paragraphs are historical AtomicChat
+measurements from 2026-10-09/10. All four offered style plug-ins have since been
+rerun on Unsloth Q5_K_S as described above; Q8 adapter-specific output remains untested.
+
 Validated on Turbo with real pictures: Film Stills and Grainscape through their
 `config/lora/` plug-ins at their strength 0.7, each against the same prompt and seed
-without it, at seeds 42 and 7 (1024×1024, AD-Q4_K; `--suite style` of
+without it, at seeds 42 and 7 (historical 1024×1024 AD-Q4_K measurements; `--suite style` of
 [`qwen-image21-turbo.py`](../../eng/validation/qwen-image21-turbo.py) reproduces them, and
 its seed-42 pictures were byte-identical to an earlier run's). Both plug-ins apply their
 look, and both redraw part of the scene, Film Stills more than Grainscape:
@@ -494,7 +535,7 @@ no clear advantage over the no-adapter baseline at 0.6. That is an exclusion bas
 on a limited sample, not a claim that every input will fail. Neither popularity
 nor a matching tensor layout establishes image quality.
 
-### Parity with stable-diffusion.cpp
+### Historical AtomicChat parity with stable-diffusion.cpp
 
 TensorSharp against stable-diffusion.cpp `f89d9b1` (its master on 2026-10-09, which
 includes the `c150a6b` custom-sigma fix; built with Metal and its own ggml submodule
@@ -534,7 +575,7 @@ takes `TS_QWEN21_EDIT_NOISE=seed`, which the bench sets when both engines run.
 The card's sample grid uses `--rng cpu` and a BF16 text encoder, so it cannot be matched
 pixel for pixel here; the comparison above uses sd.cpp itself as the reference.
 
-### Performance
+### Historical AtomicChat performance (2026-10-09)
 
 Apple M5 Pro, 48 GB, `ggml_metal`, 1024×1024, the neon-sign prompt, seed 42, the Q4_K_M
 text encoder. Each configuration ran in two fresh processes, in A-B-C-D-D-C-B-A order with

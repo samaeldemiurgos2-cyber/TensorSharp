@@ -51,7 +51,8 @@ namespace TensorSharp.Chat
         long Seed,
         string Codec,
         double ElapsedSeconds,
-        bool AudioMuxed = false);
+        bool AudioMuxed = false,
+        string LastFramePath = null);
 
     /// <summary>
     /// The Web UI's request handlers with the transport taken out: queue status,
@@ -2121,11 +2122,13 @@ namespace TensorSharp.Chat
         /// set is applied and the recipe checked under the lock the clip runs in; a set the model
         /// refuses, or a recipe that is no longer the model's, throws
         /// <see cref="InvalidOperationException"/> before anything is generated.
+        /// <paramref name="lastFramePath"/>, when given, also receives the clip's last frame as a
+        /// lossless PNG of the pixels the video was encoded from (Video Studio continues a chain on it).
         /// </summary>
         public Task<VideoGenerationResult> GenerateVideoAsync(
             string prompt, TensorSharp.Models.Video.VideoGenerationParams parameters,
             TensorSharp.Models.Video.IVideoGenerationModel expectedModel,
-            IReadOnlyList<LoraSpec> loras, string expectedSamplingRecipe)
+            IReadOnlyList<LoraSpec> loras, string expectedSamplingRecipe, string lastFramePath = null)
         {
             if (parameters == null) throw new ArgumentNullException(nameof(parameters));
             var videoModel = RequireVideoModel();
@@ -2136,7 +2139,7 @@ namespace TensorSharp.Chat
                 throw new WebUiRequestRejectedException(400, new { error = conditioningError });
             if (!_uploads.HasQuotaHeadroom(out string quotaError))
                 throw new WebUiRequestRejectedException(507, new { error = quotaError });
-            return GenerateVideoCoreAsync(videoModel, prompt ?? "", parameters, loras, expectedSamplingRecipe);
+            return GenerateVideoCoreAsync(videoModel, prompt ?? "", parameters, loras, expectedSamplingRecipe, lastFramePath);
         }
 
         /// <summary>
@@ -2185,7 +2188,7 @@ namespace TensorSharp.Chat
 
         private async Task<VideoGenerationResult> GenerateVideoCoreAsync(
             TensorSharp.Models.Video.IVideoGenerationModel videoModel, string prompt, TensorSharp.Models.Video.VideoGenerationParams p,
-            IReadOnlyList<LoraSpec> loras, string expectedSamplingRecipe)
+            IReadOnlyList<LoraSpec> loras, string expectedSamplingRecipe, string lastFramePath = null)
         {
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
             string outName = $"video-{Guid.NewGuid():N}.mp4";
@@ -2203,6 +2206,11 @@ namespace TensorSharp.Chat
                         p.CancellationToken.ThrowIfCancellationRequested();
                         string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(
                             outPath, video.Frames, video.Fps, video.Audio, out bool audioMuxed);
+                        if (lastFramePath != null)
+                        {
+                            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(lastFramePath)));
+                            TensorSharp.Models.QwenImage.ImageIO.SavePng(lastFramePath, video.Frames[^1]);
+                        }
                         return (video, codec, audioMuxed);
                     }));
             }
@@ -2219,7 +2227,7 @@ namespace TensorSharp.Chat
                 url, audioUrl, outPath,
                 result.video.Frames[0].Width, result.video.Frames[0].Height,
                 result.video.Frames.Length, result.video.Fps, result.video.Seed, result.codec,
-                sw.Elapsed.TotalSeconds, result.audioMuxed);
+                sw.Elapsed.TotalSeconds, result.audioMuxed, lastFramePath);
         }
 
         // A generation request the loaded model can explain rather than an internal

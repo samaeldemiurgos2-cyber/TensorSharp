@@ -10,6 +10,9 @@ internal sealed class StudioJobRecord
     public StudioProject? Snapshot { get; set; }
     public StudioGenerationRequest? Generation { get; set; }
     public string Fingerprint { get; set; } = "";
+    /// <summary>The take's last frame, saved losslessly in the job directory before its video was encoded; null when
+    /// the adapter kept none. <see cref="StudioService.ExtractFrameAsync"/> starts the next segment of a chain on it.</summary>
+    public string? LastFrameFileName { get; set; }
     // Live step timing behind the remaining-time estimate. Fields are not serialized: a restart interrupts running work.
     internal int FirstStep, LastStep;
     internal DateTimeOffset FirstStepAt, LastStepAt;
@@ -55,6 +58,8 @@ public sealed partial class StudioService
                 {
                     Finish(record.Job, "completed", record.Job.UpdatedAt); record.Job.Progress = 1;
                     record.Job.OutputAssetId = adopted.Id; record.Job.Error = null;
+                    // The last frame is moved into the job directory before the take is imported.
+                    if (File.Exists(StudioPaths.SafeChild(directory, LastFrameFile))) record.LastFrameFileName = LastFrameFile;
                 }
                 else
                 {
@@ -125,9 +130,33 @@ public sealed partial class StudioService
         if (request.TemporalConditions is null || request.ReferenceAssetIds is null || request.TemporalConditions.Any(c => c is null) || request.ReferenceAssetIds.Any(id => id is null))
             throw new StudioException("invalid_conditioning", "Conditioning collections must not be null.");
         var project = await GetProjectAsync(request.ProjectId, cancellationToken);
+        var (capability, imageCanvas) = await AdmitAsync(request, cancellationToken);
+        var fingerprint = Hash(new { kind = "generate", request });
+        lock (jobSync)
+        {
+            // An accepted request owns its captured inputs, even after a library deletion.
+            // Reconnecting clients may retrieve that job without re-admitting removed assets.
+            var existing = FindExistingJob(request.ProjectId, request.RequestId, fingerprint);
+            if (existing != null) return existing;
+        }
+        var paths = ResolveConditioning(request, project);
+        await generation.ValidateAsync(request, paths, cancellationToken);
+        // The adapter has replaced a first-frame 0x0 with the concrete canvas; the job records that size.
+        if (imageCanvas) RequireResolution(request, capability);
+        // Bound after the fingerprint, so resubmitting the same unbound request finds this job. The run refuses a model
+        // whose recipe has changed since (the chat service re-checks it under the model's GPU lock).
+        request.SamplingRecipe ??= capability.SamplingRecipe;
+        return Enqueue(new() { Job = new() { ProjectId = project.Id, RequestId = request.RequestId, Kind = "generate", ProjectRevision = project.Revision }, Generation = request, Snapshot = project,
+            Fingerprint = fingerprint });
+    }
+    /// <summary>The checks a request passes before its inputs are read: the host can ingest the output, the model is
+    /// loaded and runs the request's mode with its settings. Fills in the model's defaults in place; with width = height = 0
+    /// in an image-canvas mode the size is left for the adapter. Returns the capability and whether that is the case.</summary>
+    async Task<(StudioModelCapability Capability, bool ImageCanvas)> AdmitAsync(StudioGenerationRequest request, CancellationToken cancellationToken)
+    {
         var generationMediaReason = GenerationMediaUnavailableReason(await Media.GetCapabilitiesAsync(cancellationToken));
         if (generationMediaReason != null) throw new StudioException("generation_output_unavailable", generationMediaReason);
-        var capabilities = await generation.GetCapabilitiesAsync(cancellationToken);
+        var capabilities = await generation!.GetCapabilitiesAsync(cancellationToken);
         var capability = capabilities.FirstOrDefault(c => c.ModelId == request.ModelId) ?? throw new StudioException("model_not_found", "Selected video model is not available from this host registry.");
         if (!capability.Available) throw new StudioException("model_unavailable", capability.UnavailableReason ?? "Selected video model is not installed.");
         // A shot planned for another sampling recipe carries that recipe's steps: refuse it before defaults or the fingerprint.
@@ -154,6 +183,9 @@ public sealed partial class StudioService
             throw new StudioException("invalid_sampling", capability.FixedStepsRefusal());
         if (request.Steps is < 1 or > 200 || !float.IsFinite(request.CfgScale) || request.CfgScale is < 1 or > 30 || capability.FixedCfgScale is { } cfg && Math.Abs(request.CfgScale - cfg) > 0.0001)
             throw new StudioException("invalid_sampling", "Steps or CFG do not match the selected model's supported sampling settings.");
+        // First, so a chain segment that keeps a character hears why this family cannot do both, not "load the reference
+        // checkpoint", which would refuse the pinned first frame in turn.
+        capability.RequireReferencesWithFirstFrame(request, mode);
         if (!capability.Modes.Contains(mode))
             throw new StudioException("unsupported_mode", capability.UnavailableModes.TryGetValue(mode, out var reason) ? reason
                 : !capability.TextToVideo && mode == StudioGenerationModes.TextToVideo ? "This checkpoint requires first-frame image conditioning."
@@ -170,23 +202,7 @@ public sealed partial class StudioService
         foreach (var guide in request.TemporalConditions)
             if (guide.FrameIndex < -1 || guide.FrameIndex >= request.FrameCount || !float.IsFinite(guide.Strength) || guide.Strength is <= 0 or > 1)
                 throw new StudioException("invalid_conditioning", "Temporal guide indices and strengths must fit the output frame range and (0, 1].");
-        var fingerprint = Hash(new { kind = "generate", request });
-        lock (jobSync)
-        {
-            // An accepted request owns its captured inputs, even after a library deletion.
-            // Reconnecting clients may retrieve that job without re-admitting removed assets.
-            var existing = FindExistingJob(request.ProjectId, request.RequestId, fingerprint);
-            if (existing != null) return existing;
-        }
-        var paths = ResolveConditioning(request, project);
-        await generation.ValidateAsync(request, paths, cancellationToken);
-        // The adapter has replaced a first-frame 0x0 with the concrete canvas; the job records that size.
-        if (imageCanvas) RequireResolution(request, capability);
-        // Bound after the fingerprint, so resubmitting the same unbound request finds this job. The run refuses a model
-        // whose recipe has changed since (the chat service re-checks it under the model's GPU lock).
-        request.SamplingRecipe ??= capability.SamplingRecipe;
-        return Enqueue(new() { Job = new() { ProjectId = project.Id, RequestId = request.RequestId, Kind = "generate", ProjectRevision = project.Revision }, Generation = request, Snapshot = project,
-            Fingerprint = fingerprint });
+        return (capability, imageCanvas);
     }
     static void RequireResolution(StudioGenerationRequest request, StudioModelCapability capability)
     {
@@ -317,6 +333,9 @@ public sealed partial class StudioService
         if (title.Length >= 47 && title.LastIndexOf(' ') is int cut and >= 20) title = title[..cut];
         title = title.Trim().TrimEnd('.', ',', ';', ':');
         if (title.Length == 0) title = "Generated take";
+        // A segment that continues a video says which part of the chain it is, so the parts are told apart in the library.
+        int part = ChainPart(request, project);
+        if (part > 1) title += $" · part {part}";
         // Numbered after the highest take of the shot, so deleting one never makes the next repeat a name.
         int take = 1;
         if (request.ShotId != null)
@@ -327,6 +346,22 @@ public sealed partial class StudioService
             }
         if (take > 1) title += $" · take {take}";
         return title + Path.GetExtension(outputPath);
+    }
+    /// <summary>Which segment of a chain a shot is: 1 unless it starts on a still taken from a video, then one more than
+    /// that video (an imported video counts as part 1), following each take's first frame back.</summary>
+    internal static int ChainPart(StudioGenerationRequest request, StudioProject project)
+    {
+        int part = 1; var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (string? first = request.ConditioningAssetId; first != null && part < 999;)
+        {
+            var still = project.Assets.FirstOrDefault(a => a.Id == first);
+            if (still?.DerivedFrom is not { } source) break;
+            part++;
+            var video = project.Assets.FirstOrDefault(a => a.Id == source.AssetId);
+            if (video?.Generation is not { } generation || !seen.Add(video.Id)) break;
+            first = generation.Request.ConditioningAssetId;
+        }
+        return part;
     }
     /// <summary>Elapsed, queued and remaining time as of <paramref name="now"/>. Denoising is estimated from the steps this
     /// run has finished; the stages around it only from <paramref name="previous"/>, a completed run of the same model and
@@ -388,6 +423,43 @@ public sealed partial class StudioService
         return (stages.Take(first).Sum(s => s.Seconds), stages.Skip(first).Take(last - first + 1).Sum(s => s.Seconds), stages.Skip(last + 1).Sum(s => s.Seconds));
     }
     sealed class InlineProgress(Action<StudioProgress> callback) : IProgress<StudioProgress> { public void Report(StudioProgress value) => callback(value); }
+    /// <summary>The job-directory name of a take's lossless last frame.</summary>
+    internal const string LastFrameFile = "last-frame.png";
+    internal static string FailureDiagnostic(StudioJob job, Exception error)
+    {
+        var diagnostic = new StringBuilder($"Studio job {job.Id} ({job.Kind}) failed during {job.Stage}.");
+        // The job document retains the user-facing error. The durable host log adds the call sites without copying
+        // exception messages, which adapters or media tools may populate with prompts, file names or command lines.
+        for (Exception? cause = error; cause != null; cause = cause.InnerException)
+        {
+            diagnostic.AppendLine().Append(cause.GetType().FullName);
+            if (cause is StudioException studio) diagnostic.Append(" [").Append(studio.Code).Append(']');
+            if (cause.StackTrace is { } stack) diagnostic.AppendLine().Append(stack);
+        }
+        return diagnostic.ToString();
+    }
+    // An adapter's output must be a regular file inside the job's own work directory.
+    static string ManagedOutput(string path, string workDirectory)
+    {
+        var actualPath = Path.GetFullPath(path);
+        if (!actualPath.StartsWith(workDirectory + Path.DirectorySeparatorChar, StringComparison.Ordinal) || File.GetAttributes(actualPath).HasFlag(FileAttributes.ReparsePoint))
+            throw new StudioException("unsafe_generation_output", "Generation adapter returned a file outside its managed job directory.");
+        return actualPath;
+    }
+    /// <summary>Moves the take's lossless last frame into the job directory when it is the take's size, so a chain can
+    /// continue from the exact pixels rather than a decode of the encoded video. A frame of any other size is not kept,
+    /// and the take is then continued from its decoded video (the still records which).</summary>
+    async Task KeepLastFrameAsync(StudioJobRecord record, StudioGenerationResult output, string workDirectory, StudioGenerationRequest request, CancellationToken ct)
+    {
+        if (output.LastFramePath == null || !File.Exists(output.LastFramePath)) return;
+        var path = ManagedOutput(output.LastFramePath, workDirectory);
+        if (!string.Equals(Path.GetExtension(path), ".png", StringComparison.OrdinalIgnoreCase))
+            throw new StudioException("unsafe_generation_output", "A take's last frame must be a PNG image.");
+        var probe = await Media.ProbeAsync(path, LastFrameFile, ct);
+        if (probe.Kind != "image" || probe.Width != request.Width || probe.Height != request.Height) return;
+        File.Move(path, StudioPaths.SafeChild(JobDirectory(record.Job.Id), LastFrameFile), true);
+        record.LastFrameFileName = LastFrameFile;
+    }
     async Task ProcessJobsAsync()
     {
         try
@@ -431,14 +503,14 @@ public sealed partial class StudioService
                         var output = await generation!.GenerateAsync(request, workDirectory, ResolveConditioning(request, snapshot), progress, cancellation.Token);
                         cancellation.Token.ThrowIfCancellationRequested();
                         lock (jobSync) if (record.Job.State == "running") { EnterStage(record.Job, "importing", DateTimeOffset.UtcNow); SaveJob(record); }
-                        var actualPath = Path.GetFullPath(output.FilePath);
-                        if (!actualPath.StartsWith(workDirectory + Path.DirectorySeparatorChar, StringComparison.Ordinal) || File.GetAttributes(actualPath).HasFlag(FileAttributes.ReparsePoint))
-                            throw new StudioException("unsafe_generation_output", "Generation adapter returned a file outside its managed job directory.");
+                        var actualPath = ManagedOutput(output.FilePath, workDirectory);
+                        // Kept before the import: the work directory is deleted once the job ends.
+                        await KeepLastFrameAsync(record, output, workDirectory, request, cancellation.Token);
                         await using var stream = File.OpenRead(actualPath);
                         string takeName = TakeFileName(request, await GetProjectAsync(request.ProjectId, cancellation.Token), actualPath);
-                        var updated = await ImportAssetInternalAsync(request.ProjectId, stream, takeName, new()
+                        var imported = await ImportAssetInternalAsync(request.ProjectId, stream, takeName, new()
                         { Request = StudioJson.Clone(request), ModelVersion = output.ModelVersion, EffectiveParameters = output.EffectiveParameters }, cancellation.Token);
-                        record.Job.OutputAssetId = updated.Assets.Last(a => a.Generation?.Request.RequestId == request.RequestId).Id;
+                        record.Job.OutputAssetId = imported.AssetId;
                     }
                     lock (jobSync) { Finish(record.Job, "completed", DateTimeOffset.UtcNow); record.Job.Progress = 1; SaveJob(record); }
                 }
@@ -452,6 +524,8 @@ public sealed partial class StudioService
                 }
                 catch (Exception e)
                 {
+                    try { Options.LogJobFailure?.Invoke(FailureDiagnostic(record.Job, e)); }
+                    catch (Exception) { /* A diagnostic sink must not stop this worker or prevent the durable job save. */ }
                     lock (jobSync) { Finish(record.Job, "failed", DateTimeOffset.UtcNow); record.Job.Error = e is OutOfMemoryException ? "Insufficient memory. Release other loaded models or explicitly choose lower settings, then retry." : e.Message; SaveJob(record); }
                 }
                 finally

@@ -13,6 +13,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using TensorSharp.AgentHost;
+using TensorSharp.Chat.Studio;
+using TensorSharp.Studio;
 using Xunit;
 
 namespace InferenceWeb.Tests;
@@ -50,6 +52,14 @@ public class HostOSTests
         Assert.False(HostOS.IsAppleMobile);
     }
 
+    [Fact]
+    public void StudioDesktopDefaultsAllowMediaSubprocesses()
+    {
+        Assert.True(new StudioOptions().EnableExternalProcesses);
+        Assert.True(StudioHostOptions.Create().EnableExternalProcesses);
+        Assert.Equal(1024, StudioHostOptions.Create(1024).MaxImportBytes);
+    }
+
     /// <summary>
     /// Every Apple platform check in the code the Mac app shares with the phone either
     /// goes through <see cref="HostOS"/> or names Mac Catalyst itself, so its author had
@@ -60,7 +70,7 @@ public class HostOSTests
     {
         string root = RepoRoot;
         var sources = new List<string>();
-        foreach (string project in new[] { "TensorSharp.AgentHost", Path.Combine("TensorAgent", "src", "TensorAgent.Core") })
+        foreach (string project in new[] { "TensorSharp.AgentHost", "TensorSharp.Studio", Path.Combine("TensorSharp.Chat", "Studio"), Path.Combine("TensorAgent", "src", "TensorAgent.Core") })
         {
             sources.AddRange(Directory.EnumerateFiles(Path.Combine(root, project), "*.cs", SearchOption.AllDirectories)
                 .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal)

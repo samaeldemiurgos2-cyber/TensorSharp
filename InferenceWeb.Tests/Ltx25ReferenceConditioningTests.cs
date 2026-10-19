@@ -2,16 +2,29 @@ using System.Text.Json;
 using TensorSharp.Models.Ltx25;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.Video;
+using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
 public sealed class Ltx25ReferenceConditioningTests
 {
+    private readonly ITestOutputHelper _output;
+    public Ltx25ReferenceConditioningTests(ITestOutputHelper output) => _output = output;
+
     private static float[] Values(JsonElement node) => node.EnumerateArray().Select(value => value.GetSingle()).ToArray();
     private static void Close(float[] expected, float[] actual)
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; ++i) Assert.InRange(Math.Abs(expected[i] - actual[i]), 0, 4e-7f);
+    }
+    private static float Close(Dictionary<string, float> differences, string field, float[] expected, float[] actual)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        float worst = 0;
+        for (int i = 0; i < expected.Length; ++i) worst = Math.Max(worst, Math.Abs(expected[i] - actual[i]));
+        differences[field] = Math.Max(differences.GetValueOrDefault(field), worst);
+        Close(expected, actual);
+        return worst;
     }
     private static RgbImage Solid(int width, int height, float r, float g, float b)
     {
@@ -60,6 +73,79 @@ public sealed class Ltx25ReferenceConditioningTests
         Assert.Equal(new[] { 1f, 1f }, initial.KeyframeMask.Take(2));
         Assert.All(initial.KeyframeMask.Skip(2), value => Assert.Equal(0, value));
         Close(initial.CleanVideo[(settings.VideoTokens * 128)..], result.Video[(settings.VideoTokens * 128)..]);
+    }
+
+    /// <summary>A chain take that keeps a character: one frame-0 image guide beside the Ingredients reference video.
+    /// The fixture runs the unchanged official combined_image_conditionings (frame 0 -> VideoConditionByLatentIndex at
+    /// latent_idx 0) and then VideoConditionByReferenceLatent, ICLoraPipeline's per-stage order, through
+    /// create_noised_state; TensorSharp appends the references first and pins frame 0 after, on disjoint tokens.</summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void FrameZeroGuideBesideReferenceVideoMatchesUnchangedOfficialImagesThenReferences(int caseIndex)
+    {
+        using var stream = typeof(Ltx25ReferenceConditioningTests).Assembly.GetManifestResourceStream(
+            "InferenceWeb.Tests.Fixtures.Ltx25.reference-first-frame-conditioning.json")!;
+        using var document = JsonDocument.Parse(stream);
+        var fixture = document.RootElement;
+        Assert.Equal("be6d6d0a69d11a0a399c462ed92606692e5f8697", fixture.GetProperty("source_revision").GetString());
+        var expected = fixture.GetProperty("cases")[caseIndex];
+        Assert.Equal(new[] { "VideoConditionByLatentIndex", "VideoConditionByReferenceLatent" },
+            expected.GetProperty("order").EnumerateArray().Select(name => name.GetString()));
+        Assert.True(expected.GetProperty("reverse_order_identical").GetBoolean());
+        float strength = expected.GetProperty("strength").GetSingle();
+        var parameters = new VideoGenerationParams
+        {
+            Mode = "ref", ReferenceImagePaths = ["identity.png"], Width = 64, Height = 32, Frames = 121, Seed = 42,
+            ImageConditions = [new() { ImagePath = "first-frame.png", FrameIndex = 0, Strength = strength }],
+        };
+        var settings = Ltx25GenerationSettings.Resolve(parameters, true);
+        var guide = Ltx25ReferenceConditioning.ResolveFirstFrameGuide(parameters)!;
+        float[] noise = Values(fixture.GetProperty("noise"));
+        var input = new Ltx25DenoiserInput
+        {
+            Video = noise, VideoTokens = settings.VideoTokens * 2, Audio = [0], AudioTokens = 1,
+            VideoContext = [0], VideoContextTokens = 1, AudioContext = [0], AudioContextTokens = 1,
+            VideoPositions = Ltx25Geometry.VideoPositions(settings.LatentFrames, 1, 2, 24),
+            AudioPositions = Ltx25Geometry.AudioPositions(1), VideoSigma = 1, AudioSigma = 1,
+            FrequencyPrecision = Ltx25FrequencyPrecision.Float64,
+        };
+        float[] reference = Values(fixture.GetProperty("reference_latent")), preservedReference = (float[])reference.Clone();
+        float[] image = Values(fixture.GetProperty("image_latent")), preservedImage = (float[])image.Clone();
+        var referenced = Ltx25ReferenceConditioning.Apply(input, settings, reference, 16, 1, 2);
+        float[] referencedVideo = (float[])referenced.Video.Clone(), referencedClean = (float[])referenced.CleanVideo.Clone();
+        var initial = Ltx25ImageConditioning.ApplyFirstFrame(referenced, settings, new(image, guide.FrameIndex, guide.Strength));
+        var differences = new Dictionary<string, float>();
+        Close(differences, "initial", Values(expected.GetProperty("initial")), initial.Video);
+        Close(differences, "clean", Values(expected.GetProperty("clean")), initial.CleanVideo);
+        Close(differences, "mask", Values(expected.GetProperty("mask")), initial.VideoDenoiseMask);
+        Close(differences, "keyframe_mask", Values(expected.GetProperty("keyframe_mask")), initial.KeyframeMask);
+        Close(differences, "positions", Values(expected.GetProperty("positions")), initial.VideoPositions.Boundaries);
+        Assert.True(initial.UseReferenceLora); Assert.Same(input.Audio, initial.Audio);
+        Assert.Equal(preservedReference, reference); Assert.Equal(preservedImage, image);
+        Close(Values(fixture.GetProperty("noise")), input.Video);
+        Assert.Equal(referencedVideo, referenced.Video); Assert.Equal(referencedClean, referenced.CleanVideo);
+        var steps = expected.GetProperty("steps").EnumerateArray().ToArray();
+        int step = 0;
+        var result = Ltx25Sampling.RunEuler(current =>
+        {
+            Assert.True(current.UseReferenceLora);
+            Close(differences, "step_input", step == 0 ? Values(expected.GetProperty("initial")) : Values(steps[step - 1].GetProperty("output")), current.Video);
+            Close(differences, "timesteps", Values(steps[step].GetProperty("timesteps")), current.VideoTimesteps);
+            return new(Values(steps[step++].GetProperty("velocity")), [0], 48);
+        }, initial, Values(fixture.GetProperty("sigmas")));
+        Assert.Equal(steps.Length, step);
+        Close(differences, "euler_output", Values(steps[^1].GetProperty("output")), result.Video);
+        _output.WriteLine($"strength {strength.ToString("R", System.Globalization.CultureInfo.InvariantCulture)}: " +
+            string.Join(", ", differences.Select(pair => $"{pair.Key} {pair.Value:G3}")));
+        int frameZero = settings.LatentHeight * settings.LatentWidth, canvasValues = settings.VideoTokens * 128;
+        Assert.All(initial.VideoDenoiseMask.Take(frameZero), value => Assert.Equal(1 - strength, value));
+        Assert.All(initial.VideoDenoiseMask.Skip(frameZero).Take(settings.VideoTokens - frameZero), value => Assert.Equal(1, value));
+        Assert.All(initial.VideoDenoiseMask.Skip(settings.VideoTokens), value => Assert.Equal(0, value));
+        Assert.Equal(new[] { 1f, 1f }, initial.KeyframeMask.Take(2));
+        Assert.All(initial.KeyframeMask.Skip(2), value => Assert.Equal(0, value));
+        Close(initial.CleanVideo[canvasValues..], result.Video[canvasValues..]);
+        if (strength == 1) Assert.Equal(initial.CleanVideo[..(frameZero * 128)], result.Video[..(frameZero * 128)]);
     }
 
     [Fact]

@@ -1,5 +1,5 @@
 {
-  // LTX 2.5 Distilled Q4_K_M — experimental video and audio preset.
+  // LTX 2.5 Distilled UD-Q4_K_XL — experimental video and audio preset.
   // Native text and image conditioning, eight-step AV sampling and video/audio decoding.
   // Accepts first/last images and multiple timed image guides (imageConditions).
   // Ordered referenceImages are temporal guides, evenly spaced first to last.
@@ -7,10 +7,16 @@
   // Ingredients adapter is installed beside the model in loras/, or selected
   // through TS_LTX25_INGREDIENTS_LORA. Its trained preview is 768x448x121.
 
-  // Five verified assets, 44,764,412,884 bytes in total, pinned by commit and
-  // SHA-256. The official Lightricks companions are gated: accept their license
-  // and configure HF_TOKEN or the Hugging Face CLI token cache for downloading.
-  // The stock Gemma 4 checkpoint is not a substitute for the LTX projection file.
+  // Five verified assets, 43,077,008,276 bytes in total, pinned by commit and SHA-256, all
+  // from unsloth/LTX-2.5-GGUF, which is not gated: no Hugging Face token is needed. The
+  // denoiser is Unsloth's Dynamic 2.0 mixed-precision 4-bit file from the repository's
+  // distilled/ folder; the files at that repository's root are the DEV checkpoint (30 steps,
+  // CFG 3), which this distilled recipe cannot sample and TensorSharp refuses. The text
+  // encoder, VAEs and upscaler are the publisher's files, byte for byte (same SHA-256 as
+  // Lightricks/LTX-2.5, listed second as a mirror; that repository is gated). The stock
+  // Gemma 4 checkpoint is not a substitute for the LTX projection file.
+  // For output closest to BF16, distilled/ltx-2.5-22b-distilled-Q8_0.gguf (22,779,666,816 bytes,
+  // sha256 110f262ab19e1580613fd6d0cc9a58b91ddfd79b5dc603d137f4ba3b62a874ba) is the same layout.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "ltxRoot": "${modelRoot}/ltx25",
@@ -30,37 +36,51 @@
   "video-frames": 17,
   "fps": 24,
 
+  // Kept at the root of ltxRoot, not in a distilled/ sub-folder: the companions below and the
+  // optional Ingredients adapter (loras/) are found beside the denoiser.
   "model": {
-    "path": "${ltxRoot}/LTX-2.5-Distilled-Q4_K_M.gguf",
-    "urls": [ "${hf}/Abiray/LTX-2.5-Distilled-GGUF/resolve/7b0c2025441f1bf12c18eac375ad21f5e3d3c9e0/LTX-2.5-Distilled-Q4_K_M.gguf" ],
-    "sha256": "0f51eb0d82b19bddbfb3b0371a65217844ea03750f27dd733528f22152e0e0d0"
+    "path": "${ltxRoot}/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf",
+    "urls": [ "${hf}/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf" ],
+    "sha256": "55442750eb0013d94fffaa4dadb577c5f4dc07107ec04389d41444f6e517d980"
   },
 
   "video-text-encoder": {
     "path": "${ltxRoot}/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-    "urls": [ "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors" ],
+    "urls": [
+      "${hf}/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+      "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
+    ],
     "sha256": "ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1"
   },
 
   "video-vae": {
     "path": "${ltxRoot}/vae/ltx-2.5-video-vae-conv-bf16.safetensors",
-    "urls": [ "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/vae/ltx-2.5-video-vae-conv-bf16.safetensors" ],
+    "urls": [
+      "${hf}/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+      "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/vae/ltx-2.5-video-vae-conv-bf16.safetensors"
+    ],
     "sha256": "685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d"
   },
 
-  // The publisher's diffusion video decoder (ltx-2.5-video-vae-bf16.safetensors) is
-  // opt-in through --video-diffusion-vae: cleaner, with less grain and flicker, but
-  // softer than this convolutional decoder on the preset's 1024x1024 output.
+  // The publisher's diffusion video decoder (ltx-2.5-video-vae-bf16.safetensors, only in the
+  // gated Lightricks/LTX-2.5) is opt-in through --video-diffusion-vae: cleaner, with less grain
+  // and flicker, but softer than this convolutional decoder on the preset's 1024x1024 output.
 
   "video-upscaler": {
     "path": "${ltxRoot}/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
-    "urls": [ "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors" ],
+    "urls": [
+      "${hf}/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+      "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+    ],
     "sha256": "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8"
   },
 
   "audio-vae": {
     "path": "${ltxRoot}/vae/ltx-2.5-audio-vae-bf16.safetensors",
-    "urls": [ "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/vae/ltx-2.5-audio-vae-bf16.safetensors" ],
+    "urls": [
+      "${hf}/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/vae/ltx-2.5-audio-vae-bf16.safetensors",
+      "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/vae/ltx-2.5-audio-vae-bf16.safetensors"
+    ],
     "sha256": "c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5"
   }
 }

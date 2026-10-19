@@ -15,10 +15,10 @@
   "catalog.model.qwenImage21.quantization": "Q4_K_M（DiT）/ Q4_K_M（テキストエンコーダー）",
   "catalog.model.qwenImage21.notes": "説明文から画像を作成し、添付した写真を編集できます。24 GB のシステムメモリ（RAM）が必要です。",
   "catalog.model.qwenImage21Turbo.parameters": "Qwen-Image-2.1-Turbo DiT + Qwen3-VL-8B テキストエンコーダー",
-  "catalog.model.qwenImage21TurboAdQ4k.quantization": "AD-Q4_K（DiT）/ Q4_K_M（テキストエンコーダー）",
-  "catalog.model.qwenImage21TurboAdQ4k.notes": "40 ステップを 8 ステップに蒸留した Qwen-Image 2.1 です。説明文からの画像作成や添付した写真の編集を、約 5 分の 1 の時間で行います。テキストエンコーダー、VAE、ビジョンのファイルは Qwen-Image 2.1 と共通なので、ダウンロードは 1 回で済みます。このモデルで検証済みのプラグインだけが使え、速度プラグインは使えません。24 GB のシステムメモリ（RAM）が必要です。",
+  "catalog.model.qwenImage21TurboQ5ks.quantization": "Q5_K_S（DiT）/ Q4_K_M（テキストエンコーダー）",
+  "catalog.model.qwenImage21TurboQ5ks.notes": "40 ステップを 8 ステップに蒸留した Qwen-Image 2.1 です。説明文からの画像作成や添付した写真の編集を、約 5 分の 1 の時間で行います。テキストエンコーダー、VAE、ビジョンのファイルは Qwen-Image 2.1 と共通なので、ダウンロードは 1 回で済みます。このモデルで検証済みのプラグインだけが使え、速度プラグインは使えません。24 GB のシステムメモリ（RAM）が必要です。",
   "catalog.model.qwenImage21TurboQ8.quantization": "Q8_0（DiT）/ Q4_K_M（テキストエンコーダー）",
-  "catalog.model.qwenImage21TurboQ8.notes": "4 ビット版の代わりに 8 ビットの Transformer を使う Qwen-Image 2.1 Turbo です。Transformer 単体で測ると 8 ビット版のほうがフル精度に近くなります（GGUF のモデルカードによる BF16 との LPIPS：0.037、4 ビット版は 0.147）。ただし Turbo の 2 つのエントリーは同じ 4 ビットのテキストエンコーダーを使い、モデルカードの測定では、それによる画像のずれは 4 ビットの Transformer と同程度です。テキストエンコーダー、VAE、ビジョンのファイルは Qwen-Image 2.1 と共通なので、ダウンロードは 1 回で済みます。このモデルで検証済みのプラグインだけが使え、速度プラグインは使えません。32 GB のシステムメモリ（RAM）が必要です。",
+  "catalog.model.qwenImage21TurboQ8.notes": "5 ビット版の代わりに 8 ビットの Transformer を使う Qwen-Image 2.1 Turbo です。フル精度に最も近く（GGUF のモデルカードによる BF16 との LPIPS：0.036、5 ビット版は 0.103）、1 ステップあたりもわずかに速くなります。テキストエンコーダー、VAE、ビジョンのファイルは Qwen-Image 2.1 と共通なので、ダウンロードは 1 回で済みます。このモデルで検証済みのプラグインだけが使え、速度プラグインは使えません。32 GB のシステムメモリ（RAM）が必要です。",
   "catalog.license.qwenImage": "Qwen 研究ライセンス（非商用）；テキストエンコーダーは Apache-2.0",
   "catalog.model.minimaxH3.parameters": "33B 音声・動画 DiT（AdaLN 分岐の削減後は 20B）+ Qwen3-VL-32B テキストエンコーダー",
   "catalog.model.minimaxH3.quantization": "Q4_K（DiT）/ Q4_K_M（テキストエンコーダー）",
@@ -67,6 +67,6 @@
   "catalog.extended.744b40b.parameters": "7440 億（有効 400 億）",
   "catalog.extended.384experts.parameters": "MoE、384 のルーティング対象エキスパート",
   "catalog.extended.14bExpert.parameters": "エキスパートあたり 140 億",
-  "catalog.model.ltx25.notes": "48kHzステレオ音声付きの実験的なテキスト・画像動画生成。LTX2.5 DistilledはCFG1で、半分のサイズでAncestral Eulerを8ステップ、潜在空間の2倍アップスケール、仕上げ3ステップを実行し、最初・最後のフレームと、位置・強度を指定した複数の画像キーフレームに対応します。画像は出力の時間軸を指定します。人物の参照や動画・音声アダプターには別のチェックポイントが必要です。固定ダウンロードは合計44.76GBで、Hugging Faceの承認済みアクセスが必要です。端末の目安は48GBで、短い1024×1024動画で検証済みです。",
+  "catalog.model.ltx25.notes": "48kHzステレオ音声付きの実験的なテキスト・画像動画生成。LTX2.5 DistilledはCFG1で、半分のサイズでAncestral Eulerを8ステップ、潜在空間の2倍アップスケール、仕上げ3ステップを実行し、最初・最後のフレームと、位置・強度を指定した複数の画像キーフレームに対応します。画像は出力の時間軸を指定します。人物の参照や動画・音声アダプターには別のチェックポイントが必要です。固定ダウンロードは合計43.08GBで、アクセス制限のないリポジトリから取得するため、Hugging Faceのアカウントは不要です。端末の目安は48GBで、短い1024×1024動画で検証済みです。",
   "catalog.license.ltx25": "LTX-2.5 と Gemma の利用条件"
 }

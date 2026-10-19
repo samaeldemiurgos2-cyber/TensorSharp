@@ -15,8 +15,8 @@ namespace TensorSharp.Runtime
 {
     /// <summary>
     /// Which Qwen-Image-2.1 checkpoint a diffusion-transformer GGUF holds. The two have the same
-    /// tensors, names and shapes, and the community GGUFs carry no metadata at all, so nothing in
-    /// the file tells them apart; the host declares it (<see cref="QwenImageVariantFlag"/>).
+    /// tensors, names and shapes, and the community GGUFs name at most their architecture, so
+    /// nothing in the file tells them apart; the host declares it (<see cref="QwenImageVariantFlag"/>).
     /// </summary>
     public enum QwenImageVariant
     {

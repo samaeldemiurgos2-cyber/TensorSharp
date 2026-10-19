@@ -441,16 +441,25 @@ public sealed class ModelStore
     /// <see cref="Delete"/> can. The bytes it reports freed then overstate: they include
     /// files whose space stays in use under the other name.
     /// </para>
+    /// <para>
+    /// A retired entry that was re-pointed at another file of the same model has a successor
+    /// (<see cref="ModelCatalog.Successors"/>), and the successor first takes over what it can
+    /// still use (<see cref="CarryOver"/>): what is reclaimed is the superseded file, not the
+    /// companions it shared a folder with.
+    /// </para>
     /// </summary>
     /// <param name="catalog">The entries whose folders are kept; the store's catalog when null.</param>
     /// <param name="retired">The ids whose folders are reclaimed; <see cref="ModelCatalog.Retired"/> when null.</param>
+    /// <param name="successors">Retired id to the id that replaced it; <see cref="ModelCatalog.Successors"/> when null.</param>
     /// <returns>Bytes freed.</returns>
-    public long SweepOrphanedModels(IReadOnlyList<CatalogModel>? catalog = null, IReadOnlyCollection<string>? retired = null)
+    public long SweepOrphanedModels(IReadOnlyList<CatalogModel>? catalog = null, IReadOnlyCollection<string>? retired = null,
+        IReadOnlyDictionary<string, string>? successors = null)
     {
         string root = Root;
-        var known = new HashSet<string>(
-            (catalog ?? _catalog).Select(m => m.Id), StringComparer.OrdinalIgnoreCase);
+        IReadOnlyList<CatalogModel> entries = catalog ?? _catalog;
+        var known = new HashSet<string>(entries.Select(m => m.Id), StringComparer.OrdinalIgnoreCase);
         var reclaimable = new HashSet<string>(retired ?? ModelCatalog.Retired, StringComparer.OrdinalIgnoreCase);
+        successors ??= ModelCatalog.Successors;
 
         long freed = 0;
         IEnumerable<string> directories;
@@ -471,6 +480,10 @@ public sealed class ModelStore
             }
             try
             {
+                if (successors.TryGetValue(id, out string? successorId)
+                    && entries.FirstOrDefault(m => string.Equals(m.Id, successorId, StringComparison.OrdinalIgnoreCase))
+                        is { } successor)
+                    CarryOver(directory, id, successor);
                 long bytes = Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)
                     .Sum(f => new FileInfo(f).Length);
                 Directory.Delete(directory, recursive: true);
@@ -514,6 +527,130 @@ public sealed class ModelStore
             }
         }
         return freed;
+    }
+
+    /// <summary>
+    /// Move into <paramref name="successor"/>'s folder what the retired entry's
+    /// <paramref name="directory"/> holds that the successor can use, before the sweep deletes it:
+    /// <list type="bullet">
+    /// <item>a complete copy of a file the successor lists under the same name (a companion both
+    /// entries share; "complete" is the exact size, as everywhere in the store), and</item>
+    /// <item>whatever sits in a sub-folder. The store itself writes only top-level files, so a
+    /// sub-folder is something the user added beside the model for the engine to find, like LTX
+    /// 2.5's Ingredients adapter in <c>loras/</c>.</item>
+    /// </list>
+    /// Nothing the successor already holds is replaced, except a wrong-sized file under a name
+    /// it lists, which is a broken download. Every other top-level file -- the superseded
+    /// weights, a part file -- stays for the sweep to reclaim.
+    /// <para>
+    /// A link is never followed. The sweep's delete only unlinks a linked folder, and the
+    /// carry-over keeps to that: a retired folder that is itself a link (moved to another disk)
+    /// is left alone, and a linked sub-folder (a <c>loras/</c> pointing at a shared library) moves
+    /// as the link, not as the files behind it, which belong to the user and other tools. Within
+    /// the folder every move is then a rename on the store's volume. A failed move leaves the
+    /// retired folder for a later retry, preserving user-added files that cannot be downloaded.
+    /// </para>
+    /// </summary>
+    private void CarryOver(string directory, string retiredId, CatalogModel successor)
+    {
+        if (IsLink(directory))
+            return;
+        string target = DirectoryFor(successor);
+        if (IsLink(target))
+            throw new IOException($"The successor folder {target} is a link; keeping the retired folder for manual migration.");
+        long carried = 0;
+        int count = 0;
+        bool moveFailed = false;
+
+        bool Move(string source, string relative, bool isDirectoryLink)
+        {
+            string destination = Path.Combine(target, relative);
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                if (isDirectoryLink)
+                    Directory.Move(source, destination);
+                else
+                {
+                    long bytes = new FileInfo(source).Length;
+                    File.Move(source, destination);
+                    carried += bytes;
+                }
+                count++;
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Console.WriteLine($"TensorAgent: could not move {retiredId}/{relative} to {successor.Id}: {ex.Message}");
+                moveFailed = true;
+                return false;
+            }
+        }
+
+        // Top level: the store's own files, of which only a complete companion the successor
+        // lists under the same name moves.
+        foreach (string file in Directory.EnumerateFiles(directory).ToList())
+        {
+            string name = Path.GetFileName(file);
+            CatalogFile? listed = successor.Files.FirstOrDefault(f => string.Equals(f.FileName, name, StringComparison.Ordinal));
+            string destination = Path.Combine(target, name);
+            if (listed is null || IsLink(file) || !IsComplete(file, listed) || IsComplete(destination, listed))
+                continue;
+            try
+            {
+                if (File.Exists(destination))
+                    File.Delete(destination);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Console.WriteLine($"TensorAgent: could not replace {successor.Id}/{name}: {ex.Message}");
+                moveFailed = true;
+                continue;
+            }
+            Move(file, name, isDirectoryLink: false);
+        }
+
+        // Sub-folders: what the user added, kept wherever the successor has no entry of that name.
+        void Walk(string folder)
+        {
+            foreach (string sub in Directory.EnumerateDirectories(folder).ToList())
+            {
+                string relative = Path.GetRelativePath(directory, sub);
+                string destination = Path.Combine(target, relative);
+                if (IsLink(sub))
+                {
+                    if (!Directory.Exists(destination) && !File.Exists(destination) && !IsLink(destination))
+                        Move(sub, relative, isDirectoryLink: true);
+                    continue;
+                }
+                if (IsLink(destination))
+                    throw new IOException($"The successor folder {destination} is a link; keeping the retired folder for manual migration.");
+                foreach (string file in Directory.EnumerateFiles(sub).ToList())
+                {
+                    string fileRelative = Path.GetRelativePath(directory, file);
+                    string fileDestination = Path.Combine(target, fileRelative);
+                    if (!File.Exists(fileDestination) && !Directory.Exists(fileDestination) && !IsLink(fileDestination))
+                        Move(file, fileRelative, isDirectoryLink: false);
+                }
+                Walk(sub);
+            }
+        }
+        // Enumeration failure or a destination link must leave this folder intact. The sweep
+        // catches the exception and retries on a later launch after the user resolves it.
+        Walk(directory);
+        if (moveFailed)
+            throw new IOException($"Some files of {retiredId} could not be moved; keeping its folder for a later migration retry.");
+
+        if (count > 0)
+            Console.WriteLine(
+                $"TensorAgent: kept {count} item(s) of the retired {retiredId} for {successor.Id}, which replaced it "
+                + $"({carried / (1024.0 * 1024.0 * 1024.0):0.0} GB not downloaded again)");
+    }
+
+    private static bool IsLink(string path)
+    {
+        try { return new FileInfo(path).LinkTarget is not null; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
     }
 
     /// <summary>Remove one optional companion (e.g. a projector) to free memory/disk.</summary>

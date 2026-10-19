@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 namespace TensorSharp.MLX
@@ -9,6 +10,7 @@ namespace TensorSharp.MLX
         private readonly object sync = new();
         private IntPtr buffer;
         private MlxNative.MlxArray deviceArray;
+        private int[] deviceShape;
         private bool hostDirty = true;
         private bool deviceDirty;
 
@@ -23,6 +25,20 @@ namespace TensorSharp.MLX
         internal MlxAllocator AllocatorImpl { get; }
 
         public int DeviceId => AllocatorImpl.DeviceId;
+
+        protected override void SetTensorMetadata(ReadOnlySpan<long> sizes, ReadOnlySpan<long> strides)
+        {
+            if (ElementCount <= int.MaxValue || deviceShape != null)
+                return;
+            long count = 1;
+            foreach (long size in sizes)
+            {
+                if (size < 0 || size > int.MaxValue) return;
+                count = checked(count * size);
+            }
+            if (count == ElementCount)
+                deviceShape = ToIntArray(sizes);
+        }
 
         protected override void Destroy()
         {
@@ -75,36 +91,48 @@ namespace TensorSharp.MLX
             if (!ReferenceEquals(tensor.Storage, this))
                 throw new ArgumentException("Tensor is not backed by this MLX storage.", nameof(tensor));
 
-            EnsureDeviceCurrent();
-            return MlxNative.AsStrided(deviceArray, ToIntArray(tensor.Sizes), ToLongArray(tensor.Strides), tensor.StorageOffset);
+            int[] shape = ToIntArray(tensor.Sizes);
+            int[] storageShape = tensor.ElementCount() == ElementCount ? shape : null;
+            if (storageShape == null && MlxBasicOps.TryGetStridedBox(tensor, out int[] parent, out _, out _))
+                storageShape = parent;
+            EnsureDeviceCurrent(storageShape);
+            return MlxNative.AsStrided(deviceArray, shape, ToLongArray(tensor.Strides), tensor.StorageOffset, ElementCount > int.MaxValue);
         }
 
         /// <summary>A view of this storage in a shape no TensorSharp tensor describes (an
         /// extra leading batch axis, say), so it reaches MLX as a view rather than a copy.</summary>
         internal MlxNative.MlxArray CreateArrayView(int[] shape, long[] strides, long offset)
         {
-            EnsureDeviceCurrent();
-            return MlxNative.AsStrided(deviceArray, shape, strides, offset);
+            EnsureDeviceCurrent(shape);
+            return MlxNative.AsStrided(deviceArray, shape, strides, offset, ElementCount > int.MaxValue);
         }
 
         internal void ReplaceDeviceArray(MlxNative.MlxArray array)
         {
             if (!array.IsValid)
                 throw new ArgumentException("MLX array is empty.", nameof(array));
-            if (ElementCount > int.MaxValue)
-                throw new NotSupportedException("MLX storage arrays larger than Int32.MaxValue elements are not supported yet.");
-
-            // Storing a row-contiguous multi-dim array directly as the
-            // storage's deviceArray (skipping the reshape) breaks
-            // <see cref="UpdateDeviceSlice"/>, which calls 1D
-            // <c>SliceUpdate</c> on <c>deviceArray</c> — mlx errors out
-            // with "Invalid number of indices or strides for array with
-            // dimension 2" when the deviceArray is multi-dim. Keep the
-            // invariant: <c>deviceArray</c> is always stored as 1D flat,
-            // and reshape on entry. The reshape on a row-contiguous array
-            // is internally a metadata-only no-op in MLX, so the cost is
-            // limited to the mlx_reshape C call itself (~5 µs).
-            MlxNative.MlxArray flat = MlxNative.Reshape(array, new[] { (int)ElementCount });
+            // MLX dimensions are int, but its total array size and strides are
+            // size_t. Flattening a large video activation would overflow one
+            // dimension even though all of its original dimensions are valid.
+            // Keep small storage flat for the common 1D slice-update path and
+            // retain the original contiguous shape for larger storage.
+            if (ElementCount > int.MaxValue && MlxNative.GetArraySize(array) != ElementCount)
+                throw new ArgumentException("MLX array size does not match this storage.", nameof(array));
+            MlxNative.MlxArray contiguous = ElementCount <= int.MaxValue
+                ? MlxNative.Reshape(array, new[] { (int)ElementCount })
+                : MlxNative.Contiguous(array);
+            int[] shape;
+            try
+            {
+                shape = ElementCount <= int.MaxValue
+                    ? new[] { (int)ElementCount }
+                    : MlxNative.GetArrayShape(contiguous);
+            }
+            catch
+            {
+                MlxNative.FreeArray(contiguous);
+                throw;
+            }
             MlxNative.FreeArray(array);
 
             lock (sync)
@@ -112,7 +140,8 @@ namespace TensorSharp.MLX
                 if (deviceArray.IsValid)
                     MlxNative.FreeArray(deviceArray);
 
-                deviceArray = flat;
+                deviceArray = contiguous;
+                deviceShape = shape;
                 hostDirty = false;
                 deviceDirty = true;
             }
@@ -128,10 +157,17 @@ namespace TensorSharp.MLX
                 throw new ArgumentException("MLX update array is empty.", nameof(update));
             if (!tensor.IsContiguous())
                 throw new NotSupportedException("MLX slice updates require contiguous tensor views.");
-            if (tensor.StorageOffset < 0 || tensor.StorageOffset > int.MaxValue)
-                throw new NotSupportedException("MLX slice offsets larger than Int32.MaxValue are not supported yet.");
-            if (tensor.ElementCount() > int.MaxValue)
-                throw new NotSupportedException("MLX slice lengths larger than Int32.MaxValue are not supported yet.");
+            ValidateElementRange(tensor.StorageOffset, tensor.ElementCount());
+
+            if (ElementCount > int.MaxValue)
+            {
+                int[] shape = null;
+                if (MlxBasicOps.TryGetStridedBox(tensor, out int[] parent, out _, out _))
+                    shape = parent;
+                EnsureDeviceCurrent(shape);
+                UpdateLargeDeviceSlice(tensor.StorageOffset, tensor.ElementCount(), update);
+                return;
+            }
 
             EnsureDeviceCurrent();
             MlxNative.MlxArray flatUpdate = default;
@@ -141,7 +177,7 @@ namespace TensorSharp.MLX
                 int length = (int)tensor.ElementCount();
                 int start = (int)tensor.StorageOffset;
                 flatUpdate = MlxNative.Reshape(update, new[] { length });
-                updatedStorage = MlxNative.SliceUpdate(deviceArray, flatUpdate, start, start + length);
+                updatedStorage = MlxNative.SliceUpdate(deviceArray, flatUpdate, start, checked(start + length));
 
                 lock (sync)
                 {
@@ -173,7 +209,7 @@ namespace TensorSharp.MLX
             if (!update.IsValid)
                 throw new ArgumentException("MLX update array is empty.", nameof(update));
 
-            EnsureDeviceCurrent();
+            EnsureDeviceCurrent(parentShape);
             MlxNative.MlxArray shaped = default;
             MlxNative.MlxArray updated = default;
             MlxNative.MlxArray flat = default;
@@ -183,7 +219,8 @@ namespace TensorSharp.MLX
                 Array.Fill(strides, 1);
                 shaped = MlxNative.Reshape(deviceArray, parentShape);
                 updated = MlxNative.SliceUpdateMulti(shaped, update, starts, stops, strides);
-                flat = MlxNative.Reshape(updated, new[] { (int)ElementCount });
+                int[] shape = ElementCount <= int.MaxValue ? new[] { (int)ElementCount } : parentShape;
+                flat = MlxNative.Reshape(updated, shape);
 
                 lock (sync)
                 {
@@ -191,6 +228,7 @@ namespace TensorSharp.MLX
                         MlxNative.FreeArray(deviceArray);
 
                     deviceArray = flat;
+                    deviceShape = (int[])shape.Clone();
                     flat = default;
                     hostDirty = false;
                     deviceDirty = true;
@@ -206,14 +244,28 @@ namespace TensorSharp.MLX
 
         public override void EnsureDeviceCurrent()
         {
+            EnsureDeviceCurrent(null);
+        }
+
+        private void EnsureDeviceCurrent(int[] shapeHint)
+        {
             ThrowIfDestroyed();
-            if (ElementCount > int.MaxValue)
-                throw new NotSupportedException("MLX storage arrays larger than Int32.MaxValue elements are not supported yet.");
 
             lock (sync)
             {
                 if (deviceArray.IsValid && !hostDirty)
                     return;
+
+                int[] shape = deviceShape;
+                if (shape == null)
+                {
+                    if (ElementCount <= int.MaxValue)
+                        shape = new[] { (int)ElementCount };
+                    else if (shapeHint != null && ShapeElementCount(shapeHint) == ElementCount)
+                        shape = (int[])shapeHint.Clone();
+                    else
+                        throw new NotSupportedException("Large MLX storage requires a tensor view whose dimensions describe the full storage.");
+                }
 
                 if (deviceArray.IsValid)
                 {
@@ -222,12 +274,124 @@ namespace TensorSharp.MLX
                 }
 
                 if (buffer != IntPtr.Zero)
-                    deviceArray = MlxNative.NewArrayFromHost(buffer, new[] { (int)ElementCount }, ElementType);
+                    deviceArray = MlxNative.NewArrayFromHost(buffer, shape, ElementType);
                 else
-                    deviceArray = MlxNative.Full(new[] { (int)ElementCount }, 0f, ElementType);
+                    deviceArray = MlxNative.Full(shape, 0f, ElementType);
+                deviceShape = shape;
                 hostDirty = false;
                 deviceDirty = false;
             }
+        }
+
+        private void UpdateLargeDeviceSlice(long start, long length, MlxNative.MlxArray update)
+        {
+            MlxNative.MlxArray updatedStorage = default;
+            MlxNative.MlxArray contiguousUpdate = default;
+            try
+            {
+                if (MlxNative.GetArraySize(update) != length)
+                    throw new ArgumentException("MLX update size does not match the tensor view.", nameof(update));
+                contiguousUpdate = MlxNative.Contiguous(update);
+                updatedStorage = MlxNative.Retain(deviceArray);
+                foreach (var box in GetSliceBoxes(deviceShape, start, length))
+                {
+                    MlxNative.MlxArray part = default;
+                    MlxNative.MlxArray next = default;
+                    try
+                    {
+                        part = MlxNative.AsStrided(contiguousUpdate, box.Shape, box.Strides, box.SourceOffset, largeStorage: true);
+                        int[] steps = new int[deviceShape.Length];
+                        Array.Fill(steps, 1);
+                        next = MlxNative.SliceUpdateMulti(updatedStorage, part, box.Starts, box.Stops, steps);
+                        MlxNative.FreeArray(updatedStorage);
+                        updatedStorage = next;
+                        next = default;
+                    }
+                    finally
+                    {
+                        MlxNative.FreeArray(part);
+                        MlxNative.FreeArray(next);
+                    }
+                }
+
+                lock (sync)
+                {
+                    MlxNative.FreeArray(deviceArray);
+                    deviceArray = updatedStorage;
+                    updatedStorage = default;
+                    hostDirty = false;
+                    deviceDirty = true;
+                }
+            }
+            finally
+            {
+                MlxNative.FreeArray(updatedStorage);
+                MlxNative.FreeArray(contiguousUpdate);
+            }
+        }
+
+        internal readonly record struct SliceBox(int[] Starts, int[] Stops, int[] Shape, long[] Strides, long SourceOffset);
+
+        // Cover a flat interval with row-major boxes without ever narrowing a
+        // linear offset or a total element count to int. Each native slice index
+        // is only a coordinate within an individual (int-sized) dimension.
+        internal static IEnumerable<SliceBox> GetSliceBoxes(int[] shape, long start, long length)
+        {
+            long total = ShapeElementCount(shape);
+            if (start < 0 || length < 0 || start > total || length > total - start)
+                throw new ArgumentOutOfRangeException(nameof(start));
+            long[] strides = new long[shape.Length];
+            long stride = 1;
+            for (int axis = shape.Length - 1; axis >= 0; --axis)
+            {
+                strides[axis] = stride;
+                stride = checked(stride * shape[axis]);
+            }
+            long consumed = 0;
+            while (consumed < length)
+            {
+                long position = start + consumed;
+                int[] starts = new int[shape.Length];
+                for (int axis = 0; axis < shape.Length; ++axis)
+                {
+                    starts[axis] = checked((int)(position / strides[axis]));
+                    position %= strides[axis];
+                }
+                int split = shape.Length - 1;
+                for (int axis = 0; axis < shape.Length; ++axis)
+                {
+                    if ((start + consumed) % strides[axis] == 0 && length - consumed >= strides[axis])
+                    {
+                        split = axis;
+                        break;
+                    }
+                }
+                int run = checked((int)Math.Min(shape[split] - starts[split], (length - consumed) / strides[split]));
+                int[] stops = new int[shape.Length];
+                int[] boxShape = new int[shape.Length];
+                long[] boxStrides = new long[shape.Length];
+                long boxCount = 1;
+                for (int axis = shape.Length - 1; axis >= 0; --axis)
+                {
+                    stops[axis] = axis < split ? starts[axis] + 1 : axis == split ? starts[axis] + run : shape[axis];
+                    boxShape[axis] = stops[axis] - starts[axis];
+                    boxStrides[axis] = boxCount;
+                    boxCount = checked(boxCount * boxShape[axis]);
+                }
+                yield return new SliceBox(starts, stops, boxShape, boxStrides, consumed);
+                consumed += boxCount;
+            }
+        }
+
+        private static long ShapeElementCount(int[] shape)
+        {
+            long count = 1;
+            foreach (int dimension in shape)
+            {
+                if (dimension < 0) throw new ArgumentOutOfRangeException(nameof(shape));
+                count = checked(count * dimension);
+            }
+            return count;
         }
 
         public override int[] GetElementsAsInt(long index, int length)
@@ -490,7 +654,7 @@ namespace TensorSharp.MLX
 
         private void ValidateElementRange(long index, long length)
         {
-            if (index < 0 || length < 0 || index + length > ElementCount)
+            if (index < 0 || length < 0 || index > ElementCount || length > ElementCount - index)
                 throw new ArgumentOutOfRangeException(nameof(index));
         }
 
@@ -500,7 +664,7 @@ namespace TensorSharp.MLX
                 throw new ArgumentOutOfRangeException(nameof(byteCount));
 
             long byteOffset = checked(storageIndex * ElementType.Size());
-            if (byteOffset < 0 || byteOffset + byteCount > ByteLength)
+            if (byteOffset < 0 || byteOffset > ByteLength || byteCount > ByteLength - byteOffset)
                 throw new ArgumentOutOfRangeException(nameof(storageIndex));
         }
 

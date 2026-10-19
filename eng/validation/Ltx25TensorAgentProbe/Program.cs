@@ -13,26 +13,33 @@ string Arg(string key,string fallback="") {int i=Array.IndexOf(args,key);return 
 string assets=Path.GetFullPath(Arg("--assets")),backend=Arg("--backend","mlx");
 string workspace=Path.GetFullPath(Arg("--workspace",Path.Combine("artifacts","ltx25","tensoragent-e2e-"+Guid.NewGuid().ToString("N"))));
 string output=Path.GetFullPath(Arg("--output",Path.Combine(workspace,"report.json")));
-string mode=Arg("--mode");bool identityMode=mode=="ref";
-int width=int.Parse(Arg("--width",identityMode?"768":"512")),height=int.Parse(Arg("--height",identityMode?"448":"512")),frames=int.Parse(Arg("--frames",identityMode?"121":"17")),fps=int.Parse(Arg("--fps","24"));
-long seed=long.Parse(Arg("--seed","42"));string prompt=Arg("--prompt","A small red fox walks through a quiet grassy meadow, natural daylight, gentle camera motion.");
-bool verify=bool.Parse(Arg("--verify-hashes","true"));
-int repeats=int.Parse(Arg("--repeats","1"));
-bool chatTurn=bool.Parse(Arg("--chat-turn","true"));
+bool studio=bool.Parse(Arg("--studio","false"));
 string firstImage=Arg("--image"),endImage=Arg("--end-image");
 string referenceImagesFile=Arg("--reference-images");
 string[] referenceImages=string.IsNullOrWhiteSpace(referenceImagesFile)?[]:
     JsonSerializer.Deserialize<string[]>(File.ReadAllText(referenceImagesFile))??throw new InvalidDataException("Expected an image-path JSON array.");
+string mode=Arg("--mode");
+if(studio&&string.IsNullOrWhiteSpace(mode)&&referenceImages.Length>0)mode="ref";
+bool identityMode=mode=="ref";
+int width=int.Parse(Arg("--width",identityMode?"768":"1024")),height=int.Parse(Arg("--height",identityMode?"448":"1024")),frames=int.Parse(Arg("--frames",identityMode?"121":"17")),fps=int.Parse(Arg("--fps","24"));
+long seed=long.Parse(Arg("--seed","42"));string prompt=Arg("--prompt","A small red fox walks through a quiet grassy meadow, natural daylight, gentle camera motion.");
+bool verify=bool.Parse(Arg("--verify-hashes","true"));
+int repeats=int.Parse(Arg("--repeats","1"));
+bool chatTurn=bool.Parse(Arg("--chat-turn",studio?"false":"true"));
 if(referenceImages.Length>0&&(!string.IsNullOrWhiteSpace(firstImage)||!string.IsNullOrWhiteSpace(endImage)))
     throw new ArgumentException("Use ordered images or first/last aliases.");
-if(repeats<0||(repeats==0&&!chatTurn))throw new ArgumentOutOfRangeException("--repeats","At least one HTTP generation or normal chat is required.");
+if(studio&&(repeats!=1||chatTurn))throw new ArgumentException("--studio runs one complete Studio workflow; use --repeats 1 and --chat-turn false.");
+if(repeats<0||(repeats==0&&!chatTurn&&!studio))throw new ArgumentOutOfRangeException("--repeats","At least one HTTP generation or normal chat is required.");
 if(File.Exists(output))throw new IOException("Refusing to overwrite an existing evidence report: "+output);
 string stage="catalog and pinned asset preflight";
 var executions=new List<object>();
 object? chatExecution=null;
+object? studioExecution=null;
+var uploads=new List<object>();
+object? requestBody=null;
 try
 {
-CatalogModel entry=ModelCatalog.Find("ltx-2.5-distilled-q4km")??throw new InvalidOperationException("Missing LTX catalog entry.");
+CatalogModel entry=ModelCatalog.Find("ltx-2.5-distilled-q4kxl")??throw new InvalidOperationException("Missing LTX catalog entry.");
 if(!entry.IsAvailable)throw new NotSupportedException(entry.UnavailableReason);
 if(backend is not ("mlx" or "cuda"))throw new ArgumentException("This real generation probe requires mlx or cuda.");
 Directory.CreateDirectory(workspace);
@@ -41,7 +48,7 @@ string destination=Path.Combine(paths.ModelsDirectory,entry.Id);Directory.Create
 var installed=new List<object>();
 foreach(CatalogFile file in entry.Files)
 {
-    string subdirectory=file.Role switch{CatalogFileRole.TextEncoder=>"text_encoders",CatalogFileRole.Vae or CatalogFileRole.AudioVae=>"vae",_=>""};
+    string subdirectory=file.Role switch{CatalogFileRole.TextEncoder=>"text_encoders",CatalogFileRole.Vae or CatalogFileRole.AudioVae=>"vae",CatalogFileRole.LatentUpscaler=>"latent_upscale_models",_=>""};
     string source=Path.Combine(assets,subdirectory,file.FileName);
     using(var stream=File.OpenRead(source))
     {
@@ -80,8 +87,14 @@ if(host.ModelService.Model is not Ltx25Model||selected!=backend)throw new Invali
 host.Server.Start();
 using var client=new HttpClient{BaseAddress=new Uri(host.Server.BaseUrl),Timeout=TimeSpan.FromMinutes(30)};
 client.DefaultRequestHeaders.Add("Cookie",$"{LoopbackServer.TokenCookie}={host.Server.Token}");
+if(studio)
+{
+    studioExecution=await StudioPipelineProbe.RunAsync(client,workspace,prompt,mode,width,height,frames,fps,seed,
+        firstImage,endImage,referenceImages,value=>stage=value);
+}
+else
+{
 stage="reference image upload";
-var uploads=new List<object>();
 async Task<string> UploadImage(string path)
 {
     string absolute=Path.GetFullPath(path);
@@ -112,6 +125,7 @@ if(uploadedEnd!=null)body["endImage"]=uploadedEnd;
 if(uploadedReferences.Count>0){body["referenceImages"]=uploadedReferences;body["videoMode"]="keyframes";}
 else if(uploadedFirst!=null||uploadedEnd!=null)body["videoMode"]=uploadedEnd!=null?"fl2v":"i2v"; // fl2v: a last frame, optionally with a first
 if(!string.IsNullOrWhiteSpace(mode))body["videoMode"]=mode;
+requestBody=body;
 for(int repeat=0;repeat<repeats;++repeat)
 {
 long cacheHitsBefore=((Ltx25Model)host.ModelService.Model).PromptCacheHits;
@@ -179,7 +193,7 @@ if(chatTurn)
     JsonElement videoFrame=chatEvents.LastOrDefault(e=>e.TryGetProperty("videoUrl",out var url)&&url.ValueKind==JsonValueKind.String);
     if(videoFrame.ValueKind!=JsonValueKind.Object||!chatEvents.Any(e=>e.TryGetProperty("done",out var done)&&done.ValueKind==JsonValueKind.True))
         throw new InvalidDataException("Normal chat did not finish with a generated video.");
-    foreach(var expected in new[]{("width",identityMode?768:512),("height",identityMode?448:512),("frames",identityMode?121:17),("fps",24)})
+    foreach(var expected in new[]{("width",identityMode?768:1024),("height",identityMode?448:1024),("frames",identityMode?121:17),("fps",24)})
         if(videoFrame.GetProperty(expected.Item1).GetInt32()!=expected.Item2)throw new InvalidDataException("The normal chat did not apply the LTX recipe: "+expected.Item1);
     if(!videoFrame.GetProperty("hasAudio").GetBoolean()||videoFrame.GetProperty("audioUrl").ValueKind!=JsonValueKind.Null)
         throw new InvalidDataException("Normal chat must deliver its generated soundtrack inside the MP4.");
@@ -206,10 +220,11 @@ if(chatTurn)
         request=chatBody,sessionId,conversationId,seed=actualSeed,conditioning_cache_hit=((Ltx25Model)host.ModelService.Model).PromptCacheHits>cacheHitsBefore,whole_http_chat_ms=chatElapsed.Elapsed.TotalMilliseconds,
         video_frame=videoFrame,events=chatEvents,conversation,video=chatVideo,audio=chatAudio,video_sha256=FileHash(chatVideo),audio_sha256=FileHash(chatAudio),audio_samples=chatSamples};
 }
+}
 var report=new{status="passed",provenance=Provenance(),entry.Id,backend=selected,model_type=host.ModelService.Model.GetType().FullName,
-    scope="Real AgentAppHost.UseModel, pinned cache assets, native full generation and WebUI SSE/upload download pipeline",
-    timing_scope="Native generation comes from the model's final progress callback; HTTP time also includes codec/export and transport. Model activation is separate; pinned setup hashing is excluded. File and JIT caches may be warm.",
-    installed,uploads,request=body,load_ms=load.Elapsed.TotalMilliseconds,executions,chat_execution=chatExecution};
+    scope=studio?"Real AgentAppHost.UseModel, pinned cache assets and native Studio HTTP generation/import/timeline/export pipeline":"Real AgentAppHost.UseModel, pinned cache assets, native full generation and WebUI SSE/upload download pipeline",
+    timing_scope=studio?"Studio job timings include native generation, provenance hashing, encoding and ingestion; model activation and pinned setup hashing are separate. File/JIT caches are uncontrolled; no matched performance comparison.":"Native generation comes from the model's final progress callback; HTTP time also includes codec/export and transport. Model activation is separate; pinned setup hashing is excluded. File and JIT caches may be warm.",
+    installed,uploads,request=requestBody,load_ms=load.Elapsed.TotalMilliseconds,executions,chat_execution=chatExecution,studio_execution=studioExecution};
 Directory.CreateDirectory(Path.GetDirectoryName(output)!);
 await File.WriteAllTextAsync(output,JsonSerializer.Serialize(report,new JsonSerializerOptions{WriteIndented=true})+"\n");Console.WriteLine(output);
 
@@ -217,7 +232,7 @@ await File.WriteAllTextAsync(output,JsonSerializer.Serialize(report,new JsonSeri
 catch(Exception error)
 {
     Directory.CreateDirectory(Path.GetDirectoryName(output)!);
-    File.WriteAllText(output,JsonSerializer.Serialize(new{status="failed",stage,backend,workspace,executions,chat_execution=chatExecution,error_type=error.GetType().FullName,error=error.Message,provenance=Provenance()},new JsonSerializerOptions{WriteIndented=true})+"\n");
+    File.WriteAllText(output,JsonSerializer.Serialize(new{status="failed",stage,backend,workspace,executions,chat_execution=chatExecution,studio_execution=studioExecution,error_type=error.GetType().FullName,error=error.Message,provenance=Provenance()},new JsonSerializerOptions{WriteIndented=true})+"\n");
     throw;
 }
 static object Provenance()

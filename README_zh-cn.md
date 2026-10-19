@@ -10,6 +10,11 @@
 
 当前源码涵盖文本与推理、多模态输入、嵌入、图像生成与编辑、带音频的视频、个人知识库，以及带代码工具的 Agent Skills。TensorSharp 也为 iPhone、iPad、Mac 和 Windows 上的本地应用 [TensorAgent](TensorAgent/README.md) 提供引擎。可直接从下文开始，或查看[项目状态](docs/PROJECT_STATUS_zh-cn.md)中的能力与验证限制；LTX 2.5、EmbeddingGemma 2 与原生技能发现需要 `v2026.10.11` 标签之后的源码构建。
 
+<p align="center">
+  <a href="https://trendshift.io/repositories/51351#achievements"><img src="https://trendshift.io/api/badge/repositories/51351" alt="TensorSharp on GitHub Trending: #2 Repository Of The Day" width="250" height="55"></a>
+  <a href="https://trendshift.io/repositories/51351#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/51351/daily?language=C%23" alt="TensorSharp on Trendshift: #5 C# Repository Of The Day" width="250" height="55"></a>
+</p>
+
 ## 亮点功能
 
 - **本地模型，多种入口。** 同一引擎用于 CLI、浏览器聊天及兼容 Ollama/OpenAI 的 API，支持纯托管 CPU 与原生加速后端。
@@ -21,6 +26,20 @@
 - **生成中追加指令。** CLI、服务端 Web UI 和 TensorAgent 在推理或回答时都可提交新指令；后续回答使用对话、已有部分输出与新指导。仍可单独停止当前生成。
 - **有记录的性能对比。** 与 `llama.cpp` 的测试使用相同 GGUF 文件和硬件，结果对应所测的模型、后端及工作负载。详见[性能数据](docs/benchmarks_zh-cn.md)。
 - **TensorAgent 应用。** 在手机和桌面进行本地聊天、使用附件与技能并保存工作。详见 [Mac / Windows 安装指南](docs/tensoragent_desktop_zh-cn.md)与[应用验证范围](TensorAgent/README.md)。
+
+## 配合书籍学习
+
+| Qwen 推理与智能体运行时 | Gemma 4 与多模态推理 |
+|---|---|
+| <a href="https://www.amazon.com/dp/B0HJQ4VQ31"><img src="website/assets/building-llm-inference-engines-cover.jpg" alt="Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent" width="190"></a> | <a href="https://www.amazon.com/dp/B0H9P44QZZ"><img src="website/assets/from-tensors-to-tokens-cover.jpg" alt="From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B" width="190"></a> |
+| **[Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent](https://www.amazon.com/dp/B0HJQ4VQ31)** | **[From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B](https://www.amazon.com/dp/B0H9P44QZZ)** |
+| 使用 C# 构建 Qwen 稠密/MoE 推理与受控智能体工作流。从张量、分词、注意力、专家路由、量化和缓存，逐步走向 GPU 加速、多模态执行、工具、技能、沙箱代码执行，以及 TensorSharp 和 TensorAgent 的桌面与移动端部署。 | 以 Gemma 4 E4B 为例，用 C#/.NET 构建多模态推理引擎。从张量、GGUF 模型加载、量化与分词，走向文本、图像、视频和音频执行，并结合 TensorSharp 源码理解正确性检查与服务优化。 |
+| **[在 Amazon 购买](https://www.amazon.com/dp/B0HJQ4VQ31)** | **[在 Amazon 购买](https://www.amazon.com/dp/B0H9P44QZZ)** |
+
+**[查看两本书的介绍与仓库伴读路线](docs/BOOK_zh-cn.md)**
+
+<p align="center"><a href="https://buymeacoffee.com/zhongkaifu"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
+<sub>TensorSharp/TensorAgent is free. If you like it, a coffee keeps the work on it going.</sub></p>
 
 ## 快速开始
 
@@ -175,17 +194,3 @@ Zhongkai Fu
 ## 许可证
 
 详见 [LICENSE](LICENSE)。
-
-## 配合书籍学习
-
-| Qwen 推理与智能体运行时 | Gemma 4 与多模态推理 |
-|---|---|
-| <a href="https://www.amazon.com/dp/B0HJQ4VQ31"><img src="website/assets/building-llm-inference-engines-cover.jpg" alt="Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent" width="190"></a> | <a href="https://www.amazon.com/dp/B0H9P44QZZ"><img src="website/assets/from-tensors-to-tokens-cover.jpg" alt="From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B" width="190"></a> |
-| **[Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent](https://www.amazon.com/dp/B0HJQ4VQ31)** | **[From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B](https://www.amazon.com/dp/B0H9P44QZZ)** |
-| 使用 C# 构建 Qwen 稠密/MoE 推理与受控智能体工作流。从张量、分词、注意力、专家路由、量化和缓存，逐步走向 GPU 加速、多模态执行、工具、技能、沙箱代码执行，以及 TensorSharp 和 TensorAgent 的桌面与移动端部署。 | 以 Gemma 4 E4B 为例，用 C#/.NET 构建多模态推理引擎。从张量、GGUF 模型加载、量化与分词，走向文本、图像、视频和音频执行，并结合 TensorSharp 源码理解正确性检查与服务优化。 |
-| **[在 Amazon 购买](https://www.amazon.com/dp/B0HJQ4VQ31)** | **[在 Amazon 购买](https://www.amazon.com/dp/B0H9P44QZZ)** |
-
-**[查看两本书的介绍与仓库伴读路线](docs/BOOK_zh-cn.md)**
-
-<p align="center"><a href="https://buymeacoffee.com/zhongkaifu"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>TensorSharp/TensorAgent is free. If you like it, a coffee keeps the work on it going.</sub></p>

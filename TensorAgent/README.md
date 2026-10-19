@@ -57,8 +57,8 @@ those changes.
 RAM tier, with larger models requiring higher tiers. Qwen3.8 Flash Next has an
 experimental UD-IQ1_M entry from 32 GB and a UD-Q2_K_XL entry from 48 GB,
 both with SSD-backed weights and optional vision and draft companions. LTX 2.5
-Distilled is experimental at the 48 GB tier, with 44.76 GB of pinned downloads
-and publisher-approved access required for its official companions. These eligibility tiers describe physical system RAM,
+Distilled is experimental at the 48 GB tier, with 43.08 GB of pinned downloads
+from Unsloth's ungated repository; its preset needs no Hugging Face account. These eligibility tiers describe physical system RAM,
 including unified memory on Apple devices; storage size and GPU VRAM are separate.
 Image/video generation has been measured in the Mac app, with no recorded
 iOS media generation or Windows image/audio/video generation. The physical-phone run recorded
@@ -307,11 +307,11 @@ See [The desktop's larger models](#the-desktops-larger-models) for the historica
 | Qwen3.8 Flash Next (UD-Q2_K_XL) | text; images/video with optional projector | download: three shards of 10,946,624, 49,979,779,296 and 28,878,402,944 bytes (78.9 GB); 907,542,944-byte projector and 2,786,568,256-byte shared MTP head optional | 48 GB | `unsloth/Qwen3.8-Flash-Next-GGUF` |
 | Qwen3.8 Flash Next (UD-IQ1_M) | text; images/video with optional projector | download: three shards of 10,946,624, 49,988,981,792 and 24,538,827,360 bytes (74.54 GB total); 907,542,944-byte projector and 2,786,568,256-byte shared MTP head optional | 32 GB, experimental | `unsloth/Qwen3.8-Flash-Next-GGUF` |
 | Qwen-Image 2.1 (Q4_K_M) | text or a photo in, a picture out | download: 4,189,343,904-byte DiT + 5,027,784,800-byte Qwen3-VL-8B text encoder + 675,509,688-byte VAE + 1,159,029,824-byte vision projector | 24 GB | `Abiray/Qwen-Image-2.1-GGUF` + `Qwen/Qwen3-VL-8B-Instruct-GGUF` + `Comfy-Org/Qwen-Image-2.1` |
-| Qwen-Image 2.1 Turbo (AD-Q4_K) | text or a photo in, a picture out, in 8 steps | download: 4,201,694,944-byte DiT, plus the same three companions as Qwen-Image 2.1 (6.9 GB), linked from it when it is installed rather than downloaded again | 24 GB | `AtomicChat/Qwen-Image-2.1-Turbo-GGUF` + the Qwen-Image 2.1 companions |
-| Qwen-Image 2.1 Turbo (Q8_0) | text or a photo in, a picture out, in 8 steps | download: 7,591,554,784-byte DiT, plus the same three companions | 32 GB | `AtomicChat/Qwen-Image-2.1-Turbo-GGUF` + the Qwen-Image 2.1 companions |
+| Qwen-Image 2.1 Turbo (Q5_K_S) | text or a photo in, a picture out, in 8 steps | download: 4,501,948,224-byte DiT, plus the same three companions as Qwen-Image 2.1 (6.9 GB), linked from it when installed | 24 GB | `unsloth/Qwen-Image-2.1-Turbo-GGUF` + the Qwen-Image 2.1 companions |
+| Qwen-Image 2.1 Turbo (Q8_0) | text or a photo in, a picture out, in 8 steps | download: 7,640,860,480-byte DiT, plus the same three companions | 32 GB | `unsloth/Qwen-Image-2.1-Turbo-GGUF` + the Qwen-Image 2.1 companions |
 | MiniMax-H3 (Q4_K) | text, or one or two photos as the first and last frames, in; a video with its soundtrack out | download: 11,420,663,904-byte denoiser + 18,218,065,024-byte Qwen3-VL-32B text encoder + 5,207,808,496-byte video VAE + 605,254,808-byte audio VAE + 2,776,833-byte `vocab.json`, 1,671,839-byte `merges.txt` and 11,003-byte `tokenizer_config.json` | 32 GB | `unsloth/MiniMax-H3-GGUF` + `MiniMaxAI/MiniMax-H3` (tokenizer files) |
 | MiniMax-H3 References (Q4_K) | text with up to nine photos, clips and recordings to feature in; a video with its soundtrack out | download: 11,381,096,544-byte denoiser, plus the same four companions as MiniMax-H3 (six files, 24.0 GB), linked from it when it is installed rather than downloaded again | 32 GB | `unsloth/MiniMax-H3-GGUF` + `MiniMaxAI/MiniMax-H3` (tokenizer files) |
-| LTX 2.5 Distilled (Q4_K_M + BF16) | text or image keyframes in; video with 48 kHz stereo audio out | five pinned files, 44,764,412,884 bytes (44.76 GB): denoiser, custom Gemma 4 12B prompt encoder, video/audio VAEs and x2 latent upscaler; official companions require approved Hugging Face access | 48 GB, experimental | `Abiray/LTX-2.5-Distilled-GGUF` + `Lightricks/LTX-2.5` |
+| LTX 2.5 Distilled (UD-Q4_K_XL + BF16) | text or image keyframes in; video with 48 kHz stereo audio out | five pinned files, 43,077,008,276 bytes (43.08 GB): distilled denoiser, custom Gemma 4 12B prompt encoder, video/audio VAEs and x2 latent upscaler; ungated downloads | 48 GB, experimental | `unsloth/LTX-2.5-GGUF` |
 
 Additional entries in [ModelCatalog.Extended.cs](src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs)
 cover Gemma 4 26B/31B, Qwen 3.5/3.6, GPT-OSS, DeepSeek V4/V4.1 Flash,
@@ -458,7 +458,7 @@ keeps the switch that turns it off. Most are under the Qwen Research License
 (non-commercial), Anime Consistency is Apache-2.0, and the authors of Quality Fix, Detail
 Enhancer and Casual Phone Photo state none; each row says which.
 
-**Qwen-Image 2.1 Turbo.** The Turbo entries' GGUFs carry no metadata and have the base
+**Qwen-Image 2.1 Turbo.** The Turbo entries' GGUFs identify only their architecture and have the base
 model's tensors, so each entry declares that it is Turbo (`CatalogModel.ImageVariant`,
 published to the engine as `TS_QWEN_IMAGE_VARIANT` with its companions) and every picture
 samples Turbo's own 8-step schedule at CFG 1, whatever the file is called. Turbo is
@@ -467,8 +467,9 @@ entry is loaded the sheet lists only compatible plug-ins: Film Stills,
 Grainscape, Casual Phone Photo, and Voxel Style. Casual Phone Photo uses strength 0.8 and
 the `lbxstyle` trigger; Voxel Style uses strength 1 with an attached photo and the
 instruction `Transform the image into a voxel style`. Both keep Turbo’s eight steps.
-The new adapters' image validation covers AD-Q4_K; Q8 shares their architecture
-and adapter mapping, but has not been separately image-tested. See the
+Film Stills, Grainscape, Casual Phone Photo and Voxel Style were image-tested on the
+Unsloth Q5_K_S file. Q8 shares their architecture and adapter mapping, but its
+adapter-specific output and latency have not been separately tested. See the
 [validation scope](../docs/models/qwenimage21.md#lora-plug-ins-on-turbo).
 A plug-in turned on for Qwen-Image 2.1 that does not apply to Turbo stays saved
 and sits out Turbo's pictures, which the log says for each one ("Viggle Turbo sits out:
@@ -479,7 +480,8 @@ passed on the AD-Q4_K transformer on an M5 Pro (2026-10-09), drawing the 1024x10
 words in 73.5 s (325 s at the base model's 40 steps in that test's recorded runs), planning
 "make it brighter" with the image model's own Qwen3-VL in 0.9 s, and making the edit at the
 picture's own size in 102.6 s. The Turbo entries' tiers come from the CLI's peak footprint of
-an edit at 1248x832, 14.35-14.37 GB with any of the three transformers, plus the weights.
+an edit at 1248x832: Q5_K_S peaked at 14.43 GB and Q8_0 at 15.14 GB over two
+fresh-process runs (2026-10-18), plus the resident weights.
 
 Measured in the Release app on an M5 Pro, 1024x1024 (`TENSORAGENT_IMAGE_BENCH`): a picture
 from words took 321.5 s at the model's 40 steps and 58.3 s with Viggle Turbo, applying it
@@ -507,10 +509,14 @@ implementation. Generate starts from a description; a first frame and a last
 frame are each optional and are picked from the library's thumbnails, and the
 filled slots set the mode (none is t2v, a first frame i2v, a last frame alone or
 with a first fl2v). Timed keyframes and identity references (ref) are the other
-uses of photos. What can be used follows the loaded checkpoint. Desktop
-composition uses operator-installed FFmpeg. Where Studio runs without media
-subprocesses (iOS, and Mac Catalyst, which .NET reports as iOS), it says that
-generation, import and export are unavailable and keeps project review and editing. See the [user guide](../docs/video-studio.md#generation-modes) and
+uses of photos. What can be used follows the loaded checkpoint. A long video is
+made as a chain (**Continue from last frame**, then **Add after**), and reference
+photos beside the frame slots keep a character in a new shot (no installed model
+also starts on a pinned frame with them, and the form says why). Desktop composition and frame stills use
+operator-installed FFmpeg. Where Studio runs without media subprocesses (iOS,
+and Mac Catalyst, which .NET reports as iOS), it says that generation, taking
+frames from videos, import and export are unavailable and keeps project review
+and editing. See the [user guide](../docs/video-studio.md#generation-modes) and
 [actual validation and limitations](../docs/video-studio-validation.md).
 
 **Videos.** With MiniMax-H3 loaded, a message describes a short clip, and an attached
@@ -2296,7 +2302,7 @@ checked and these were not:
   from the prompts and photos `chat-e2e.py` sends, and the two box-driven edits were also run
   on their authors' example photos. Object Remover failed on one of its two. How each fares
   on other subjects is up to the plug-in, and nothing here measures it. The two newly added
-  adapters have separate AD-Q4_K image validation; their Q8 image quality and latency remain untested.
+  adapters have separate Unsloth Q5_K_S image and HTTP-route validation; their Q8 adapter-specific quality and latency remain untested.
 - **Qwen3.8 Flash Next beyond the recorded configurations.** UD-Q2_K_XL was measured
   in the Debug app on one 48 GB M5 Pro. A Mac with more memory gets a different expert
   placement plan, which nothing here has measured; the Q2 entry retains its 48 GB tier.

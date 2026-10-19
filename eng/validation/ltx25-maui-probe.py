@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise an isolated actual MAUI app's native Use action and LTX HTTP jobs.
 
-Launch the app with TENSORAGENT_VALIDATION_ROOT containing the four pinned cache
+Launch the app with TENSORAGENT_VALIDATION_ROOT containing the five pinned cache
 assets, then pass its private connection.json. This tool never exports the cookie.
 """
 import argparse
@@ -54,7 +54,7 @@ def main():
         binaries = args.app / "Contents/MonoBundle"
         report["binaries"] = {name: sha(binaries / name) for name in
             ("TensorSharp.Models.dll", "TensorSharp.Backends.MLX.dll", "TensorAgent.Core.dll", "libmlxc.dylib", "libmlx.dylib", "mlx.metallib")}
-        report["native_use_action"] = read_json("/api/agent/validation/tap-model", {"id": "ltx-2.5-distilled-q4km"})
+        report["native_use_action"] = read_json("/api/agent/validation/tap-model", {"id": "ltx-2.5-distilled-q4kxl"})
         if not report["native_use_action"].get("ok"):
             raise RuntimeError("The native Models page did not accept Use: " + str(report["native_use_action"]))
         deadline = time.monotonic() + 120
@@ -69,8 +69,8 @@ def main():
                 raise RuntimeError("The actual app did not activate LTX.")
             time.sleep(.5)
         body = {"prompt": "A red toy car drives slowly along a quiet road in warm afternoon light.",
-                "width": 512, "height": 512, "frames": 17, "fps": 24, "steps": 8,
-                "cfg": 1, "sampler": "euler", "flowShift": 0, "seed": 42, "generateAudio": True}
+                "width": 1024, "height": 1024, "frames": 17, "fps": 24, "steps": 8,
+                "cfg": 1, "sampler": "euler_ancestral", "flowShift": 0, "seed": 42, "generateAudio": True}
         report["request"] = body
         save()
         for repeat in range(args.repeats):
@@ -92,7 +92,7 @@ def main():
                         terminal = event
             execution["whole_http_job_ms"] = (time.monotonic() - before) * 1000
             if terminal is None or any(terminal.get(key) != value for key, value in
-                {"width": 512, "height": 512, "frames": 17, "fps": 24, "seed": 42, "codec": "h264", "audioMuxed": True}.items()):
+                {"width": 1024, "height": 1024, "frames": 17, "fps": 24, "seed": 42, "codec": "h264", "audioMuxed": True}.items()):
                 raise RuntimeError("Invalid generated AV result: " + str(terminal))
             execution["generation_ms"] = next(e["elapsedSeconds"] * 1000 for e in reversed(events) if e.get("phase") == "done")
             execution["terminal"] = terminal
@@ -132,7 +132,7 @@ def main():
                         break
             chat["whole_http_job_ms"] = (time.monotonic() - before) * 1000
             if not done or video is None or any(video.get(key) != value for key, value in
-                {"width": 512, "height": 512, "frames": 17, "fps": 24, "hasAudio": True}.items()):
+                {"width": 1024, "height": 1024, "frames": 17, "fps": 24, "hasAudio": True}.items()):
                 raise RuntimeError("Normal chat did not produce the expected AV preview: " + str(video))
             chat["video_result"] = video
             if not video["videoUrl"].endswith(".mp4"):

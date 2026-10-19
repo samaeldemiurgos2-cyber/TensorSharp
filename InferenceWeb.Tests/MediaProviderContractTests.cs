@@ -28,6 +28,7 @@ namespace InferenceWeb.Tests;
 /// parity allows a few levels per channel: stb_image and libjpeg-turbo use different IDCT
 /// and upsampling arithmetic, which is codec noise, not a contract violation.</para>
 /// </summary>
+[Collection(MediaCodecSwaps.Name)]
 public class MediaProviderContractTests : IDisposable
 {
     private readonly string _dir;

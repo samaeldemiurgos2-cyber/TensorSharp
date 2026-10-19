@@ -158,6 +158,15 @@ namespace TensorSharp.Models.MiniMaxH3
             var textClock = Stopwatch.StartNew();
             var teOpenClock = Stopwatch.StartNew();
             double teRunSeconds = 0;
+            // A CUDA upload warms the encoder's mapped pages by touching them (eight
+            // workers, one fault per page), which on an A40 pod's network volume read the
+            // 15.5 GB at ~1 GB/s: 16 s of an 18 s trunk. Concurrent 8 MiB reads reach
+            // ~2.3 GiB/s there, and the touches then find the pages cached. Metal binds the
+            // same mapped pages zero-copy and reads them from a local SSD, so it needs none.
+            using var teRead = _model.Backend == BackendType.GgmlCuda
+                ? MappedFileReadAhead.TryStart(_model.TextEncoderPath, MappedFileReadAhead.WholeFile(_model.TextEncoderPath),
+                    message => Console.WriteLine("  [h3] warning: text-encoder " + message), long.MaxValue)
+                : null;
             using (var te = _model.CreateTextEncoder())
             {
                 teOpenClock.Stop();
@@ -197,6 +206,11 @@ namespace TensorSharp.Models.MiniMaxH3
                 textHidden = te.Encode(ids, promptImages);
                 teRunClock.Stop();
                 teRunSeconds = teRunClock.Elapsed.TotalSeconds;
+                if (teRead != null)
+                {
+                    teRead.Stop();
+                    if (PhaseTiming) Console.WriteLine($"  [h3] .. text-encoder {teRead.Describe()}");
+                }
                 // The trunk is finished with, so the denoiser read can start now and run
                 // alongside the encoder's teardown. Releasing 551 per-tensor device
                 // buffers is ~2 s of driver work (cudaFree measures 1.15 ms apiece on this

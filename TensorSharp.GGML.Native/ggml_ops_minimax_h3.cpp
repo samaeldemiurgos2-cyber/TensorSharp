@@ -134,29 +134,44 @@ ggml_status h3_compute(ggml_backend_t backend, ggml_cgraph* graph, const char* t
 }
 
 
+// The sine table rotate-half RoPE multiplies the half-swapped head by:
+// [-sin(first half), sin(second half)]. sin: [rot, seq]. Built once per graph.
+ggml_tensor* h3_rope_signed_sin(ggml_context* ctx, ggml_tensor* sinf)
+{
+    const std::int64_t rot = sinf->ne[0], half = rot / 2;
+    ggml_tensor* first = ggml_view_2d(ctx, sinf, half, sinf->ne[1], sinf->nb[1], 0);
+    ggml_tensor* second = ggml_view_2d(ctx, sinf, half, sinf->ne[1], sinf->nb[1],
+                                       static_cast<std::size_t>(half) * sizeof(float));
+    return ggml_concat(ctx, ggml_neg(ctx, ggml_cont(ctx, first)), second, 0);
+}
+
 // Rotate-half RoPE over the leading `rot` dims of each head.
-// x: [head_dim, heads, seq]; cos/sin: [rot, seq].
+// x: [head_dim, heads, seq], contiguous or a row-contiguous view;
+// cos and signedSin (h3_rope_signed_sin): [rot, seq].
+//
+// x*cos + rotate_half(x)*sin with rotate_half(x) = [-x2, x1]. The half-swapped
+// head [x2, x1] is read straight out of x, and the sign moves onto the sine:
+// (-a)*b and a*(-b) are both exactly -(a*b), so every element is the same
+// product, sum and rounding as the explicit rotate_half -- five passes where
+// slicing, negating and re-concatenating the halves took ten.
 ggml_tensor* h3_vit_rope(ggml_context* ctx, ggml_tensor* x,
-                         ggml_tensor* cosf, ggml_tensor* sinf,
+                         ggml_tensor* cosf, ggml_tensor* signedSin,
                          int hd, int heads, int seq, int rot)
 {
     if (rot <= 0) return x;
     const std::size_t f = sizeof(float);
-    ggml_tensor* xr = ggml_cont(ctx, ggml_view_3d(ctx, x, rot, heads, seq, x->nb[1], x->nb[2], 0));
     const int half = rot / 2;
-    ggml_tensor* a = ggml_cont(ctx, ggml_view_3d(ctx, xr, half, heads, seq, xr->nb[1], xr->nb[2], 0));
-    ggml_tensor* b = ggml_cont(ctx, ggml_view_3d(ctx, xr, half, heads, seq, xr->nb[1], xr->nb[2],
-                                                 static_cast<std::size_t>(half) * f));
-    // rotate_half(x) = [-x2, x1]
-    ggml_tensor* rot_half = ggml_concat(ctx, ggml_neg(ctx, b), a, 0);
+    ggml_tensor* xr = ggml_view_3d(ctx, x, rot, heads, seq, x->nb[1], x->nb[2], 0);
+    ggml_tensor* swapped = ggml_concat(ctx,
+        ggml_view_3d(ctx, x, half, heads, seq, x->nb[1], x->nb[2], static_cast<std::size_t>(half) * f),
+        ggml_view_3d(ctx, x, half, heads, seq, x->nb[1], x->nb[2], 0), 0);
     ggml_tensor* c3 = ggml_reshape_3d(ctx, cosf, rot, 1, seq);
-    ggml_tensor* s3 = ggml_reshape_3d(ctx, sinf, rot, 1, seq);
-    ggml_tensor* rotated = ggml_add(ctx, ggml_mul(ctx, xr, c3), ggml_mul(ctx, rot_half, s3));
+    ggml_tensor* s3 = ggml_reshape_3d(ctx, signedSin, rot, 1, seq);
+    ggml_tensor* rotated = ggml_add(ctx, ggml_mul(ctx, xr, c3), ggml_mul(ctx, swapped, s3));
     if (rot == hd) return rotated;
-    ggml_tensor* tail = ggml_cont(ctx, ggml_view_3d(ctx, x, hd - rot, heads, seq,
-                                                    x->nb[1], x->nb[2],
-                                                    static_cast<std::size_t>(rot) * f));
-    return ggml_concat(ctx, rotated, tail, 0);
+    return ggml_concat(ctx, rotated, ggml_view_3d(ctx, x, hd - rot, heads, seq,
+                                                  x->nb[1], x->nb[2],
+                                                  static_cast<std::size_t>(rot) * f), 0);
 }
 
 // Effective keys one FP16 softmax numerator is allowed to sum over before V is
@@ -204,12 +219,13 @@ ggml_tensor* h3_attend_padded(ggml_context* ctx, ggml_backend_t backend,
 {
     const int chunk = tsg_metal_flash_query_chunk(seq, heads);
     // ggml_pad zero-fills the K/V rows past seq, and its output stands in for the
-    // ggml_cont the permute needs.
-    ggml_tensor* vs = vScale == 1.0f ? v : ggml_scale(ctx, v, 1.0f / vScale);
+    // ggml_cont the permute needs. V may be a strided view, so it is pre-scaled
+    // after the pad: the pad copies values and its zeros stay zero.
+    ggml_tensor* vp = ggml_pad(ctx, v, 0, 0, keys - seq, 0);
+    ggml_tensor* vs = vScale == 1.0f ? vp : ggml_scale(ctx, vp, 1.0f / vScale);
     ggml_tensor* kf = ggml_cast(ctx,
         ggml_permute(ctx, ggml_pad(ctx, k, 0, 0, keys - seq, 0), 0, 2, 1, 3), GGML_TYPE_F16);
-    ggml_tensor* vf = ggml_cast(ctx,
-        ggml_permute(ctx, ggml_pad(ctx, vs, 0, 0, keys - seq, 0), 0, 2, 1, 3), GGML_TYPE_F16);
+    ggml_tensor* vf = ggml_cast(ctx, ggml_permute(ctx, vs, 0, 2, 1, 3), GGML_TYPE_F16);
     ggml_tensor* merged = tsg_metal_flash_attn_chunked(ctx, backend, ggml_permute(ctx, q, 0, 2, 1, 3),
                                                        kf, vf, masks.get(ctx, seq, keys, chunk),
                                                        chunk, scale);
@@ -415,6 +431,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeDecode(const TSGgmlMiniMaxH3VideoVaeDecod
         ggml_tensor* sinf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rot, seq);
         ggml_tensor* outT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pdim, ntok);
         ggml_set_input(latent); ggml_set_input(cosf); ggml_set_input(sinf);
+        ggml_tensor* sinS = h3_rope_signed_sin(ctx, sinf);
 
         ggml_tensor *pqw, *pqb, *xew, *xeb, *pow_, *pob;
         declLin(d->post_quant, pqw, pqb);
@@ -462,21 +479,19 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeDecode(const TSGgmlMiniMaxH3VideoVaeDecod
             ggml_tensor* qkv = lin(qkvw, n1, qkvb);              // [3*dim, seq]
 
             // Per-head interleaved: head h occupies [h*3*hd, (h+1)*3*hd).
+            // q/k/v stay views of qkv: the norm and h3_attend read rows in place.
             const std::size_t headStride = static_cast<std::size_t>(3) * hd * f;
-            ggml_tensor* q = ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
-                                                         headStride, qkv->nb[1], 0));
-            ggml_tensor* k = ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
-                                                         headStride, qkv->nb[1],
-                                                         static_cast<std::size_t>(hd) * f));
-            ggml_tensor* v = ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
-                                                         headStride, qkv->nb[1],
-                                                         static_cast<std::size_t>(2) * hd * f));
+            ggml_tensor* q = ggml_view_3d(ctx, qkv, hd, heads, seq, headStride, qkv->nb[1], 0);
+            ggml_tensor* k = ggml_view_3d(ctx, qkv, hd, heads, seq, headStride, qkv->nb[1],
+                                          static_cast<std::size_t>(hd) * f);
+            ggml_tensor* v = ggml_view_3d(ctx, qkv, hd, heads, seq, headStride, qkv->nb[1],
+                                          static_cast<std::size_t>(2) * hd * f);
 
             // qk-norm: RMSNorm over head_dim with no learnable gain.
             q = ggml_rms_norm(ctx, q, eps);
             k = ggml_rms_norm(ctx, k, eps);
-            q = h3_vit_rope(ctx, q, cosf, sinf, hd, heads, seq, rot);
-            k = h3_vit_rope(ctx, k, cosf, sinf, hd, heads, seq, rot);
+            q = h3_vit_rope(ctx, q, cosf, sinS, hd, heads, seq, rot);
+            k = h3_vit_rope(ctx, k, cosf, sinS, hd, heads, seq, rot);
 
             ggml_tensor* merged = h3_attend(ctx, g_backend, q, k, v, hd, heads, seq,
                                             scale, /*allowFlash*/ true, &flashMasks);
@@ -670,6 +685,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         ggml_tensor* sinf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, seq);
         ggml_tensor* outT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq);
         ggml_set_input(x); ggml_set_input(cosf); ggml_set_input(sinf);
+        ggml_tensor* sinS = h3_rope_signed_sin(ctx, sinf);
 
         // An explicit additive mask, not ggml_diag_mask_inf: Metal implements no
         // diag-mask kernel, so the whole-trunk graph would fail its supports_op
@@ -719,8 +735,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
             if (qNorm) q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), qNorm);
             if (kNorm) k = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), kNorm);
 
-            q = h3_vit_rope(ctx, q, cosf, sinf, hd, heads, seq, hd);
-            k = h3_vit_rope(ctx, k, cosf, sinf, hd, kvh, seq, hd);
+            q = h3_vit_rope(ctx, q, cosf, sinS, hd, heads, seq, hd);
+            k = h3_vit_rope(ctx, k, cosf, sinS, hd, kvh, seq, hd);
 
             ggml_tensor* qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
             ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
@@ -1128,6 +1144,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         ggml_tensor* sinf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rot, ntok);
         ggml_set_input(vin); ggml_set_input(ain);
         ggml_set_input(temb); ggml_set_input(cosf); ggml_set_input(sinf);
+        ggml_tensor* sinS = h3_rope_signed_sin(ctx, sinf);
         ggml_tensor* tin = nullptr;
         if (d->text_count > 0 && d->text_hidden != nullptr)
         {
@@ -1160,17 +1177,23 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
                             h3_lora_expand(ctx, bindFn, *parts[i], shrunk[i]), qkv, inner,
                             static_cast<std::size_t>(i) * inner * f), hd, heads, seq);
             }
-            ggml_tensor* q = adapted[0] != nullptr ? adapted[0] : ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
-                static_cast<std::size_t>(hd) * f, qkv->nb[1], 0));
-            ggml_tensor* k = adapted[1] != nullptr ? adapted[1] : ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
+            // Unadapted q/k/v stay views of qkv. The q/k norm and RoPE read rows in
+            // place and h3_attend's V path copies before its kernels; q or k with
+            // neither keeps the copy the attention kernel's inputs had before.
+            const bool rope = cosT != nullptr && sinT != nullptr;
+            ggml_tensor* q = adapted[0] != nullptr ? adapted[0] : ggml_view_3d(ctx, qkv, hd, heads, seq,
+                static_cast<std::size_t>(hd) * f, qkv->nb[1], 0);
+            ggml_tensor* k = adapted[1] != nullptr ? adapted[1] : ggml_view_3d(ctx, qkv, hd, heads, seq,
                 static_cast<std::size_t>(hd) * f, qkv->nb[1],
-                static_cast<std::size_t>(inner) * f));
-            ggml_tensor* v = adapted[2] != nullptr ? adapted[2] : ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
+                static_cast<std::size_t>(inner) * f);
+            ggml_tensor* v = adapted[2] != nullptr ? adapted[2] : ggml_view_3d(ctx, qkv, hd, heads, seq,
                 static_cast<std::size_t>(hd) * f, qkv->nb[1],
-                static_cast<std::size_t>(2) * inner * f));
+                static_cast<std::size_t>(2) * inner * f);
             if (qn) q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), qn);
+            else if (!rope) q = ggml_cont(ctx, q);
             if (kn) k = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), kn);
-            if (cosT != nullptr && sinT != nullptr)
+            else if (!rope) k = ggml_cont(ctx, k);
+            if (rope)
             {
                 q = h3_vit_rope(ctx, q, cosT, sinT, hd, heads, seq, rot);
                 k = h3_vit_rope(ctx, k, cosT, sinT, hd, heads, seq, rot);
@@ -1361,7 +1384,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
             const TSGH3BlockLora* bl = adapter != nullptr ? &adapter->blocks[l] : nullptr;
             ggml_tensor* h = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), n1w);
             h = modulate(h, mods, 0, 1);
-            ggml_tensor* a = attention(h, qkvw, qkvb, qn, kn, ow, ob, ntok, cosf, sinf, bl);
+            ggml_tensor* a = attention(h, qkvw, qkvb, qn, kn, ow, ob, ntok, cosf, sinS, bl);
             x = gatedResidual(x, a, mods, 2);
 
             h = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), n2w);
@@ -2215,6 +2238,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
         ggml_tensor* sinf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, seq);
         ggml_set_input(patches); ggml_set_input(posEmbed);
         ggml_set_input(cosf); ggml_set_input(sinf);
+        ggml_tensor* sinS = h3_rope_signed_sin(ctx, sinf);
 
         ggml_tensor *pew, *peb;
         declLin(d->patch_embed, pew, peb);
@@ -2266,14 +2290,15 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
 
             ggml_tensor* n1 = layerNorm(h, n1w, n1b);
             ggml_tensor* qkv = lin(qkvw, n1, qkvb);
-            ggml_tensor* q = ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
-                static_cast<std::size_t>(hd) * f, qkv->nb[1], 0));
-            ggml_tensor* k = ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
-                static_cast<std::size_t>(hd) * f, qkv->nb[1], static_cast<std::size_t>(dim) * f));
-            ggml_tensor* v = ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
-                static_cast<std::size_t>(hd) * f, qkv->nb[1], static_cast<std::size_t>(2) * dim * f));
-            q = h3_vit_rope(ctx, q, cosf, sinf, hd, heads, seq, hd);
-            k = h3_vit_rope(ctx, k, cosf, sinf, hd, heads, seq, hd);
+            // Views of qkv: RoPE and h3_attend read rows in place.
+            ggml_tensor* q = ggml_view_3d(ctx, qkv, hd, heads, seq,
+                static_cast<std::size_t>(hd) * f, qkv->nb[1], 0);
+            ggml_tensor* k = ggml_view_3d(ctx, qkv, hd, heads, seq,
+                static_cast<std::size_t>(hd) * f, qkv->nb[1], static_cast<std::size_t>(dim) * f);
+            ggml_tensor* v = ggml_view_3d(ctx, qkv, hd, heads, seq,
+                static_cast<std::size_t>(hd) * f, qkv->nb[1], static_cast<std::size_t>(2) * dim * f);
+            q = h3_vit_rope(ctx, q, cosf, sinS, hd, heads, seq, hd);
+            k = h3_vit_rope(ctx, k, cosf, sinS, hd, heads, seq, hd);
             // Qwen3-VL runs FULL attention on every layer; the windowed variant in the
             // Qwen2.5-VL config is dead for this path.
             ggml_tensor* merged2 = h3_attend(ctx, g_backend, q, k, v, hd, heads, seq,

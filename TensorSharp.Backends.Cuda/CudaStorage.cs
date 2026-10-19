@@ -97,6 +97,22 @@ namespace TensorSharp.Cuda
             return HostPtrAtElementUnchecked(index);
         }
 
+        public override IntPtr PtrAtElementForOverwrite(long index)
+        {
+            ThrowIfDisposed();
+            ValidateElementRange(index, 0);
+
+            // The caller replaces every element, so the device copy (often never
+            // written) is not read back first; the host becomes the current copy.
+            lock (sync)
+            {
+                EnsureHostBuffer();
+                hostDirty = true;
+                deviceDirty = false;
+            }
+            return HostPtrAtElementUnchecked(index);
+        }
+
         internal IntPtr DevicePtrAtElement(long index)
         {
             ThrowIfDisposed();
@@ -453,9 +469,8 @@ namespace TensorSharp.Cuda
 
             ValidateElementRange(index, value.Length);
             EnsureHostBuffer();
-            float* target = (float*)HostPtrAtElementUnchecked(index).ToPointer();
-            for (int i = 0; i < value.Length; i++)
-                target[i] = value[i];
+            // A block copy, not a per-element loop that first runs as tier-0 code.
+            value.AsSpan().CopyTo(new Span<float>(HostPtrAtElementUnchecked(index).ToPointer(), value.Length));
 
             hostDirty = true;
             deviceDirty = false;

@@ -50,6 +50,12 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(mlx-c)
 
+# TensorSharp-owned integration: MLX's public as_strided first flattens its
+# input into an int-sized axis. Its AsStrided primitive supports size_t-sized
+# contiguous backing arrays directly, which large video activations require.
+target_sources(mlxc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/TensorSharpMlx.cpp")
+target_sources(mlx PRIVATE "${CMAKE_CURRENT_LIST_DIR}/TensorSharpMlxView.cpp")
+
 install(
   TARGETS mlxc
   LIBRARY DESTINATION .

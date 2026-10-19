@@ -191,7 +191,7 @@ public sealed class DiffusionCatalogTests
     public void TheTurboEntriesShareTheBaseEntrysCompanionsAndDeclareTheirCheckpoint()
     {
         Assert.Equal(QwenImageVariant.Base, QwenImage21.ImageVariant);
-        Assert.Equal(new[] { "qwen-image-2.1-turbo-adq4k", "qwen-image-2.1-turbo-q8" }, Turbos.Select(m => m.Id));
+        Assert.Equal(new[] { "qwen-image-2.1-turbo-q5ks", "qwen-image-2.1-turbo-q8-0" }, Turbos.Select(m => m.Id));
         foreach (CatalogModel turbo in Turbos)
         {
             Assert.True(turbo.IsImageGenerator);
@@ -200,14 +200,14 @@ public sealed class DiffusionCatalogTests
             foreach (CatalogFileRole role in new[] { CatalogFileRole.TextEncoder, CatalogFileRole.Vae, CatalogFileRole.VisionProjector })
                 Assert.Equal(QwenImage21.Files.Single(f => f.Role == role), turbo.Files.Single(f => f.Role == role));
             Assert.Equal(4, turbo.Files.Count);
-            Assert.Contains("/AtomicChat/Qwen-Image-2.1-Turbo-GGUF/resolve/bb25d06bc74119c12207243d68917951e6d9c232/", turbo.Weights.Url);
+            Assert.Contains("/unsloth/Qwen-Image-2.1-Turbo-GGUF/resolve/5d1f9f759ea877ae556cda88dbec958b62ad3809/", turbo.Weights.Url);
             string weights = turbo.Weights.FileName;
             Assert.False(VaeScanFinds(weights) || TextEncoderScanFinds(weights) || VisionProjectorScanFinds(weights), weights);
         }
-        CatalogModel fast = ModelCatalog.Find("qwen-image-2.1-turbo-adq4k")!, best = ModelCatalog.Find("qwen-image-2.1-turbo-q8")!;
-        Assert.Equal(("Qwen-Image-2.1-Turbo-AD-Q4_K.gguf", 4_201_694_944L, "4bb73c53cbe284bbd6d69b9fdc59539c531f0389dd2aa567663d777f8130bc59"),
+        CatalogModel fast = ModelCatalog.Find("qwen-image-2.1-turbo-q5ks")!, best = ModelCatalog.Find("qwen-image-2.1-turbo-q8-0")!;
+        Assert.Equal(("qwen-image-2.1-turbo-Q5_K_S.gguf", 4_501_948_224L, "72d93eb6f5d7be1a619c34f525393d001bc2fb9485d087f63c8462932b40177d"),
             (fast.Weights.FileName, fast.Weights.Bytes, fast.Weights.Sha256));
-        Assert.Equal(("Qwen-Image-2.1-Turbo-Q8_0.gguf", 7_591_554_784L, "99f498fb7188be7eac9eb5f345a9e074d30eef3ca235b419e92563e5b48073c4"),
+        Assert.Equal(("qwen-image-2.1-turbo-Q8_0.gguf", 7_640_860_480L, "399d2ddc3636f36456e2f5bfa57187da4e38721bc046430317f42a9eab5b1712"),
             (best.Weights.FileName, best.Weights.Bytes, best.Weights.Sha256));
     }
 

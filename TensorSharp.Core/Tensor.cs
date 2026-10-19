@@ -62,6 +62,8 @@ namespace TensorSharp
             elementCount = TensorDimensionHelpers.ElementCount(sizes);
             storageOffset = 0;
             storage = allocator.Allocate(elementType, TensorDimensionHelpers.GetStorageSize(sizes, strides));
+            try { storage.SetTensorMetadata(this.sizes, this.strides); }
+            catch { storage.Release(); throw; }
         }
 
         public Tensor(long[] sizes, long[] strides, Storage storage, long storageOffset)

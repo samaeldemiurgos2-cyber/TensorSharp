@@ -3686,7 +3686,7 @@ if (simd_id == 0) {
             });
         }
 
-        internal static MlxArray AsStrided(MlxArray array, int[] shape, long[] strides, long offset)
+        internal static MlxArray AsStrided(MlxArray array, int[] shape, long[] strides, long offset, bool largeStorage = false)
         {
             if (!array.IsValid)
                 throw new ArgumentException("MLX array is empty.", nameof(array));
@@ -3698,8 +3698,26 @@ if (simd_id == 0) {
             return MlxWorker.Shared.Invoke(() =>
             {
                 MlxArray result;
-                Check(mlx_as_strided(out result, array, shape, (nuint)shape.Length, strides, (nuint)strides.Length, (nuint)offset, DefaultStream()), "creating MLX strided view");
+                int status = largeStorage
+                    ? tensorsharp_mlx_as_strided(out result, array, shape, (nuint)shape.Length, strides, (nuint)strides.Length, (nuint)offset, DefaultStream())
+                    : mlx_as_strided(out result, array, shape, (nuint)shape.Length, strides, (nuint)strides.Length, (nuint)offset, DefaultStream());
+                Check(status, "creating MLX strided view");
                 return result;
+            });
+        }
+
+        internal static long GetArraySize(MlxArray array)
+        {
+            return MlxWorker.Shared.Invoke(() => checked((long)mlx_array_size(array)));
+        }
+
+        internal static int[] GetArrayShape(MlxArray array)
+        {
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                int[] shape = new int[checked((int)mlx_array_ndim(array))];
+                Marshal.Copy(mlx_array_shape(array), shape, 0, shape.Length);
+                return shape;
             });
         }
 
@@ -8814,6 +8832,18 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int mlx_array_free(MlxArray array);
 
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_size")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial nuint mlx_array_size(MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_ndim")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial nuint mlx_array_ndim(MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_shape")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr mlx_array_shape(MlxArray array);
+
         [LibraryImport(LibraryName, EntryPoint = "mlx_astype")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int mlx_astype(out MlxArray result, MlxArray array, int dtype, MlxStream stream);
@@ -8881,6 +8911,10 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         [LibraryImport(LibraryName, EntryPoint = "mlx_async_eval")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int mlx_async_eval(MlxVectorArray outputs);
+
+        [LibraryImport(LibraryName, EntryPoint = "tensorsharp_mlx_as_strided")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int tensorsharp_mlx_as_strided(out MlxArray result, MlxArray array, int[] shape, nuint shapeCount, long[] strides, nuint stridesCount, nuint offset, MlxStream stream);
 
         [LibraryImport(LibraryName, EntryPoint = "mlx_as_strided")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

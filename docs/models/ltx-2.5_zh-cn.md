@@ -4,17 +4,22 @@
 
 TensorSharp 原生实现 LTX 2.5 Distilled 的文生视频、图像条件视频及联合生成的
 **48 kHz 立体声音频**。TensorAgent 的实验条目为
-**LTX 2.5 Distilled — Q4_K_M + BF16**，Download 下载五个固定文件，Use 激活模型。
+**LTX 2.5 Distilled — UD-Q4_K_XL + BF16**，Download 下载五个固定文件，Use 激活模型。
 48 GB 目录档位是保守起点，并非已证明的最低要求或任意分辨率/时长保证。
 
 ## 文件与启动
 
 [config/ltx-2.5-distilled.json](../../config/ltx-2.5-distilled.json)
-按提交和 SHA-256 固定五份文件，共 **44,764,412,884 字节（44.76 GB）**：
-Q4_K_M 去噪器、带投影的专用 Gemma 4 编码器、卷积视频 VAE、x2 空间潜变量上采样器、
-音频 VAE。官方伴随文件需要先获得发布方 Hugging Face 仓库访问许可。
-可设置 `HF_TOKEN`、`HUGGING_FACE_HUB_TOKEN`，或使用 Hugging Face CLI token 缓存；
-凭证只附在 HTTPS `huggingface.co` 请求上，CDN 重定向不携带凭证。
+按提交和 SHA-256 固定五份文件，共 **43,077,008,276 字节（43.08 GB）**：
+UD-Q4_K_XL 去噪器、带投影的专用 Gemma 4 编码器、卷积视频 VAE、x2 空间潜变量上采样器、
+音频 VAE。全部来自无访问限制的 [Unsloth 仓库](https://huggingface.co/unsloth/LTX-2.5-GGUF)，
+固定修订为 `ac3c540c6025903784336e99b2dc179385c4c3b7`，无需 Hugging Face 账号。
+伴随文件与 Lightricks 原文件逐字节相同，配置还保留受限的官方地址作为备用。
+
+应下载 `distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf`，直接放在 `ltx25/` 下与伴随文件夹并列。
+仓库根目录的 **dev** 检查点使用另一套配方（30 步、CFG 3）；TensorSharp 拒绝文件名标注 dev 的文件，
+改名无法将其转换为蒸馏检查点。TensorAgent 新条目为 `ltx-2.5-distilled-q4kxl`，
+使用默认模型缓存时，启动迁移保留旧条目中完整的伴随文件与用户添加的适配器文件夹。
 
 配置在 `${TENSORSHARP_MODELS:-../models}/ltx25` 下查找文件。
 手动安装可用 `TS_VIDEO_TEXT_ENCODER`、`TS_VIDEO_VAE`、`TS_VIDEO_AUDIO_VAE`、
@@ -40,6 +45,19 @@ dotnet run --project TensorSharp.Cli -- \
 不支持 Vulkan 或多 GPU。GPU 测量不证明 CPU 吞吐。
 桌面 MP4 音轨需要 `PATH` 上的 FFmpeg 或 `TS_FFMPEG`，CLI 另写原始 PCM WAV；
 Mac 应用通过 AVFoundation 编码。
+
+## Unsloth 预设实测（2026-10-18）
+
+48 GB M5 Pro、MLX、`MLX_ENABLE_TF32=0`、1024×1024×17 两阶段生成、seed 42，
+同一进程的两条不同提示词分别耗时 109.7 / 107.1 秒，旧 Abiray 文件为 115.3 / 115.2 秒。
+新文件的进程峰值占用为 17.6 GB，旧文件 27.0 GB。混合 Q2_K/Q3_K/BF16 权重现在保持映射，
+逐次投影精确解量化到 F32；修复前一次性展开会导致 56 GB 占用。修复前后原始视频与音频逐比特相同。
+
+以更高精度的 Unsloth Q8_0 为参考，狐狸/灯塔两条样本的 PSNR 为 26.6/30.8 dB，旧量化为
+25.1/23.0 dB。这两条样本支持当前选择，但不能证明通用质量排名。
+1280×704×121 样本生成耗时 513.5 秒、编码 36.2 秒，MLX 分配峰值为 20.2 GB。
+CLI 配置下载与真实 TensorAgent HTTP/SSE 生成、媒体下载路径已验证；本轮未重测 CUDA、iOS
+或原生 MAUI 控件。工具与限制见[验证说明](../../eng/validation/README-ltx25.md#unsloth-distilled-gguf-validation-2026-10-18)。
 
 ## 两阶段生成与限制
 
@@ -80,6 +98,19 @@ CUDA 的 SM 8.0+ 提示词投影默认用 BF16 Tensor Core、F32 累加并保留
 CUDA 对映射投影做有界预读，每个 reader 一个 8 MiB 缓冲；Linux 检查驻留页，
 至多八路读取 1 MiB 切片。`TS_LTX25_CUDA_PREFAULT=0` 关闭，
 `TS_LTX25_CUDA_PREFAULT_WORKERS=1` 选择顺序读取。
+
+所有后端还会在 4 GiB 窗口内按层的运行顺序提前读取权重：Gemma 编码器、提示词
+connector 以及第一次 CUDA 去噪器上传。upscaler、视频解码器和音频 VAE 则在首次
+使用前一个阶段读取。safetensors 与 GGUF 按名字字母序存放张量（第 0、1、10……层）。
+没有预读时，冷映射在 M5 Pro SSD 上只能以 0.9 GiB/s 缺页读入，而一个顺序读取线程
+可达 12 GiB/s；在 A40 pod 的网络卷上只有 0.3 GiB/s，而 16 路并发读取可达
+2.3 GiB/s。已在文件缓存中的块会跳过。
+
+当内存（或容器的内存上限）小于文本编码器、去噪器与 16 GiB 之和时，每个新提示词
+编码后释放编码器的缓存页，使其不与去噪器争用；之后的新提示词会重新读取。
+`TS_VIDEO_READAHEAD=0` 同时关闭预读与释放。`TS_VIDEO_READAHEAD_WORKERS`（1–32）
+设置读取线程：Linux 默认 16，其他平台默认 1。条件编码日志行会报告读取的字节数、
+已驻留的字节数以及是否释放缓存。
 大序列自注意力在 256 MiB 分数工作区中按查询/head 分块，仍关注完整 key 序列。
 
 ## 首帧、尾帧与多图时间线
@@ -109,7 +140,8 @@ var video = model.GenerateVideo("The woman smiles and blows a kiss.", request);
 ```
 
 最多 16 张图，位置必须唯一且位于片段内；强度为有限的 0–1，1 保留编码引导潜变量。
-`ReferenceImagePaths` 不可与其他图像输入混用。
+`ReferenceImagePaths` 不可与其他图像输入混用；唯一例外是 `Mode = "ref"` 下的一个第 0 帧
+`ImageConditions` 引导（见[从首帧开始](#从首帧开始)）。
 时间线图像按发布方 LTX 2.5 的流程预处理：先去掉底部/右侧的奇数边缘以满足偶数尺寸，
 使用 libx264、CRF 18、`veryfast`、`yuv420p` 再压缩；随后对完整图像做 Float32
 双线性缩放（`align_corners=False`），最后中心裁剪到各阶段尺寸，保留缩放产生的小数像素。
@@ -157,6 +189,25 @@ IC-LoRA 对 AV Transformer 施加独立低秩更新，不替换生成首帧。
 保留身份与遵循动作是两个独立质量要求，当前没有多人物广泛验证。
 MotionTrack、Union depth/canny/pose、layout、inpainting、HDR、AlphaGen 等官方工作流
 需要各自管线/适配器/解码器，不能当作通用图片参考使用。
+
+### 从首帧开始
+
+Ingredients 请求也可以从固定的首帧开始，即发布方 IC-LoRA 管线同时接收图像与参考条件时的组合。
+Video Studio **不提供**此功能（原因见下方验证结果与[跨片段保持人物](../video-studio.md#keep-a-character-across-segments)，英文），
+可通过视频 API 使用。
+做法是加一个 `FrameIndex = 0` 的 `ImageConditions` 条目；`Mode = "ref"` 下 `Image` / `ImagePath`
+仍是单张身份图，而不是帧。仍为单次全尺寸流程：该引导与其他图像引导一样经 CRF 18 预处理（因此需要带
+libx264 的 FFmpeg），按输出尺寸只编码一次，并按其强度固定——画布第 0 个潜变量帧取干净引导潜变量，
+去噪掩码为 1 − strength，不增加 token；参考板 token 照常追加在画布之后。两者占用互不重叠的 token，
+所以先参考后引导与上游"先图像后参考"的顺序等价，对应上游
+`ICLoraPipeline(stages=(ICLoraStageConfig(1, True, DISTILLED_SIGMA_VALUES),))(images=[(frame, 0, 1.0)], video_conditioning=[(sheet, 1.0)])`。
+最多一个引导且只能在第 0 帧；参考旁的尾帧或带时间位置的引导会被拒绝。去噪日志会写出
+`first-frame guide strength: frame 0=1`。该组合在强度 1 时与未修改的上游函数逐位一致
+（`FrameZeroGuideBesideReferenceVideoMatchesUnchangedOfficialImagesThenReferences`）。发布方训练 Ingredients 时
+`first_frame_conditioning_p` 为 0.0，训练中从未见过固定首帧，也未验证这种用法。2026-10-17
+（Q4_K_M、MLX、768×448×121、seed 42）的实测中，每个从首帧开始的镜头都在第二帧切走：第 0 帧与固定首帧一致
+（PSNR 27–29 dB），第 1 帧与第 0 帧相差 9.6–9.7 dB，呈现参考板的构图（竖幅参考在板上加黑边、宽幅参考铺满时均如此）。
+用竖幅参考的普通 Ingredients 镜头同样复现了加黑边的参考板。
 
 ## 视频解码器与清晰度
 
@@ -206,6 +257,33 @@ MLX Q5_K 以有界 CPU 并行直接打包，保留所有量化值和缩放字节
 组件微基准与打包耗时不能换算成模型整体提速。
 
 ## 验证与复现
+
+2026-10-17 的工作为默认 1024×1024×17 配方（seed 42）去掉了权重加载与主机开销，
+所有输出都没有改变。M5 Pro 各行使用端到端探针，用
+`ltx25-compare-native-generations.py --require-bitwise` 比较原始 Float32 RGB 与两个
+PCM 声道。A40 各行是交替两轮的完整 CLI 进程，四次运行的解码 RGB 与 PCM 全部相同。
+M5 Pro 上的模型文件从冷缓存开始，A40 上未受控。
+
+| 机器 / 后端 | 之前 | 之后 | 输出 |
+|---|---:|---:|---|
+| M5 Pro `mlx`，新进程 | 168.9 秒 | 108.0 秒 | RGB 与 PCM 逐位相同 |
+| M5 Pro `mlx`，同一进程中第二个未缓存提示词 | 142.8 秒 | 110.3 秒 | RGB 与 PCM 逐位相同 |
+| A40 `ggml_cuda`（direct CUDA），CLI 进程 | 163.9 秒 | 72.9 秒 | 解码 RGB 与 PCM 相同 |
+
+改动如下：
+
+- **按计算顺序预读权重。** M5 Pro 上文本编码在新进程中从 42.3 降到 5.5 秒，第二个提示词
+  从 30.6 降到 5.2 秒；在 A40 pod 的网络卷上从 61.7–65.2 降到 13.0–13.5 秒。A40 的第一遍去噪（包含首次去噪器上传）
+  从 39–44 降到 15–19 秒。
+- **提示词 connector。** RoPE 表改为用相同表达式只计算一次，connector 权重按层序预读。
+  A40 上 connector 从 12.3 降到 1.8 秒。
+- **视频 VAE 与 upscaler 权重。** 权重转换分摊到多个核心，CUDA 主机缓冲写入前不再回读
+  从未写过的设备副本。A40 上 upsample 从 9.0–11.6 降到 2.5 秒，视频解码从 12.7–15.4
+  降到 6.9 秒；M5 Pro 上 upsample 从 2.3 降到 0.5 秒。
+- **释放 Gemma 缓存。** 在 48 GB Mac 上，每个新提示词后释放 Gemma 的缓存页，避免 22 GiB
+  过期页拖慢第一个 1024×1024 去噪步。与预读一起，M5 Pro 新进程的第一遍去噪从 64.8
+  降到 43.5 秒。
+- **权重转换循环。** 这些循环现在直接编译为优化代码，并使用块拷贝。
 
 [eng/validation/README-ltx25.md](../../eng/validation/README-ltx25.md)
 记录独立小夹具、实际权重、完整媒体、应用和计时的不同门禁。

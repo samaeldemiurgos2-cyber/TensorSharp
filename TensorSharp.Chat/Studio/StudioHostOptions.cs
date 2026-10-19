@@ -4,9 +4,9 @@ using TensorSharp.Studio;
 namespace TensorSharp.Chat.Studio;
 public static class StudioHostOptions
 {
-    public static StudioOptions Create(long maxImportBytes = 0)
+    public static StudioOptions Create(long maxImportBytes = 0, System.Action<string>? logJobFailure = null)
     {
-        var options = new StudioOptions();
+        var options = new StudioOptions { LogJobFailure = logJobFailure };
         if (maxImportBytes > 0) options.MaxImportBytes = System.Math.Min(options.MaxImportBytes, maxImportBytes);
         if (!options.EnableExternalProcesses) return options;
         options.FfmpegPath = MediaExecutableLocator.Find("ffmpeg", "TS_FFMPEG") ?? "ffmpeg";

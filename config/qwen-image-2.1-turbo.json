@@ -8,20 +8,26 @@
   //   TensorSharp.Cli --config config/qwen-image-2.1-turbo.json --prompt "..." --width 1024 --height 1024
   //   TensorSharp.Server.Host --config config/qwen-image-2.1-turbo.json
   //
-  // The GGUF carries no metadata and Turbo has the base checkpoint's tensors, so this config
-  // declares the checkpoint ("qwen-image-variant": "turbo"). Turbo then samples its published
+  // The GGUF names only its architecture (qwen_image), and Turbo has the base checkpoint's
+  // tensors, so nothing in the file tells the two apart: this config declares the checkpoint
+  // ("qwen-image-variant": "turbo"). Turbo then samples its published
   // schedule, the model_index.json sample_sigmas [1.0, 0.978453, 0.95418, 0.926626, 0.89508,
   // 0.845148, 0.704534, 0.414568] and a final 0, unshifted at every size, at CFG 1. Other step
   // counts are refused (Qwen has evaluated no other schedule), and so are step-distillation LoRA
   // plug-ins (they bring a second schedule). Defaults: native 2048x2048; edits retain the input
   // aspect ratio; explicit dimensions must be divisible by 32.
   //
-  // AD-Q4_K is AtomicChat's importance-matrix 4-bit file (4.20 GB). For the transformer closest
-  // to the full-precision checkpoint (the card's LPIPS against BF16: Q8_0 0.037, AD-Q4_K 0.147;
-  // the Q4_K_M text encoder below moves pictures about as far as AD-Q4_K by the card's own
-  // measurement, and stays), use the 7.59 GB Q8_0: replace the file name in "path" and "urls" with
-  // Qwen-Image-2.1-Turbo-Q8_0.gguf and set "sha256" to
-  //   99f498fb7188be7eac9eb5f345a9e074d30eef3ca235b419e92563e5b48073c4
+  // The denoiser is Unsloth's Q5_K_S (4.50 GB), Dynamic 2.0 with an importance matrix collected on
+  // Turbo at its own 8-step schedule. It is 0.3 GB larger than the card's recommended Q4_K_M, runs at
+  // the same speed (7.97 vs 7.94 s/step at 1024x1024 on an M5 Pro) and stays closer to the F16
+  // transformer (LPIPS against BF16 on the card: 0.103 vs 0.153; measured here, mean PSNR against the
+  // F16 GGUF over four prompts: 22.4 vs 20.3 dB). Alternatives from the same revision:
+  //   qwen-image-2.1-turbo-Q4_K_M.gguf  4.20 GB  sha256 8940e8b522af886e0c0f5afddf720e82dd223cb9a43580b5f61c4d740452ac20
+  //   qwen-image-2.1-turbo-Q8_0.gguf    7.64 GB  sha256 399d2ddc3636f36456e2f5bfa57187da4e38721bc046430317f42a9eab5b1712
+  // (Q8_0 is the transformer closest to full precision: LPIPS 0.036, 39.4 dB here, and 0.3 s/step
+  // faster.) Replace the file name in "path" and "urls" and set "sha256". On macOS and Windows the
+  // Q8_0 name matches AtomicChat's earlier Qwen-Image-2.1-Turbo-Q8_0.gguf except for letter case, and
+  // a file already at "path" is reused without a hash check: delete an AtomicChat copy first.
   // Apple Silicon uses ggml_metal. Override --backend ggml_cuda for NVIDIA GPUs.
   // License: Qwen Research License (non-commercial); text encoder Apache-2.0.
   "variables": {
@@ -30,9 +36,9 @@
   "backend": "ggml_metal",
   "qwen-image-variant": "turbo",
   "model": {
-    "path": "${root}/Qwen-Image-2.1-Turbo-AD-Q4_K.gguf",
-    "urls": ["https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF/resolve/bb25d06bc74119c12207243d68917951e6d9c232/Qwen-Image-2.1-Turbo-AD-Q4_K.gguf"],
-    "sha256": "4bb73c53cbe284bbd6d69b9fdc59539c531f0389dd2aa567663d777f8130bc59"
+    "path": "${root}/qwen-image-2.1-turbo-Q5_K_S.gguf",
+    "urls": ["https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF/resolve/5d1f9f759ea877ae556cda88dbec958b62ad3809/qwen-image-2.1-turbo-Q5_K_S.gguf"],
+    "sha256": "72d93eb6f5d7be1a619c34f525393d001bc2fb9485d087f63c8462932b40177d"
   },
   "qwen-image-vae": {
     "path": "${root}/qwen_image_2.1_vae_bf16.safetensors",

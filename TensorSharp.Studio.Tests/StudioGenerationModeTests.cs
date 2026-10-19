@@ -27,6 +27,7 @@ public sealed class StudioGenerationModeTests : IDisposable
     [InlineData("keyframes", "G")]
     [InlineData("keyframes", "FLG")]
     [InlineData("ref", "R")]
+    [InlineData("ref", "FR")]  // A character kept while starting on a frame; whether a checkpoint runs it is admission's call.
     public void EachModeAcceptsExactlyItsOwnInputs(string mode, string inputs) =>
         Assert.Equal(mode, StudioGenerationModes.Resolve(Inputs(mode, inputs)));
 
@@ -43,7 +44,7 @@ public sealed class StudioGenerationModeTests : IDisposable
     [InlineData("keyframes", "F")]
     [InlineData("keyframes", "GR")]
     [InlineData("ref", "")]
-    [InlineData("ref", "FR")]  // A reference is never also a pinned frame.
+    [InlineData("ref", "LR")]  // A reference is never also a pinned last or timed frame.
     [InlineData("ref", "RG")]
     public void AModeRefusesInputsThatBelongToAnotherMode(string mode, string inputs) =>
         Assert.Equal("invalid_mode_inputs", Assert.Throws<StudioException>(() => StudioGenerationModes.Resolve(Inputs(mode, inputs))).Code);

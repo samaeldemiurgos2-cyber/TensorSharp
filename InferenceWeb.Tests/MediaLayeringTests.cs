@@ -138,10 +138,19 @@ public class MediaLayeringTests
         string removalCondition = (string?)removal!.Parent?.Attribute("Condition") ?? string.Empty;
         Assert.Contains("'$(TargetPlatformIdentifier)' == 'ios'", removalCondition);
         Assert.Contains("'$(TargetPlatformIdentifier)' == 'maccatalyst'", removalCondition);
+
+        // The process-only guide transform is shared with the Mac app, without
+        // pulling any OpenCV/Magick source into either Apple target or enabling
+        // process spawning on the phone.
+        XElement sharedTransform = Assert.Single(doc.Descendants("Compile").Where(c =>
+            ((string?)c.Attribute("Include") ?? string.Empty).Replace('\\', '/') == "Media/Desktop/FfmpegImageConditioning.cs"));
+        Assert.Equal("'$(TargetPlatformIdentifier)' == 'maccatalyst'",
+            (string?)sharedTransform.Parent?.Attribute("Condition"));
     }
 
     /// <summary>
-    /// Every source under <c>Media/Apple/</c> is wrapped in <c>#if IOS || MACCATALYST</c>.
+    /// Every source under <c>Media/Apple/</c> is gated to Apple platforms. A Mac-only
+    /// process adapter uses the narrower <c>#if MACCATALYST</c> guard.
     ///
     /// <para>Without the guard the file compiles into the net10.0 build, where its
     /// <c>using AVFoundation;</c> does not resolve — that much fails loudly. The reason this
@@ -166,8 +175,9 @@ public class MediaLayeringTests
         {
             string text = File.ReadAllText(file);
             Assert.True(
-                text.Contains("#if IOS || MACCATALYST", StringComparison.Ordinal),
-                $"{Path.GetFileName(file)} is not gated with '#if IOS || MACCATALYST'");
+                text.Contains("#if IOS || MACCATALYST", StringComparison.Ordinal)
+                    || text.Contains("#if MACCATALYST", StringComparison.Ordinal),
+                $"{Path.GetFileName(file)} is not gated to Apple platforms");
             Assert.True(
                 text.TrimEnd().EndsWith("#endif", StringComparison.Ordinal),
                 $"{Path.GetFileName(file)} does not close its platform guard at the end of the file");

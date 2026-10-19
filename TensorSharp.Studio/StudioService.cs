@@ -200,11 +200,15 @@ public sealed partial class StudioService : IAsyncDisposable
     public async Task<StudioProject> ImportAssetAsync(string projectId, Stream input, string fileName, CancellationToken cancellationToken = default)
     {
         await importGate.WaitAsync(cancellationToken);
-        try { return await ImportAssetInternalAsync(projectId, input, fileName, null, cancellationToken); }
+        try { return (await ImportAssetInternalAsync(projectId, input, fileName, null, cancellationToken)).Project; }
         finally { importGate.Release(); }
     }
 
-    async Task<StudioProject> ImportAssetInternalAsync(string projectId, Stream input, string fileName, StudioGenerationProvenance? provenance, CancellationToken cancellationToken)
+    /// <summary>Imports media into the library and returns the project with the asset's id: the new asset, or for a plain
+    /// import of content already in the library, the existing one. A generated take keeps its provenance; a still taken
+    /// from a video (<paramref name="derived"/>) records its source and is reused when that frame was taken before.</summary>
+    async Task<(StudioProject Project, string AssetId, bool Existing)> ImportAssetInternalAsync(string projectId, Stream input, string fileName, StudioGenerationProvenance? provenance,
+        CancellationToken cancellationToken, StudioFrameSource? derived = null)
     {
         StudioPaths.Id(projectId); LoadDocument(projectId); CheckDisk();
         var extension = Path.GetExtension(fileName).ToLowerInvariant(); StudioMedia.ContentType(extension);
@@ -228,16 +232,22 @@ public sealed partial class StudioService : IAsyncDisposable
                 if (count == 0) throw new StudioException("empty_media", "The media file is empty.");
                 await output.FlushAsync(cancellationToken); output.Flush(true); hash = Convert.ToHexStringLower(sha.GetHashAndReset());
             }
-            var asset = await Media.ProbeAsync(target, displayName, cancellationToken); asset.Sha256 = hash; asset.Generation = provenance;
+            var asset = await Media.ProbeAsync(target, displayName, cancellationToken); asset.Sha256 = hash; asset.Generation = provenance; asset.DerivedFrom = derived;
             if (provenance is { } generated && (asset.Kind != "video" || asset.Width != generated.Request.Width || asset.Height != generated.Request.Height ||
                 Math.Abs(asset.DurationSeconds - (double)generated.Request.FrameCount / generated.Request.Fps) > 2d / generated.Request.Fps + .01))
                 throw new StudioException("generation_output_mismatch", "Decoded generation output does not match its requested dimensions, duration, or media type.");
+            if (derived != null && asset.Kind != "image")
+                throw new StudioException("frame_extraction_failed", "The frame taken from the video did not decode as a still image.");
             await projectGate.WaitAsync(cancellationToken);
             try
             {
                 var doc = LoadDocument(projectId);
-                if (provenance == null && doc.Project.Assets.Any(a => a.Sha256 == hash && File.Exists(StudioPaths.SafeChild(directory, a.FileName)))) return PublicProject(doc.Project);
-                doc.Project.Assets.Add(asset); Touch(doc.Project); StudioCommands.Validate(doc.Project, Options); SaveDocument(doc); keep = true; return PublicProject(doc.Project);
+                // A frame taken twice (a double tap, or two pages) is one still. Another import never stands in for it:
+                // byte-identical content without the record would lose where the frame came from.
+                var existing = derived != null ? FindStill(doc.Project, derived)
+                    : provenance == null ? doc.Project.Assets.FirstOrDefault(a => a.Sha256 == hash && File.Exists(StudioPaths.SafeChild(directory, a.FileName))) : null;
+                if (existing != null) return (PublicProject(doc.Project), existing.Id, true);
+                doc.Project.Assets.Add(asset); Touch(doc.Project); StudioCommands.Validate(doc.Project, Options); SaveDocument(doc); keep = true; return (PublicProject(doc.Project), asset.Id, false);
             }
             finally { projectGate.Release(); }
         }

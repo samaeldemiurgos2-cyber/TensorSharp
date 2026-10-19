@@ -23,7 +23,8 @@ namespace TensorSharp.Models.QwenImage;
 /// card measured 8 steps only. Resampling the eight values for another count would be a schedule
 /// nobody trained or measured, so the recipe defines 8 steps and nothing else, like a LoRA recipe
 /// with one schedule.</para>
-/// <para><b>Identification.</b> The GGUFs have no metadata and Turbo's tensors have the base
+/// <para><b>Identification.</b> The GGUFs name at most their architecture (Unsloth's say
+/// <c>qwen_image</c>, AtomicChat's carry no metadata) and Turbo's tensors have the base
 /// checkpoint's names and shapes, so the host declares the variant
 /// (<see cref="QwenImageVariantFlag"/>). Without a declaration a file name with the word
 /// <c>turbo</c> is assumed to be Turbo, the way Wan's step-distilled checkpoints are recognized

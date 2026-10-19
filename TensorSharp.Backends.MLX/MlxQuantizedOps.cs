@@ -24,6 +24,9 @@ namespace TensorSharp.MLX
         private const int Q4_KBlockBytes = 4 + KScaleSize + QK_K / 2;
         private const int Q5_KBlockBytes = 4 + KScaleSize + QK_K / 8 + QK_K / 2;
         private const int Q6_KBlockBytes = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
+        // block_q2_K: scales[16] + qs[64] + d + dmin; block_q3_K: hmask[32] + qs[64] + scales[12] + d.
+        private const int Q2_KBlockBytes = QK_K / 16 + QK_K / 4 + 2 + 2;
+        private const int Q3_KBlockBytes = QK_K / 8 + QK_K / 4 + KScaleSize + 2;
         private const int IQ2_XXSBlockBytes = 2 + QK_K / 8 * 2;
         private const int IQ2_SBlockBytes = 2 + QK_K / 4 + QK_K / 16;
         private const int IQ3_SBlockBytes = 2 + 13 * (QK_K / 32) + QK_K / 64;
@@ -526,6 +529,99 @@ namespace TensorSharp.MLX
             DeviceWeight weight = EnsureWeight(resultStorage.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
             return MlxWorker.Shared.Invoke(() => RunAddmmQuantizedToFloat32(
                 result, input, weight, ggmlType, ne0, ne1, inputStorage, rows, preserveFloat32));
+        }
+
+        /// <summary>
+        /// Whether the direct models' exact F32 projections (DirectLinear) keep a GGUF weight of
+        /// this type on the device in compressed form: every <see cref="CanPreloadQuantizedType"/>
+        /// type, plus Q2_K, Q3_K and BF16, which stay as their raw file bytes and are dequantized
+        /// to F32 per call. Anything else is expanded to a dense F32 tensor by the caller.
+        /// </summary>
+        public static bool CanPreloadDirectFloatType(int ggmlType)
+            => CanPreloadQuantizedType(ggmlType) || MlxNative.IsDirectRawFloatType(ggmlType);
+
+        /// <summary><see cref="PreloadQuantizedWeight"/> for <see cref="CanPreloadDirectFloatType"/> types.</summary>
+        public static void PreloadDirectFloatWeight(
+            MlxAllocator allocator, IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)
+        {
+            if (allocator == null)
+                throw new ArgumentNullException(nameof(allocator));
+            if (!MlxNative.IsDirectRawFloatType(ggmlType))
+            {
+                PreloadQuantizedWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+                return;
+            }
+            EnsureWeight(allocator.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+        }
+
+        /// <summary>
+        /// The direct models' F32 projection over a <see cref="CanPreloadDirectFloatType"/> weight:
+        /// <see cref="TryAddmmQuantizedToFloat32(Tensor, Tensor, IntPtr, IntPtr, int, long, long, long, bool)"/>
+        /// with F32 activations, or, for Q2_K, Q3_K and BF16, the raw weight dequantized to exact
+        /// F32 a bounded slice at a time (<see cref="MlxNative.DirectRawFloatMatmul"/>).
+        /// </summary>
+        public static bool TryAddmmDirectFloat32(
+            Tensor result, Tensor input, IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)
+        {
+            if (!MlxNative.IsDirectRawFloatType(ggmlType))
+                return TryAddmmQuantizedToFloat32(result, input, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes, preserveFloat32: true);
+            if (!TryValidateMatmul(result, input, ne0, ne1, out MlxStorage resultStorage, out MlxStorage inputStorage, out int rows))
+                return false;
+
+            DeviceWeight weight = EnsureWeight(resultStorage.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray inputView = default;
+                MlxNative.MlxArray output = default;
+                try
+                {
+                    inputView = inputStorage.CreateArrayView(input);
+                    output = MlxNative.DirectRawFloatMatmul(inputView, weight.Weight, ggmlType, rows, (int)ne0, (int)ne1);
+                    SetDeviceResult(result, output);
+                    output = default;
+                    return true;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(inputView);
+                    MlxNative.FreeArray(output);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Rows [row0, row0 + rows) of a cached Q2_K, Q3_K or BF16 direct weight as the F32 the
+        /// projection multiplies, read back to the host: how a test sees the dequantized values
+        /// without a GEMM in between (whose TF32 mode MLX fixes once per process).
+        /// </summary>
+        internal static float[] ReadDirectRawRows(MlxAllocator allocator, IntPtr cacheKey, int row0, int rows)
+        {
+            DeviceWeight weight;
+            lock (Sync)
+            {
+                if (!Cache.TryGetValue(new CacheKey(allocator.DeviceId, cacheKey), out LinkedListNode<DeviceWeight> node))
+                    throw new InvalidOperationException("The direct weight is not cached on this MLX device.");
+                weight = node.Value;
+            }
+            if (!MlxNative.IsDirectRawFloatType(weight.GgmlType))
+                throw new InvalidOperationException($"{(GgmlTensorType)weight.GgmlType} is not a raw direct weight.");
+            int inDim = checked((int)weight.Ne0);
+            var values = new float[checked((long)rows * inDim)];
+            MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray slice = MlxNative.DirectRawDequantize(weight.Weight, weight.GgmlType, row0, rows, inDim);
+                try
+                {
+                    unsafe
+                    {
+                        fixed (float* destination = values)
+                            MlxNative.CopyArrayToHost(slice, DType.Float32, (IntPtr)destination, values.LongLength * sizeof(float));
+                    }
+                }
+                finally { MlxNative.FreeArray(slice); }
+                return true;
+            });
+            return values;
         }
 
         private static bool RunAddmmQuantizedToFloat32(
@@ -1435,6 +1531,11 @@ namespace TensorSharp.MLX
                     (int)GgmlTensorType.IQ4_XS => CreateIq4XsRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.IQ4_NL => CreateIq4NlRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.MXFP4 => CreateMxfp4Weight(deviceId, hostData, ne0, ne1, rawBytes),
+                    // Only the direct F32 projections reach these (TryAddmmDirectFloat32): no other
+                    // path has kernels for them, and CanPreloadQuantizedType does not list them.
+                    (int)GgmlTensorType.Q2_K => CreateRawKWeight(deviceId, ggmlType, hostData, ne0, ne1, rawBytes, Q2_KBlockBytes, "Q2_K", mode: "q2_k"),
+                    (int)GgmlTensorType.Q3_K => CreateRawKWeight(deviceId, ggmlType, hostData, ne0, ne1, rawBytes, Q3_KBlockBytes, "Q3_K", mode: "q3_k"),
+                    (int)GgmlTensorType.BF16 => CreateRawBf16Weight(deviceId, hostData, ne0, ne1, rawBytes),
                     _ => throw new NotSupportedException($"MLX quantized preload does not support GGML tensor type {(GgmlTensorType)ggmlType}."),
                 };
                 entry.Key = key;
@@ -2013,6 +2114,8 @@ namespace TensorSharp.MLX
                         : ggmlType == (int)GgmlTensorType.IQ3_XXS ? 3
                         : ggmlType == (int)GgmlTensorType.IQ2_XXS ? 2
                         : ggmlType == (int)GgmlTensorType.IQ2_S ? 2
+                        : ggmlType == (int)GgmlTensorType.Q3_K ? 3
+                        : ggmlType == (int)GgmlTensorType.Q2_K ? 2
                         : 5,
                     Mode = mode,
                 };
@@ -2023,6 +2126,32 @@ namespace TensorSharp.MLX
             {
                 MlxNative.FreeArray(rawWeight);
             }
+        }
+
+        /// <summary>A BF16 matrix wrapped in place over its mapped bytes, for the direct F32 path.</summary>
+        private static DeviceWeight CreateRawBf16Weight(int deviceId, IntPtr hostData, long ne0, long ne1, long rawBytes)
+        {
+            if (ne0 <= 0 || ne1 <= 0 || ne0 > int.MaxValue || ne1 > int.MaxValue)
+                throw new NotSupportedException($"BF16 MLX preload requires positive dimensions, got [{ne0}, {ne1}].");
+            long expectedBytes = checked(ne0 * ne1 * sizeof(ushort));
+            if (rawBytes < expectedBytes)
+                throw new ArgumentException($"BF16 raw buffer is too small: expected at least {expectedBytes} bytes, got {rawBytes}.", nameof(rawBytes));
+            if (expectedBytes > int.MaxValue)
+                throw new NotSupportedException($"BF16 raw MLX array exceeds the current Int32 shape limit: {expectedBytes} bytes.");
+            MlxNative.MlxArray rawWeight = default;
+            try
+            {
+                rawWeight = MlxNative.NewArrayFromHostNoCopy(hostData, new[] { (int)expectedBytes }, DType.UInt8);
+                var entry = new DeviceWeight
+                {
+                    Weight = rawWeight, Scales = default, Biases = default, DeviceId = deviceId,
+                    GgmlType = (int)GgmlTensorType.BF16, Ne0 = ne0, Ne1 = ne1, RawBytes = rawBytes,
+                    GroupSize = 1, Bits = 16, Mode = "bf16",
+                };
+                rawWeight = default;
+                return entry;
+            }
+            finally { MlxNative.FreeArray(rawWeight); }
         }
 
         private static unsafe DeviceWeight CreateQ8Weight(int deviceId, IntPtr hostData, long ne0, long ne1, long rawBytes)

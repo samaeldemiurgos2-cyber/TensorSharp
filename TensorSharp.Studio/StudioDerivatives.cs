@@ -11,13 +11,18 @@ public sealed partial class StudioService
     private readonly SemaphoreSlim derivativeGate = new(1, 1);
     private const string DerivativeFormats = "mov,matroska,avi,wav,mp3,flac,ogg,image2,png_pipe,jpeg_pipe,webp_pipe,gif,aiff";
 
-    public async Task<string> GetThumbnailAsync(string projectId, string assetId, CancellationToken ct = default)
+    public Task<string> GetThumbnailAsync(string projectId, string assetId, CancellationToken ct = default) => GetThumbnailAsync(projectId, assetId, false, ct);
+
+    /// <summary>A small JPEG of the asset: a video's opening, or with <paramref name="lastFrame"/> its last frame, the frame
+    /// a chain continues from (a photo is its own last frame).</summary>
+    public async Task<string> GetThumbnailAsync(string projectId, string assetId, bool lastFrame, CancellationToken ct)
     {
         var project = await GetProjectAsync(projectId, ct).ConfigureAwait(false);
         var asset = project.Assets.SingleOrDefault(a => a.Id == assetId) ?? throw new StudioException("asset_not_found", "Asset does not belong to this project.");
         if (asset.Kind == "audio") throw new StudioException("unsupported_thumbnail", "Audio assets have a waveform instead of a thumbnail.");
+        lastFrame &= asset.Kind == "video";
         string source = GetAssetPath(projectId, assetId);
-        string target = DerivativePath(projectId, assetId, ".jpg");
+        string target = DerivativePath(projectId, assetId, lastFrame ? "-end.jpg" : ".jpg");
         if (File.Exists(target)) return target;
         if (!Options.EnableExternalProcesses) throw new StudioException("unsupported_platform", "Thumbnail generation requires a desktop media decoder on this host.");
         await derivativeGate.WaitAsync(ct).ConfigureAwait(false);
@@ -27,10 +32,28 @@ public sealed partial class StudioService
             var temporary = target + "." + StudioJson.NewId() + ".jpg";
             try
             {
-                List<string> args = ["-v", "error", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-format_whitelist", DerivativeFormats];
-                if (asset.Kind == "video") args.AddRange(["-ss", Math.Min(.1, asset.DurationSeconds / 2).ToString("R", CultureInfo.InvariantCulture)]);
-                args.AddRange(["-i", source, "-an", "-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2,setsar=1", "-q:v", "4", temporary]);
-                await StudioMedia.RunAsync(Options.FfmpegPath, args, null, ct, TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+                const string fit = "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2,setsar=1";
+                if (lastFrame)
+                {
+                    // The very frame a chain would continue from: the same decode as taking it, then fitted like any thumbnail.
+                    var scratch = StudioPaths.SafeChild(RootPath, "imports", StudioJson.NewId()); Directory.CreateDirectory(scratch);
+                    try
+                    {
+                        string still;
+                        await frameGate.WaitAsync(ct).ConfigureAwait(false);
+                        try { still = await DecodeFrameAsync(asset, source, StudioFrameSource.LastFrame, project.FrameRate, scratch, ct).ConfigureAwait(false); }
+                        finally { frameGate.Release(); }
+                        await StudioMedia.RunAsync(Options.FfmpegPath, ["-v", "error", "-nostdin", "-y", "-i", still, "-vf", fit, "-q:v", "4", temporary], null, ct, TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+                    }
+                    finally { try { Directory.Delete(scratch, true); } catch (IOException) { } catch (UnauthorizedAccessException) { } }
+                }
+                else
+                {
+                    List<string> args = ["-v", "error", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-format_whitelist", DerivativeFormats];
+                    if (asset.Kind == "video") args.AddRange(["-ss", Math.Min(.1, asset.DurationSeconds / 2).ToString("R", CultureInfo.InvariantCulture)]);
+                    args.AddRange(["-i", source, "-an", "-frames:v", "1", "-vf", fit, "-q:v", "4", temporary]);
+                    await StudioMedia.RunAsync(Options.FfmpegPath, args, null, ct, TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+                }
                 if (!File.Exists(temporary) || new FileInfo(temporary).Length is < 4 or > 1024 * 1024)
                     throw new StudioException("thumbnail_failed", "The media decoder did not produce a bounded thumbnail.");
                 File.Move(temporary, target, true);

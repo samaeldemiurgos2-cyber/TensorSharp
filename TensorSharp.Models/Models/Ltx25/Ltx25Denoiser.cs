@@ -8,6 +8,7 @@ using System.Threading;
 using TensorSharp.Cuda;
 using TensorSharp.MLX;
 using TensorSharp.Models.Direct;
+using TensorSharp.Models.Video;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.Ltx25;
@@ -59,6 +60,8 @@ public sealed class Ltx25Denoiser : IDisposable
     private readonly bool _forceCudaAttention;
     private readonly bool _cudaFusedHeadGates;
     private Ltx25CudaFilePrefault _cudaPrefault;
+    // CUDA weights are uploaded and not released since; the next forward needs no read-ahead.
+    private bool _cudaWeightsUploaded;
     private readonly Dictionary<string, DirectLinear> _linears = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Tensor> _weights = new(StringComparer.Ordinal);
     private readonly object _sync = new();
@@ -549,10 +552,12 @@ public sealed class Ltx25Denoiser : IDisposable
             using var audioContext = _ctx.FromFloats(input.AudioContext, input.AudioContextTokens, Config.AudioContextDim);
             using var vt = PrepareTime(true, input.VideoSigma, input.AudioSigma, input.VideoTimesteps ?? [input.VideoSigma]);
             using var at = PrepareTime(false, input.AudioSigma, input.VideoSigma, input.AudioTimesteps ?? [input.AudioSigma]);
+            using var readAhead = StartUploadReadAhead();
             var rope = PrepareRope(input);
             timing?.Mark("prelude");
             for (int i = 0; i < blocks; ++i)
             {
+                readAhead?.Enter(i + 1);
                 string block = $"transformer_blocks.{i}.";
                 SelfAndText(block, true, video, videoContext, vt, rope.Video);
                 timing?.Mark("video_self_text");
@@ -570,12 +575,49 @@ public sealed class Ltx25Denoiser : IDisposable
             var videoValues = DirectOps.ToArray(videoOutput);
             var audioValues = DirectOps.ToArray(audioOutput);
             timing?.Mark("output_readback");
+            if (readAhead != null)
+            {
+                readAhead.Stop();
+                Console.WriteLine($"  [ltx25] denoiser upload {readAhead.Describe()}");
+            }
+            _cudaWeightsUploaded = _ctx.IsCuda && blocks == Config.Layers;
             if (videoValues.Any(value => !float.IsFinite(value)) || audioValues.Any(value => !float.IsFinite(value)))
                 throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
             var result = new Ltx25DenoiserOutput(videoValues, audioValues, blocks);
             ForwardObserver?.Invoke(input, result);
             return result;
         }
+    }
+
+    // A first CUDA forward uploads every matrix from the mapped checkpoint, each
+    // warmed synchronously by Ltx25CudaFilePrefault with at most 8 MiB in flight.
+    // On a network volume that read ran at ~0.4 GiB/s and made the first stage-1
+    // pass ~40 s of a 46 s denoise; reading ahead in block order with concurrent
+    // readers lets each upload find its pages cached. The file stores tensors
+    // alphabetically (blocks 0, 1, 10, ...), so the plan follows the forward:
+    // the prelude and output tensors first, then one stage per block.
+    private MappedFileReadAhead StartUploadReadAhead()
+    {
+        if (!_ctx.IsCuda || _cudaWeightsUploaded || _file.IsSplit) return null;
+        var stages = new List<(long Offset, long Length)>[Config.Layers + 1];
+        for (int i = 0; i < stages.Length; ++i) stages[i] = new();
+        string blocks = Config.Prefix + "transformer_blocks.";
+        foreach (var (name, info) in _file.Tensors)
+        {
+            if (!name.StartsWith(Config.Prefix, StringComparison.Ordinal) ||
+                name.Contains("_embeddings_connector.", StringComparison.Ordinal)) continue; // the prompt encoder's
+            int stage = 0;
+            if (name.StartsWith(blocks, StringComparison.Ordinal))
+            {
+                int end = name.IndexOf('.', blocks.Length);
+                if (end < 0 || !int.TryParse(name.AsSpan(blocks.Length, end - blocks.Length), out int block) ||
+                    (uint)block >= (uint)Config.Layers) continue;
+                stage = block + 1;
+            }
+            stages[stage].Add((checked(_file.DataOffset + (long)info.Offset), _file.GetTensorByteCount(info)));
+        }
+        return MappedFileReadAhead.TryStart(_file.FilePaths[0], stages.Select(stage => stage.OrderBy(range => range.Offset)),
+            message => Console.WriteLine("  [ltx25] warning: denoiser " + message));
     }
 
     private void Validate(Ltx25DenoiserInput input)
@@ -610,6 +652,7 @@ public sealed class Ltx25Denoiser : IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             _ropeCache?.Dispose(); _ropeCache = null;
+            _cudaWeightsUploaded = false;
             _cudaAttention?.ReleaseWorkspace();
             _cudaProjection?.ReleaseWorkspace();
             _ctx.ReleaseDeviceResidency();

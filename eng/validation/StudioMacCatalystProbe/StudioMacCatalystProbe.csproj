@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-maccatalyst</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <SupportedOSPlatformVersion>17.0</SupportedOSPlatformVersion>
+    <ApplicationId>ai.tensorsharp.validation.studiomac</ApplicationId>
+    <ApplicationTitle>TensorSharp Studio Mac Probe</ApplicationTitle>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    <RuntimeIdentifier>maccatalyst-arm64</RuntimeIdentifier>
+    <CodesignKey>-</CodesignKey>
+    <TrimMode>partial</TrimMode>
+    <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../TensorSharp.Studio/TensorSharp.Studio.csproj" />
+    <TrimmerRootAssembly Include="TensorSharp.Studio" />
+    <!-- Exercise desktop discovery without pulling model weights or native inference into this host check. -->
+    <Compile Include="../../../TensorSharp.Chat/Studio/StudioHostOptions.cs" Link="StudioHostOptions.cs" />
+    <Compile Include="../../../TensorSharp.Models/Media/MediaExecutableLocator.cs" Link="MediaExecutableLocator.cs" />
+  </ItemGroup>
+  <Import Project="../../../TensorAgent/src/TensorAgent.Maui/XcodeVersion.targets" />
+</Project>

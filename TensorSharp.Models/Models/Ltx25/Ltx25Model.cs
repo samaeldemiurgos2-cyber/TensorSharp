@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using TensorSharp.Cuda;
 using TensorSharp.MLX;
@@ -38,6 +39,7 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     private Ltx25VideoVaeEncoder _videoEncoder;
     private Ltx25AudioDecoder _audioDecoder;
     private Ltx25LatentUpsampler _latentUpsampler;
+    private readonly List<MappedFileReadAhead> _companionReads = new();
     public long PromptCacheHits { get; private set; }
     private bool _disposed;
 
@@ -49,6 +51,11 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             if (geometry.VideoDim != 4096 || geometry.AudioDim != 2048 || geometry.Layers != 48 ||
                 geometry.VideoChannels != 128 || geometry.AudioChannels != 128)
                 throw new NotSupportedException("LTX generation requires the authentic 48-layer LTX 2.5 AV checkpoint.");
+            if (IsDevCheckpointName(checkpoint))
+                throw new ModelLoadRefusedException(
+                    $"'{Path.GetFileName(checkpoint)}' is LTX 2.5's dev checkpoint, which is sampled with 30 steps at CFG 3. " +
+                    "TensorSharp runs the distilled recipe (8 + 3 steps at CFG 1) and needs a distilled GGUF, such as " +
+                    "distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf from unsloth/LTX-2.5-GGUF.");
             CheckpointPath = Path.GetFullPath(checkpoint);
             string directory = Path.GetDirectoryName(CheckpointPath);
             TextEncoderPath = Companion(directory, "TS_VIDEO_TEXT_ENCODER", "text_encoders", "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors");
@@ -75,6 +82,23 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     }
 
     internal const string LatentUpscalerFileName = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors";
+
+    /// <summary>
+    /// Whether <paramref name="checkpoint"/> is named as LTX 2.5's dev (full, non-distilled)
+    /// checkpoint: a "dev" word in the file name, as in the publisher's
+    /// ltx-2.5-22b-dev-transformer-bf16 and the ltx-2.5-22b-dev-*.gguf files at the root of
+    /// unsloth/LTX-2.5-GGUF, beside its distilled/ folder. The two checkpoints have the same
+    /// tensors, shapes and embedded config, so the name is all that tells them apart, and the
+    /// distilled recipe this model runs turns the dev weights into noise without an error.
+    /// A name that also says "distill" is the distilled checkpoint whatever else it says.
+    /// </summary>
+    internal static bool IsDevCheckpointName(string checkpoint)
+    {
+        string name = Path.GetFileNameWithoutExtension(checkpoint);
+        return System.Text.RegularExpressions.Regex.IsMatch(name, @"(^|[-_. ])dev([-_. ]|$)",
+                   System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+               && name.IndexOf("distill", StringComparison.OrdinalIgnoreCase) < 0;
+    }
 
     /// <summary>The diffusion VAE when explicitly selected: TS_VIDEO_DIFFUSION_VAE, or
     /// the video VAE itself when that is the diffusion checkpoint. It is never picked up
@@ -164,7 +188,8 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
                     $"connectors={encoder.LastConnectorMilliseconds:F3}ms mlx_bf16={encoder.NativeBf16Projections - mlxBf16} " +
                     $"cuda_mapped={encoder.CudaMappedProjections - cudaMapped} cuda_bf16={encoder.CudaBf16Projections - cudaBf16} " +
                     $"cuda_connector_projections={encoder.CudaConnectorProjections - connectorProjections} " +
-                    $"cuda_connector_attentions={encoder.CudaConnectorAttentions - connectorAttentions}");
+                    $"cuda_connector_attentions={encoder.CudaConnectorAttentions - connectorAttentions}" +
+                    (encoder.LastReadAhead == null ? "" : " " + encoder.LastReadAhead));
             }
             finally { encoder.ReleaseDeviceResidency(); }
         }
@@ -177,6 +202,40 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             _promptOrder.RemoveFirst();
         }
         return encoding;
+    }
+
+    internal enum CompanionFile { Upscaler, VideoDecoder, AudioDecoder }
+
+    /// <summary>Read a companion file a later stage will open into the file cache in the
+    /// background, one stage ahead of its use. Each is otherwise read through page faults
+    /// when its network is first built, which on an A40 pod's network volume was most of
+    /// 4.4 s of audio decode. Not earlier: pages read once are the first a memory-limited
+    /// container evicts, and a prefetch at the first denoise step was gone again by the
+    /// audio decode. Networks this process already holds are skipped.</summary>
+    internal void PrefetchCompanion(CompanionFile companion)
+    {
+        string path = companion switch
+        {
+            CompanionFile.Upscaler when _latentUpsampler == null => LatentUpscalerPath,
+            CompanionFile.VideoDecoder when (UsesDiffusionDecoder ? _diffusionDecoder == null : _videoDecoder == null) =>
+                UsesDiffusionDecoder ? DiffusionVaePath : VideoVaePath,
+            CompanionFile.AudioDecoder when _audioDecoder == null => AudioVaePath,
+            _ => null,
+        };
+        if (path != null && File.Exists(path) && MappedFileReadAhead.TryStart(path, MappedFileReadAhead.WholeFile(path),
+                windowBytes: long.MaxValue) is { } read)
+            _companionReads.Add(read);
+    }
+
+    /// <summary>Stops any companion prefetch and describes what it read, or returns null.</summary>
+    internal string StopCompanionPrefetch()
+    {
+        if (_companionReads.Count == 0) return null;
+        foreach (var read in _companionReads) read.Stop();
+        string description = string.Join(", ", _companionReads.Select(read => read.Describe()));
+        foreach (var read in _companionReads) read.Dispose();
+        _companionReads.Clear();
+        return description;
     }
 
     internal Ltx25SamplingOutput Sample(Ltx25DenoiserInput input, Ltx25GenerationSettings settings, Action<int, int> onStep,

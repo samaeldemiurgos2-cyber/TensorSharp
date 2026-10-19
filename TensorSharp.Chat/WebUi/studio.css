@@ -154,7 +154,8 @@
 .ts-studio .ts-asset-prompt { font-size: 12px; color: var(--studio-muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-top: 2px; }
 .ts-studio .ts-asset-frames { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
 .ts-studio .ts-asset-frames .ts-hint { flex: 1 1 100%; }
-.ts-studio .ts-asset-frames button { flex: 1 1 0; min-width: 0; font-size: 12px; }
+/* Buttons keep their words whole: a third ("As character reference") takes its own row in a narrow card. */
+.ts-studio .ts-asset-frames button { flex: 1 1 auto; min-width: 0; font-size: 12px; }
 .ts-studio .ts-more { border-top: 0; padding-top: 0; margin-top: 6px; }
 .ts-studio .ts-more summary { font-size: 12px; color: var(--studio-muted); margin-bottom: 6px; }
 
@@ -211,6 +212,16 @@
 .ts-studio .ts-guide-row { display: grid; gap: 6px; border: 1px solid var(--studio-border); border-radius: 8px; padding: 8px; }
 .ts-studio .ts-guide-row .ts-slot-pick { min-height: 56px; grid-auto-flow: column; justify-content: start; }
 .ts-studio .ts-guide-thumb { width: 64px; height: 40px; object-fit: cover; border-radius: 4px; }
+.ts-studio .ts-picker-sub { margin: 4px 0 0; font-size: 12px; font-weight: 600; color: var(--studio-muted); }
+.ts-studio .ts-picker-tag { font-size: 10px; color: var(--studio-muted); text-transform: uppercase; letter-spacing: .04em; }
+/* Reference photos beside the frame slots: a short list that keeps the character of a chain. */
+.ts-studio .ts-gen-refs { display: grid; gap: 6px; border-top: 1px solid var(--studio-border); padding-top: 8px; margin-top: 2px; }
+.ts-studio .ts-gen-refs h4 { margin: 0; }
+.ts-studio .ts-ref-list { display: grid; gap: 6px; }
+.ts-studio .ts-ref-list:empty { display: none; }
+.ts-studio .ts-ref-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 1px solid var(--studio-border); border-radius: 8px; padding: 6px; }
+.ts-studio .ts-ref-item .ts-picker-name { white-space: normal; }
+.ts-studio .ts-gen-refs > .ts-slot-pick { min-height: 48px; }
 .ts-studio .ts-gen-other summary { font-size: 13px; }
 .ts-studio .ts-use { border: 0; margin: 0; padding: 0; display: grid; gap: 6px; }
 .ts-studio .ts-use legend { font-size: 12px; color: var(--studio-muted); margin-bottom: 4px; }

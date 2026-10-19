@@ -15,10 +15,10 @@
   "catalog.model.qwenImage21.quantization": "Q4_K_M（DiT）/ Q4_K_M（文本编码器）",
   "catalog.model.qwenImage21.notes": "根据描述生成图片，或编辑附加的照片。需要 24 GB 系统内存（RAM）。",
   "catalog.model.qwenImage21Turbo.parameters": "Qwen-Image-2.1-Turbo DiT + Qwen3-VL-8B 文本编码器",
-  "catalog.model.qwenImage21TurboAdQ4k.quantization": "AD-Q4_K（DiT）/ Q4_K_M（文本编码器）",
-  "catalog.model.qwenImage21TurboAdQ4k.notes": "蒸馏为 8 步（原为 40 步）的 Qwen-Image 2.1：根据描述生成图片，或编辑附加的照片，用时约为原来的五分之一。文本编码器、VAE 和视觉文件与 Qwen-Image 2.1 共用，只需下载一次。只有在此模型上验证过的插件才适用，速度插件均不适用。需要 24 GB 系统内存（RAM）。",
+  "catalog.model.qwenImage21TurboQ5ks.quantization": "Q5_K_S（DiT）/ Q4_K_M（文本编码器）",
+  "catalog.model.qwenImage21TurboQ5ks.notes": "蒸馏为 8 步（原为 40 步）的 Qwen-Image 2.1：根据描述生成图片，或编辑附加的照片，用时约为原来的五分之一。文本编码器、VAE 和视觉文件与 Qwen-Image 2.1 共用，只需下载一次。只有在此模型上验证过的插件才适用，速度插件均不适用。需要 24 GB 系统内存（RAM）。",
   "catalog.model.qwenImage21TurboQ8.quantization": "Q8_0（DiT）/ Q4_K_M（文本编码器）",
-  "catalog.model.qwenImage21TurboQ8.notes": "使用 8 位 Transformer（取代 4 位）的 Qwen-Image 2.1 Turbo。单独测量时，8 位 Transformer 更接近全精度（GGUF 模型卡中相对 BF16 的 LPIPS：0.037，4 位版本为 0.147）；但两个 Turbo 条目使用同一个 4 位文本编码器，按模型卡的测量，它让图片偏离的程度与 4 位 Transformer 相当。文本编码器、VAE 和视觉文件与 Qwen-Image 2.1 共用，只需下载一次。只有在此模型上验证过的插件才适用，速度插件均不适用。需要 32 GB 系统内存（RAM）。",
+  "catalog.model.qwenImage21TurboQ8.notes": "使用 8 位 Transformer（取代 5 位）的 Qwen-Image 2.1 Turbo：最接近全精度（GGUF 模型卡中相对 BF16 的 LPIPS：0.036，5 位版本为 0.103），每步也略快。文本编码器、VAE 和视觉文件与 Qwen-Image 2.1 共用，只需下载一次。只有在此模型上验证过的插件才适用，速度插件均不适用。需要 32 GB 系统内存（RAM）。",
   "catalog.license.qwenImage": "Qwen 研究许可（非商业用途）；文本编码器采用 Apache-2.0",
   "catalog.model.minimaxH3.parameters": "330 亿参数音视频 DiT（裁剪 AdaLN 分支后为 200 亿）+ Qwen3-VL-32B 文本编码器",
   "catalog.model.minimaxH3.quantization": "Q4_K（DiT）/ Q4_K_M（文本编码器）",
@@ -67,6 +67,6 @@
   "catalog.extended.744b40b.parameters": "7440 亿（激活 400 亿）",
   "catalog.extended.384experts.parameters": "MoE，384 个路由专家",
   "catalog.extended.14bExpert.parameters": "每个专家 140 亿",
-  "catalog.model.ltx25.notes": "实验性原生文/图生视频，含48kHz立体声音频。LTX2.5 Distilled使用CFG1：先以一半尺寸运行8步Ancestral Euler，再做2倍潜空间放大和3步精修，支持首尾帧及指定位置和强度的多个图像关键帧。图像引导输出时间线；身份参考及视频/音频适配器需要独立检查点。固定版本文件共44.76GB，下载需要已获批准的Hugging Face访问权限。设备内存档位保守设为48GB；已用短时1024×1024视频验证。",
+  "catalog.model.ltx25.notes": "实验性原生文/图生视频，含48kHz立体声音频。LTX2.5 Distilled使用CFG1：先以一半尺寸运行8步Ancestral Euler，再做2倍潜空间放大和3步精修，支持首尾帧及指定位置和强度的多个图像关键帧。图像引导输出时间线；身份参考及视频/音频适配器需要独立检查点。固定版本文件共43.08GB，来自无访问限制的仓库，无需Hugging Face账号。设备内存档位保守设为48GB；已用短时1024×1024视频验证。",
   "catalog.license.ltx25": "LTX-2.5 和 Gemma 条款"
 }

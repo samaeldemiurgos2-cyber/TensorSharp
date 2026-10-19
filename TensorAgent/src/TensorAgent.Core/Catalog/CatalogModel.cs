@@ -270,8 +270,8 @@ public sealed record CatalogModel
     public bool IsImageGenerator => Family == CatalogFamily.QwenImage;
 
     /// <summary>
-    /// For a Qwen-Image entry, which 2.1 checkpoint its weights are. The GGUFs carry no metadata
-    /// and Turbo has the base checkpoint's tensors, so the entry declares it and
+    /// For a Qwen-Image entry, which 2.1 checkpoint its weights are. The GGUFs name at most their
+    /// architecture and Turbo has the base checkpoint's tensors, so the entry declares it and
     /// <see cref="DiffusionCompanions"/> publishes it to the engine
     /// (<see cref="QwenImageVariantFlag.EnvironmentVariable"/>): the sampling schedule follows the
     /// entry, never the file name. Turbo also decides which LoRA plug-ins the entry takes

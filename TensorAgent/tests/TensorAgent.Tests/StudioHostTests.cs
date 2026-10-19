@@ -184,6 +184,59 @@ public sealed class StudioHostTests : IAsyncLifetime
         Assert.Equal(otherProject.Revision, (await studio.GetProjectAsync(otherProject.Id)).Revision);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ChainsArePlannedEverywhereButFramesAreTakenOnlyWhereAMediaDecoderRuns(bool standaloneServer)
+    {
+        // The TensorAgent app (iOS, Mac Catalyst) runs no media subprocesses: it can plan the next segment of a chain, and
+        // refuses to take a frame or draw a last-frame thumbnail with a reason, in both hosts alike.
+        var project = await studio.CreateProjectAsync("Chain");
+        byte[] bytes = [0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70];
+        var video = new StudioAsset { Name = "Segment 1.mp4", FileName = StudioJson.NewId() + ".mp4", Kind = "video", ContentType = "video/mp4", Width = 64, Height = 64,
+            DurationSeconds = 1, Bytes = bytes.Length, Sha256 = Convert.ToHexStringLower(SHA256.HashData(bytes)) };
+        string projectDirectory = Path.Combine(directory, "studio", "projects", project.Id), documentPath = Path.Combine(projectDirectory, "project.json");
+        var document = JsonNode.Parse(await File.ReadAllTextAsync(documentPath))!;
+        document["project"]!["assets"]!.AsArray().Add(JsonSerializer.SerializeToNode(video, StudioJson.Options));
+        Directory.CreateDirectory(Path.Combine(projectDirectory, "assets"));
+        await File.WriteAllBytesAsync(Path.Combine(projectDirectory, "assets", video.FileName), bytes);
+        await File.WriteAllTextAsync(documentPath, document.ToJsonString());
+        project = await studio.GetProjectAsync(project.Id);
+
+        await using var webHost = standaloneServer ? BuildStudioServer() : null;
+        using var agentHost = standaloneServer ? null : new LoopbackServer();
+        string baseUrl;
+        if (webHost is not null) { await webHost.StartAsync(); baseUrl = webHost.Urls.Single(); }
+        else { agentHost!.MapStudio(studio, directory); agentHost.Start(); baseUrl = agentHost.BaseUrl; }
+        using var client = new HttpClient(new HttpClientHandler { CookieContainer = new CookieContainer() });
+        if (agentHost is not null) await client.GetAsync(agentHost.EntryUrl);
+        client.DefaultRequestHeaders.Add("X-TensorSharp-Studio", "1");
+        string api = baseUrl + "/api/studio";
+        async Task<(HttpStatusCode Status, JsonElement Body)> Post(object request)
+        {
+            using var response = await client.PostAsJsonAsync(api, request);
+            return (response.StatusCode, await response.Content.ReadFromJsonAsync<JsonElement>());
+        }
+
+        var take = await Post(new { action = "assets/extract-frame", payload = new { projectId = project.Id, assetId = video.Id, frame = "last" } });
+        Assert.Equal((HttpStatusCode.BadRequest, "unsupported_platform"), (take.Status, take.Body.GetProperty("code").GetString()));
+        Assert.Contains("FFmpeg", take.Body.GetProperty("error").GetString());
+        var bad = await Post(new { action = "assets/extract-frame", payload = new { projectId = project.Id, assetId = video.Id, frame = "middle" } });
+        Assert.Equal((HttpStatusCode.BadRequest, "invalid_request"), (bad.Status, bad.Body.GetProperty("code").GetString()));
+        using (var thumbnail = await client.GetAsync(api + $"/thumbnail/{project.Id}/{video.Id}?frame=last"))
+            Assert.Equal("unsupported_platform", (await thumbnail.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString());
+        using (var thumbnail = await client.GetAsync(api + $"/thumbnail/{project.Id}/{video.Id}?frame=first"))
+            Assert.Equal((HttpStatusCode.BadRequest, "invalid_request"), (thumbnail.StatusCode, (await thumbnail.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString()));
+        Assert.Equal(project.Revision, (await studio.GetProjectAsync(project.Id)).Revision);
+
+        // Planning the next segment needs no decoder: the frame is taken when the plan starts on a host that has one.
+        var plan = await Post(new { action = "generation-drafts/create", payload = new { projectId = project.Id, expectedRevision = project.Revision, summary = "Segment 2",
+            request = new { prompt = "It goes on", mode = "i2v", width = 64, height = 64 }, firstFrameFrom = new { assetId = video.Id, frame = "last" } } });
+        Assert.Equal(HttpStatusCode.OK, plan.Status);
+        Assert.Equal(video.Id, plan.Body.GetProperty("firstFrameFrom").GetProperty("assetId").GetString());
+        Assert.Equal(project.Revision, (await studio.GetProjectAsync(project.Id)).Revision);
+    }
+
     WebApplication BuildStudioServer()
     {
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { EnvironmentName = "Testing" });
@@ -262,6 +315,62 @@ public sealed class StudioHostTests : IAsyncLifetime
         Assert.Single(plans); Assert.Null(plans[0].JobId); Assert.Empty((await studio.GetProjectAsync(project.Id)).Assets);
         var error = await Assert.ThrowsAsync<StudioException>(() => studio.StartGenerationDraftAsync(project.Id, plans[0].Id, 0, "", CancellationToken.None));
         Assert.Equal("model_required", error.Code);
+    }
+
+    [Fact]
+    public async Task ThePlannerSeesChainsAndPlansTheNextSegmentFromAVideo()
+    {
+        var project = await studio.CreateProjectAsync("Chain plan");
+        byte[] bytes = [0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70];
+        string sha = Convert.ToHexStringLower(SHA256.HashData(bytes));
+        var video = new StudioAsset { Name = "Part 1.mp4", FileName = StudioJson.NewId() + ".mp4", Kind = "video", ContentType = "video/mp4", Width = 64, Height = 64, DurationSeconds = 2, Bytes = bytes.Length, Sha256 = sha };
+        var still = new StudioAsset { Name = "Part 1 · last frame.png", FileName = StudioJson.NewId() + ".png", Kind = "image", ContentType = "image/png", Width = 64, Height = 64, Bytes = bytes.Length, Sha256 = sha,
+            DerivedFrom = new() { AssetId = video.Id, Name = video.Name, Sha256 = sha, Frame = StudioFrameSource.LastFrame, Method = StudioFrameSource.GenerationMethod } };
+        // A take from an untrusted package: its request lacks the reference list and carries a long shot id.
+        var take = new StudioAsset { Name = "Part 2.mp4", FileName = StudioJson.NewId() + ".mp4", Kind = "video", ContentType = "video/mp4", Width = 64, Height = 64, DurationSeconds = 2, Bytes = bytes.Length, Sha256 = sha,
+            Generation = new() { ModelVersion = "m", Request = new() { Prompt = "p", ConditioningAssetId = still.Id, ReferenceAssetIds = null!, ShotId = new string('s', 150), FrameCount = 49, Fps = 24 } } };
+        string documentPath = Path.Combine(directory, "studio", "projects", project.Id, "project.json");
+        var document = JsonNode.Parse(await File.ReadAllTextAsync(documentPath))!;
+        foreach (var asset in new[] { video, still, take }) document["project"]!["assets"]!.AsArray().Add(JsonSerializer.SerializeToNode(asset, StudioJson.Options));
+        await File.WriteAllTextAsync(documentPath, document.ToJsonString());
+        project = await studio.GetProjectAsync(project.Id);
+        using var model = new TextModelService();
+        var scope = StudioChatScope.Create(studio, model, JsonSerializer.SerializeToElement(new { studio = new { projectId = project.Id, expectedRevision = project.Revision } }), directory);
+        SkillToolResult Call(string name, Dictionary<string, object> arguments) =>
+            SkillTools.Execute(new ToolCall { Name = name, Arguments = arguments }, new SkillToolContext(Array.Empty<Skill>()) { Studio = scope });
+
+        var listed = Call("studio_assets", new());
+        Assert.True(listed.Ok, listed.Content);
+        var assets = JsonDocument.Parse(listed.Content).RootElement.GetProperty("assets").EnumerateArray().ToDictionary(a => a.GetProperty("id").GetString()!);
+        Assert.Equal(video.Id, assets[still.Id].GetProperty("derivedFrom").GetProperty("videoAssetId").GetString());
+        Assert.Equal("last", assets[still.Id].GetProperty("derivedFrom").GetProperty("frame").GetString());
+        var summary = assets[take.Id].GetProperty("take");
+        Assert.Equal((still.Id, 0, 49), (summary.GetProperty("firstFrameAssetId").GetString(), summary.GetProperty("referenceCount").GetInt32(), summary.GetProperty("frameCount").GetInt32()));
+        Assert.True(summary.GetProperty("shotId").GetString()!.Length <= 65);
+        Assert.Equal(JsonValueKind.Null, summary.GetProperty("mode").ValueKind); // not inferred from a missing list
+
+        const string request = "{\"prompt\":\"It goes on\",\"mode\":\"i2v\",\"width\":64,\"height\":64}";
+        foreach (var (frame, expected) in new (object?, long)[] { ("last", -1), (JsonSerializer.SerializeToElement(12), 12), ("12", 12), (null, -1), (JsonSerializer.SerializeToElement<object?>(null), -1), ("", -1) })
+        {
+            var arguments = new Dictionary<string, object> { ["summary"] = "Part 2", ["request"] = request, ["continueFromAssetId"] = video.Id };
+            if (frame != null) arguments["continueFromFrame"] = frame;
+            var planned = Call("studio_generate", arguments);
+            Assert.True(planned.Ok, planned.Content);
+            var from = JsonDocument.Parse(planned.Content).RootElement.GetProperty("draft").GetProperty("firstFrameFrom");
+            Assert.Equal((video.Id, expected), (from.GetProperty("assetId").GetString(), from.GetProperty("frame").GetInt64()));
+        }
+        foreach (var arguments in new[]
+        {
+            new Dictionary<string, object> { ["summary"] = "x", ["request"] = request, ["continueFromAssetId"] = video.Id, ["continueFromFrame"] = JsonSerializer.SerializeToElement(1.5) },
+            new Dictionary<string, object> { ["summary"] = "x", ["request"] = request, ["continueFromAssetId"] = video.Id, ["continueFromFrame"] = "-1" },
+            new Dictionary<string, object> { ["summary"] = "x", ["request"] = request, ["continueFromFrame"] = "last" },
+        })
+            Assert.False(Call("studio_generate", arguments).Ok);
+        // Without the arguments (or with them null) a plan is an ordinary one.
+        var plain = Call("studio_generate", new() { ["summary"] = "x", ["request"] = "{\"prompt\":\"A new scene\"}", ["continueFromAssetId"] = JsonSerializer.SerializeToElement<object?>(null) });
+        Assert.True(plain.Ok, plain.Content);
+        Assert.False(JsonDocument.Parse(plain.Content).RootElement.GetProperty("draft").TryGetProperty("firstFrameFrom", out _));
+        Assert.Equal(project.Revision, (await studio.GetProjectAsync(project.Id)).Revision); // planning took no frame
     }
 
     [Fact]

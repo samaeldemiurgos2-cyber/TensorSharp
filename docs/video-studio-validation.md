@@ -312,6 +312,62 @@ node eng/studio/validate_ui_browser.mjs --url http://127.0.0.1:8187 --assistant 
 node eng/studio/validate_ui_browser.mjs --entry "<entryUrl from connection.json>" --screens-only --output artifacts/studio-optional-frames/agent-ui-zh
 ```
 
+### Video chains and character references (2026-10-17)
+
+A long video is made as a chain: a video's last frame (or a timeline clip's out
+point) becomes a still that starts the next segment, generated takes keep their
+exact last frame, and **Add after** places a chained take after the clip it
+continues ([make a long video as a chain](video-studio.md#make-a-long-video-as-a-chain)).
+Reference photos sit beside the frame slots, and `ref` may carry a first frame on a
+checkpoint that advertises `referencesWithFirstFrame`; none installed here does
+([keep a character across segments](video-studio.md#keep-a-character-across-segments)).
+The build is branch `codex/video-studio` at `29d825f7` plus the uncommitted change.
+ggml is upstream `a05c9922613c6a2230dbb1d0de679519ecafb4f0`, working tree
+unchanged; this change adds no ggml patch and no native kernel. Homebrew FFmpeg
+9.0.2, macOS 27.0.1, Apple M5 Pro, .NET SDK 10.0.302.
+
+| Check | Actual result and scope |
+|---|---|
+| Reference behaviour | Read, not run: MiniMax-H3 `d21241f0` model card and prompt guide, sglang `ed40c7fc`, vllm-omni `43e50711`, stable-diffusion.cpp `d637cfb9`, LTX-2 `be6d6d0a`, ComfyUI-LTXVideo workflows (`db476dac`) and the Ingredients card at `12040e40`. FL2VA takes one image as a first frame; MiniMax's pipeline, sd.cpp and vllm-omni refuse keyframes with references (only sglang's "hybrid" merged checkpoints accept them). LTX `ICLoraPipeline` takes images and IC-LoRA references in one stage, but Ingredients was trained with `first_frame_conditioning_p` 0.0 and its official workflow has no first-frame node. |
+| LTX ref + frame-0 guide vs upstream | `eng/validation/generate-ltx25-reference-first-frame-oracle.py` runs the unchanged upstream helpers (`combined_image_conditionings`, `state_with_conditionings`, the noiser, masked Euler) at `be6d6d0a`; the C# composition matches bit for bit at strength 1 and within 2.4e-7 at 0.6 (a float32 `1 - 0.6f` versus Python's double). Synthetic latents; the VAE and the video loader are stubbed. |
+| Shared core tests | `TensorSharp.Studio.Tests`: 168 passed, 0 failed, with real FFmpeg/ffprobe. New: last frames bit-equal (framemd5) to the decoder's last frame for B-frames, a longer soundtrack, VFR frames bunched at the end, a display rotation, one frame, a 10 s clip with a 14 s soundtrack, and 3 s container start offsets in MP4 and Matroska; frame N equal to the timeline renderer's frame at 30000/1001; a still reused, never re-made; take's lossless frame used and kept across restart; a wrong-size kept frame not used; HDR/interlace refusals; non-square pixels widened (720×480 at 32:27 gives 854×480) and 8:1 refused; part N names; ref plus a first frame admitted only with the capability, and refused before the mode check; plans taking their frame only when started, after admission, and a retried start returning its job; a forged source record refused from a package; every clip showing its own first frame on its start frame whether its start time rounds up or down. The VFR and render tests fail with the previous code. |
+| Renderer on older FFmpeg | The overlay window is half a frame either side in exact rational seconds. Against an unmodified FFmpeg 6.1.1 build and 9.0.2, at 24, 25 and 30000/1001 fps with back-to-back clips starting at frames 8, 22, 52 and 121, both give identical, frame-exact output; a frame-number bound would have dropped a clip after its first frame on 6.1. |
+| Adapter, native and host tests | `InferenceWeb.Tests` Studio/LTX/MiniMax-H3/video/Wan/CLI/Web UI/media/LoRA filter: 2,134 passed, 0 failed, 99 skipped (existing CUDA-, fixture- and weight-gated tests, not passes). New: a ref request with a first frame reaches LTX as a frame-0 guide beside the sheet; LTX refuses a timed, last or second guide beside references; the composition pins frame 0 and leaves the reference tail untouched; no checkpoint advertises `referencesWithFirstFrame`, each with its reason, with and without the LTX image transform. |
+| TensorAgent tests | Whole suite: 1,626 passed, 112 skipped, 2 failed. The 2 failures (`ResearchSkillTests`, `MarketDataSkillTests`) are the ones recorded on 2026-10-17 above: they compare skill descriptions under `TensorAgent/skills`, which this change does not touch. New: on a host without media subprocesses both transports refuse taking a frame and a last-frame thumbnail with `unsupported_platform`, and a plan that continues a video is still saved; the planner sees stills' sources and take summaries (null-safe for package metadata) and plans with `continueFromAssetId`/`continueFromFrame` given as text, numbers or null. All eight `studio.json` catalogs have the same 505 keys. |
+| Shared UI tests | `studio-ui.test.mjs`: 101 passed, 24 new (continue actions, the picker's video group, sizes, reference section and its refusals, Add after with frame-rate skips, plans with a pending frame, and a refusal after Generate took that frame shown in the redrawn form). |
+| Code review | Five dimensions, a verifier per dimension: 18 findings confirmed and fixed (among them the FFmpeg 6.1 overlay window, a plan taking its frame before admission, a seek counted from zero on files with a start offset, and a thumbnail fallback that could not run), 7 refuted. A second pass over the fixed code (page and hosts): 12 confirmed and fixed (among them a refusal written to the form Generate had just redrawn, a pending frame sized from the stored rather than the displayed dimensions, a plan's frame taken before its conditioning was resolved, and a pixel-aspect bound that ignored rotation), 2 refuted. |
+| Real chain, Server, MiniMax-H3 FL2VA Q4_K, `ggml_metal`, 640×384×22, 20 steps, seed 42 | Take 1 from `imgs/banner_1.png` (147 s), its last frame taken losslessly (37.4 dB PSNR against the H.264 decode), take 2 from it (147 s, named "… · part 2"). Take 2's frame 0 is 29.3 dB from the still (23.0 dB from take 1's first frame). Rendered with take 2 one frame in: 43 frames; the seam is 29.7 dB against 40.0–41.3 dB between frames inside each take. Before the renderer fix the same timeline showed a black frame at the seam (6.2 dB). A character photo with the frame was refused (`unsupported_conditioning`, the FL2VA reason) before any job. |
+| Real chain, Server, LTX-2.5 Distilled Q4_K_M, `mlx`, 768×448×49 | Take 1 i2v (126 s), lossless last frame 35.6 dB against the decode, take 2 i2v (114 s): frame 0 29.0 dB from the still, seam 29.0 dB against 29.2–31.5 dB inside the takes. A character photo with the frame was refused with the LTX reason. |
+| LTX ref + first frame, 768×448×121 (why Studio does not offer it) | With the composition enabled, take 2 (690 s) started on the frame (27.3 dB) and cut at frame 1 (9.7 dB) to the reference photo laid out as the sheet: a portrait letterboxed on black. Controls: ref without a frame reproduced the same letterboxed sheet (no cut, 41.5 dB between frames 0 and 1); ref plus the frame with a full-width reference again started on the frame (29.2 dB) and cut at frame 1 (9.6 dB) to the reference's composition. |
+| H3 Ref2VA, frame as reference Picture 1 | Take 1 imported (the FL2VA take), its last frame decoded, then ref with [frame, character] and "Picture 1 is the first frame of the shot …" (188 s): the character, outfit and setting carried over, but in a new, closer framing; frame 0 is 10.3 dB from the frame, so the join is a cut. |
+| Browser, Server, H3 (headless Chrome) | `validate_ui_browser.mjs --chain`: take 1 from "As first frame"; **Continue from the last frame** opened Generate on "Last frame of “…”" at 640 × 384 with the description focused; the first-frame picker listed the video with a `?frame=last` thumbnail; a character photo beside the frame showed the FL2VA reason and was refused before any job; take 2 "· part 2"; **Add after** placed it after take 1, one frame in; the two rendered as one preview. A library card's three photo buttons were found wrapping mid-word and fixed. Re-run on the final build, after the second review changed the Generate handler: all 8 steps passed again (take 2 in 2 min 28 s). |
+| Real chain, TensorAgent `AgentAppHost` harness, MiniMax-H3 FL2VA | The same chain through TensorAgent's own Studio routes and loopback host: the same numbers as the Server at the same seed (lossless frame 37.4 dB, frame 0 29.3 dB, seam 29.7 dB, 43 frames), take 2 "· part 2", and the character refused with the FL2VA reason. |
+
+Limits of this evidence:
+- Each case ran once with one seed and short clips (0.9–5 s); H3 recommends 4–15 s.
+  PSNR measures how close frames are, not how a join looks; the seams were also
+  viewed. Motion does not carry across a seam: a single frame has no velocity.
+- No Wan checkpoint exists here: Wan chains have contract tests only.
+- Only Homebrew FFmpeg 9.0.2 ran the full suites; 6.1.1 ran the render window
+  experiment only. Windows and Linux were not run.
+- The TensorAgent Mac (Catalyst) and iOS apps were not run; they disable media
+  subprocesses, so Studio there cannot take frames, generate or export (refusals
+  covered by tests).
+
+Evidence (ignored): `artifacts/studio-chain/` (takes, stills, seam frames, `report.json`
+per run, the browser run's screenshots and the host logs).
+
+```sh
+python3 eng/studio/validate_chain.py --url http://127.0.0.1:8191 --image imgs/banner_1.png \
+  --character face.png --width 640 --height 384 --frames 22 --output artifacts/studio-chain/h3-fl2va
+python3 eng/studio/validate_chain.py --connection artifacts/studio-chain/agent-root/connection.json \
+  --image imgs/banner_1.png --character face.png --width 640 --height 384 --frames 22 --output artifacts/studio-chain/agent-h3-chain
+python3 eng/studio/validate_chain.py --url http://127.0.0.1:8193 --segment1 artifacts/studio-chain/h3-fl2va/segment1.mp4 \
+  --character face.png --frame-as-reference --width 640 --height 384 --frames 22 --output artifacts/studio-chain/h3-ref2va-guided
+node eng/studio/validate_ui_browser.mjs --url http://127.0.0.1:8191 --chain --image imgs/banner_1.png \
+  --character face.png --size 640x384 --output artifacts/studio-chain/ui-h3
+```
+
 ## Feature and platform status
 
 | Capability | Implemented | Validation / limits |
@@ -343,8 +399,8 @@ the loaded checkpoint's capabilities, not just the family name.
 | Family | Exposed Studio operations | Validation in this task |
 |---|---|---|
 | Wan (2.1 / 2.2 variants) | t2v where permitted; i2v for TI2V and I2V-A14B checkpoints; a last frame (alone or with a first) and ref disabled with a reason, and an end image refused by the pipeline rather than dropped; 4n+1 temporal grid, variant sampling defaults | Capability/mode contract tests only; no local Wan checkpoint and no real Wan Studio inference. |
-| MiniMax-H3 partitions | Modes t2v/i2v/fl2v on FL2VA (fl2v with a last frame alone or with a first) and t2v/ref on Ref2VA (up to 9 reference images); the other partition's modes are disabled with a reason; available audio output; 17n+5 frames at 24 fps; with a Turbo plug-in on FL2VA, the plug-in's fixed steps and jobs bound to its sampling recipe | 2026-10-16: real FL2VA t2v/i2v/fl2v through the Server and Ref2VA t2v/ref through the TensorAgent harness on ggml_metal; see the generation modes follow-up. 2026-10-17: Turbo recipe binding by automated tests only; no Turbo take generated. 2026-10-17: last-frame-only FL2VA through the Server and the TensorAgent harness; see the optional frames follow-up. H3 model license has separate territory restrictions; no license changes or downloads authorized. |
-| LTX 2.5 Distilled | Modes t2v/i2v/fl2v/keyframes (fl2v with a last frame alone or with a first); ref (up to 16 images, at least 121 frames, one full-size pass) only with the installed Ingredients LoRA; optional audio output; 8n+1 frames and fixed distilled recipe | Real T2V/audio at 512×512×17 on MLX in both hosts (2026-10-15). 2026-10-16: all five modes through the Server on MLX; see the generation modes follow-up. 2026-10-17: last frame only on MLX; see the optional frames follow-up. |
+| MiniMax-H3 partitions | Modes t2v/i2v/fl2v on FL2VA (fl2v with a last frame alone or with a first) and t2v/ref on Ref2VA (up to 9 reference images); the other partition's modes are disabled with a reason; available audio output; 17n+5 frames at 24 fps; with a Turbo plug-in on FL2VA, the plug-in's fixed steps and jobs bound to its sampling recipe | 2026-10-16: real FL2VA t2v/i2v/fl2v through the Server and Ref2VA t2v/ref through the TensorAgent harness on ggml_metal; see the generation modes follow-up. 2026-10-17: Turbo recipe binding by automated tests only; no Turbo take generated. 2026-10-17: last-frame-only FL2VA through the Server and the TensorAgent harness; see the optional frames follow-up. 2026-10-17: a two-take FL2VA chain through the Server, the browser and the TensorAgent harness, references beside a pinned frame refused on both checkpoints, and Ref2VA with the frame as a reference picture; see the video chains follow-up. H3 model license has separate territory restrictions; no license changes or downloads authorized. |
+| LTX 2.5 Distilled | Modes t2v/i2v/fl2v/keyframes (fl2v with a last frame alone or with a first); ref (up to 16 images, at least 121 frames, one full-size pass) only with the installed Ingredients LoRA; optional audio output; 8n+1 frames and fixed distilled recipe | Real T2V/audio at 512×512×17 on MLX in both hosts (2026-10-15). 2026-10-16: all five modes through the Server on MLX; see the generation modes follow-up. 2026-10-17: last frame only on MLX; see the optional frames follow-up. 2026-10-17: a two-take i2v chain on MLX; Ingredients references beside a pinned first frame composed as upstream but cut to the reference sheet, so not offered; see the video chains follow-up. |
 
 Audio/video reference inputs (H3 Ref2VA clips and soundtracks), arbitrary LoRA selection, native
 retake/extension and masked generative edits are not exposed by this Studio

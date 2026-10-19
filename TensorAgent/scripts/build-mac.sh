@@ -19,9 +19,9 @@ CONFIGURATION="${CONFIGURATION:-Debug}"
 
 export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
 export PATH="${DOTNET_ROOT}:${PATH}"
-# The Mac app never uses MLX. The GGML native build is NOT skipped: the app ships the
-# desktop engine library, and a library older than the native sources beside it fails
-# at its first missing export.
+# The app's LTX executor uses the packaged MLX runtime. Skip duplicate referenced-project
+# builds here; TensorAgentBuildMlxDesktopEngine handles the app's runtime separately.
+# The GGML native build stays enabled so the desktop engine matches its exports.
 export TENSORSHARP_MLX_NATIVE_SKIP=true
 
 echo "==> dotnet $(dotnet --version): building TensorAgent.Maui (${CONFIGURATION}, Mac Catalyst)"

@@ -19,9 +19,10 @@ retake/refinement, specialized control pipelines and multi-GPU remain unsupporte
 
 `config/ltx-2.5-distilled.json` pins five verified files and starts at 1024×1024
 output (512×512 first pass), 17 frames, 24 fps. TensorAgent enables Download/Use for
-`ltx-2.5-distilled-q4km`. The conservative 48 GB catalog tier is not an established
-minimum for arbitrary shapes. Both downloaders support current-host Hugging Face
-credentials for gated official files; tokens never go to mirrors/CDN redirects.
+`ltx-2.5-distilled-q4kxl`, using Unsloth's distilled UD-Q4_K_XL and its ungated,
+byte-identical companion mirrors (43.08 GB total). The conservative 48 GB catalog
+tier is not an established minimum for arbitrary shapes. Optional Ingredients
+and diffusion-decoder downloads still require publisher access.
 The preset/catalog test keeps all five names, URLs and hashes aligned.
 
 Prompt conditioning caches at most four final context pairs. The model retains
@@ -31,6 +32,95 @@ weight caches are retained; prompt connector device weights are released after
 each new prompt. `TrimIdleMemory` releases all retained components. Prompt weights
 stream per projection, and video decoder weights per convolution. Complete-generation memory
 and cache behavior must be measured separately from component measurements.
+
+## Unsloth distilled GGUF validation (2026-10-18)
+
+Generated evidence is under ignored `docs/validation/unsloth-repoint-20261018/`.
+On a 48 GB M5 Pro, the mixed Q2_K/Q3_K/BF16 tensors originally expanded to dense
+F32 on MLX: peak physical footprint was 56.0 GB. TensorSharp-owned Metal kernels
+now dequantize these mapped weights to exact F32 in bounded 64 MiB slices per
+projection. The native dequant tests compare every value with the independent
+CPU implementation and exercise multiple slices and cache eviction/reload.
+
+`Ltx25EndToEndProbe`, 1024×1024×17, seed 42, two-stage 8+3 sampling, two different
+prompts in one process; an eviction was requested before each arm:
+
+| File / code | First / second generation | Peak physical footprint | MLX peak |
+|---|---:|---:|---:|
+| Unsloth UD-Q4_K_XL before the fix | 131.7 / 125.5 s | 56.0 GB | 35.3 GB |
+| Unsloth UD-Q4_K_XL with the fix | 109.7 / 107.1 s | 17.6 GB | 17.8 GB |
+| Previous Abiray Q4_K_M, same fixed code | 115.3 / 115.2 s | 27.0 GB | 22.05 GB |
+
+Both raw RGB arrays and both PCM channels remain bitwise equal across the code
+change for both files. These are one process per arm, with two prompt lifecycles;
+they are not an estimate of statistical variance. The config path was also run
+with the audio VAE missing: it downloaded and hash-verified the ungated mirror.
+The TensorAgent probe hash-verified all five files, activated the real catalog
+entry and generated video/audio through HTTP/SSE and media download routes.
+A 1280×704×121 clip took 513.5 s of generation and 36.2 s of codec work, with a
+20.2 GB MLX peak. This is one long-clip sample.
+
+Dependencies stayed unchanged: TensorSharp ggml `a05c9922613c6a2230dbb1d0de679519ecafb4f0`,
+MLX `1f8e74e3f12f31365464a6867c6579f0e9b29d85`, mlx-c pinned by `MLX_C_VERSION`.
+The newly added kernels live in TensorSharp's C# MLX integration and compile at
+runtime. CUDA was unavailable for this update; existing CUDA skips are not passes.
+Native MAUI controls and iOS were not exercised by the CoreCLR HTTP probes.
+
+Reproduce generation with the existing probe (see build instructions below):
+
+```sh
+MLX_ENABLE_TF32=0 dotnet path/to/Ltx25EndToEndProbe.dll \
+  --model models/ltx25/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf \
+  --backend Mlx --output artifacts/ltx25/unsloth.json \
+  --width 1024 --height 1024 --frames 17 --fps 24 --seed 42 --audio 1
+
+python3 eng/validation/ltx25-compare-native-generations.py \
+  --before artifacts/ltx25/before.json --after artifacts/ltx25/unsloth.json \
+  --output artifacts/ltx25/comparison.json --require-bitwise
+```
+
+The comparison requires matching checkpoint paths, prompts, inputs and settings;
+use the same command for both builds, changing only the output report path.
+
+## Exact weight read-ahead and host overheads (2026-10-17)
+
+Evidence is in ignored `artifacts/perf/local/final-ltx-e2e/`,
+`artifacts/perf/local/ltx-prompt/` and `artifacts/perf/local/ltx-coldwarm/`, and
+in `/workspace/perf/final-ltx/` on the A40 pod. Before every M5 Pro arm, the model
+files were evicted with `eng/validation/file-cache.py evict ...`, which also
+reports cached bytes and measures cold read throughput with `read --readers N`.
+
+**Gates.**
+
+- **M5 Pro:** the HEAD (3f422687) and final `Ltx25EndToEndProbe` builds each
+  ran 1024×1024×17 at seed 42, with a second, uncached prompt in the same
+  process. They were then compared with:
+
+  ```sh
+  python3 eng/validation/ltx25-compare-native-generations.py \
+    --before head.json --after final.json --output compare.json --require-bitwise
+  ```
+
+  Raw RGB and both PCM channels were bitwise-equal in both executions.
+  Generation time went from 168.9 to 108.0 s (new process) and from 142.8 to
+  110.3 s (second prompt).
+- **A40:** frozen base and final CLIs ran in two alternating rounds. The decoded
+  RGB and PCM sha256 were identical in all four runs. Process time went from
+  163.9 / 164.0 s to 74.5 / 71.3 s.
+- **Prompt conditioning:** `Ltx25PromptProbe --device-math-rounds 1,1` kept the
+  video and audio context hashes `da30bda33b2ec0aa` / `8d2832ae6a1f31e9` through
+  every change.
+
+**Tests.** `MappedFileReadAheadTests` covers planned bytes, the stage window, the
+resident skip, stop, release and the switch. The LTX test filters passed on both
+hosts; the M5 Pro skipped the CUDA tests, and the A40 skipped the MLX tests and
+the absent real-adapter, tokenizer and PyAV fixtures.
+
+**Limitations.** This round covered t2v at 1024×1024×17 only. Image guides,
+keyframes, Ingredients, the diffusion video decoder and long clips were not
+re-run. The A40 file cache was uncontrolled; that pod's 50 GB cgroup counts page
+cache, and audio decode there still pays direct reclaim (4–6 s, against 0.6 s on
+the M5 Pro).
 
 ## Complete generation and application probes
 
@@ -42,6 +132,34 @@ hits. `Ltx25TensorAgentProbe` separately activates the real catalog entry throug
 MP4/WAV through the real upload routes, using isolated pinned cache symlinks.
 Fixture download tests exercise all four roles without redownloading 43.77 GB.
 
+`Ltx25TensorAgentProbe --studio true` runs the real Studio HTTP workflow instead
+of the chat/SSE workflow: capability preflight, byte-preserving image import,
+queued native generation, library ingestion, video preview thumbnail, lossless
+last-frame extraction, timeline insertion and captured-revision H.264/AAC export.
+It fully decodes both MP4s, checks frame count and stereo audio geometry, then
+compares export pixels and PCM with the unedited generated clip. For example,
+after publishing the probe, run:
+
+```sh
+MLX_ENABLE_TF32=0 \
+TENSORSHARP_MLX_LIBRARY_DIR="$PWD/TensorSharp.Backends.MLX/Native/dist" \
+dotnet artifacts/ltx25/tensoragent-probe/Ltx25TensorAgentProbe.dll \
+  --assets /absolute/path/to/ltx25 --backend mlx --studio true \
+  --workspace artifacts/ltx25/studio-http \
+  --output artifacts/ltx25/studio-http/report.json \
+  --width 1024 --height 1024 --frames 17 --fps 24 --seed 42
+```
+
+The asset directory uses the model's `text_encoders/`, `vae/` and
+`latent_upscale_models/` layout. Hash verification defaults on. Studio mode runs
+one workflow (`--repeats 1`, `--chat-turn false`); `--image` and `--end-image`
+import real keyframes. `--reference-images` defaults to Ingredients `ref` mode,
+requiring its pinned adapter and defaulting to 768×448×121. Every report describes
+its actual coverage: these HTTP checks exclude native MAUI controls, iOS, CUDA
+when MLX is selected, long clips and subjective perceptual quality. Their timings
+include model hashing, encoding and media ingestion, with uncontrolled file/JIT
+caches, so they are functional evidence rather than matched inference benchmarks.
+
 `ltx25-maui-probe.py` exercises the actual Release Mac Catalyst app: the native
 Models page Use action, its loopback HTTP/SSE route and downloaded MP4/WAV. Launch
 with an isolated `TENSORAGENT_VALIDATION_ROOT` containing the verified cache,
@@ -50,6 +168,29 @@ loopback cookie locally and never exports it. It requires Metal activation, H.26
 video with muxed audio and the original-length 48 kHz stereo WAV. CoreCLR tests
 alone do not cover Apple AOT: MLX native callbacks use static Cdecl entry points
 because runtime-generated delegate trampolines are unavailable there.
+
+For a fresh native download check, start `tensoragent-download-watch.py` with the
+app's private `--connection`, a catalog `--model` ID and a fresh `--output` JSON
+path **before** pressing Download in the native Models page. It records progress
+and hashes completed files. Optional `--reference` directories only reclaim disk
+space after a complete download independently matches a reference's SHA-256;
+they never seed partial files or replace the app's transfer path. The observer
+requires an empty model directory inside an isolated validation root.
+
+`tensoragent-media-chat-probe.py` measures the already activated native app's
+normal chat route with `--family ltx-2.5` or `--family qwen-image`, `--prompt`, a
+fresh `--output` folder and optional `--reference` image. It checks the published
+recipe, retrieves media, and verifies conversation persistence. Native controls,
+visual quality and complete video/audio decoding require separate checks. Keep
+download/build activity out of benchmark samples and retain binary provenance
+for the actual app bundle. Neither observer exports its private loopback cookie.
+
+Mac Catalyst uses the same installed FFmpeg/libx264 transform as the desktop host
+for LTX image/keyframe guides (discovered through `TS_FFMPEG`, PATH or the standard
+Homebrew locations). AVFoundation still exports the generated video and audio.
+An OS H.264 bitrate encoder cannot substitute for this CRF-18 preprocessing step.
+Without libx264 the app keeps temporal guides unavailable; iOS cannot spawn this
+tool and is not covered by the Mac implementation or validation.
 
 The Mac Catalyst app sets `MLX_ENABLE_TF32=0` in both managed and native
 environments at its entry point when the variable is unset. MLX caches this
@@ -391,7 +532,12 @@ tested samples; multiple identity views can preserve the sheet layout.
 
 `generate-ltx25-reference-conditioning-oracle.py` generates an independent
 official fixture for full reference latents, coordinates, masks, noise and
-masked Euler. The synthetic encoder reference supports `--static-frame --shape
+masked Euler. `generate-ltx25-reference-first-frame-oracle.py` adds one frame-0
+image guide (strengths 1.0 and 0.6) on the same geometry, running the original
+`combined_image_conditionings`, then `VideoConditionByReferenceLatent`, through
+`create_noised_state` in ICLoraPipeline's per-stage order; it also checks that
+the reverse order gives a bitwise-identical official state. Its fixture is
+`reference-first-frame-conditioning.json`. The synthetic encoder reference supports `--static-frame --shape
 121 16 32` to verify genuine 121-frame RGB encoding against the original
 temporal network, and the same fixture checks the static specialization.
 Use the encoder probe's `--static 1 --frames 121` with one RGB frame as input
@@ -452,6 +598,9 @@ the warm-up decode, prompt conditioning, denoising, audio and media encoding.
 
 ## Tools
 
+- `file-cache.py report|evict|read` reports a file's cached bytes, drops them
+  (macOS msync invalidate, Linux `POSIX_FADV_DONTNEED`) and measures cold read
+  throughput with N concurrent 8 MiB readers, for cold-arm benchmarks.
 - `ltx25-download-remote.py` resolves pinned official companion metadata using
   local cached Hugging Face authentication. Temporary signed download locations
   travel through SSH stdin; tokens and locations are excluded from argv and

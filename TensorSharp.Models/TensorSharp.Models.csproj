@@ -63,5 +63,10 @@
   <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'ios' Or '$(TargetPlatformIdentifier)' == 'maccatalyst'">
     <Compile Remove="Media/Desktop/**" />
   </ItemGroup>
+  <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'maccatalyst'">
+    <!-- Process-only libx264 transform; no OpenCV/Magick dependencies. iOS cannot
+         spawn this tool and must keep temporal image conditioning unavailable. -->
+    <Compile Include="Media/Desktop/FfmpegImageConditioning.cs" />
+  </ItemGroup>
   <Import Project="../TensorSharp.Cpu.Native/Packaging.targets" />
 </Project>

@@ -283,18 +283,46 @@ Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒
 [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) 是 Qwen 对同一个
 7B Transformer 的加速检查点：蒸馏为 **8 步 Euler、CFG 1**，使用一个固定调度。它的 VAE、
 Qwen3-VL-8B 文本编码器与视觉投影器与上面的 2.1 文件逐字节相同。TensorSharp 运行
-[AtomicChat 的 GGUF](https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF)（修订版本
-`bb25d06`），这些文件不含元数据：
+[Unsloth GGUF](https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF)，
+固定修订为 `5d1f9f759ea877ae556cda88dbec958b62ad3809`：
 
-| 文件 | 大小 | 相对 BF16 的 LPIPS（模型卡） | 用途 |
+| 文件 | 大小 | 相对 BF16 的 LPIPS（发布方） | 用途 |
 |---|---:|---:|---|
-| `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf` | 4,201,694,944 字节 | 0.147 | [`config/qwen-image-2.1-turbo.json`](../../config/qwen-image-2.1-turbo.json) 的快速默认 |
-| `Qwen-Image-2.1-Turbo-Q8_0.gguf` | 7,591,554,784 字节 | 0.037 | 最接近全精度的 Transformer |
+| `qwen-image-2.1-turbo-Q5_K_S.gguf` | 4,501,948,224 字节 | 0.103 | 默认配置与 TensorAgent 24 GB 条目 |
+| `qwen-image-2.1-turbo-Q8_0.gguf` | 7,640,860,480 字节 | 0.036 | 最接近全精度；32 GB 条目 |
 
-模型卡中的其他文件（AD-Q6_K、AD-Q5_K、AD-Q3_K、AD-Q2_K、BF16）张量名相同；这里只运行了上面两个。
-模型卡还测量了文本编码器：Q4_K_M 编码器让图片偏离 BF16 编码器的程度（LPIPS 约 0.17）与
-AD-Q4_K 偏离 BF16 Transformer 的程度相当，Q8_0 编码器为 0.037。配置文件沿用上面 2.1 布局中的 Q4_K_M
-编码器及其发布文件名，因此在同一目录中存放两个模型时只需下载一次。
+Q5_K_S 比模型卡推荐的 Q4_K_M 大 0.3 GB，速度基本相同，在本地四条提示词上均更接近 F16，
+因此设为默认。沿用与基础模型共用的官方 Q4_K_M 文本编码器；与 BF16 编码器进行三条匹配提示词
+比较时，Unsloth 推荐的 UD-Q4_K_XL 编码器未表现出一致优势，还需要额外下载 5 GB。
+
+**2026-10-18 验证：**48 GB M5 Pro、`ggml_metal`、1024×1024、8 步、CFG 1、seed 42。
+固定提示词与伴随文件，交替顺序的两次新进程运行取中位数：
+
+| Transformer | 稳态秒/步 | 进程耗时 | 四条提示词相对 F16 的平均 PSNR |
+|---|---:|---:|---:|
+| Unsloth Q5_K_S | 7.97 | 70.1 秒 | 22.4 dB |
+| Unsloth Q4_K_M | 7.94 | 69.8 秒 | 20.3 dB |
+| Unsloth Q8_0 | 7.69 | 67.7 秒 | 39.4 dB |
+| 旧 AtomicChat AD-Q4_K | 7.93 | 69.9 秒 | 23.8 dB |
+
+质量提示词涵盖霓虹招牌、中文茶馆招牌、渔夫肖像和拉面店。像素相似性也受构图漂移影响，
+这组小样本不能证明通用语义质量排名；重视保真度时应选择 Q8_0。重复运行的 PNG 逐字节相同。
+1248×832 编辑各测两次，Q5_K_S 峰值占用为 14.43 GB，Q8_0 为 15.14 GB。
+配置默认的原生 2048×2048、seed 42 也已跑通，耗时 498.8 秒（其中 VAE 解码 30.0 秒），
+峰值占用 39.9 GB。24/32 GB 目录档位对应上面的 1024 级交互/编辑任务，不保证任意原生分辨率请求。
+Film Stills 与 Grainscape 已在 Q5_K_S 上用 seed 42、7 重测，真实 TensorAgent 目录加载、
+文生图、Casual Phone Photo 与 Voxel Style 编辑、上传及对话保存也通过验证。
+
+Unsloth Q4_K_M 与未修改的 stable-diffusion.cpp `d637cfb` 在文生图上为 53.3–60.7 dB RGBA PSNR，
+1728×608 游艇编辑为 35.2 dB；Q8_0 霓虹图为 54.9 dB。
+文生图 TensorSharp 约 7.93 秒/步，sd.cpp 8.94–8.95 秒/步。
+最终 Q5_K_S 对比的 RGB PSNR 为霓虹图 58.5 dB、游艇编辑 33.0 dB（RGBA 为 59.7/34.3 dB）。
+本轮覆盖一台 Metal 设备，未重测 CUDA、Vulkan、iOS 或任意分辨率。
+生成证据保存在忽略目录 `docs/validation/unsloth-repoint-20261018/`。
+
+TensorAgent 新条目为 `qwen-image-2.1-turbo-q5ks`、`qwen-image-2.1-turbo-q8-0`，
+默认模型缓存中的旧 AtomicChat 条目在启动迁移时保留伴随文件。手动切换 Q8_0 配置时，应先删除缓存中的旧 AtomicChat 文件：
+两者文件名仅大小写不同，而配置加载器会直接复用现有文件，不重新计算哈希。
 
 ```bash
 dotnet run --project TensorSharp.Cli -c Release --no-build -- \
@@ -307,7 +335,7 @@ dotnet run --project TensorSharp.Server.Host -c Release --no-build -- \
 
 ### 声明检查点
 
-Turbo 的张量名与形状与基础检查点相同，GGUF 又没有元数据，文件本身无法区分二者，所以由宿主声明：
+Turbo 的张量名与形状与基础检查点相同，Unsloth GGUF 仅标注架构（`qwen_image`），文件本身无法区分二者，所以由宿主声明：
 
 - CLI 与服务端用 `--qwen-image-variant turbo`（或 `base`），配置文件用
   `"qwen-image-variant": "turbo"`；Turbo 配置文件已经写好。宿主通过 `TS_QWEN_IMAGE_VARIANT`
@@ -362,6 +390,9 @@ schedule.` CLI 与服务端都会拒绝加载（退出码 2），报错还会写
 不带配方的插件可以加载。不带插件配置直接传入的 LoRA `.safetensors` 也没有配方，引擎无法区分加速
 适配器与风格适配器；请传入 `config/lora/` 中的插件。
 
+以下范例与耗时为 2026-10-09/10 的历史 AtomicChat 测量。四个可用风格插件均已在
+Unsloth Q5_K_S 上重测，见上文；Q8 的插件专属输出尚未验证。
+
 已用真实图片在 Turbo 上验证：通过 `config/lora/` 中的插件以强度 0.7 使用 Film Stills 与
 Grainscape，各自与不加插件的同一提示词、同一种子对比，种子为 42 和 7（1024×1024、AD-Q4_K；
 [`qwen-image21-turbo.py`](../../eng/validation/qwen-image21-turbo.py) 的 `--suite style` 可复现，
@@ -401,7 +432,7 @@ Voxel Style 只在编辑附加照片时应用。不要在官方 Turbo 上叠加 
 等另带采样配方的加速适配器。候选模型的筛选依据与质量限制见
 [英文来源审查](qwenimage21.md#additional-adapters-reviewed-on-2026-10-10)。
 
-### 与 stable-diffusion.cpp 的一致性
+### 历史 AtomicChat 与 stable-diffusion.cpp 的一致性
 
 2026-10-09 在 Apple M5 Pro（48 GB，`ggml_metal`）上对比 TensorSharp 与 stable-diffusion.cpp
 `f89d9b1`（当天的 master，包含修正自定义 sigma 的 `c150a6b`；以 Metal 和它自带的 ggml 子模块
@@ -432,7 +463,7 @@ GGUF、Q4_K_M 文本编码器、BF16 VAE 与 F16 mmproj，同样的提示词、�
 
 模型卡的示例图使用 `--rng cpu` 与 BF16 文本编码器，无法在这里逐像素复现；上面的对比以 sd.cpp 本身为参考。
 
-### 性能
+### 历史 AtomicChat 性能（2026-10-09）
 
 Apple M5 Pro（48 GB），`ggml_metal`，1024×1024，霓虹灯招牌提示词，种子 42，Q4_K_M 文本编码器。
 每种配置在两个全新进程中各运行一次，按 A-B-C-D-D-C-B-A 顺序、每次间隔 20 秒，表中为中位数（同一配置

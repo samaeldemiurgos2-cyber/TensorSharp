@@ -4,7 +4,7 @@
 
 TensorSharp implements native text-to-video and image-conditioned video with jointly
 generated 48 kHz stereo audio for the LTX 2.5 Distilled checkpoint. The experimental TensorAgent entry is
-**LTX 2.5 Distilled — Q4_K_M + BF16**; Download installs all five pinned files,
+**LTX 2.5 Distilled — UD-Q4_K_XL + BF16**; Download installs all five pinned files,
 and Use activates the video model.
 
 ## Files and startup
@@ -12,11 +12,18 @@ and Use activates the video model.
 [`config/ltx-2.5-distilled.json`](../../config/ltx-2.5-distilled.json) pins the
 denoiser, dedicated Gemma 4 text encoder/projections, convolutional video VAE,
 x2 spatial latent upscaler and audio VAE by commit and SHA-256. They total
-44,764,412,884 bytes. The official
-companions require approved access to the publisher's Hugging Face repository.
-Set `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, or use the Hugging Face CLI token cache.
-Credentials are attached only to HTTPS `huggingface.co` requests, and are stripped
-from redirected CDN requests.
+43,077,008,276 bytes (43.08 GB), all from the ungated
+[Unsloth repository](https://huggingface.co/unsloth/LTX-2.5-GGUF), revision
+`ac3c540c6025903784336e99b2dc179385c4c3b7`. No Hugging Face account is needed.
+The companions are byte-identical to the Lightricks files; the config also lists
+their gated originals as fallback URLs.
+
+Use `distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf`, installed directly in
+`ltx25/` beside its companion folders. The repository root holds the **dev**
+checkpoint, which needs a different sampler recipe (30 steps, CFG 3).
+TensorSharp refuses dev-named files; renaming one does not turn it into a distilled model.
+TensorAgent's current id is `ltx-2.5-distilled-q4kxl`. For the default model cache, launch migration preserves
+the previous entry's complete companions and user-added adapter folders.
 
 The config resolves files under `${TENSORSHARP_MODELS:-../models}/ltx25`.
 Manual installations can instead set `TS_VIDEO_TEXT_ENCODER`, `TS_VIDEO_VAE`,
@@ -40,6 +47,24 @@ CPU implementation; GPU generation measurements do not establish CPU throughput.
 Vulkan and multi-GPU execution are unsupported. Desktop MP4 audio requires
 FFmpeg on `PATH` or `TS_FFMPEG`; the CLI also writes the original PCM as a WAV.
 The Mac app encodes audio/video through AVFoundation.
+
+## Measured Unsloth preset (2026-10-18)
+
+On a 48 GB M5 Pro, MLX with `MLX_ENABLE_TF32=0`, two-stage 1024×1024×17,
+seed 42, the new UD-Q4_K_XL took 109.7 / 107.1 seconds for two different prompts
+in one process, versus 115.3 / 115.2 seconds with the previous Abiray file.
+Peak process footprint was 17.6 GB versus 27.0 GB. The mixed Q2_K/Q3_K/BF16
+weights stay mapped and dequantize to F32 per projection; expanding them all at
+load had caused a 56 GB footprint. This fix preserves every raw video and audio bit.
+
+Against Unsloth Q8_0 as a higher-precision reference, the fox/lighthouse samples
+scored 26.6/30.8 dB PSNR, versus 25.1/23.0 dB with the previous quantization.
+These two samples support this preset choice, not a universal quality ranking.
+A 1280×704×121 sample completed in 513.5 seconds plus 36.2 seconds of encoding,
+with a 20.2 GB MLX allocation peak. CLI config downloads and the real TensorAgent
+HTTP/SSE generation and media download paths were exercised. CUDA, iOS and the
+native MAUI controls were not revalidated in this update. See the
+[validation tools and limits](../../eng/validation/README-ltx25.md#unsloth-distilled-gguf-validation-2026-10-18).
 
 ## Generation recipe and limits
 
@@ -94,6 +119,24 @@ and uses up to eight concurrent 1 MiB reads. This reduces
 small page faults on network-backed model storage without loading the complete
 checkpoint into host memory. `TS_LTX25_CUDA_PREFAULT=0` disables these reads.
 `TS_LTX25_CUDA_PREFAULT_WORKERS=1` selects sequential reads.
+
+Every backend also reads weights ahead of their use, in the order the layers run,
+within a 4 GiB window: the Gemma encoder, the prompt connectors and the first
+CUDA denoiser upload. The upscaler, video decoder and audio VAE are read one
+stage before their first use. Safetensors and GGUF files store tensors
+alphabetically (layers 0, 1, 10, …). Without the read-ahead, a cold mapping
+faults pages in at 0.9 GiB/s on an M5 Pro SSD, against 12 GiB/s for one
+sequential reader. On an A40 pod's network volume it reaches 0.3 GiB/s,
+against 2.3 GiB/s for sixteen concurrent readers. Chunks already in the file
+cache are skipped.
+
+When RAM, or the container's memory limit, is below the text encoder plus the
+denoiser plus 16 GiB, the encoder's cached pages are released after each new
+prompt, so they do not compete with the denoiser. A later new prompt reads them
+again. `TS_VIDEO_READAHEAD=0` disables both the read-ahead and the release.
+`TS_VIDEO_READAHEAD_WORKERS` (1–32) sets the readers: 16 on Linux, 1 elsewhere.
+The conditioning log line reports the bytes read, the bytes already resident
+and whether the cache is released.
 CUDA self-attention tiles queries and heads within a 256 MiB score workspace,
 including the 10,752-token Ingredients recipe. Each query attends to the complete
 key sequence with pedantic Float32 GEMM; independent large-sequence numerical
@@ -185,7 +228,8 @@ equality between Studio and chat is a separate check from anatomy quality.
 Remaining differences from the publisher's default ComfyUI workflow: TensorSharp
 decodes with the convolutional VAE by default (the diffusion decoder is opt-in),
 passes the prompt through without the optional image-aware enhancer, and the
-preset denoiser is a third-party Q4_K_M quantization. The new shorthand image
+preset denoiser is Unsloth's mixed UD-Q4_K_XL quantization (the earlier captures
+below used Abiray Q4_K_M). The new shorthand image
 strengths match the [official ComfyUI image-to-video example](https://docs.ltx.io/open-source-model/usage-guides/image-to-video);
 the other differences remain comparison dimensions, not proven fixes for extra
 fingers. The GGUF publisher's own ComfyUI workflow uses the same model file.
@@ -252,7 +296,7 @@ The model API offers the following inputs:
 | --- | --- |
 | `Image`, `ImageBytes`, `ImagePath` | First frame; decoded image takes precedence over bytes, then path. |
 | `EndImage`, `EndImagePath` | Last output frame. |
-| `ReferenceImagePaths` | Ordered, evenly spaced keyframes by default; identity sheet panels in `Mode = "ref"`. Cannot be combined with the other image inputs. |
+| `ReferenceImagePaths` | Ordered, evenly spaced keyframes by default; identity sheet panels in `Mode = "ref"`. Cannot be combined with the other image inputs, except one frame-0 `ImageConditions` guide in `Mode = "ref"` ([starting on a first frame](#starting-on-a-first-frame)). |
 | `ImageConditions` | `VideoImageCondition` entries with an image, `FrameIndex`, and `Strength`. `-1` selects the last frame. |
 
 ```csharp
@@ -375,6 +419,54 @@ generated keyframe workflows also remain unsupported. See the official
 [conditioning documentation](https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/docs/conditioning.md)
 for these distinctions.
 
+### Starting on a first frame
+
+An Ingredients request can also start on a pinned frame: the composition the
+publisher's IC-LoRA pipeline runs when it is given images and reference
+conditioning together. Video Studio does **not** offer it (see the validation
+result below and [Keep a character across segments](../video-studio.md#keep-a-character-across-segments));
+it is reachable through the video API. Add one `ImageConditions` entry at
+`FrameIndex = 0`. In `Mode = "ref"`, `Image`
+and `ImagePath` remain a single identity image, not a frame.
+
+```csharp
+var request = new VideoGenerationParams
+{
+    Mode = "ref", Width = 768, Height = 448, Frames = 121, Fps = 24, Seed = 42,
+    ReferenceImagePaths = new[] { "character.png" },
+    ImageConditions = new[]
+    {
+        new VideoImageCondition { ImagePath = "previous-last-frame.png", FrameIndex = 0, Strength = 1 },
+    },
+};
+```
+
+The recipe stays one full-size pass. The guide goes through the same CRF 18
+preprocessing as the other image guides, so it needs FFmpeg with libx264, and is
+encoded once at the output size. It is pinned at its strength: canvas latent
+frame 0 takes the clean guide latent with denoise mask 1 − strength, adding no
+tokens. The reference sheet's tokens are appended after the canvas as before.
+Because the guide and the references occupy disjoint tokens, applying the guide
+after the references equals upstream's images-then-references order. The
+upstream equivalent is
+`ICLoraPipeline(stages=(ICLoraStageConfig(1, True, DISTILLED_SIGMA_VALUES),))(images=[(frame, 0, 1.0)], video_conditioning=[(sheet, 1.0)])`.
+At most one guide is accepted, and only at frame 0. A last-frame image or timed
+guides beside references are refused: no publisher workflow uses them. The
+denoise log line reports the guide (`first-frame guide strength: frame 0=1`).
+The composition matches the unchanged upstream functions bit for bit at strength 1
+(`FrameZeroGuideBesideReferenceVideoMatchesUnchangedOfficialImagesThenReferences`,
+fixture from `eng/validation/generate-ltx25-reference-first-frame-oracle.py`).
+
+The publisher trained Ingredients with `first_frame_conditioning_p` 0.0, so the
+adapter never saw a pinned first frame in training, and the publisher has not
+validated this use. On 2026-10-17 (Q4_K_M, MLX, 768×448×121, seed 42) every take
+that started on a frame cut away from it at its second frame: frame 0 matched the
+pinned frame (27–29 dB PSNR), frame 1 was 9.6–9.7 dB from frame 0 and showed the
+reference sheet's composition, with a portrait reference letterboxed on the sheet
+and with a full-width one alike. A plain Ingredients take with the portrait
+reference reproduced the letterboxed sheet too. See the
+[validation record](../video-studio-validation.md#video-chains-and-character-references-2026-10-17).
+
 ## Native graph and memory
 
 [`Ltx25PromptEncoder`](../../TensorSharp.Models/Models/Ltx25/Ltx25PromptEncoder.cs)
@@ -408,7 +500,44 @@ while keeping subsequent uncached prompts bounded.
 
 ### Latest exact performance work
 
-Current source runs Gemma prompt BF16 rounding and split-half RoPE on CUDA/MLX
+The 2026-10-17 work removed weight loading and host overheads from the default
+1024×1024×17 recipe (seed 42). Every output is unchanged. The M5 Pro rows use
+the end-to-end probe, comparing raw Float32 RGB and both PCM channels with
+`ltx25-compare-native-generations.py --require-bitwise`. The A40 rows use
+complete CLI processes in two alternating rounds; their decoded RGB and PCM
+were identical in all four runs. Model files started cold on the M5 Pro and
+were uncontrolled on the A40.
+
+| Host / backend | Before | After | Output |
+|---|---:|---:|---|
+| M5 Pro `mlx`, new process | 168.9 s | 108.0 s | Bitwise RGB and PCM |
+| M5 Pro `mlx`, a second, uncached prompt in the same process | 142.8 s | 110.3 s | Bitwise RGB and PCM |
+| A40 `ggml_cuda` (direct CUDA), CLI process | 163.9 s | 72.9 s | Identical decoded RGB and PCM |
+
+The changes:
+
+- **Read-ahead in compute order** (see [Video decoders](#video-decoders) and
+  the weight-reading paragraph above). On the M5 Pro, text-encode went from
+  42.3 to 5.5 s in a new process and from 30.6 to 5.2 s for a second prompt.
+  On the A40 pod's network volume it went from 61.7–65.2 to 13.0–13.5 s. The
+  A40's first-pass denoise, which includes the first denoiser upload, went from
+  39–44 to 15–19 s.
+- **Prompt connectors.** RoPE tables are now computed once with the same
+  expressions, and the connector weights are read ahead in layer order. On the
+  A40 the connectors went from 12.3 to 1.8 s.
+- **Video VAE and upsampler weights.** Weights are widened across cores, and
+  CUDA host buffers are written without first reading back their never-written
+  device copy. On the A40, upsampling went from 9.0–11.6 to 2.5 s and video
+  decoding from 12.7–15.4 to 6.9 s; on the M5 Pro, upsampling went from 2.3 to
+  0.5 s.
+- **Gemma cache release.** On a 48 GB Mac, releasing Gemma's cached pages
+  after each new prompt keeps 22 GiB of stale pages from slowing the first
+  1024×1024 denoise step. Together with the read-ahead, the M5 Pro's first-pass
+  denoise in a new process went from 64.8 to 43.5 s.
+- **Weight-widening loops.** These now compile straight to optimized code and
+  use block copies.
+
+The previous exact performance work: current source runs Gemma prompt BF16 rounding and split-half RoPE on CUDA/MLX
 devices while retaining the original host-computed trigonometric values and
 arithmetic order. `TS_LTX25_DEVICE_PROMPT_MATH=0` selects the host control.
 CUDA also fuses the existing per-head `2 * sigmoid(logit)` gating without

@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Threading;
 using TensorSharp.Cuda;
 using TensorSharp.Models.Direct;
+using TensorSharp.Models.Video;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.Ltx25;
@@ -24,11 +25,20 @@ public sealed class Ltx25PromptEncoder : IDisposable
     private readonly Configuration _config;
     private readonly bool _cudaBf16Supported;
     private readonly Ltx25CudaFilePrefault _cudaPrefault;
+    private MappedFileReadAhead _readAhead;
+    private bool _readAheadWarned;
+    private readonly bool _releaseTextCache;
+    // Dropping 22 GiB of cached pages took 1.5 s on an A40 pod's network volume; it
+    // runs beside the denoiser and the next encode waits for it before reading again.
+    private System.Threading.Tasks.Task _pendingRelease;
+    private readonly string _releasePolicy;
     private bool _disposed;
     public Ltx25PromptTokenizer Tokenizer { get; }
     public double LastGemmaMilliseconds { get; private set; }
     public double LastAggregationMilliseconds { get; private set; }
     public double LastConnectorMilliseconds { get; private set; }
+    /// <summary>The last encode's weight read-ahead (and whether its cache is being released), or null when none ran.</summary>
+    public string LastReadAhead { get; private set; }
     public long NativeBf16Projections { get; private set; }
     public long CudaMappedProjections { get; private set; }
     public long CudaBf16Projections { get; private set; }
@@ -68,6 +78,17 @@ public sealed class Ltx25PromptEncoder : IDisposable
                 CudaDevice.GetDevice(cuda.DeviceId).ComputeCapabilityMajor >= 8;
             if (_context.IsCuda && Environment.GetEnvironmentVariable("TS_LTX25_CUDA_PREFAULT") != "0")
                 _cudaPrefault = new(_file);
+            // A text-encoder file cache left behind after encoding competes with the
+            // denoiser: 22 GiB of stale Gemma pages added ~10 s to the first 1024x1024
+            // denoise step on a 48 GiB M5 Pro, and in a memory-limited container they
+            // evict the denoiser file the upload is about to read. Release it when the
+            // machine (or container) cannot also hold the denoiser file with headroom;
+            // the read-ahead makes a later re-read cheap.
+            long physical = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            long needed = checked(new FileInfo(checkpoint).Length + new FileInfo(denoiserPath).Length + (16L << 30));
+            _releaseTextCache = physical > 0 && physical < needed;
+            _releasePolicy = $"{physical / (double)(1L << 30):F0} GiB RAM < {needed / (double)(1L << 30):F0} GiB " +
+                "(text encoder + denoiser + 16 GiB headroom)";
             _video = new(denoiserPath, allocator, "video_embeddings_connector");
             _audio = new(denoiserPath, allocator, "audio_embeddings_connector");
             ValidateProjection("video", _video.Dimension);
@@ -87,9 +108,66 @@ public sealed class Ltx25PromptEncoder : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         int[] ids = Tokenizer.Encode(prompt);
+        _pendingRelease?.Wait();
+        _pendingRelease = null;
+        var readAhead = StartReadAhead();
+        _readAhead = readAhead;
+        try { return Encode(ids, cancellationToken); }
+        finally
+        {
+            _readAhead = null;
+            LastReadAhead = null;
+            if (readAhead != null)
+            {
+                readAhead.Stop();
+                LastReadAhead = readAhead.Describe();
+                if (_releaseTextCache)
+                {
+                    LastReadAhead += $" releasing in the background ({_releasePolicy})";
+                    _pendingRelease = System.Threading.Tasks.Task.Run(() => { try { readAhead.ReleaseCache(); } finally { readAhead.Dispose(); } });
+                }
+                else readAhead.Dispose();
+            }
+        }
+    }
+
+    // MLX and CPU read the mapped weights directly, so a cold checkpoint is
+    // otherwise read through page faults: 24 s of a 28 s first encode on an M5 Pro.
+    // CUDA warms each matrix before its upload (Ltx25CudaFilePrefault), one matrix
+    // at a time; reading ahead with concurrent readers lets that warm find the
+    // pages already cached.
+    private MappedFileReadAhead StartReadAhead()
+    {
+        var stages = new List<(long Offset, long Length)>[_config.Layers + 1];
+        for (int i = 0; i < stages.Length; ++i) stages[i] = new();
+        const string layers = "model.layers.";
+        foreach (var info in _file.Tensors.Values)
+        {
+            int stage;
+            if (info.Name.StartsWith(layers, StringComparison.Ordinal))
+            {
+                int end = info.Name.IndexOf('.', layers.Length);
+                if (end < 0 || !int.TryParse(info.Name.AsSpan(layers.Length, end - layers.Length), out stage) ||
+                    (uint)stage >= (uint)_config.Layers) continue;
+            }
+            else if (info.Name == "model.norm.weight" || info.Name.StartsWith("text_embedding_projection.", StringComparison.Ordinal))
+                stage = _config.Layers;
+            else continue; // the token table is read row by row; vision and audio towers are unused
+            stages[stage].Add((checked(_file.DataOffset + info.Begin), info.ByteCount));
+        }
+        return MappedFileReadAhead.TryStart(_file.Path, stages.Select(stage => stage.OrderBy(range => range.Offset)), message =>
+        {
+            if (!_readAheadWarned) Console.WriteLine("  [ltx25] warning: text-encoder " + message);
+            _readAheadWarned = true;
+        });
+    }
+
+    private Ltx25PromptEncoding Encode(int[] ids, CancellationToken cancellationToken)
+    {
         var timer = Stopwatch.StartNew();
         var states = EncodeHiddenStates(ids, cancellationToken);
         LastGemmaMilliseconds = timer.Elapsed.TotalMilliseconds; timer.Restart();
+        _readAhead?.Enter(_config.Layers);
         using var features = _context.FromFloats(Features(states, ids.Length), ids.Length,
             checked(_config.Hidden * (_config.Layers + 1)));
         float[] video = Aggregate(features, _video.Dimension, "video", cancellationToken);
@@ -132,6 +210,7 @@ public sealed class Ltx25PromptEncoder : IDisposable
             for (int layer = 0; layer < _config.Layers; ++layer)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                _readAhead?.Enter(layer);
                 var next = Layer(x, mask, layer, 1024 - count, cancellationToken);
                 x.Dispose(); x = next;
                 if (layer + 1 < _config.Layers) states[layer + 1] = x.GetElementsAsFloat(checked((int)x.ElementCount()));
@@ -243,7 +322,7 @@ public sealed class Ltx25PromptEncoder : IDisposable
     }
 
     public void ReleaseDeviceResidency() { ObjectDisposedException.ThrowIf(_disposed, this); _video.ReleaseDeviceResidency(); _audio.ReleaseDeviceResidency(); }
-    public void Dispose() { if (_disposed) return; _disposed = true; _audio.Dispose(); _video.Dispose(); _cudaPrefault?.Dispose(); _context.Dispose(); _file.Dispose(); }
+    public void Dispose() { if (_disposed) return; _disposed = true; _pendingRelease?.Wait(); _audio.Dispose(); _video.Dispose(); _cudaPrefault?.Dispose(); _context.Dispose(); _file.Dispose(); }
 
     private sealed record Configuration(int Hidden, int Layers, int Heads, int Kv, int GlobalKv, int Head,
         int GlobalHead, float Epsilon, string[] Types, float Theta, float GlobalTheta, float Partial)

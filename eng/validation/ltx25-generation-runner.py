@@ -55,7 +55,7 @@ def file_cache(paths):
 def model_paths(command):
     paths = {Path(item).resolve() for item in command if item.endswith((".gguf", ".safetensors")) and Path(item).is_file()}
     for model in list(paths):
-        if model.suffix == ".gguf" and "LTX" in model.name:
+        if model.suffix == ".gguf" and "ltx" in model.name.lower():
             root = model.parent
             paths.update([root / "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
                           root / "vae/ltx-2.5-video-vae-conv-bf16.safetensors", root / "vae/ltx-2.5-audio-vae-bf16.safetensors"])

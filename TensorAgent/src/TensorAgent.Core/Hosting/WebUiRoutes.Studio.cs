@@ -58,7 +58,7 @@ public static partial class WebUiRoutes
         });
         server.MapGet("/api/studio/thumbnail/{projectId}/{assetId}", async (request, ct) =>
         {
-            try { return LoopbackResponse.File(await service.GetThumbnailAsync(request.RouteValues["projectId"], request.RouteValues["assetId"], ct), "image/jpeg"); }
+            try { return LoopbackResponse.File(await service.GetThumbnailAsync(request.RouteValues["projectId"], request.RouteValues["assetId"], StudioHostBoundary.ThumbnailOfLastFrame(request.Query("frame") ?? ""), ct), "image/jpeg"); }
             catch (Exception e) when (e is not OperationCanceledException) { return StudioError(e); }
         });
         server.MapGet("/api/studio/waveform/{projectId}/{assetId}", async (request, ct) =>

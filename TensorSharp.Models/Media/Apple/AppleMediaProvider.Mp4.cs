@@ -16,6 +16,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using AVFoundation;
 using CoreMedia;
 using CoreVideo;
@@ -151,6 +152,7 @@ public sealed partial class AppleMediaProvider
         // Built outside the try so the finally can always reach them.
         AVAssetWriterInput? audioInput = null;
         AVAudioFormat? pcm = null;
+        Task? audioTask = null;
         try
         {
             // The index ('moov') goes at the front of the file instead of after the media, so
@@ -227,17 +229,38 @@ public sealed partial class AppleMediaProvider
             }
             writer.StartSessionAtSourceTime(CMTime.Zero);
 
-            long audioWritten = 0;
+            if (audioInput != null && audio != null && pcm is not null)
+            {
+                // Each input must keep draining independently. Even alternating one frame
+                // with its audio can deadlock: AVFoundation may stop accepting audio while
+                // it needs more video, or need the audio input marked finished before it
+                // will accept the last video frames of a longer clip.
+                audioTask = Task.Run(() =>
+                {
+                    try
+                    {
+                        long written = 0;
+                        while (written < audio.SampleCount)
+                            written = AppendAudio(audioInput, writer, pcm, audio, written,
+                                Math.Min(audio.SampleCount, written + 4096));
+                        audioInput.MarkAsFinished();
+                    }
+                    catch
+                    {
+                        // Release a video thread waiting on this input before it observes
+                        // the task's exception. The caller joins this task before disposal.
+                        if (writer.Status == AVAssetWriterStatus.Writing)
+                            writer.CancelWriting();
+                        throw;
+                    }
+                });
+            }
+
             for (int i = 0; i < frames.Length; i++)
             {
-                // Interleaved as it plays: the sound up to the end of this frame, then the
-                // frame. Offline, the writer holds back whichever input runs too far ahead
-                // of the other, so appending all of one track first would stall it.
-                if (audioInput != null && audio != null && pcm != null)
-                {
-                    long until = Math.Min(audio.SampleCount, (long)Math.Round((i + 1) * (double)audio.SampleRate / fps));
-                    audioWritten = AppendAudio(audioInput, writer, pcm, audio, audioWritten, until);
-                }
+                // Preserve the audio error when its input has failed before this frame.
+                if (audioTask?.IsFaulted == true)
+                    audioTask.GetAwaiter().GetResult();
                 WaitForInput(input, writer, $"frame {i}");
 
                 // A fresh buffer per frame: the adaptor hands it to VideoToolbox and may still
@@ -250,12 +273,8 @@ public sealed partial class AppleMediaProvider
                 }
             }
 
-            if (audioInput != null && audio != null && pcm != null)
-            {
-                AppendAudio(audioInput, writer, pcm, audio, audioWritten, audio.SampleCount);
-                audioInput.MarkAsFinished();
-            }
             input.MarkAsFinished();
+            audioTask?.GetAwaiter().GetResult();
             writer.EndSessionAtSourceTime(new CMTime(frames.Length, fps));
             FinishWriting(writer, path);
             return "h264";
@@ -264,6 +283,9 @@ public sealed partial class AppleMediaProvider
         {
             if (writer.Status == AVAssetWriterStatus.Writing)
                 writer.CancelWriting();
+            // Cancellation makes the audio input stop waiting. Join before disposing the
+            // shared writer/format; keep the original failure if both inputs failed.
+            try { audioTask?.GetAwaiter().GetResult(); } catch { }
             // A half-written file plays as nothing; do not leave one behind pretending to be output.
             try { if (File.Exists(path)) File.Delete(path); } catch { /* best effort */ }
             throw;
@@ -341,9 +363,12 @@ public sealed partial class AppleMediaProvider
     /// </summary>
     private static void FinishWriting(AVAssetWriter writer, string path)
     {
-        using var done = new ManualResetEventSlim(false);
-        writer.FinishWriting(() => done.Set());
-        if (!done.Wait(AppendTimeout))
+        // The native callback may arrive after a timeout and cancellation. Its signal
+        // must remain usable then; disposing a wait handle here made that late callback
+        // throw ObjectDisposedException on AVFoundation's dispatch thread.
+        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        writer.FinishWriting(() => done.TrySetResult());
+        if (!done.Task.Wait(AppendTimeout))
             throw new TimeoutException($"The H.264 encoder did not finish '{path}' within {AppendTimeout.TotalSeconds:0} s.");
 
         if (writer.Status != AVAssetWriterStatus.Completed)

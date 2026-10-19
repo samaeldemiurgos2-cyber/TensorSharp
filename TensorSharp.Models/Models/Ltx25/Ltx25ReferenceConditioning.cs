@@ -24,8 +24,9 @@ public static class Ltx25ReferenceConditioning
     {
         ArgumentNullException.ThrowIfNull(parameters);
         if (parameters.Mode != "ref") throw new ArgumentException("Ingredients identity images require mode ref.");
-        if (parameters.EndImage != null || !string.IsNullOrWhiteSpace(parameters.EndImagePath) || parameters.ImageConditions is { Count: > 0 })
-            throw new ArgumentException("Identity references cannot be combined with first/last or timed image guides.");
+        if (parameters.EndImage != null || !string.IsNullOrWhiteSpace(parameters.EndImagePath))
+            throw new ArgumentException("Identity references cannot be combined with a last-frame image.");
+        _ = ResolveFirstFrameGuide(parameters);
         bool single = parameters.Image != null || parameters.ImageBytes is { Length: > 0 } || !string.IsNullOrWhiteSpace(parameters.ImagePath);
         if (single && parameters.ReferenceImagePaths is { Count: > 0 })
             throw new ArgumentException("Use a single identity image or a reference-image list, rather than combining both.");
@@ -40,6 +41,25 @@ public static class Ltx25ReferenceConditioning
         if (sources.Count is < 1 or > MaxImages)
             throw new ArgumentException($"Ingredients mode requires between 1 and {MaxImages} identity reference images.");
         return sources;
+    }
+
+    /// <summary>The optional first-frame guide of an identity request: at most one image condition, at output frame 0,
+    /// which pins the take's opening (the last frame of the segment a chain continues) while the sheet keeps the
+    /// character. Upstream ICLoraPipeline conditions a stage on its <c>images</c> and its IC-LoRA
+    /// <c>video_conditioning</c> together; a frame-0 image replaces latent frame 0 in place and adds no tokens. Last-frame
+    /// and timed guides beside identity references are refused: no publisher workflow uses them.</summary>
+    public static VideoImageCondition ResolveFirstFrameGuide(VideoGenerationParams parameters)
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+        if (parameters.ImageConditions is not { Count: > 0 } guides) return null;
+        if (guides.Count > 1 || guides[0] is not { FrameIndex: 0 } guide)
+            throw new ArgumentException("Identity references take at most one image guide, at output frame 0 (the frame a take starts on); " +
+                "last-frame and timed guides cannot be combined with Ingredients references.");
+        if (guide.Image == null && guide.ImageBytes is not { Length: > 0 } && string.IsNullOrWhiteSpace(guide.ImagePath))
+            throw new ArgumentException("The first-frame guide requires an image.");
+        if (!float.IsFinite(guide.Strength) || guide.Strength < 0 || guide.Strength > 1)
+            throw new ArgumentException("Image conditioning strength must be finite and in [0,1].");
+        return guide;
     }
 
     /// <summary>Compose an ordered contact sheet on black, fitting each complete

@@ -431,32 +431,34 @@ public static partial class ModelCatalog
             License = QwenImageLicense,
             Notes = "catalog.model.qwenImage21.notes",
         },
-        // Qwen-Image-2.1-Turbo (AtomicChat/Qwen-Image-2.1-Turbo-GGUF at bb25d06, read on
-        // 2026-10-09): the 2.1 transformer distilled to 8 steps at CFG 1 on its own fixed
-        // schedule. The GGUF carries no metadata and has the base checkpoint's tensors, so the
-        // entry declares the variant (ImageVariant, published by DiffusionCompanions) instead of
-        // the engine guessing from the file name. The VAE, text encoder and projector are the
-        // base entry's files, byte for byte: an install that has either entry links them from
+        // Qwen-Image-2.1-Turbo (unsloth/Qwen-Image-2.1-Turbo-GGUF at 5d1f9f75, read on 2026-10-18;
+        // AtomicChat's files before that): the 2.1 transformer distilled to 8 steps at CFG 1 on its
+        // own fixed schedule. The GGUF names only its architecture and has the base checkpoint's
+        // tensors, so the entry declares the variant (ImageVariant, published by DiffusionCompanions)
+        // instead of the engine guessing from the file name. The VAE, text encoder and projector are
+        // the base entry's files, byte for byte: an install that has either entry links them from
         // there instead of downloading them again (ModelStore).
+        // Q5_K_S rather than the card's recommended Q4_K_M: 0.3 GB more, the same speed (7.97 vs
+        // 7.94 s/step at 1024x1024 on an M5 Pro), and closer to the F16 transformer on every prompt
+        // measured (mean PSNR 22.4 vs 20.3 dB; the card's LPIPS against BF16 0.103 vs 0.153).
         QwenImage21Turbo(
-            id: "qwen-image-2.1-turbo-adq4k",
-            weights: new CatalogFile(CatalogFileRole.Weights, "Qwen-Image-2.1-Turbo-AD-Q4_K.gguf",
-                QwenImageTurboUrl("Qwen-Image-2.1-Turbo-AD-Q4_K.gguf"),
-                4_201_694_944, "4bb73c53cbe284bbd6d69b9fdc59539c531f0389dd2aa567663d777f8130bc59"),
-            quantization: "catalog.model.qwenImage21TurboAdQ4k.quantization",
+            id: "qwen-image-2.1-turbo-q5ks",
+            weights: new CatalogFile(CatalogFileRole.Weights, "qwen-image-2.1-turbo-Q5_K_S.gguf",
+                QwenImageTurboUrl("qwen-image-2.1-turbo-Q5_K_S.gguf"),
+                4_501_948_224, "72d93eb6f5d7be1a619c34f525393d001bc2fb9485d087f63c8462932b40177d"),
+            quantization: "catalog.model.qwenImage21TurboQ5ks.quantization",
             // Measured like the base entry: the CLI's peak footprint for an edit at 1248x832
             // (CatalogTests.MeasuredOnAMac).
             minDeviceMemoryGB: 24,
-            notes: "catalog.model.qwenImage21TurboAdQ4k.notes"),
+            notes: "catalog.model.qwenImage21TurboQ5ks.notes"),
         // The transformer closest to the full-precision Turbo (the card's LPIPS against BF16:
-        // Q8_0 0.037, AD-Q4_K 0.147), for the tier that holds 3.4 GB more weights. It keeps the
-        // shared Q4_K_M encoder, which by the card's measurement moves pictures about as far as
-        // AD-Q4_K, so its notes claim no more than the transformer's measurement.
+        // Q8_0 0.036, Q5_K_S 0.103), for the tier that holds 3.1 GB more weights. It keeps the
+        // shared Q4_K_M encoder, so its notes claim no more than the transformer's measurement.
         QwenImage21Turbo(
-            id: "qwen-image-2.1-turbo-q8",
-            weights: new CatalogFile(CatalogFileRole.Weights, "Qwen-Image-2.1-Turbo-Q8_0.gguf",
-                QwenImageTurboUrl("Qwen-Image-2.1-Turbo-Q8_0.gguf"),
-                7_591_554_784, "99f498fb7188be7eac9eb5f345a9e074d30eef3ca235b419e92563e5b48073c4"),
+            id: "qwen-image-2.1-turbo-q8-0",
+            weights: new CatalogFile(CatalogFileRole.Weights, "qwen-image-2.1-turbo-Q8_0.gguf",
+                QwenImageTurboUrl("qwen-image-2.1-turbo-Q8_0.gguf"),
+                7_640_860_480, "399d2ddc3636f36456e2f5bfa57187da4e38721bc046430317f42a9eab5b1712"),
             quantization: "catalog.model.qwenImage21TurboQ8.quantization",
             minDeviceMemoryGB: 32,
             notes: "catalog.model.qwenImage21TurboQ8.notes"),
@@ -502,9 +504,9 @@ public static partial class ModelCatalog
         1_159_029_824, "ca524100ebf825c9a870db1c580d03879e0da0ab2541697e2458e64891cf9d38");
 
     private static string QwenImageTurboUrl(string file) =>
-        $"https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF/resolve/bb25d06bc74119c12207243d68917951e6d9c232/{file}";
+        $"https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF/resolve/5d1f9f759ea877ae556cda88dbec958b62ad3809/{file}";
 
-    /// <summary>A Qwen-Image 2.1 Turbo entry: one of the AtomicChat Turbo denoisers plus the base
+    /// <summary>A Qwen-Image 2.1 Turbo entry: one of the Unsloth Turbo denoisers plus the base
     /// entry's companions.</summary>
     private static CatalogModel QwenImage21Turbo(
         string id, CatalogFile weights, string quantization, int minDeviceMemoryGB, string notes) => new()
@@ -633,7 +635,27 @@ public static partial class ModelCatalog
         "bonsai-27b-q1-0",
         // Withdrawn on 2026-10-11.
         "gemma-4-12b-iq2m",
+        // Re-pointed at Unsloth's files on 2026-10-18 (see Successors).
+        "ltx-2.5-distilled-q4km",
+        "qwen-image-2.1-turbo-adq4k",
+        "qwen-image-2.1-turbo-q8",
     };
+
+    /// <summary>
+    /// The entry that replaced each <see cref="Retired"/> entry re-pointed at another file of the
+    /// same model. Before the launch sweep reclaims a retired folder it hands the successor what it
+    /// can still use (<see cref="ModelStore.SweepOrphanedModels"/>): the companions both entries
+    /// list, and what the user put in a sub-folder, such as LTX 2.5's Ingredients adapter in
+    /// <c>loras/</c>, which comes from a gated repository and has no download in the app. Without
+    /// it, re-pointing LTX 2.5's denoiser re-downloaded 29.1 GB of unchanged companions.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> Successors { get; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ltx-2.5-distilled-q4km"] = "ltx-2.5-distilled-q4kxl",
+            ["qwen-image-2.1-turbo-adq4k"] = "qwen-image-2.1-turbo-q5ks",
+            ["qwen-image-2.1-turbo-q8"] = "qwen-image-2.1-turbo-q8-0",
+        };
 
     /// <summary>Whether <paramref name="id"/> is one of the <see cref="Retired"/> ids.</summary>
     public static bool IsRetired(string id) => Retired.Contains(id, StringComparer.OrdinalIgnoreCase);

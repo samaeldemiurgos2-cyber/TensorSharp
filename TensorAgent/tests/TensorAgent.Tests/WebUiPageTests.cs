@@ -1861,6 +1861,42 @@ public sealed partial class WebUiPageTests : IDisposable
         Assert.Equal(new[] { "It broke.Retry", "Just so you know." }, Strings(result, "notices"));
     }
 
+    [WebJavaScriptTheory]
+    [InlineData("text")]
+    [InlineData("imageUrl")]
+    [InlineData("videoUrl")]
+    public void ReopeningACompletedTranscriptDoesNotReplayItsFinishedTurn(string kind)
+    {
+        JsonElement result = Run($$"""
+            var reply = { role: 'assistant', content: 'Finished answer.' };
+            var frame = { token: 'Finished answer.' };
+            if ('{{kind}}' !== 'text') {
+              reply['{{kind}}'] = frame['{{kind}}'] = '/uploads/finished.{{(kind == "videoUrl" ? "mp4" : "png")}}';
+            }
+            R['/api/sessions?conversation=saved'] = { sessionId: 's2', conversationId: 'saved',
+              messages: [{ role: 'user', content: 'Make it.' }, reply],
+              activeTurn: { id: 'finished', running: false, state: 'Completed' } };
+            R['/api/agent/turns'] = { turn: { id: 'finished', running: false, state: 'Completed' } };
+            R['/api/agent/turns/finished'] = { __sse: [frame, { done: true }] };
+            """, """
+            window.TensorAgent.openConversation('saved');
+            return settle(10).then(function () {
+              window.TensorAgent.resumeTurn();
+              return settle(30);
+            }).then(function () {
+              return { transcript: __page.transcript(), history: window.TensorAgent.history(),
+                       attaches: __page.requests('/api/agent/turns/finished').length,
+                       generating: window.TensorAgent.isGenerating() };
+            });
+            """);
+
+        Assert.False(result.TryGetProperty("error", out _), result.ToString());
+        Assert.Equal(2, result.GetProperty("history").GetArrayLength());
+        Assert.Single(Bubbles(result.GetProperty("transcript")), t => t.GetProperty("role").GetString() == "assistant");
+        Assert.Equal(0, result.GetProperty("attaches").GetInt32());
+        Assert.False(result.GetProperty("generating").GetBoolean());
+    }
+
     [WebJavaScriptFact]
     public void ASendLostBeforeTheTurnIdIsNeverAnsweredWithAnEarlierTurnsAnswer()
     {

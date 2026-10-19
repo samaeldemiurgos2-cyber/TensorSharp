@@ -242,8 +242,8 @@ namespace TensorSharp.Models.Direct
             var lin = new DirectLinear(ctx, p, IntPtr.Zero, (int)info.Type, ne0, ne1, bytes, bias,
                                           prescale && !h3PreserveFloat32 && GgufFile.GetBlockSize(info.Type) > 1,
                                           h3PreserveFloat32: h3PreserveFloat32, ltxProjection: ltxProjection);
-            if (ctx.IsMlx && MlxQuantizedOps.CanPreloadQuantizedType((int)info.Type))
-                MlxQuantizedOps.PreloadQuantizedWeight(ctx.MlxAllocator, p, p, (int)info.Type, ne0, ne1, bytes);
+            if (ctx.IsMlx && MlxQuantizedOps.CanPreloadDirectFloatType((int)info.Type))
+                MlxQuantizedOps.PreloadDirectFloatWeight(ctx.MlxAllocator, p, p, (int)info.Type, ne0, ne1, bytes);
             else if (!ctx.IsCuda && (ctx.IsMlx || !lin.UseManagedQuantOnCpu))
                 lin.SetCpuWeight(DirectOps.DequantTensor(gguf, weightName), ne0, ne1);
             return ctx.Track(lin);
@@ -269,8 +269,8 @@ namespace TensorSharp.Models.Direct
             if (biasName != null && gguf.Tensors.ContainsKey(biasName))
                 bias = ctx.Own(ctx.FromFloats(DirectOps.DequantTensor(gguf, biasName), (long)gguf.Tensors[biasName].NumElements));
             var lin = new DirectLinear(ctx, p, IntPtr.Zero, (int)info.Type, ne0, ne1, bytes, bias, false);
-            if (ctx.IsMlx && MlxQuantizedOps.CanPreloadQuantizedType((int)info.Type))
-                MlxQuantizedOps.PreloadQuantizedWeight(ctx.MlxAllocator, p, p, (int)info.Type, ne0, ne1, bytes);
+            if (ctx.IsMlx && MlxQuantizedOps.CanPreloadDirectFloatType((int)info.Type))
+                MlxQuantizedOps.PreloadDirectFloatWeight(ctx.MlxAllocator, p, p, (int)info.Type, ne0, ne1, bytes);
             else if (!ctx.IsCuda && (ctx.IsMlx || !lin.UseManagedQuantOnCpu))
                 lin.SetCpuWeight(DirectOps.DequantTensor(gguf, weightName), ne0, ne1);
             return ctx.Track(lin);
@@ -356,8 +356,8 @@ namespace TensorSharp.Models.Direct
                 {
                     if (_wCpu != null)
                         Ops.Addmm(r, 0f, r, 1f, x, _wCpuT);
-                    else if (!MlxQuantizedOps.TryAddmmQuantizedToFloat32(r, x, _host, _host, _type,
-                        InDim, OutDim, _bytes, preserveFloat32: true))
+                    else if (!MlxQuantizedOps.TryAddmmDirectFloat32(r, x, _host, _host, _type,
+                        InDim, OutDim, _bytes))
                         throw new InvalidOperationException(
                             $"MLX compressed F32 linear failed (type {_type}, [{x.Sizes[0]},{InDim}]x[{InDim},{OutDim}]).");
                 }

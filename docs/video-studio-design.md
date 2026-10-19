@@ -175,7 +175,8 @@ optional: `fl2v` needs a last frame and takes a first frame too when one is give
 while a first frame alone is `i2v`. This follows MiniMax-H3's FL2VA contract (zero,
 one or two keyframes; sglang's `fl2va` signatures `[0]`, `[-1]` and `[0, -1]`), and
 nothing stands in for a missing frame. The page derives the mode from two optional
-slots (none → `t2v`, first → `i2v`, last or both → `fl2v`). It runs for every client: the page,
+slots and the reference photos beside them (none → `t2v`, first → `i2v`, last or
+both → `fl2v`, any reference photo → `ref`). It runs for every client: the page,
 saved assistant plans and the HTTP API. Each capability derives its `modes` from
 the checkpoint's conditioning flags. The native adapter adds `unavailableModes`,
 which explain the family modes the loaded file or host cannot run. Admission
@@ -184,6 +185,32 @@ names, so `MiniMaxH3ModeResolver` and `Ltx25GenerationSettings` stay the final
 authority on each family's combination rules. A request saved without a mode is
 inferred from its inputs. Its serialized form omits the field, so idempotency
 fingerprints of earlier jobs do not change.
+
+`ref` may also carry a first frame (`conditioningAssetId`), to keep a character
+while a chain continues from the previous segment's last frame. It never takes a
+last frame or temporal guides. Few checkpoints run the combination, so it is a
+capability flag rather than another mode: `referencesWithFirstFrame`, with
+`referencesWithFirstFrameUnavailableReason` when it is false. Admission
+(`RequireReferencesWithFirstFrame`) and the native adapter's validation refuse
+ref plus a first frame on a checkpoint without the flag as
+`unsupported_conditioning`, with that reason, before the mode check, and never
+drop either input; the reason names what the family can do instead. No installed
+family sets the flag. MiniMax-H3 FL2VA pins frames but takes no references,
+Ref2VA takes references but pins no frames, and MiniMax's pipeline,
+stable-diffusion.cpp and vllm-omni refuse keyframes with references in one
+request; Wan has no identity references. LTX 2.5's pipeline does compose a frame-0
+image guide with the Ingredients sheet, equivalent to upstream `ICLoraPipeline`
+called with `images` and `video_conditioning` together and checked bit for bit
+against the unchanged upstream functions; for a ref request with a first frame the
+adapter would send that frame as a frame-0 `VideoImageCondition` at strength 1, not
+as `ImagePath`, which LTX's ref mode reads as an identity image. LTX still leaves
+the flag false: Ingredients was trained without a pinned first frame, and in
+validation every such take cut to the reference sheet at its second frame (see the
+[LTX 2.5 card](models/ltx-2.5.md#starting-on-a-first-frame)). The flag, the page's
+first-frame slot in the reference view and the adapter mapping are ready for a
+checkpoint that does both. When the host pins no output size,
+LTX's capability also names `referenceDefaultWidth`/`referenceDefaultHeight`
+(768 × 448, the Ingredients trained bucket), which the page offers as a size.
 
 A capability may also list `imageCanvasModes`, with the recipe that sizes them
 (`imageCanvasShortEdge`, `imageCanvasMaxPixels`, `imageCanvasMaxAspect`). In
@@ -219,3 +246,88 @@ renders to 120 combined clips/captions; imports/packages have a 2 GiB limit and
 256 MiB disk reserve. Forty undo transactions are retained. These limits bound
 individual work; they are not a general multi-user quota system. See the user
 guide and validation report for exact implemented and unverified features.
+
+## Frame stills and video chains
+
+A long video is made as a chain of takes, each starting on the frame the previous
+segment ends on. `StudioFrames.cs` materializes that frame as an ordinary image
+asset. Its `derivedFrom` records the source: the video's `assetId`, its `name` and
+`sha256` when the frame was taken, `frame` (-1 for the last frame, else N on the
+project clock), `frameRate` (only for N, the rate that counts it) and `method`
+(`generation` or `decode`). The generation request then names a photo, as every
+other first frame does. Putting a video ID and frame in the request instead would
+have changed the request shape and with it the idempotency fingerprint, the job
+snapshot, package contents and every model adapter, each of which would then need
+to decode video. A still changes none of them: adapters receive an image path,
+the job snapshot captures the still, and a package carries it as an image with
+its record. Because the record keeps the name and hash, a still keeps its meaning
+after its video is renamed or deleted. Package metadata is untrusted, so
+`StudioCommands.Validate` refuses a record Studio could not have written: one on
+a non-image or generated asset, an out-of-range frame, a frame rate present for
+the last frame or missing for N, an unknown method, or a malformed name or hash.
+
+Host action `assets/extract-frame` takes `{projectId, assetId, frame: "last" | N}`
+and returns `{project, assetId, reused}`. Stills are deduplicated by source and
+frame (source asset ID and hash, frame and frame rate, with the file present),
+never by content hash. Two frames with equal pixels stay two stills, and an
+ordinary import of byte-identical content never stands in for one, since it
+would lose the record. A repeated request, such as a double tap or a second page,
+returns the existing still with `reused: true`, even on a host that cannot
+decode. A new still enters the library as an import does: the project moves to a
+new revision without an undo step, and the still can be deleted like any asset.
+Photos and audio are refused with `invalid_frame_source`. Without external
+processes the action is refused with `unsupported_platform`: taking a frame needs
+FFmpeg, which is off where Studio media subprocesses are (iOS and Mac Catalyst).
+
+Frames are decoded one at a time, apart from thumbnails and waveforms, with
+Studio's protocol and format allow-lists and a timeout scaled to the video's
+length (2 to 30 minutes). Pixels are copied, never remapped. PQ/HLG transfers
+and interlaced field orders are refused with `unsupported_frame_source` rather
+than tone-mapped or deinterlaced. Non-square sample aspect ratios are widened to
+square pixels, because the decoders that read the still ignore aspect metadata.
+The PNG is upright RGB24 at full size. The last frame is the last frame the
+decoder presents, with edit lists honored. Decoding starts 2 s before the video
+stream's own end (a longer soundtrack moves the container's end past the
+picture), then 2 s before the container's end, then at the start, and each
+decoded frame overwrites the output. Frame N is sampled exactly as the timeline
+renderer samples the source at the project rate: an unseeked `fps` grid from 0
+with nearest rounding, then that one frame. It is therefore the frame that a clip
+ending on N shows.
+
+A generated take's last frame needs no decode. `WebUiChatService.GenerateVideoAsync`
+takes an optional `lastFramePath` and writes the clip's final frame there as a
+lossless PNG of the pixels the MP4 was encoded from. The native adapter asks for
+`last-frame.png` in the job's work directory and returns it as
+`StudioGenerationResult.LastFramePath`. The work directory is deleted when the
+job ends, so before the take is imported the service checks that the file is a
+PNG inside that directory, not a reparse point, and that it probes as an image of
+the request's exact size. It then moves the file to `jobs/<id>/last-frame.png`
+and records `LastFrameFileName` in the persisted job record; a frame of another
+size is not kept. When a restart reconciles a take that was committed before its
+job record finished, the file is re-linked as well. The last frame of such a take
+comes from this file
+(`method: generation`), so a chain does not go through an H.264 round trip at
+each join. Frame N, imported videos and takes whose job record is absent are
+decoded (`method: decode`); packages omit job history.
+
+The thumbnail route `GET /api/studio/thumbnail/{projectId}/{assetId}?frame=last`
+on both hosts shows a video's last frame through the same decode, cached as a
+separate derivative. A photo is its own last frame, and any other `frame` value
+is refused with `invalid_request`. The page uses it for the first-frame picker's
+video tiles.
+
+A shot plan continues a video by reference. A generation draft may store
+`firstFrameFrom` (`{assetId, frame}`) and no `conditioningAssetId`. Saving checks
+that the video belongs to the project and resolves the mode as if the frame were
+the first frame. The still is taken or reused when the plan starts, or when the
+page opens the plan in Generate, so planning never changes the library. The
+planner's asset summaries add `derivedFrom` and a bounded take summary (mode,
+first-frame asset, reference count, frame count, fps, shot) without returning
+whole requests. `ChainPart` names a take " · part N" by following first frames
+back through stills and the takes they came from; an imported video is part 1.
+
+Placing a segment is a page action over existing commands. **Add after** sends
+one `insertClip` right after the clip the take continues, on the same track. Its
+`sourceStartFrame` is max(1, round(project fps / take fps)), because the take's
+first frame repeats the previous clip's last frame, and its `durationFrames` is
+the rest of the take.

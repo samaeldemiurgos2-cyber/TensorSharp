@@ -470,6 +470,10 @@ namespace TensorSharp.Runtime
         /// <c>(u16.astype(u32) &lt;&lt; 16).view(f32)</c>. Vectorised 16 lanes at a time when the hardware
         /// supports it; scalar tail otherwise.
         /// </summary>
+        // Straight to optimized code: a checkpoint's first tensors otherwise convert in
+        // tier-0 code, where Vector256 is not inlined (~0.1 GB/s; 3 s of a 0.35 GB audio
+        // VAE load on an A40 pod).
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public static unsafe void Bf16ToF32(ushort* src, float* dst, long n)
         {
             long i = 0;

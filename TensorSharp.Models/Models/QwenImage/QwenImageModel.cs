@@ -130,7 +130,7 @@ namespace TensorSharp.Models.QwenImage
                     n => n.Contains("mmproj") && (n.Contains("qwen3vl-8b") || n.Contains("qwen3-vl-8b")) && n.EndsWith(".gguf"));
 
                 // Turbo and the base checkpoint share every tensor name and shape, and the GGUFs
-                // carry no metadata: the host declares which one this is (QwenImage21Turbo).
+                // name at most their architecture: the host declares which one this is (QwenImage21Turbo).
                 string variantNote;
                 try
                 {

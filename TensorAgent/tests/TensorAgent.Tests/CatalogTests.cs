@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using TensorAgent.Core.Catalog;
+using TensorSharp.Runtime;
 
 namespace TensorAgent.Tests;
 
@@ -19,11 +20,11 @@ public sealed class CatalogTests
             "qwen3.8-flash-next-q2kxl",
             "qwen3.8-flash-next-iq1m",
             "qwen-image-2.1-q4km",
-            "qwen-image-2.1-turbo-adq4k",
-            "qwen-image-2.1-turbo-q8",
+            "qwen-image-2.1-turbo-q5ks",
+            "qwen-image-2.1-turbo-q8-0",
             "minimax-h3-fl2va-q4k",
             "minimax-h3-ref2va-q4k",
-            "ltx-2.5-distilled-q4km",
+            "ltx-2.5-distilled-q4kxl",
             "gemma-4-26b-a4b-qat-q4kxl",
             "gemma-4-31b-q4-0",
             "qwen3.5-35b-a3b-q4km",
@@ -230,8 +231,8 @@ public sealed class CatalogTests
         "qwen3.8-flash-next-q2kxl",
         "qwen3.8-flash-next-iq1m",
         "qwen-image-2.1-q4km",
-        "qwen-image-2.1-turbo-adq4k",
-        "qwen-image-2.1-turbo-q8",
+        "qwen-image-2.1-turbo-q5ks",
+        "qwen-image-2.1-turbo-q8-0",
         "minimax-h3-fl2va-q4k",
         "minimax-h3-ref2va-q4k",
     };
@@ -259,8 +260,8 @@ public sealed class CatalogTests
     [InlineData("qwen3.8-27b-q4kxl", 32)]
     [InlineData("muse-glimmer-30b-q4kxl", 32)]
     [InlineData("qwen-image-2.1-q4km", 24)]
-    [InlineData("qwen-image-2.1-turbo-adq4k", 24)]
-    [InlineData("qwen-image-2.1-turbo-q8", 32)]
+    [InlineData("qwen-image-2.1-turbo-q5ks", 24)]
+    [InlineData("qwen-image-2.1-turbo-q8-0", 32)]
     [InlineData("minimax-h3-fl2va-q4k", 32)]
     [InlineData("minimax-h3-ref2va-q4k", 32)]
     [InlineData("qwen3.8-flash-next-q2kxl", 48)]
@@ -337,11 +338,11 @@ public sealed class CatalogTests
         ["muse-glimmer-30b-q4kxl"] = (15.88, 10.9, "chat-e2e.py's seven scenarios with the projector, LeanCaches"),
         // The DiT stays mapped through the denoise; the text encoder is released first.
         ["qwen-image-2.1-q4km"] = (4.19, 14.3, "an edit at 1248x832, 40 steps (the CLI's peak footprint)"),
-        // Measured 2026-10-09 the same way (/usr/bin/time -l, peak memory footprint), 8 steps: the
-        // peak does not depend on the transformer's quantization (base 14.37, AD-Q4_K 14.35,
-        // Q8_0 14.36 GB), so the 8-bit file's 3.4 GB of extra weights are what move it up a tier.
-        ["qwen-image-2.1-turbo-adq4k"] = (4.20, 14.4, "an edit at 1248x832, 8 steps (the CLI's peak footprint)"),
-        ["qwen-image-2.1-turbo-q8"] = (7.59, 14.4, "an edit at 1248x832, 8 steps (the CLI's peak footprint)"),
+        // Unsloth files, measured 2026-10-18, two fresh-process edits at 1248x832, 8 steps,
+        // /usr/bin/time -l. Upper bounds rounded up from both runs: Q5_K_S 14.427/14.423 GB,
+        // Q8_0 14.401/15.134 GB. The 8-bit file's extra resident weights move it up a tier.
+        ["qwen-image-2.1-turbo-q5ks"] = (4.50, 14.43, "an edit at 1248x832, 8 steps (maximum CLI peak footprint of two runs)"),
+        ["qwen-image-2.1-turbo-q8-0"] = (7.64, 15.14, "an edit at 1248x832, 8 steps (maximum CLI peak footprint of two runs)"),
         // The largest stage is the 18.2 GB text encoder: the denoiser and the VAEs kept from the
         // previous clip are taken off the device before it runs (MiniMaxH3Pipeline), and wired
         // memory peaked at 20 GB with the decode (denoiser + video VAE) on top of the system's.
@@ -670,6 +671,9 @@ public sealed class CatalogTests
         "wan2.2-t2v-a14b-q4km",
         "wan2.2-i2v-a14b-q4km",
         "wan2.2-i2v-a14b-lightx2v-q4km",
+        "ltx-2.5-distilled-q4kxl",
+        "qwen-image-2.1-turbo-q5ks",
+        "qwen-image-2.1-turbo-q8-0",
     };
 
     /// <summary>
@@ -699,6 +703,26 @@ public sealed class CatalogTests
             $"{string.Join(", ", unrecorded)} is not in CatalogTests.Shipped; add every new entry's id there");
         Assert.True(ModelCatalog.IsRetired("GEMMA-4-12B-IQ3XXS"));
         Assert.True(ModelCatalog.IsRetired("gemma-4-12b-iq2m"));
+    }
+
+    /// <summary>
+    /// A successor receives what the sweep would otherwise delete from a retired folder
+    /// (<see cref="ModelStore.SweepOrphanedModels"/>), so it must be an entry this catalog
+    /// offers, of the same family, and never an id a build could retire in turn.
+    /// </summary>
+    [Fact]
+    public void EverySuccessorIsABuiltInEntryThatReplacedARetiredOne()
+    {
+        foreach ((string retired, string successor) in ModelCatalog.Successors)
+        {
+            Assert.True(ModelCatalog.IsRetired(retired), $"{retired} has a successor but is not retired");
+            CatalogModel? entry = ModelCatalog.Find(successor);
+            Assert.True(entry is not null, $"{retired}'s successor {successor} is not a built-in entry");
+            Assert.False(ModelCatalog.IsRetired(successor));
+        }
+        Assert.Equal(CatalogFamily.Ltx25, ModelCatalog.Find(ModelCatalog.Successors["ltx-2.5-distilled-q4km"])!.Family);
+        Assert.All(new[] { "qwen-image-2.1-turbo-adq4k", "qwen-image-2.1-turbo-q8" },
+            id => Assert.Equal(QwenImageVariant.Turbo, ModelCatalog.Find(ModelCatalog.Successors[id])!.ImageVariant));
     }
 
     [Fact]

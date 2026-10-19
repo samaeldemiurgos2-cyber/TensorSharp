@@ -23,7 +23,7 @@ public sealed class Ltx25CatalogTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "tensoragent-ltx25-" + Guid.NewGuid().ToString("N"));
     private readonly Dictionary<string,string?> _environment = Environment.GetEnvironmentVariables().Cast<DictionaryEntry>().ToDictionary(e=>(string)e.Key,e=>(string?)e.Value,StringComparer.Ordinal);
-    private static CatalogModel Entry => ModelCatalog.Find("ltx-2.5-distilled-q4km")!;
+    private static CatalogModel Entry => ModelCatalog.Find("ltx-2.5-distilled-q4kxl")!;
 
     // A synthetic unavailable card uses an existing localized catalog value to
     // exercise the gate without retaining an obsolete LTX-unavailable message.
@@ -51,14 +51,17 @@ public sealed class Ltx25CatalogTests : IDisposable
         Assert.False(model.IsImageGenerator);
         Assert.Equal(48, model.MinDeviceMemoryGB);
         Assert.NotEmpty(model.Notes!);
-        Assert.Equal(44_764_412_884, model.TotalBytes);
+        Assert.Equal(43_077_008_276, model.TotalBytes);
         Assert.Equal(5, model.Files.Count);
         Assert.All(model.Files, file => Assert.False(file.Optional));
-        Assert.Equal("0f51eb0d82b19bddbfb3b0371a65217844ea03750f27dd733528f22152e0e0d0", model.Weights.Sha256);
-        Assert.Contains("/resolve/7b0c2025441f1bf12c18eac375ad21f5e3d3c9e0/", model.Weights.Url);
+        Assert.Equal("55442750eb0013d94fffaa4dadb577c5f4dc07107ec04389d41444f6e517d980", model.Weights.Sha256);
+        // Unsloth's ungated repository, the distilled checkpoint from its distilled/ folder (its root
+        // holds the dev checkpoint the engine refuses), and every companion from the same revision.
+        Assert.StartsWith("https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/distilled/", model.Weights.Url);
+        Assert.Contains("distilled", model.Weights.FileName);
         Assert.Equal(new[] { CatalogFileRole.TextEncoder, CatalogFileRole.Vae, CatalogFileRole.AudioVae, CatalogFileRole.LatentUpscaler },
             model.Files.Skip(1).Select(file => file.Role));
-        Assert.All(model.Files.Skip(1), file => Assert.Contains("/resolve/49b093a39c19169a8a81721dcc541e07e945232f/", file.Url));
+        Assert.All(model.Files.Skip(1), file => Assert.StartsWith("https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/", file.Url));
         Assert.Contains("with-proj", model.Files.Single(file => file.Role == CatalogFileRole.TextEncoder).FileName);
         Assert.Contains("video-vae-conv", model.Files.Single(file => file.Role == CatalogFileRole.Vae).FileName);
         // The two-stage recipe's x2 spatial (not temporal) latent upscaler.
