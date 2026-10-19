@@ -1,6 +1,6 @@
 # Nemotron 3.5 Super VL / Bolt support — Design & gap analysis
 
-**Status:** G1 implemented. G2 characterized (needs DGX-Spark validation). G3–G5 pending.
+**Status:** G1 fixed. G6 (per-block MoE) implemented. G2 characterized (needs DGX-Spark validation). G3–G5 pending.
 **Date:** 2026-10-19
 **Target models:**
 - `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` (ggml-org GGUF, ~79GB)
@@ -116,6 +116,29 @@ This only bites the NVFP4 (Blackwell) path, so it must be validated on the DGX S
 fix shape is the Gemma4 pattern: read `ffn_*_exps.scale` into a per-layer `float[]` (`GetGemma4ExpertScale`)
 and fold `scale[e]` into the expert's routing contribution (`weight *= scale[e]`) across the
 batched/TP/decode MoE paths.
+
+### G6 — Per-block MoE config ("Puzzle"/Bolt) — **IMPLEMENTED**
+
+Bolt-74B-A9B (the "Puzzle" / `block_configs` variant) gives each MoE layer its own expert count,
+FF width and top-k, unlike the uniform Super-VL:
+
+```
+blk.1  ffn_up_exps [1024, 2048, 240]  # 240 experts, n_ff 2048
+blk.3  ffn_up_exps [1024, 1536, 240]  # n_ff 1536
+blk.21 ffn_up_exps [1024, 2560, 432]  # 432 experts, n_ff 2560
+```
+
+`expert_used_count` and `expert_feed_forward_length` are per-layer arrays `[88]`, not scalars.
+
+**Fix (in tree):** `NemotronModel.InitPerLayerMoEConfig()` derives `_numExpertsPerLayer[]` (from the
+stacked expert tensor's last dim) and `_numExpertsUsedPerLayer[]` (from the `expert_used_count` array,
+scalar fallback). `_numExperts`/`_numExpertsUsed` are grown to the observed maximum so every pre-allocated
+routing buffer still fits; `MoEForward` and `TryMoEPrefillBatchedByExpert` route against the per-layer
+counts. Uniform checkpoints are binary-identical to before (per-layer == global). Per-block under **tensor
+parallelism is rejected with a clear error** for now (the TP MoE paths are not per-layer aware yet).
+
+Note: Bolt's experts are `IQ2_XXS` (type 16), so G2 (NVFP4 per-expert scale2) does **not** apply to Bolt —
+it only affects the 120B NVFP4 file.
 
 ### G3 — 512 experts / top-22 (verify scale handling)
 
