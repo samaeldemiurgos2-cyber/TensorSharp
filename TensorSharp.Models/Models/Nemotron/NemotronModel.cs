@@ -112,6 +112,13 @@ namespace TensorSharp.Models
         private int[] _numExpertsUsedPerLayer;
         private uint[]? _expertUsedCountArray;
 
+        // Per-layer, per-expert combined NVFP4 scale2 (downScale * upScale²) folded into
+        // the routing weight. The routed experts are up -> ReLU² -> down, and both up and
+        // down carry a per-expert "<base>.scale" sidecar (llama.cpp applies them inside
+        // the up/down matmuls, i.e. up before and down after the non-linearity).
+        // Null entry = no sidecar (e.g. IQ-quantized experts, which are self-scaling).
+        private float[][] _layerExpertScale;
+
         // Pre-allocated decode buffers for Mamba2
         private float[] _mamba2ConvOutBuf;
         private float[] _mamba2YBuf;
@@ -439,6 +446,7 @@ namespace TensorSharp.Models
             // dictionaries) works unchanged for both naming conventions.
             NormalizeLatentWeightNames();
             InitPerLayerMoEConfig();
+            InitExpertScales();
 
             if (_numExperts == 0)
                 FuseFFNWeights();
@@ -840,6 +848,53 @@ namespace TensorSharp.Models
                 _numExperts = maxExperts;
             if (maxUsed > _numExpertsUsed)
                 _numExpertsUsed = maxUsed;
+        }
+
+        /// <summary>
+        /// Read the per-expert NVFP4 scale2 sidecars (<c>ffn_up_exps.scale</c> /
+        /// <c>ffn_down_exps.scale</c>) and fold them into a single per-expert multiplier.
+        /// llama.cpp applies <c>up_exps_s</c> inside the up matmul (before ReLU²) and
+        /// <c>down_exps_s</c> inside the down matmul, so the combined factor on the expert
+        /// output is <c>downScale * upScale²</c>. No sidecars -> null (no scaling).
+        /// </summary>
+        private void InitExpertScales()
+        {
+            if (_numExperts <= 0)
+                return;
+
+            _layerExpertScale = new float[Config.NumLayers][];
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_layerTypes[l] != LayerType.FFN)
+                    continue;
+                int ne = _numExpertsPerLayer[l];
+                if (ne <= 0)
+                    continue;
+
+                float[]? upScale = ReadExpertScale($"blk.{l}.ffn_up_exps.scale", ne);
+                float[]? downScale = ReadExpertScale($"blk.{l}.ffn_down_exps.scale", ne);
+                if (upScale == null && downScale == null)
+                {
+                    _layerExpertScale[l] = null!;
+                    continue;
+                }
+
+                var combined = new float[ne];
+                for (int e = 0; e < ne; e++)
+                {
+                    float us = upScale != null ? upScale[e] : 1.0f;
+                    float ds = downScale != null ? downScale[e] : 1.0f;
+                    combined[e] = ds * us * us;
+                }
+                _layerExpertScale[l] = combined;
+            }
+        }
+
+        private float[]? ReadExpertScale(string key, int expectedLength)
+        {
+            if (!_weights.TryGetValue(key, out var tensor) || tensor.ElementCount() != expectedLength)
+                return null;
+            return tensor.GetElementsAsFloat(expectedLength);
         }
 
         private unsafe void InitLayerInfo()
@@ -2360,6 +2415,18 @@ namespace TensorSharp.Models
                         routeW[k] *= _expertWeightsScale;
                 }
 
+                // Fold the per-expert NVFP4 scale2 into the gating weight. This is applied
+                // after the gating normalization/scale (those act on the router probs, not
+                // the weight scale); it is a per-expert scalar, so it commutes with the
+                // routed-weights accumulation in every MoE path (per-expert, prefill-batched,
+                // GGML/MLX batched).
+                if (_layerExpertScale != null && _layerExpertScale[layer] != null)
+                {
+                    float[] expertScale = _layerExpertScale[layer];
+                    for (int k = 0; k < nUsed; k++)
+                        routeW[k] *= expertScale[topExperts[k]];
+                }
+
                 // Get the input for expert computation
                 Tensor routedInput;
                 bool disposeRouted;
@@ -2671,6 +2738,12 @@ namespace TensorSharp.Models
             RouteMoEPrefillTokens(
                 routerPtr, biasPtr, seqLen, numExperts, nUsed, _expertWeightsNorm, _expertWeightsScale, layer,
                 _moeProbs, _moeSelectionProbs, _moeTopExperts, selectedExperts, routingWeights);
+            if (_layerExpertScale != null && _layerExpertScale[layer] != null)
+            {
+                float[] expertScale = _layerExpertScale[layer];
+                for (int i = 0; i < totalRoutes; i++)
+                    routingWeights[i] *= expertScale[selectedExperts[i]];
+            }
             GroupMoERoutesByExpert(
                 selectedExperts, routingWeights, seqLen, nUsed, numExperts,
                 expertCounts, expertOffsets, _moePrefillExpertCursors, routedRows, routedWeights);

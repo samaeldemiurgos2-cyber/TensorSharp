@@ -1,6 +1,6 @@
 # Nemotron 3.5 Super VL / Bolt support — Design & gap analysis
 
-**Status:** G1 fixed. G6 (per-block MoE) implemented. G2 characterized (needs DGX-Spark validation). G3–G5 pending.
+**Status:** G1 fixed. G6 (per-block MoE) implemented. G2 (per-expert NVFP4 scale2) implemented. G3–G5 pending.
 **Date:** 2026-10-19
 **Target models:**
 - `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` (ggml-org GGUF, ~79GB)
@@ -98,24 +98,24 @@ objects are untouched (their `CacheKey`/device buffers are independent of the di
 legacy `ffn_latent_in/out` path and the new `ffn_latent_down/up` checkpoint both serve the same downstream
 code.
 
-### G2 — Per-expert NVFP4 scale2 (`<base>.scale`) — confirmed gap, pending validation
+### G2 — Per-expert NVFP4 scale2 (`<base>.scale`) — **IMPLEMENTED**
 
 Routed/non-shared experts carry a **per-expert** sidecar in addition to the NVFP4 blocks:
 - `ffn_*_exps.weight` [.., 512] NVFP4(40) — self-contained per-block scale (TensorSharp's 36-byte/64-elem
   block format embeds the block scale).
 - `ffn_*_exps.scale` [512] F32 — the **`weight_scale_2`** (per llama.cpp `_generate_nvfp4_tensors`, written
-  separately and "applied at inference" per `conversion/gemma.py`).
+  separately and applied inside the up/down matmuls at inference).
 - `ffn_*_exps.input_scale` [512] F32 — `input_global_scale` calibration metadata.
 
-`AttachSidecarWeightScales` only attaches a **1-element** `.scale` to `QuantizedWeight.Scale`; vector `.scale`
-is left in `_weights` "for their model-specific consumers", and `QuantizedWeight.CreateExpertView` gives each
-expert view `Scale = 1.0f`. So the routed experts' per-expert scale2 is currently **not applied** (the
-shared experts' scalar `.scale[1]` is applied).
+`AttachSidecarWeightScales` only attaches a **1-element** `.scale` (covering the shared experts' scalar
+`.scale[1]`); the routed experts' vector `.scale[512]` stays in `_weights` with `Scale = 1.0f` on the views.
 
-This only bites the NVFP4 (Blackwell) path, so it must be validated on the DGX Spark. If logits are off, the
-fix shape is the Gemma4 pattern: read `ffn_*_exps.scale` into a per-layer `float[]` (`GetGemma4ExpertScale`)
-and fold `scale[e]` into the expert's routing contribution (`weight *= scale[e]`) across the
-batched/TP/decode MoE paths.
+**Fix (in tree):** `NemotronModel.InitExpertScales()` reads `ffn_*_exps.scale` and folds one per-expert
+multiplier `downScale * upScale²` into the routing weight, in both `MoEForward` and
+`TryMoEPrefillBatchedByExpert`. The square is required because llama.cpp applies `up_exps_s` inside the up
+matmul — *before* the ReLU² non-linearity (`ReLU²(scale·x) = scale²·ReLU²(x)` for the positive scale2
+values) — while `down_exps_s` lands after. Experts without sidecars (IQ-quantized, e.g. Bolt) are a no-op.
+Still needs DGX-Spark (Blackwell) logit validation, since NVFP4 only runs there.
 
 ### G6 — Per-block MoE config ("Puzzle"/Bolt) — **IMPLEMENTED**
 
