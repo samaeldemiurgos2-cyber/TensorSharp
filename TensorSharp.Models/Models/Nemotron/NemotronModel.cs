@@ -421,6 +421,13 @@ namespace TensorSharp.Models
 
             LoadWeights();
 
+            // Nemotron 3 Super / Bolt (and other new "nemotron 3" checkpoints) name the
+            // latent MoE projections ffn_latent_down / ffn_latent_up, whereas this model
+            // references them as ffn_latent_in / ffn_latent_out. Normalize the names up
+            // front so every downstream lookup (this includes the quantized + F32 weight
+            // dictionaries) works unchanged for both naming conventions.
+            NormalizeLatentWeightNames();
+
             if (_numExperts == 0)
                 FuseFFNWeights();
             FuseQKVWeights();
@@ -725,6 +732,42 @@ namespace TensorSharp.Models
 
             _kvCacheCapacity = newCapacity;
             Console.WriteLine($"Expanded Nemotron attention cache to {newCapacity} tokens.");
+        }
+
+        /// <summary>
+        /// The "nemotron 3 super" GGUF exports name the latent MoE projections
+        /// <c>ffn_latent_down</c> / <c>ffn_latent_up</c>, while this model references
+        /// <c>ffn_latent_in</c> / <c>ffn_latent_out</c> everywhere else. Rewrite the
+        /// dictionary keys once at load (never touching the weight objects, whose cache
+        /// keys and device buffers are independent of the dictionary key) so both the
+        /// legacy Nemotron-H and the newer Bolt/Super-VL conventions serve the same path.
+        /// </summary>
+        private void NormalizeLatentWeightNames()
+        {
+            AliasLatentTensors(_quantWeights, ".ffn_latent_down.weight", ".ffn_latent_in.weight");
+            AliasLatentTensors(_quantWeights, ".ffn_latent_up.weight", ".ffn_latent_out.weight");
+            AliasLatentTensors(_weights, ".ffn_latent_down.weight", ".ffn_latent_in.weight");
+            AliasLatentTensors(_weights, ".ffn_latent_up.weight", ".ffn_latent_out.weight");
+        }
+
+        private static void AliasLatentTensors<T>(Dictionary<string, T> map, string fromSuffix, string toSuffix)
+        {
+            var renames = new List<(string From, string To)>();
+            foreach (var key in map.Keys)
+            {
+                if (key.EndsWith(fromSuffix, StringComparison.Ordinal))
+                {
+                    string to = key[..^fromSuffix.Length] + toSuffix;
+                    if (!map.ContainsKey(to))
+                        renames.Add((key, to));
+                }
+            }
+
+            foreach (var (from, to) in renames)
+            {
+                map[to] = map[from];
+                map.Remove(from);
+            }
         }
 
         private unsafe void InitLayerInfo()
