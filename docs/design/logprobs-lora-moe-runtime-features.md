@@ -1,7 +1,12 @@
 # Log Probs, Dynamic LoRA, Runtime MoE, and MoE Selection — Design
 
-**Status:** Design (not implemented)
-**Date:** 2026-10-04
+**Status:** Partially implemented.
+- **Feature 1 (Log probs):** not started.
+- **Feature 2 (Dynamic LoRA):** **implemented** — adapter type/loader/registry, `ModelBase.SetActiveLora` + `LinearForward` hook, `lora` field on completions/responses, `/v1/loras` admin routes, `/v1/models` listing. See `TensorSharp.Models/Lora/` and `TensorSharp.Server/Endpoints/LoraEndpoints.cs`. Limitations: generic `LinearForward` path + shared fused FFN gate only; continuous-batch per-sequence scoping and TP are follow-ups.
+- **Feature 3 (Dynamic MoE):** foundation in progress (module format + registry); forward-path expert swap (P3–P6) not yet wired.
+- **Feature 4 (MoE selection by index):** not started.
+
+**Date:** 2026-10-04 (design), 2026-10-19 (LoRA implemented)
 **Scope:** Four orthogonal features touching the API surface, model lifecycle, expert routing, and sampling pipeline.
 
 ---
@@ -763,6 +768,11 @@ Env vars:
 ---
 
 ## Summary
+
+**Implementation status (2026-10-19):**
+- Feature 2 (Dynamic LoRA) is implemented end to end (adapter loader/registry, `ModelBase` hook, `lora` API field, `/v1/loras` admin routes, `/v1/models` listing). See `TensorSharp.Models/Lora/` and `TensorSharp.Server/Endpoints/LoraEndpoints.cs`.
+- Feature 3 (Dynamic MoE) foundation is implemented: `MoeModule`/`ExpertSet` types, safetensors `MoeModuleLoader`, and `MoeRegistry` (load/unload/register/list/selection). The forward-path expert swap (P3–P6) is not yet wired — `TensorSharp.Models/Moe/`.
+- Features 1 and 4 are not started.
 
 | # | Feature | Feasibility | Effort | Key Risk |
 |---|---|---|---|---|
