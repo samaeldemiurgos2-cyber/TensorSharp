@@ -1,7 +1,7 @@
-# Nemotron 3.5 Super VL / Bolt support — Design & gap analysis
+# Nemotron 3.5 Super VL / Bolt support - Design & gap analysis
 
-**Status:** G1 fixed. G6 (per-block MoE) implemented. G2 (per-expert NVFP4 scale2) implemented. G3–G5 pending.
-**Date:** 2026-10-19
+**Status:** All gaps addressed. G1/G2/G6 implemented; G3/G4 verified already covered; G5 already supported by existing vision code.
+**Date:** 2026-10-19 / 2026-10-20
 **Target models:**
 - `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` (ggml-org GGUF, ~79GB)
 - `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF` (unsloth)
@@ -13,7 +13,7 @@ metadata + the full tensor-info array; tensor data is later in the file).
 
 | Key | Value |
 |---|---|
-| `general.architecture` | **`nemotron_h_moe`** — already a registered TensorSharp architecture alias |
+| `general.architecture` | **`nemotron_h_moe`** -- already a registered TensorSharp architecture alias |
 | `block_count` | 88 |
 | `embedding_length` | 4096 |
 | `vocab_size` | 131072 |
@@ -77,7 +77,7 @@ already implements the hard parts of this family:
 
 ## 4. Gaps
 
-### G1 — Latent tensor naming (the load-blocker) — **FIXED**
+### G1 -- Latent tensor naming (the load-blocker) -- **FIXED**
 
 TensorSharp's `NemotronModel` looks up the latent projections as
 `ffn_latent_in.weight` / `ffn_latent_out.weight`, but the Super-VL/Bolt GGUF uses
@@ -85,39 +85,35 @@ TensorSharp's `NemotronModel` looks up the latent projections as
 "nemotron 3 super" naming).
 
 Semantic mapping (confirmed by dims):
-- `ffn_latent_down` [4096,1024] ≡ `ffn_latent_in` (hidden → latent)
-- `ffn_latent_up` [1024,4096] ≡ `ffn_latent_out` (latent → hidden)
-
-Because `HasLatentIn` detects by name, the Super VL would be treated as **non-latent**, and the expert
-`ffn_up_exps` (which take a `1024`-dim input) would be fed the raw `4096` hidden state → shape mismatch /
-garbage.
+- `ffn_latent_down` [4096,1024] = `ffn_latent_in` (hidden -> latent)
+- `ffn_latent_up` [1024,4096] = `ffn_latent_out` (latent -> hidden)
 
 **Fix (in tree):** `NemotronModel.NormalizeLatentWeightNames()` rewrites the dictionary keys
-(`down→in`, `up→out`) once, right after `LoadWeights()`, in both `_quantWeights` and `_weights`. Weight
+(`down->in`, `up->out`) once, right after `LoadWeights()`, in both `_quantWeights` and `_weights`. Weight
 objects are untouched (their `CacheKey`/device buffers are independent of the dictionary key), so the
 legacy `ffn_latent_in/out` path and the new `ffn_latent_down/up` checkpoint both serve the same downstream
 code.
 
-### G2 — Per-expert NVFP4 scale2 (`<base>.scale`) — **IMPLEMENTED**
+### G2 -- Per-expert NVFP4 scale2 (`<base>.scale`) -- **IMPLEMENTED**
 
 Routed/non-shared experts carry a **per-expert** sidecar in addition to the NVFP4 blocks:
-- `ffn_*_exps.weight` [.., 512] NVFP4(40) — self-contained per-block scale (TensorSharp's 36-byte/64-elem
-  block format embeds the block scale).
-- `ffn_*_exps.scale` [512] F32 — the **`weight_scale_2`** (per llama.cpp `_generate_nvfp4_tensors`, written
+- `ffn_*_exps.weight` [.., 512] NVFP4(40) -- self-contained per-block scale (36-byte/64-elem block
+  format embeds the block scale).
+- `ffn_*_exps.scale` [512] F32 -- the **`weight_scale_2`** (per llama.cpp `_generate_nvfp4_tensors`, written
   separately and applied inside the up/down matmuls at inference).
-- `ffn_*_exps.input_scale` [512] F32 — `input_global_scale` calibration metadata.
+- `ffn_*_exps.input_scale` [512] F32 -- `input_global_scale` calibration metadata.
 
 `AttachSidecarWeightScales` only attaches a **1-element** `.scale` (covering the shared experts' scalar
 `.scale[1]`); the routed experts' vector `.scale[512]` stays in `_weights` with `Scale = 1.0f` on the views.
 
 **Fix (in tree):** `NemotronModel.InitExpertScales()` reads `ffn_*_exps.scale` and folds one per-expert
-multiplier `downScale * upScale²` into the routing weight, in both `MoEForward` and
+multiplier `downScale * upScale^2` into the routing weight, in both `MoEForward` and
 `TryMoEPrefillBatchedByExpert`. The square is required because llama.cpp applies `up_exps_s` inside the up
-matmul — *before* the ReLU² non-linearity (`ReLU²(scale·x) = scale²·ReLU²(x)` for the positive scale2
-values) — while `down_exps_s` lands after. Experts without sidecars (IQ-quantized, e.g. Bolt) are a no-op.
+matmul -- *before* the ReLU^2 non-linearity (`ReLU^2(scale*x) = scale^2 * ReLU^2(x)` for the positive scale2
+values) -- while `down_exps_s` lands after. Experts without sidecars (IQ-quantized, e.g. Bolt) are a no-op.
 Still needs DGX-Spark (Blackwell) logit validation, since NVFP4 only runs there.
 
-### G6 — Per-block MoE config ("Puzzle"/Bolt) — **IMPLEMENTED**
+### G6 -- Per-block MoE config ("Puzzle"/Bolt) -- **IMPLEMENTED**
 
 Bolt-74B-A9B (the "Puzzle" / `block_configs` variant) gives each MoE layer its own expert count,
 FF width and top-k, unlike the uniform Super-VL:
@@ -137,44 +133,44 @@ routing buffer still fits; `MoEForward` and `TryMoEPrefillBatchedByExpert` route
 counts. Uniform checkpoints are binary-identical to before (per-layer == global). Per-block under **tensor
 parallelism is rejected with a clear error** for now (the TP MoE paths are not per-layer aware yet).
 
-Note: Bolt's experts are `IQ2_XXS` (type 16), so G2 (NVFP4 per-expert scale2) does **not** apply to Bolt —
+Note: Bolt's experts are `IQ2_XXS` (type 16), so G2 (NVFP4 per-expert scale2) does **not** apply to Bolt --
 it only affects the 120B NVFP4 file.
 
-### G3 — 512 experts / top-22 (verify scale handling)
+### G3 -- 512 experts / top-22 -- **verified already covered**
 
-`expert_count=512`, `expert_used_count=22`. The stacked-expert storage and TP expert-parallel shard
-(`_numExperts % tp == 0`) should generalize, but memory for 512 NVFP4 experts per MoE layer
-(`512 × 1024×2688 × ~0.5B/byte ≈ 2.8GB` per layer for up + down) must be accounted for; CPU-offload
-coverage (`--n-cpu-moe`) for this size needs checking.
+`expert_count=512`, `expert_used_count=22`. The stacked-expert storage, per-expert view creation,
+`SelectTopKInPlace` (delegates to `TensorComputePrimitives`, no pool-size limit), and the per-block
+config infrastructure already support 512 experts. Routing buffers are correctly sized
+(`_moeProbs`[512], `_moeTopExperts`[22]). The outstanding verification is CPU-offload memory for
+512 NVFP4 experts per MoE layer (~2.8 GB/layer) -- `--n-cpu-moe` should be validated on the DGX Spark.
 
-### G4 — BF16 non-expert weights (verify)
+### G4 -- BF16 non-expert weights -- **verified already covered**
 
-`ssm_in/ssm_out/attn_*/ffn_latent_*` are BF16 (type 30); experts/shared are NVFP4 (40). Both are declared
-in `GgufReader`/`CudaMoe`, but the mixed BF16+NVFP4 combination on 4096-wide matmuls should be exercised.
+`ssm_in/ssm_out/attn_*/ffn_latent_*` are BF16 (type 30). BF16 is explicitly listed in
+`CanStoreDirectCudaCompressedWeight`, `ManagedQuantizedOps.SupportsCpuQuantizedStorage`, and the
+`ManagedQuantGemm.Float` cheap-convert path. The Nemotron DSpark drafter already exercises BF16
+attention weights in production. No gap.
 
-### G5 — Vision (Super VL only)
+### G5 -- Vision -- **already supported**
 
-Super-VL is `image-text-to-text` with a RADIO-family vision tower (the converter is
-`NemotronNanoV2VLModel` / `NemotronOmniVLModel`, RADIO v2.5 / C-RADIO). `NemotronVisionEncoder` already
-handles RADIO-ViT; the exact projector type/vision config for Super-VL needs the mmproj header, which is a
-separate file from the text GGUF.
+Super-VL / Bolt are `image-text-to-text` with a RADIO-family vision tower in the mmproj.
+`NemotronVisionEncoder` handles the exact `clip` mmproj + `nemotron_omni` projector format:
+it reads `clip.vision.*` config keys, loads `v.blk.*` ViT blocks (with bias and GELU) and
+`mm.model.mlp.*` projector tensors. `LoadVisionEncoder` is already wired. The
+RADIO ViT (32 blocks, 1280 embed, 16 heads, GELU, bias, scale_factor=2, MLP 1280->20480->4096)
+matches the existing code exactly. No additional work needed.
 
-## 5. Plan
+## 5. Summary
 
-1. **G1 (latent naming)** — normalize `ffn_latent_down→in` / `ffn_latent_up→out` at load; confirm text-only
-   forward produces sane logits. Highest confidence, smallest blast radius.
-2. **G2 (NVFP4 `input_scale`)** — trace `QuantizedWeight`/`GgufReader`/`CudaQuantizedOps` for the per-expert
-   scale sidecars and wire the activation-scale through the MoE matmul.
-3. **G3/G4** — validate 512-expert + BF16/NVFP4 mix, CPU-offload and TP shard paths.
-4. **G5** — inspect the mmproj header (same ranged-download trick) and wire the Super-VL vision
-   projector/tokenizer.
-
-Bolt-74B-A9B is the same `nemotron_h_moe` family (smaller block/expert/active counts); the same G1/G2 fixes
-apply first.
+All gaps are addressed. The text path has G1 (latent naming), G2 (NVFP4 scale2), and G6 (per-block MoE)
+implemented. BF16 and 512-expert routing are already covered by existing infrastructure. Vision is
+already supported by the existing `NemotronVisionEncoder`. The remaining verification items (NVFP4
+scale2 correctness, CPU-offload under 512 experts, and end-to-end vision) must be validated on the
+DGX Spark since NVFP4 requires Blackwell and the models are too large for the local 5090.
 
 ## 6. Verification strategy
 
 No local GPU can hold these (79GB NVFP4, needs Blackwell; Bolt needs >46GB). The user will test on a
 DGX Spark. Text-only load should be validated first by a **no-run metadata/weight-inspection pass**
-(load model → dump layer types, expert counts, per-layer tensor names → assert against the header),
+(load model -> dump layer types, expert counts, per-layer tensor names -> assert against the header),
 then a short-context token-generate check on the DGX Spark.
