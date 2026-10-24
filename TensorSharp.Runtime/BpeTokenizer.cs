@@ -74,21 +74,28 @@ namespace TensorSharp.Runtime
         private readonly bool _addBos;
         private readonly bool _addEos;
         private readonly bool _spmStyleBpe;
+        private readonly bool _normalizeNfc;
 
         public string[] Vocab => _vocab;
         public int BosTokenId => _bosTokenId;
         public int[] EosTokenIds => _eosTokenIds;
         public int VocabSize => _vocab.Length;
 
+        /// <param name="normalizeNfc">The GGUF's <c>tokenizer.ggml.normalizer.nfc</c>: put every
+        /// text fragment into Unicode NFC before it is pre-tokenized, as the HF tokenizer's
+        /// <c>{"type": "NFC"}</c> normalizer and llama.cpp do (MiniMax-M2/M3). Without it a
+        /// decomposed "e&#x301;", a Hangul jamo run or an Angstrom sign reach the model as ids
+        /// it never saw for that text.</param>
         public BpeTokenizer(string[] vocab, int[] tokenTypes, string[] merges,
             int bosTokenId, int[] eosTokenIds, bool addBos, bool addEos,
-            string? preTokenizerType = null)
+            string? preTokenizerType = null, bool normalizeNfc = false)
         {
             _vocab = vocab;
             _bosTokenId = bosTokenId;
             _eosTokenIds = eosTokenIds;
             _addBos = addBos;
             _addEos = addEos;
+            _normalizeNfc = normalizeNfc;
             _spmStyleBpe = string.Equals(
                 preTokenizerType, "gemma4", StringComparison.OrdinalIgnoreCase);
 
@@ -142,7 +149,9 @@ namespace TensorSharp.Runtime
                 // pattern, whose \p{N} splits every digit individually - so "17"
                 // tokenized as '1','7' instead of the single "17" token and every
                 // numeric prompt diverged from llama.cpp.
-                "gpt-4o" or "llama4" or "kanana2" or "talkie" =>
+                // MiniMax-M2/M3 ("minimax-m2", LLAMA_VOCAB_PRE_TYPE_MINIMAX_M2) share the arm:
+                // their tokenizer.json Split regex is this exact string.
+                "gpt-4o" or "llama4" or "kanana2" or "talkie" or "minimax-m2" =>
                     @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|" +
                     @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|" +
                     @"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
@@ -229,7 +238,11 @@ namespace TensorSharp.Runtime
                     continue;
                 }
 
-                foreach (string split in SplitForBpe(frag.text))
+                // Special tokens are matched on the raw text first: their HF added-token
+                // entries are normalized=false, and llama.cpp normalizes each remaining
+                // fragment, not the whole prompt.
+                string fragmentText = _normalizeNfc ? NormalizeNfc(frag.text) : frag.text;
+                foreach (string split in SplitForBpe(fragmentText))
                 {
                     if (_spmStyleBpe)
                     {
@@ -273,6 +286,25 @@ namespace TensorSharp.Runtime
             }
 
             return ids;
+        }
+
+        /// <summary>
+        /// Unicode NFC of one text fragment, with llama.cpp's ASCII fast path (ASCII is
+        /// already NFC). Text that is not well-formed UTF-16 - a lone surrogate - is kept
+        /// as is, the same choice llama.cpp makes for malformed UTF-8.
+        /// </summary>
+        internal static string NormalizeNfc(string text)
+        {
+            if (!text.AsSpan().ContainsAnyExceptInRange('\0', '\u007f'))
+                return text;
+            try
+            {
+                return text.Normalize(NormalizationForm.FormC);
+            }
+            catch (ArgumentException)
+            {
+                return text;
+            }
         }
 
         /// <summary>

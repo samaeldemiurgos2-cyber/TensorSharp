@@ -42,6 +42,7 @@
 | [DeepSeek V4 Flash](deepseek4_zh-cn.md) | 文本 | 文本 | 条件支持：核对内存与放置；可选的 DSpark 投机解码需要匹配草稿器。 |
 | [DeepSeek V4.1 Flash / 1017](deepseek41_zh-cn.md) | 文本；有条件的图像与视频 | 文本 | 实验性：路由 MoE TP / DSpark。纯 C# CPU 为夹具级验证；1017 默认 YOCO prefill 是近似计算。 |
 | [Muse Spark](muse-spark_zh-cn.md) | 文本；图像需 Spark 投影器 | 文本 | 条件支持：需要多 GPU 或大容量主机内存。已记录 CUDA 测量不能覆盖所有后端；不支持音频。 |
+| [MiniMax-M3.1-Flash](minimax-m3_zh-cn.md) | 文本；图像需自行转换的投影器 | 文本 | 条件支持：需要 `ggml_cuda` 与多张 GPU（UD-Q4_K_XL 为 232 GiB）；投影器与 DSpark 草稿器需自行转换。已记录的 8x A40 测量不能覆盖其他后端；不支持音频。 |
 | [Muse-Glimmer](muse-glimmer_zh-cn.md) | 文本、图像 | 文本 | 条件支持：图像需投影器，工具使用 ATEM，可选投机解码需独立 DFlash 草稿器；核对后端限制。 |
 | [DiffusionGemma](diffusiongemma_zh-cn.md) | 文本、图像 | 文本 | 不支持：聊天音频、video_url 与工具。Web UI 视频以抽取图像提供。 |
 | [Jev (DiffusionGemma)](jev_zh-cn.md) | 文本、图像、抽取的文档 / 帧 / 转录 | 类型化决策 | 条件支持：抽样视频帧及已配置 ASR 的转录；核对导入与概率语义限制。 |

@@ -84,6 +84,18 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Enable shared-prefix alignment (see <see cref="AlignSharedPrefixBoundary"/>).</summary>
         public void EnablePrefixCheckpoints() => _alignToSharedPrefix = true;
 
+        // Public boundaries at most this many tokens past a request's reused prefix do not
+        // end a prefill step (ISoloPrefillBudgetModel.CheckpointGapTokens); 0 cuts at every one.
+        private int _checkpointGapTokens;
+
+        /// <summary>Set the model's checkpoint gap (see <see cref="ISoloPrefillBudgetModel.CheckpointGapTokens"/>).</summary>
+        public void SetCheckpointGapTokens(int tokens) => _checkpointGapTokens = Math.Max(0, tokens);
+
+        // Whether a scheduled prefill step ends on a public boundary, the only place its
+        // producer checkpoints; with a gap, a step may run past a boundary instead.
+        private static bool EndsOnPublicBoundary(ScheduledSequenceWork work)
+            => work.Sequence.IsPublicCheckpointBoundary(work.Sequence.NumComputedTokens + work.NumScheduledTokens);
+
         // The model's own step size for a lone prompt (ISoloPrefillBudgetModel), set by
         // the engine unless the configuration chose SoloPrefillChunkSize.
         private ISoloPrefillBudgetModel? _soloPrefillPolicy;
@@ -109,9 +121,15 @@ namespace TensorSharp.Runtime.Scheduling
                         want = breakpoint - start;
             }
             if (_radixCache != null && _radixCache.PublicCheckpointsSupported)
+            {
+                // A boundary just past the prefix this request reused gets no step of its own when
+                // the model says so: the reused prefix already serves later requests to within the gap.
+                int reused = seq.PrefixCacheReusedTokens;
                 foreach (int boundary in seq.PublicCheckpointBoundaries)
-                    if (boundary > start && boundary < start + want && seq.IsPublicCheckpointBoundary(boundary))
+                    if (boundary > start && boundary < start + want && seq.IsPublicCheckpointBoundary(boundary)
+                        && !(reused > 0 && boundary - reused <= _checkpointGapTokens))
                         want = boundary - start;
+            }
             return want;
         }
 
@@ -468,6 +486,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (_radixCache == null || !_alignToSharedPrefix) return false;
             foreach (ScheduledSequenceWork work in output.ScheduledWork)
                 if (work.NumScheduledTokens > 0
+                    && (_checkpointGapTokens == 0 || EndsOnPublicBoundary(work))
                     && _radixCache.CanSharePendingPublicCheckpoint(sequence, work.Sequence, reusableLength))
                     return true;
             return false;

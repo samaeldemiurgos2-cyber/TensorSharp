@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Benchmarks & Testing — TensorSharp Wiki</title>
-  <meta name="description" content="Recent recorded TensorSharp text benchmarks: DeepSeek V4.1 Flash 1017 exact and approximate prefill, Muse Spark matched modes, conditions and limitations.">
+  <meta name="description" content="Recent recorded TensorSharp text benchmarks: DeepSeek V4.1 Flash 1017 exact and approximate prefill, Muse Spark matched modes, MiniMax-M3.1-Flash on eight A40s, conditions and limitations.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -16,10 +16,10 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index.html">Home</a> › Benchmarks &amp; Testing</div>
   <h1>Benchmarks &amp; Testing</h1>
-  <p class="lede">Recent recorded DeepSeek V4.1 Flash 1017 and Muse Spark comparisons, with exact workload and quality limits, plus the correctness test harness.</p>
+  <p class="lede">Recent recorded DeepSeek V4.1 Flash 1017, Muse Spark and MiniMax-M3.1-Flash comparisons, with exact workload and quality limits, plus the correctness test harness.</p>
 
   <h2 id="head-to-head">Latest recorded text comparisons</h2>
-  <p>These selected results cover <strong>DeepSeek V4.1 Flash 1017 on five A40 GPUs</strong> and <strong>Muse Spark on ten A40 GPUs</strong>. Each row keeps its model, quantization, placement, workload and reference mode. The best recorded TensorSharp mode differs by metric; the rows do not form a combined score or establish a speedup for other hardware or models. No benchmark was rerun for this documentation update.</p>
+  <p>These selected results cover <strong>DeepSeek V4.1 Flash 1017 on five A40 GPUs</strong>, <strong>Muse Spark on ten A40 GPUs</strong> and <strong>MiniMax-M3.1-Flash on eight A40 GPUs</strong>. Each row keeps its model, quantization, placement, workload and reference mode. The best recorded TensorSharp mode differs by metric; the rows do not form a combined score or establish a speedup for other hardware or models. The DeepSeek and Muse Spark benchmarks were not rerun for this documentation update; the MiniMax-M3.1-Flash runs are from 2026-10-24.</p>
 
   <h2 id="deepseek41">DeepSeek V4.1 Flash 1017: exact and approximate prefill</h2>
   <p><strong>Recorded 2026-10-22–23:</strong> five NVIDIA A40 GPUs (46 GB each), <code>unsloth/DeepSeek-V4.1-Flash-1017-GGUF</code> <strong>UD-IQ2_XXS, six shards</strong>, Hugging Face revision <code>60ad3651</code>. TensorSharp uses unchanged ggml <code>da8e2a5</code> and <code>--tp 5</code>; the reference is the Unsloth llama.cpp checkout <code>be836572</code> with layer split and its own in-tree ggml. Context is 32,768 tokens, concurrency <strong>1</strong>, 256 generated tokens, greedy sampling and thinking off. Values are medians of three runs after a warmup.</p>
@@ -47,6 +47,24 @@
   </table></div>
   <p>Muse Spark prefill is uncached prompt tokens divided by streamed TTFT, unlike DeepSeek's internal-timer metric above. Layer split gives the strongest recorded prefill, while tensor parallelism gives the strongest recorded generation throughput. Ratios above 1 mean higher throughput; the 0.99× layer-split decode row is retained. TensorSharp and llama.cpp layer-split timings are medians of three repeats; llama.cpp tensor-split rows use medians of two. The reference's short and 4K tensor-split rows came from an earlier session of the same build. The teacher-forced layer-split mean KL divergence from llama.cpp is 0.0026; integration fixtures do not establish general model quality.</p>
   <p><strong>One host, no working P2P or NVLink:</strong> TensorSharp uses NCCL through host memory, while llama.cpp was built without NCCL because that build aborted on ten GPUs. Transport conditions are therefore material. The model files sit on a network filesystem. Images, speculation, CPU expert offload, contexts above 16K, other GPU counts and non-CUDA backends were not measured. The report does not freeze the final TensorSharp commit or commit complete raw records. This is a recorded working-tree comparison, not a benchmark of this documentation commit. <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/perf/muse-spark-vs-llama-cpp.md">Full setup, per-scenario results and limitations →</a></p>
+
+  <h2 id="minimax-m3">MiniMax-M3.1-Flash on eight A40 GPUs</h2>
+  <p><strong>Measured 2026-10-24.</strong> Unsloth <code>MiniMax-M3.1-Flash</code> <strong>UD-Q4_K_XL, seven shards / 232.3 GiB</strong>, eight A40 46 GB GPUs, <code>ggml_cuda</code>, layer split unless noted. TensorSharp ran on unchanged upstream ggml <code>da8e2a5</code>; the reference is llama.cpp from unslothai's <code>minimax-m31</code> branch (<code>ef8f94cc</code>, PR #320). Same box, one engine at a time with the GPUs held exclusively, three repeats, medians.</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Workload</th><th>Method</th><th>TensorSharp</th><th>llama.cpp</th><th>Ratio</th></tr></thead>
+    <tbody>
+      <tr><td>Prefill, 512 / 8,192 / 32,768 / 65,536 tokens</td><td>Executor bench vs <code>llama-bench -fa 1</code></td><td>448 / 1,699 / 2,449 / 2,567 tok/s</td><td>344 / 1,312 / 681 / 262 tok/s</td><td>1.30× / 1.29× / 3.60× / 9.80×</td></tr>
+      <tr><td>Decode, 128 tokens at depth 0 / 2,048 / 8,192 / 32,768</td><td>Executor bench vs <code>llama-bench -fa 1</code></td><td>24.8 / 23.9 / 23.8 / 23.4 tok/s</td><td>22.5 / 19.6 / 19.1 / 17.5 tok/s</td><td>1.10× / 1.22× / 1.25× / 1.34×</td></tr>
+      <tr><td>Prefill, 4K / 16K / 32K / 64K-token prompt</td><td>Server scenarios, one sequence</td><td>1,263 / 1,478 / 1,544 / 1,545 tok/s</td><td>283 / 273 / 240 / 211 tok/s</td><td>4.46× / 5.41× / 6.43× / 7.32×</td></tr>
+      <tr><td>Decode after those prompts</td><td>Server scenarios, one sequence</td><td>23.9 / 23.7 / 23.5 / 23.0 tok/s</td><td>19.2 / 18.5 / 17.7 / 16.1 tok/s</td><td>1.24× / 1.28× / 1.33× / 1.43×</td></tr>
+      <tr><td>Time to first token, short chat</td><td>Server scenarios</td><td>0.41 s</td><td>0.39 s</td><td>0.95×</td></tr>
+      <tr><td>Aggregate output, 4 / 8 concurrent requests</td><td>Server scenarios</td><td>42.1 / 53.7 tok/s</td><td>31.8 / 40.6 tok/s</td><td>1.32× / 1.32×</td></tr>
+      <tr><td>DSpark speculative decode, mean of code / prose / copy</td><td>Server scenarios, default gate vs <code>draft-dspark</code></td><td>32.3 tok/s</td><td>25.8 tok/s</td><td>1.25×</td></tr>
+      <tr><td>Decode at depth 0, <code>--tp 8</code></td><td>TP bench</td><td>35.7 tok/s</td><td>no tensor split for this model</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <p>Server prefill is uncached prompt tokens divided by streamed time to first token; llama-server ran with <code>-np 1 --no-kv-unified</code> (without it MiniMax Sparse Attention runs dense), engines rotated ABBA (the page cache was not evicted between launches, so load times are not compared). Each llama-bench prefill cell is the faster of <code>-ub 512</code> and <code>-ub 2048</code>, and its 64K cell is a single run. Short-chat and concurrent time to first token are slightly behind llama.cpp. Without the drafter both engines decoded those DSpark prompts at 22.9 and 20.5 tok/s. <code>--tp 8</code> drops to 26.0–26.5 tok/s past depth 2,048 and caps the context at 45,824 tokens, because attention and the caches are mirrored on every GPU; its figure comes from the tensor-parallel branch's build before integration.</p>
+  <p><strong>Limits:</strong> uncommitted working-tree builds rather than a frozen commit; one host and one checkpoint, no confidence intervals. Video, other GPU counts and backends, and full-checkpoint perplexity or KL divergence were not measured (MoE CPU offload was: 1.30&times; decode and 1.62&times; 4K prefill, two repeats); logit parity with llama.cpp was checked on synthetic fixtures only. The raw records are local validation evidence on the measurement host, not committed. <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/benchmarks.md#minimax-m31-flash-on-eight-a40-gpus">Every cell, method and limit →</a></p>
 
   <p>Other model families have their own capabilities and engineering notes: <a href="models-text.html">text models</a>, <a href="models-image.html">image models</a> and <a href="models-video.html">video models</a>. The selected text comparisons above make no performance claim for those workloads.</p>
 

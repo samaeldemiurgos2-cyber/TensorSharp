@@ -45,6 +45,8 @@ EmbeddingGemma 2 加载投影器后，两个嵌入端点也接受有序媒体 co
 
 **Muse Spark（`muse-spark`）同样有自己的原生整模型执行器。** 这个 816B-A42B 的 Unsloth 发布在 `--backend ggml_cuda` / `ggml_vulkan` 上由 TensorSharp 自有的执行器运行：每个微批提交一张横跨全部 GPU 与 CPU 的 GGML 图，所用 ggml 为未修改的上游版本。`--layer-split N` 把 62 层分到 N 张本地 GPU（最多 16 张），并在两张及以上、专家全部在显存中的 CUDA GPU 上把每个 prompt 的微批在各 GPU 间流水化（`TS_MUSE_SPARK_PIPELINE`）。`ggml_cuda` 上的 `--tp N` 用同一个执行器，通过上游 ggml 的 meta 后端（即 llama.cpp `-sm tensor` 背后的机制）把每一层切分到前 N 张 CUDA GPU 上（用 `CUDA_VISIBLE_DEVICES` 选择），所有专家都留在显存中。`TS_MUSE_SPARK_CPU_MOE=auto` 为按层切分逐个放置专家栈，让留在主机上的字节尽可能少；既没有它也没有 `--n-cpu-moe N` 时，放不下的 checkpoint 会被拒绝加载，错误信息会指明该选项。并发请求在按序列的 F16 KV slot 上共享批处理 decode 与 prefill 计算图。`TS_MUSE_SPARK_NATIVE=0` 选回较早的托管逐算子路径，`ggml_vulkan` 上的 `--tp N` 也走这条路径；`TS_MUSE_SPARK_NATIVE=1` 让 `ggml_cpu` 也使用该执行器。当前的完整模型测量在 `ggml_cuda`（十块 A40 GPU，UD-IQ3_XXS）上完成：与 llama.cpp 相比，`--layer-split 10` 的 4K token prompt prefill 快 2.07 倍、decode 持平（0.99 倍），`--tp 10` 的 decode 是 `-sm tensor` 的 1.40 倍。Vulkan 没有测量记录。与所有分片 GGUF 一样，`--model` 可以指向任意一片：TensorSharp 从第 1 片读取元数据，从所有分片读取张量。详见 [Muse Spark 卡片](docs/models/muse-spark_zh-cn.md)与 [llama.cpp 对比报告](docs/perf/muse-spark-vs-llama-cpp.md)（英文）。
 
+**MiniMax-M3.1-Flash（`minimax-m3`）只在原生整模型执行器上运行。** 这个 428B-A23B 的发布（Unsloth UD-Q4_K_XL，七个分片，232.3 GiB）在 `--backend ggml_cuda` 上由 TensorSharp 自有的执行器运行，所用 ggml 为未修改的上游版本；每层都是 MiniMax 稀疏注意力（位置 2048 之前为精确的稠密注意力，之后用 TensorSharp 的 CUDA MSA 内核）。`--backend ggml_cpu` 以正确性路径运行同一执行器；`mlx`、`ggml_metal`、`ggml_vulkan`、`cuda` 与 `cpu` 会拒绝加载。与所有模型一样，**除非另行指定，它只使用一张 GPU**，而该检查点放不下：请传入 `--layer-split N`（整层分布到 N 张 GPU、流水线 prefill，可用 `--n-cpu-moe N` 或 `TS_MINIMAX_M3_CPU_MOE=auto` 使用主机专家）或 `--tp N`（通过 ggml 的 meta 后端把每层切分到前 N 张 CUDA GPU，注意力与缓存镜像、FFN 切分；拒绝主机专家与草稿器）。DSpark 草稿器（`--draft-model`）在按层切分下运行。图像投影器与草稿器尚未出现在 Unsloth 仓库中，需从 Hugging Face 发布版转换。在八张 A40 上对照 llama.cpp，32K token 提示的 prefill 为 1,544 对 240 tok/s，4K 深度的 decode 为 23.9 对 19.2 tok/s。详见 [MiniMax-M3.1 卡片](docs/models/minimax-m3_zh-cn.md)与[性能数据](docs/benchmarks_zh-cn.md#八张-a40-上的-minimax-m31-flash)。
+
 
 
 ## 配置文件（CLI + Server）
@@ -846,8 +848,8 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 | `TS_NO_MULTI_AGENT` | 任何非空且不为 `0` 的值都会关闭子智能体委派，等同于 `--no-multi-agent`。仅服务端识别。 |
 | `TENSORSHARP_TP_DEGREE` | 本地张量并行度（默认 `1`），等价于 `--tp N`，不能用于按层切分。不支持的架构或后端会报错。 |
 | `TENSORSHARP_LAYER_SPLIT_DEGREE` | 本地按层切分的 GPU 数，等价于 `--layer-split N`，与 TP 及分布式 TP 参数互斥。 |
-| `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next 的共享 GGML 按层执行器的设备序号，逗号分隔，例如 `0,2`；与 `TENSORSHARP_TP_DEVICES` 独立。原生 GLM/DeepSeek 执行器请使用 `CUDA_VISIBLE_DEVICES`。 |
-| `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`；默认 `0..tp-1`）。用于 GGML 后端上的 TP。`ggml_cuda` 上 Muse Spark 的原生 `--tp` 使用前 N 张 CUDA GPU，设置了该变量时会拒绝加载；请用 `CUDA_VISIBLE_DEVICES` 选择 GPU。 |
+| `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next 的共享 GGML 按层执行器的设备序号，逗号分隔，例如 `0,2`；与 `TENSORSHARP_TP_DEVICES` 独立。原生 GLM/DeepSeek/MiniMax-M3.1 执行器请使用 `CUDA_VISIBLE_DEVICES`。 |
+| `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`；默认 `0..tp-1`）。用于 GGML 后端上的 TP。`ggml_cuda` 上 Muse Spark 与 MiniMax-M3.1 的原生 `--tp` 使用前 N 张 CUDA GPU，设置了该变量时会拒绝加载；请用 `CUDA_VISIBLE_DEVICES` 选择 GPU。 |
 | `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next（`qwen4exp`）多卡按层切分时每张 GPU 分到的层数（逗号分隔，例如 `20,28`），用于取代自动的显存均衡。给出无法满足的值时会直接抛错，而不是静默忽略。 |
 | `TENSORSHARP_TP_NODE_ID` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `TENSORSHARP_TP_PEERS` 一起设置。 |
 | `TENSORSHARP_TP_PEERS` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `TENSORSHARP_TP_NODE_ID` 一起设置。 |
@@ -1554,6 +1556,12 @@ token）——注意卸载配置离这张卡的 16 GB 有多远，以及 GPT-OSS
   结果与 ggml 逐位一致。有主机专家时
   自动流水化 prefill 不会开启；当前的对比（十张 A40，专家全部在显存中）见 [llama.cpp 对比报告](docs/perf/muse-spark-vs-llama-cpp.md)（英文）。详见
   [模型卡片](docs/models/muse-spark_zh-cn.md#原生整模型执行器)。
+* **MiniMax-M3.1 把稠密层也计入层数。** 在它的原生执行器上，`--n-cpu-moe N` 与 llama.cpp 一样从系统内存提供
+  第 0..N-1 层的路由专家，而第 0-2 层是稠密层，因此 `--n-cpu-moe 3` 及以下不会移动任何专家（加载时会给出提示）。
+  每个 MoE 层的专家约 3.8 GiB。`TS_MINIMAX_M3_CPU_MOE=auto` 则只放置放不下的 gate、up、down 专家栈；多路主机上
+  默认把主机副本放在 NUMA 本地并由绑核工作线程计算（`TS_MINIMAX_M3_HOST_NUMA=0` 保留映射）。仅限按层切分：
+  `--tp` 让全部专家留在显存并拒绝 `--n-cpu-moe`。卸载没有在完整检查点上测量。详见
+  [模型卡片](docs/models/minimax-m3_zh-cn.md#运行方式)。
 * **单 token 的主机专家走 TensorSharp 自己的内核。** 用的仍是 ggml 的 CPU 点积，但
   线程组每层只唤醒一次、算完即休眠，而不是每次调用都要唤醒工作线程的 ggml 图。忙等的
   线程组在主机侧更快，却让层间的 GPU 段在 Apple 芯片上慢了 1.5-2 倍，所以线程组改为
@@ -1682,6 +1690,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | Nemotron-H | ✅ | Mamba2 在 rank 0 上复制计算，MoE 专家切分。GGML 上仍按 token、按 rank 逐个遍历专家（尚未使用专家并行） |
 | Muse-Glimmer | ✅（最多 `--tp 2`） | 只有 2 个 KV head，因此 TP 度最多为 2；仅限 GGML CUDA / Vulkan；TP 下 DFlash 草稿器会被拒绝挂载——CLI 打印警告并按普通解码运行，服务端拒绝启动（见[约束](#约束)） |
 | Muse Spark | ✅（仅本地）+ 按层切分 | GGML CUDA 上的 `--tp N` 由原生整模型执行器运行，通过上游 ggml 的 meta 后端（即 llama.cpp `-sm tensor` 背后的机制）把每一层切分到前 N 张 CUDA GPU 上（用 `CUDA_VISIBLE_DEVICES` 选择；`TENSORSHARP_TP_DEVICES` 会被拒绝）。注意力按 KV 组切分，路由专家沿隐藏维以 256 元素为单位切分，输出头按词表行切分；norm、路由器与潜空间投影在每张 GPU 上各有一份，每层以两次 all-reduce 结束。N 可以不均匀，但不能超过 16 个 KV head；GPU 必须相同，所有专家都留在显存中（`--n-cpu-moe N`、`TS_MUSE_SPARK_LAYER_SPLIT` 与 `TS_MUSE_SPARK_PIPELINE=1` 会被拒绝）；此模式下流水化 prefill 与投机解码关闭。在十张 A40 上，`--tp 10` 的 decode 为 22.63 tok/s，是 llama.cpp `-sm tensor` 的 1.40 倍，而长 prompt 的 prefill 则是 `--layer-split 10` 更快（见 [llama.cpp 对比报告](docs/perf/muse-spark-vs-llama-cpp.md)（英文）与[模型卡片](docs/models/muse-spark_zh-cn.md#原生执行器上的张量并行)）。`TS_MUSE_SPARK_NATIVE=0` 以及 GGML Vulkan 上的 `--tp` 仍走较早的逐算子路径：按完整 GQA 头组与完整专家分到各 rank，路由器与输出头在 rank 0，读取 `TENSORSHARP_TP_DEVICES`。两种模式不能组合，分布式组会被拒绝 |
+| MiniMax-M3.1 | ✅（仅本地）+ 按层切分 | GGML CUDA 上的 `--tp N`（2 到 16 张相同型号的 CUDA GPU）在上游 ggml 的 meta 后端上用前 N 张 CUDA GPU 运行原生整模型执行器（用 `CUDA_VISIBLE_DEVICES` 选择；`TENSORSHARP_TP_DEVICES` 会被拒绝）。由于只有四个 KV 头，注意力、稀疏注意力索引器以及 K/V/索引键缓存在每张 GPU 上镜像，因此每张 GPU 能容纳的上下文更少（八张 A40 上为 45,824 token）；稠密、路由与共享专家 FFN 沿隐藏维切分，每层一次 all-reduce。`--tp` 下拒绝：`--layer-split`、`--n-cpu-moe`、`--draft-model`、`TS_MINIMAX_M3_MSA=kernel`、分布式组以及非 CUDA 后端。长提示请用 `--layer-split N`（[卡片](docs/models/minimax-m3_zh-cn.md#张量并行)） |
 | GLM 5.x | ✅（仅本地） | 仅限 GGML GPU 后端；GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 的原生 TP 路径都只支持本地单进程（`--tp-node-id` / `--tp-peers` 对整个 GLM 家族都是硬拒绝）。GLM-5.2 切 MLA head 与每个路由专家内的隐藏行。GLM-5.3-Flash 还会切 KDA head 并让每个 rank 持有对应的递归状态；其 MLA head 与路由专家隐藏行同样切分。注意力局部输出会在每次非线性 Sinkhorn 超连接之前归约。在 GLM-5.3-Flash 满足条件的分段快路径上，路由 MoE 局部输出先归约，随后每个 rank 在本地计算并加入其复制的共享专家；超连接、池化 indexer、router、norm、稠密层与 embedding 也保持不切分并按 rank 执行，output norm / LM head 留在 rank 0。CPU MoE、tracing、部分 `TS_GLM_TP_SHARD` 切分、超额 rank 或缺少原生超连接内核时使用组合调度器回退，其中共享专家只在 rank 0 运行一次。GLM-5.3（非 Flash）同样以本地单进程的方式接受 `--tp N`，并在每个 rank 上复制 MLA 与 indexer cache，因此 `--tp` 会成倍放大 KV 占用；它在 `--tp N>1` 下从未被实际跑过——唯一有记录的算术是一个装不下的例子：`--tp 8` 每个 rank 需要 41.7 GiB，而卡只有 46 GB——因此它只是一个被接受的模式，而不是已验证的配置；另外在那里只要 `--tp N>1`，`--spec` 就会被拒绝。用 `--layer-split N` 选择整层放置 |
 | DeepSeek V4 Flash | 按层切分 | 不是张量并行：整模型执行器按每张卡的空闲显存把连续的整层装箱分配，`--layer-split N` 只限制这次切分用几张卡 |
 | DeepSeek V4.1 Flash | partial TP | `--layer-split N` 选择本地整层放置。GGML CUDA 上的实验性 routed-MoE TP 使用 `--tp N`；不支持注意力 TP 与分布式组。两种模式不能组合。 |
@@ -1752,7 +1761,7 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 
 | 变量 | 作用 |
 |---|---|
-| `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号，例如 `0,2`（默认 `0..tp-1`）。Muse Spark 的原生 `--tp` 会拒绝它，请改用 `CUDA_VISIBLE_DEVICES` |
+| `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号，例如 `0,2`（默认 `0..tp-1`）。Muse Spark 与 MiniMax-M3.1 的原生 `--tp` 会拒绝它，请改用 `CUDA_VISIBLE_DEVICES` |
 | `TS_GGML_TP_PARALLEL=0` | 顺序而非并发地驱动各 rank（诊断用） |
 | `TS_GGML_TP_FUSED_MATMUL=1` | 由单个线程提交两个 rank 的线性层（默认关闭；它每次调用都要为每个 rank 分配设备缓冲，在 Qwen 3.5 35B 上实测慢 2.3×） |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 超过该元素数量时 AllReduce 走设备集合通信（默认 262144） |
@@ -1880,6 +1889,7 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | DeepSeek V4 DSpark 草稿器 GGUF（V4.1：实验性的 `deepseek41-dspark`，仅限 `ggml_cuda` / `ggml_cpu`） | 无 | `TS_SPEC_DRAFT_MODEL` | `--draft-model <path>` |
 | Muse-Glimmer DFlash / DFlash2 草稿器 GGUF | 无 | `TS_SPEC_DRAFT_MODEL` | `--draft-model <path>` |
 | Qwen 3.5 / 3.8 DFlash2 草稿器 GGUF | 无 | `TS_SPEC_DRAFT_MODEL` | `--draft-model <path>` |
+| MiniMax-M3.1 DSpark 草稿器 GGUF（`dflash`，从 Hugging Face 发布版转换；仅按层切分，`--tp` 下拒绝） | 无 | `TS_SPEC_DRAFT_MODEL` | `--draft-model <path>` |
 | 融合 DFlash 计算图（ggml） | 开启 | — | — |
 | DFlash 投机 prefill 分块 | `1024`（受草稿器环形缓冲与主干窗口限制） | `TS_DFLASH_PREFILL_CHUNK` | — |
 | DFlash2 候选选择器 | 检查点带有时开启 | `TS_DFLASH_SELECTOR=0` 改为按逐位置 argmax 起草（仅用于归因分析） | — |
@@ -1924,6 +1934,25 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | 视觉伴随件 | 原生 ggml 组件 | — | 在 `--backend cpu` 上不可用，那里 `--mmproj` 会抛异常；「视觉伴随件跟随文本模型落到同一后端」说的是 `--backend ggml_cpu` |
 | `--backend cpu` 上的上下文窗口 | `MAX_CONTEXT` 默认封到 `65,536`，且所有 compressed cache 行都在主机内存里，因此宣称的 1M 在这里到不了 | `MAX_CONTEXT=N` | —（仅环境变量） |
 | `--backend cpu` 上的多轮 KV 前缀复用与按序列 slot | 都没有：任何分叉的新一轮都会重新 prefill，并发请求会串行化 | — | — |
+
+#### MiniMax-M3.1-Flash（`minimax-m3`）
+
+所有 `TS_MINIMAX_M3_*` 变量及其默认值见
+[环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md#矩阵外的-minimax-m31-开关)。
+
+| 功能 | 默认值 | 环境变量 | CLI 等价参数 |
+|---|---|---|---|
+| 执行器 | `ggml_cuda` 上的原生整模型 ggml 图；`ggml_cpu` 为正确性路径；其他后端拒绝 | — | `--backend ggml_cuda` |
+| GPU 数 | **一张**（232 GiB 的检查点放不下） | `TENSORSHARP_LAYER_SPLIT_DEGREE`、`TENSORSHARP_TP_DEGREE` | `--layer-split N` 或 `--tp N` |
+| 显式的每 GPU 层数 | 自动放置 | `TS_MINIMAX_M3_LAYER_SPLIT` | — |
+| 注意力路径 | `auto`：位置 2048 之前稠密，之后用 TensorSharp CUDA MSA 内核 | `TS_MINIMAX_M3_MSA=auto\|dense\|ggml\|kernel` | — |
+| 上下文窗口 | 以声明的 1,048,576 为上限，限制到能放下的大小并记录 | `MAX_CONTEXT=N` 使其成为硬限制；`TS_MINIMAX_M3_PLAN_CTX_TOKENS` 决定所有槽位的 K/V 预留 | —（仅环境变量） |
+| KV 缓存 | 每个序列槽位的 F16 K、V 与索引键；拒绝块量化类型 | — | `--kv-cache-dtype`（仅 `f16`；`f32` 会带警告地以 F16 运行） |
+| 主机专家 | 关闭 | `TS_MINIMAX_M3_CPU_MOE=auto` | `--n-cpu-moe N`（仅按层切分） |
+| 按层切分的流水线 prefill | 两张及以上 CUDA GPU 且无主机专家时自动开启 | `TS_MINIMAX_M3_PIPELINE`、`TS_MINIMAX_M3_PIPELINE_UBATCH` | — |
+| prefill 微批 | `2048` | `TS_MINIMAX_M3_UBATCH` | — |
+| DSpark 投机解码 | 关闭 | `TS_SPEC_DRAFT_MODEL` | `--draft-model <path>`（仅按层切分） |
+| 视觉投影器 | 无（需自行转换，见卡片） | — | `--mmproj <path>` |
 
 #### MiniMax-H3 视频 + 音频
 

@@ -397,6 +397,70 @@ namespace TensorSharp.Runtime
 
             Register(new ChatProtocol
             {
+                Id = "minimax-m3",
+                Architectures = new[] { "minimax-m3", "minimax_m3" },
+                // The M3.1 template has no thinking switch ("Current thinking mode:
+                // adaptive", bare `]~b]ai\n` generation prompt), and TensorSharp's
+                // `think` is a boolean whose absence reads as false. So think=false renders
+                // the template exactly as shipped - the model decides, as it does under HF
+                // and llama.cpp (whose enable_thinking=false leaves this template's prompt
+                // unchanged too) - and think=true opens the block for it, the engine
+                // convention for the older M3 template's thinking_mode=enabled. The
+                // renderer's Disabled mode (a `</mm:think>` prefix, "begin your response
+                // directly after the </mm:think> prefix") has no request surface yet.
+                Render = r => ChatTemplate.RenderMiniMaxM3(r.Messages, r.AddGenerationPrompt, r.Tools,
+                    r.EnableThinking ? MiniMaxM3ThinkingMode.Enabled : MiniMaxM3ThinkingMode.Adaptive,
+                    r.ReasoningEffort),
+                // Recursive to_xml macro, namespace(), items() and Python json.dumps
+                // spacing: the feature set the lightweight Jinja engine renders
+                // inconsistently. The renderer is checked byte for byte against HF.
+                PreferOwnRenderer = _ => true,
+                // One `]<]image[>[` per image; the injector expands it into the
+                // start/end-of-image pair around N rows. Sampled video frames go the
+                // same way (see AppendMiniMaxM3MediaPlaceholders), one image's worth of
+                // rows each, so long clips are capped.
+                AppendMediaPlaceholders = ChatTemplate.AppendMiniMaxM3MediaPlaceholders,
+                CapsVideoFrames = true,
+                // Reasoning, the bare `</mm:think>` prefix and the namespaced XML tool
+                // calls all arrive as text (the markers are USER_DEFINED tokens, which
+                // detokenize), so an unparsed reply would show all of it as the answer.
+                CreateOutputParser = () => new MiniMaxM3OutputParser(),
+                OutputParserAlwaysRequired = true,
+                // The answer starts after `</mm:think>` in both modes: the end of a
+                // reasoning block, or the bare prefix the model writes when it does not
+                // think. A response_format grammar armed from token 0 would forbid that
+                // prefix and push the model off its trained reply shape. (A reply that
+                // skips the prefix entirely is left unconstrained; the reply shape the
+                // template trains always has it.)
+                GrammarActivationTrigger = ChatTemplate.MiniMaxM3ThinkClose,
+                ThinkingGrammarActivationTrigger = ChatTemplate.MiniMaxM3ThinkClose,
+                // `<effort>low|medium|high</effort>` in the system block.
+                RendersReasoningEffort = true,
+                // The system block (identity, thinking instructions, model id) and the
+                // default developer turn open every conversation.
+                SharesTemplatePreamble = true,
+                // Every past assistant turn re-renders its reasoning (all-turn visible)
+                // or a bare `</mm:think>`.
+                RendersAssistantReasoning = true,
+                // History reproduces the model's own `<mm:think>`/`</mm:think>`; only a
+                // think=true prompt's opener is not part of the turn's raw tokens.
+                AssistantGenerationSuffix = thinking => thinking ? ChatTemplate.MiniMaxM3ThinkOpen : null,
+                // The renderer leaves a raw-token turn unframed itself; nothing to strip.
+                EmitsEmptyThinkBlockForPastTurns = _ => false,
+                // Tool results are framed from role=tool alone (one `]~b]tool` turn per
+                // run), never from the preceding assistant's structured calls.
+                ToolCallRawSplicing = ToolCallRawSplicing.Always,
+                // `<mm:think>` (200059) and `</mm:think>` (200060) are single tokens. No
+                // ThinkingBudgetOpenToken: the model opens the block itself in adaptive mode
+                // (think=false, the template as shipped), and declaring the opener would arm
+                // the unrequested-channel cap (UnrequestedThinkingBudgetFor, ~64 tokens) on
+                // that normal reasoning, which HF and llama.cpp never truncate. think=true
+                // opens the block in the prompt, so its budget needs no opener either.
+                ThinkingBudgetEndToken = ChatTemplate.MiniMaxM3ThinkClose,
+            });
+
+            Register(new ChatProtocol
+            {
                 Id = "glm-dsa",
                 Architectures = new[] { "glm-dsa", "glm_dsa" },
                 Render = r => ChatTemplate.RenderGlmDsa(r.Messages, r.AddGenerationPrompt, r.EnableThinking, r.Tools),

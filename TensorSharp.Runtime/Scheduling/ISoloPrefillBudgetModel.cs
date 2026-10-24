@@ -21,5 +21,13 @@ namespace TensorSharp.Runtime.Scheduling
         /// (it may exceed <see cref="SchedulerConfig.MaxNumBatchedTokens"/>); 0 for the
         /// scheduler's own step.</summary>
         int PreferredSoloPrefillTokens(int start, int remaining);
+
+        /// <summary>Prompt tokens too few to be worth a prefill step of their own: a public
+        /// shared-prefix checkpoint boundary at most this far past the prefix a request reused from
+        /// the prefix cache does not end a prefill step. A later request that reuses the same prefix
+        /// prefills those tokens inside its own first step anyway, while the cut would cost this
+        /// request one more forward pass, which for a model whose pass has a large fixed cost is most
+        /// of a short turn's latency. 0 (the default) cuts at every boundary.</summary>
+        int CheckpointGapTokens => 0;
     }
 }

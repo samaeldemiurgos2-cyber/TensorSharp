@@ -12,7 +12,7 @@ namespace TensorSharp.Runtime.Grammar;
 public enum DeepSeek41ToolChoice { Auto, None, Required, Named }
 
 /// <summary>Immutable grammar recipe; every generation gets an independent parser.</summary>
-public sealed class DeepSeek41ToolGrammar
+public sealed class DeepSeek41ToolGrammar : IToolCallGrammar
 {
     public const string CallsOpen = "<｜DSML｜ calls>";
     private const string CallsClose = "</｜DSML｜ calls>";

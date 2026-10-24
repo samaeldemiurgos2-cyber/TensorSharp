@@ -1,0 +1,28 @@
+{
+  "images": [
+    {
+      "file": "number-7319.png",
+      "mime": "image/png",
+      "question": "What number is written in this image? Reply with the digits only.",
+      "expect_regex": "7\\s*,?\\s*3\\s*1\\s*9"
+    },
+    {
+      "file": "shapes-red-circle.jpg",
+      "mime": "image/jpeg",
+      "question": "This image shows a circle and a square. What color is the circle? Reply with one word.",
+      "expect_regex": "\\bred\\b"
+    },
+    {
+      "file": "word-ocean.jpg",
+      "mime": "image/jpeg",
+      "question": "What word is written in this image? Reply with the word only.",
+      "expect_regex": "\\bocean\\b"
+    },
+    {
+      "file": "count-green-squares.png",
+      "mime": "image/png",
+      "question": "How many green squares are in this image? Reply with a number.",
+      "expect_regex": "\\b(3|three)\\b"
+    }
+  ]
+}

@@ -110,6 +110,8 @@ internal class OracleModel : IModelArchitecture, IBatchedPagedModel, IPrefixCach
     internal long SpareBytes { get; set; } = -1;
     internal int PrimaryConversionCalls { get; private set; }
     internal List<(string Key, InvalidationReason Reason)> ReportedInvalidations { get; } = new();
+    /// <summary>Token count of every <see cref="Forward"/> call, in order (the prefill steps a scheduler chose).</summary>
+    internal List<int> ForwardLengths { get; } = new();
 
     /// <summary>Makes the next call of <paramref name="operation"/> fail: clone, capture, donate,
     /// return, convert, convert-throw, forward, export, import, truncate, copy-paged.</summary>
@@ -131,6 +133,7 @@ internal class OracleModel : IModelArchitecture, IBatchedPagedModel, IPrefixCach
     public float[] Forward(int[] tokens)
     {
         if (tokens == null || tokens.Length == 0) throw new ArgumentException("tokens required", nameof(tokens));
+        ForwardLengths.Add(tokens.Length);
         OracleCache cache = Active;
         foreach (int t in tokens)
         {

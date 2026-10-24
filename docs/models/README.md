@@ -42,6 +42,7 @@ Media in the input column is content the model receives; the output column disti
 | [DeepSeek V4 Flash](deepseek4.md) | Text | Text | Conditional: check memory and placement; optional DSpark speculation requires a matching drafter. |
 | [DeepSeek V4.1 Flash / 1017](deepseek41.md) | Text; conditional image/video | Text | Experimental: routed-MoE TP/DSpark. Pure-C# CPU coverage is fixture-only; default 1017 YOCO prefill is approximate. |
 | [Muse Spark](muse-spark.md) | Text, image with Spark projector | Text | Conditional: multi-GPU or large host memory. Recorded CUDA measurements do not qualify every backend; audio is unsupported. |
+| [MiniMax-M3.1-Flash](minimax-m3.md) | Text, image with a converted projector | Text | Conditional: `ggml_cuda` and several GPUs (232 GiB UD-Q4_K_XL); the projector and DSpark drafter must be converted. Recorded 8x A40 measurements do not qualify other backends; audio is unsupported. |
 | [Muse-Glimmer](muse-glimmer.md) | Text, image | Text | Conditional: projector for images, ATEM for tools, separate DFlash drafter for optional speculation; check backend limits. |
 | [DiffusionGemma](diffusiongemma.md) | Text, image | Text | Unsupported: chat audio, video_url and tools. Web UI video is supplied as sampled images. |
 | [Jev (DiffusionGemma)](jev.md) | Text, images, extracted documents/frames/transcripts | Typed decisions | Conditional: sampled video and configured ASR transcripts; see ingestion and probability limits. |

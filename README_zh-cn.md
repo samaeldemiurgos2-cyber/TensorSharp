@@ -98,7 +98,7 @@ dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNat
 
 ## 支持的模型家族一览
 
-- **文本、推理与多模态 LLM：** [DeepSeek V4 Flash](docs/models/deepseek4_zh-cn.md) / [V4.1 Flash](docs/models/deepseek41_zh-cn.md)、[GLM 5.x](docs/models/glm_zh-cn.md)、[Gemma 4](docs/models/gemma4_zh-cn.md)、[Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35_zh-cn.md)、[Qwen 3.8 Flash Next](docs/models/qwen38-flash-next_zh-cn.md)、[Bonsai2](docs/models/bonsai2_zh-cn.md)（Qwen 家族）、[GPT OSS](docs/models/gptoss_zh-cn.md)、[Nemotron-H](docs/models/nemotron_zh-cn.md)、[Mistral 3](docs/models/mistral3_zh-cn.md)、[Hunyuan Dense](docs/models/hunyuan-dense_zh-cn.md)、[Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md) 与 [Muse Spark](docs/models/muse-spark_zh-cn.md)（816B MoE，多 GPU）。
+- **文本、推理与多模态 LLM：** [DeepSeek V4 Flash](docs/models/deepseek4_zh-cn.md) / [V4.1 Flash](docs/models/deepseek41_zh-cn.md)、[GLM 5.x](docs/models/glm_zh-cn.md)、[Gemma 4](docs/models/gemma4_zh-cn.md)、[Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35_zh-cn.md)、[Qwen 3.8 Flash Next](docs/models/qwen38-flash-next_zh-cn.md)、[Bonsai2](docs/models/bonsai2_zh-cn.md)（Qwen 家族）、[GPT OSS](docs/models/gptoss_zh-cn.md)、[Nemotron-H](docs/models/nemotron_zh-cn.md)、[Mistral 3](docs/models/mistral3_zh-cn.md)、[Hunyuan Dense](docs/models/hunyuan-dense_zh-cn.md)、[Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md)、[Muse Spark](docs/models/muse-spark_zh-cn.md)（816B MoE，多 GPU）与 [MiniMax-M3.1-Flash](docs/models/minimax-m3_zh-cn.md)（428B MoE，多 GPU）。
 - **文本扩散：** [DiffusionGemma](docs/models/diffusiongemma_zh-cn.md)，包含 `/v1/systemone` 上的 [Jev 类型化判定](docs/models/jev_zh-cn.md)（支持文本、图像、上传文档、抽样视频帧，以及通过已配置 ASR 配套服务得到的语音转录）。
 - **图像生成/编辑与视频生成：** [Qwen-Image-2.1](docs/models/qwenimage21_zh-cn.md)、[LTX 2.5 Distilled（视频 + 48 kHz 立体声音频）](docs/models/ltx-2.5_zh-cn.md)、[MiniMax-H3（视频 + 立体声音频）](docs/models/minimax-h3_zh-cn.md) 与 [Wan 2.1 / 2.2](docs/models/wan_zh-cn.md)。
 - **嵌入：** [EmbeddingGemma 2](docs/embeddings_zh-cn.md)，包括文本 / 代码及可选的图像、音频、视频输入；以及 Snowflake Arctic Embed L v2.0、all-MiniLM-L6-v2 等 BERT / XLM-R 编码器。
@@ -144,6 +144,8 @@ TensorAgent 当前目录包含 39 个条目，按可搜索的模型家族分组�
 **Muse Spark：** UD-IQ3_XXS、32,768 token 上下文、F16 KV、贪心且关闭思考；比较对应放置模式，长提示 prefill 输出上限为 32 token，短提示 decode 与并发请求为 256 token。Prefill 按未缓存提示 token 数除以流式 TTFT 计算。层切分的 decode 略慢：16.69 对 16.79 tok/s（0.99×）。该主机 P2P 不可用，llama.cpp 张量切分未启用 NCCL，而 TensorSharp 使用 NCCL，因此 TP 对比受此限制。[完整报告](docs/perf/muse-spark-vs-llama-cpp.md)。
 
 方法、重复次数、质量取舍与构建限制见[性能数据](docs/benchmarks_zh-cn.md)。这里没有声称进行了新一轮基准，也不能据此验证所有后端或已发布的二进制。
+
+八张 A40 GPU 上的 MiniMax-M3.1-Flash（2026-10-24 测量，与上表分开）：[与 llama.cpp 的对比](docs/benchmarks_zh-cn.md#八张-a40-上的-minimax-m31-flash)。
 
 ## 文档
 

@@ -40,7 +40,7 @@ BM25 检索不需要嵌入模型。可选 GGUF 嵌入增加语义检索；聊天
 
 ### 最新加入的架构
 
-以下架构系列带着值得先了解的限制。DeepSeek V4.1 Flash 与 Hunyuan Dense 首次随 `v2026.09.01` 标签发布，Muse Spark 晚于 `v2026.10.11`；模型卡片还记录了之后的变化。
+以下架构系列带着值得先了解的限制。DeepSeek V4.1 Flash 与 Hunyuan Dense 首次随 `v2026.09.01` 标签发布，Muse Spark 与 MiniMax-M3.1-Flash 晚于 `v2026.10.11`；模型卡片还记录了之后的变化。
 
 - **Muse Spark（`muse-spark`）**——816B-A42B 的 Unsloth 发布（实测所用的 UD-IQ3_XXS 为
   8 个分片、317 GiB；UD-Q3_K_XL 为 10 个分片、374 GiB），通过自己的投影器支持图像输入，
@@ -56,6 +56,17 @@ BM25 检索不需要嵌入模型。可选 GGUF 嵌入增加语义检索；聊天
   的 prefill 为 2.07x / 1.63x；`--tp 10` 的 decode 为 1.40x，4K token 的 prefill 为 3.88x，
   均测于同一台没有可用 P2P 的机器。Vulkan、CPU 专家卸载、投机解码与 16K 以上的上下文均未测量。
   见[模型卡片](models/muse-spark_zh-cn.md)与[报告](perf/muse-spark-vs-llama-cpp.md)（英文）。
+- **MiniMax-M3.1-Flash（`minimax-m3`）**——428B-A23B 的发布，每层都是 MiniMax 稀疏注意力；
+  Unsloth 的 UD-Q4_K_XL 为 7 个分片、232.3 GiB，其仓库目前没有 mmproj 与 DSpark 草稿器，
+  两者都需用 llama.cpp PR #320 的转换器从 Hugging Face 发布版转换。TensorSharp 自有的原生执行器
+  只在 `ggml_cuda` 上运行它（`ggml_cpu` 为正确性路径；其他后端会被拒绝），所用 ggml 为未修改的
+  上游版本，位置 2048 之后使用 TensorSharp 的 CUDA MSA 内核。除非用 `--layer-split N`（流水线
+  prefill、主机专家）或 `--tp N`（ggml 的 meta 后端；注意力与缓存镜像、FFN 切分）指定，它只用
+  一张 GPU。已实现图像、自适应思维链、带语法约束 `tool_choice` 的 XML 工具、批量 decode/prefill、
+  前缀检查点与 DSpark 投机解码（仅按层切分）。2026-10-24 在八张 A40 上对照 llama.cpp，32K token
+  提示的 prefill 为 6.43x，4K 深度的 decode 为 1.24x；短对话首 token 时间略慢（0.95x）。CPU 专家
+  卸载与视频未在完整检查点上测量。见[模型卡片](models/minimax-m3_zh-cn.md)与
+  [性能数据](benchmarks_zh-cn.md#八张-a40-上的-minimax-m31-flash)。
 - **DeepSeek V4.1 Flash（`deepseek41`）**——专用的原生 V4.1 计算图，外加可选的视觉
   伴随文件。服务后端是 `ggml_cuda`；`ggml_cpu` 用同一套图跑标量回退实现，`cpu` 则运行
   纯 C# 的 V4.1 执行器，两者都是正确性与可移植性通道；`cuda` 用 Direct CUDA 引擎自己的
@@ -356,7 +367,7 @@ TensorAgent 是使用 .NET MAUI 构建的 iOS/iPadOS、macOS 与 Windows 应用�
 | 个人知识库 | 本地原文件与带版本的来源；TensorAgent 文件/多级文件夹/聊天快照导入、预览与逐聊天选择；独立服务端显式启用 `/api/knowledge` 和请求范围。BM25、可选嵌入及有界模型排序；媒体/PDF/Office 提取有明确限制。见[指南](knowledge-system_zh-cn.md)。 |
 | 生成中引导 | TensorAgent、独立浏览器聊天与交互式 CLI 的文本生成可接受新用户指令，保留部分回答后继续；不撤销已完成工具操作。见[使用指南](../USAGE_zh-cn.md)。 |
 | 嵌入模型 | BERT/XLM-R 句向量与 EmbeddingGemma 2 文本/代码和可选媒体投影器；EmbeddingGemma 2 为 8192 token，768/512/256/128 维。六条直接/原生 CPU/MLX/CUDA 路径，独立 `--embeddings` 服务与 OpenAI/Ollama API。数值/性能限制见[指南](embeddings_zh-cn.md)。 |
-| 模型家族 | DeepSeek V4 Flash（`deepseek4`）、DeepSeek V4.1 Flash（`deepseek41`）、GLM 5.x（`glm-dsa`、`glm_dsa`、`glm5next`）、Gemma 4、DiffusionGemma、Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`、`qwen3next`）、Qwen 3.8 Flash Next（`qwen4exp`）、Bonsai2 27B（带 PRISM `prism.hadamard.*` 元数据和 PQ2_0 / PTQ1_0 张量的 `qwen35` 文件）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni 与 Nemotron 3.5 Lightning；`nemotron_h`、`nemotron_h_moe`、`nemotron_h_omni`）、Mistral 3（`mistral3`，以及标为 `llama` 的 Mistral Small 3.x 文件）、Hunyuan Dense（`hunyuan-dense`）、Muse-Glimmer（`muse-glimmer`、`muse_glimmer`）、Muse Spark（`muse-spark`、`muse_spark`）。文生图与图像编辑通过 Qwen-Image-2.1（`qwen_image`、`qwen-image`）；音视频联合生成通过 MiniMax-H3（`minimax-h3`、`minimax_h3`）与实验性 LTX 2.5 Distilled（`ltx-2.5` 及别名），纯视频生成通过 Wan 2.1 / 2.2（`wan`、`wan2.1`、`wan2.2`）。 |
+| 模型家族 | DeepSeek V4 Flash（`deepseek4`）、DeepSeek V4.1 Flash（`deepseek41`）、GLM 5.x（`glm-dsa`、`glm_dsa`、`glm5next`）、Gemma 4、DiffusionGemma、Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`、`qwen3next`）、Qwen 3.8 Flash Next（`qwen4exp`）、Bonsai2 27B（带 PRISM `prism.hadamard.*` 元数据和 PQ2_0 / PTQ1_0 张量的 `qwen35` 文件）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni 与 Nemotron 3.5 Lightning；`nemotron_h`、`nemotron_h_moe`、`nemotron_h_omni`）、Mistral 3（`mistral3`，以及标为 `llama` 的 Mistral Small 3.x 文件）、Hunyuan Dense（`hunyuan-dense`）、Muse-Glimmer（`muse-glimmer`、`muse_glimmer`）、Muse Spark（`muse-spark`、`muse_spark`）、MiniMax-M3.1-Flash（`minimax-m3`、`minimax_m3`）。文生图与图像编辑通过 Qwen-Image-2.1（`qwen_image`、`qwen-image`）；音视频联合生成通过 MiniMax-H3（`minimax-h3`、`minimax_h3`）与实验性 LTX 2.5 Distilled（`ltx-2.5` 及别名），纯视频生成通过 Wan 2.1 / 2.2（`wan`、`wan2.1`、`wan2.2`）。 |
 | 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API、OpenAI Responses 风格 API，以及 Jev 类型化决策 API（`POST /v1/systemone`，由已加载的 DiffusionGemma 模型提供，状态支持文本、图像、上传文档、抽样视频帧和已配置 ASR 服务的语音转录；见 [Jev](models/jev_zh-cn.md)）。 |
 | TensorAgent 应用 | TensorAgent 支持 iOS/iPadOS，同一个项目还能构建 Mac 版（Mac Catalyst：桌面引擎库、Seatbelt 约束的进程，已实测）与 Windows 版（Windows x64 上有限的 Debug/Release 聊天、合成图像与工具检查；图像/音频/视频生成尚未验证）。在手机上它将 GGML 作为 iOS `.xcframework` 链接，并在真机上使用 `ggml_metal`。它共享与宿主无关的聊天流水线（`TensorSharp.Chat`），但通过进程内 loopback 宿主提供自己的手机版页面——iOS 既没有 ASP.NET Core 运行时包，也不能启动子进程。它支持 iPhone 与 iPad（arm64，iOS 17.0 或更高版本）。应用离开屏幕后这一轮不会丢失（应用不在前台时生成暂停，回到前台后继续）；投机解码与子智能体委派默认开启；共享提示词前缀的 checkpoint 会按模型持久化，使每次启动的第一条消息只需一次恢复而不必完整预填充（在 iPhone 17 Pro Max 上以 Qwen3.5 9B 实测：原本 54 秒的冷启动首条消息，变成 1.2 秒预热加约 0.6 秒的首条消息）；引擎的内存策略也按 iOS jetsam 实际计费的口径来设定。详见 [TensorAgent](../TensorAgent/README.md)。 |
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA、GGML Vulkan。DeepSeek V4 另有三套专属的整模型执行器——Direct CUDA、原生 ggml 与纯 C# CPU——在 GPU 执行器上通过 `--layer-split N` 按整层放置权重（`--layer-split N` 指定卡数）。DeepSeek V4.1 的服务路径是 `ggml_cuda`；`ggml_cpu` 用同一套原生计算图跑标量回退实现，`cpu` 则是纯 C# 的 V4.1 执行器，两者都是正确性与可移植性通道，而非服务通道。`cuda` 用 Direct CUDA 引擎自己的内核运行 V4.1（不经过 ggml），已有针对合成内核/槽位的测试，但没有完整检查点的数值门禁。`ggml_vulkan` / `ggml_metal` 需要 `TS_DSV41_ALLOW_NON_CUDA_GPU=1`；`mlx` 会直接拒绝该检查点，而不会把 V4.1 的权重塞进并未实现它的计算图。Wan 可运行于各 GGML 后端以及 Direct `cuda` / 纯 C# `cpu`，不支持 MLX。MiniMax-H3 有六条原生/直接 CPU、CUDA、MLX 路径。LTX 将 `ggml_cuda` / `cuda` 映射到自有 CUDA，`ggml_metal` / `mlx` 映射到 MLX，`ggml_cpu` / `cpu` 映射到 Direct CPU，拒绝 Vulkan 与多 GPU。Qwen-Image-2.1 支持 GGML 后端及完整的纯 C# `cpu` 流水线（单进程，不支持张量并行），Bonsai2 需要单设备 GGML 后端。Qwen 3.8 Flash Next 会直接拒绝 `mlx`，并指明改用 `ggml_metal`。Muse Spark 的原生整模型执行器是 `ggml_cuda` / `ggml_vulkan` 上的默认路径，完整模型测量仅在 CUDA 上完成；它的 `--tp N` 在 `ggml_cuda` 上走原生执行器，在 `ggml_vulkan` 上走逐算子路径，`TS_MUSE_SPARK_NATIVE=0` 选择逐算子路径，它的按层切分与 `--tp N` 需要 `ggml_cuda` / `ggml_vulkan`。 |

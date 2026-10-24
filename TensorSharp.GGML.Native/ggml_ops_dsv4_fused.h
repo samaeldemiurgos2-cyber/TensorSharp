@@ -69,6 +69,12 @@ enum tsg_dsv4_fused_kind : int32_t
     // enqueued across every rank without a host synchronization
     // (device_launch), on the CPU backend it runs host_compute.
     TSG_DSV41_TP_MOE            = 26,
+    // MiniMax-M3 sparse attention (ggml_ops_minimax_msa.h): src q, iq, k, v,
+    // idx caches, I32 positions -> dst F32 1-D, the [head_dim, n_head, nt]
+    // result followed by the CUDA workspace. i0 block, i1 topk, i2 local
+    // blocks, i3 index precision, f0 kq scale. The CPU backend runs the
+    // node's own callback; CUDA runs desc.cuda_compute.
+    TSG_MSA_ATTENTION           = 27,
 };
 
 #define TSG_DSV4_FUSED_MAGIC 0x5453445356344655ull  // "TSDSV4FU"
@@ -86,6 +92,11 @@ struct tsg_dsv4_fused_desc
     void *   object = nullptr;
     void   (*host_compute)(void * object, struct ggml_tensor * dst) = nullptr;
     void   (*device_launch)(void * object, struct ggml_tensor * dst, void * cuda_stream, int device) = nullptr;
+    // TSG_MSA_ATTENTION only: launches the node on the paired ggml-cuda
+    // backend's stream, with the workspace in the node's own tail. Kept a
+    // pointer for the same reason as the TP hooks: no link dependency from
+    // this backend.
+    void   (*cuda_compute)(struct ggml_tensor * dst, ggml_backend_t cuda_backend) = nullptr;
 };
 
 // CPU reference implementation (ggml_custom_op_t signature); used when a

@@ -99,7 +99,7 @@ The app includes its .NET runtime and native engine. Windows needs [WebView2 Eve
 
 ## Supported model families at a glance
 
-- **Text, reasoning, and multimodal LLMs:** [DeepSeek V4 Flash](docs/models/deepseek4.md) / [V4.1 Flash](docs/models/deepseek41.md), [GLM 5.x](docs/models/glm.md), [Gemma 4](docs/models/gemma4.md), [Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35.md), [Qwen 3.8 Flash Next](docs/models/qwen38-flash-next.md), [Bonsai2](docs/models/bonsai2.md) (Qwen family), [GPT OSS](docs/models/gptoss.md), [Nemotron-H](docs/models/nemotron.md), [Mistral 3](docs/models/mistral3.md), [Hunyuan Dense](docs/models/hunyuan-dense.md), [Muse-Glimmer](docs/models/muse-glimmer.md), and [Muse Spark](docs/models/muse-spark.md) (816B MoE, multi-GPU).
+- **Text, reasoning, and multimodal LLMs:** [DeepSeek V4 Flash](docs/models/deepseek4.md) / [V4.1 Flash](docs/models/deepseek41.md), [GLM 5.x](docs/models/glm.md), [Gemma 4](docs/models/gemma4.md), [Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35.md), [Qwen 3.8 Flash Next](docs/models/qwen38-flash-next.md), [Bonsai2](docs/models/bonsai2.md) (Qwen family), [GPT OSS](docs/models/gptoss.md), [Nemotron-H](docs/models/nemotron.md), [Mistral 3](docs/models/mistral3.md), [Hunyuan Dense](docs/models/hunyuan-dense.md), [Muse-Glimmer](docs/models/muse-glimmer.md), [Muse Spark](docs/models/muse-spark.md) (816B MoE, multi-GPU), and [MiniMax-M3.1-Flash](docs/models/minimax-m3.md) (428B MoE, multi-GPU).
 - **Text diffusion:** [DiffusionGemma](docs/models/diffusiongemma.md), including [Jev typed decision inference](docs/models/jev.md) at `/v1/systemone`, over text, images, uploaded documents, sampled video frames and audio transcripts (configured ASR companion).
 - **Image generation/editing and video generation:** [Qwen-Image-2.1](docs/models/qwenimage21.md), [LTX 2.5 Distilled (video + 48 kHz stereo audio)](docs/models/ltx-2.5.md), [MiniMax-H3 (video + stereo audio)](docs/models/minimax-h3.md), and [Wan 2.1 / 2.2](docs/models/wan.md).
 - **Embeddings:** [EmbeddingGemma 2](docs/embeddings.md), including text/code and optional image, audio, and video inputs; BERT / XLM-R encoders including Snowflake Arctic Embed L v2.0 and all-MiniLM-L6-v2.
@@ -145,6 +145,8 @@ Latest recorded comparisons, audited on **2026-10-23**. DeepSeek V4.1 Flash 1017
 **Muse Spark:** UD-IQ3_XXS, 32,768-token context, F16 KV, greedy/thinking off; matching placement modes, 32 output tokens for long-prompt prefill and 256 for short decode / concurrent requests. Prefill is uncached prompt tokens divided by streamed TTFT. Layer-split decode was slightly slower: 16.69 vs 16.79 tok/s (0.99×). On this host P2P was broken and llama.cpp tensor split ran without NCCL, while TensorSharp used NCCL; that limits the TP comparison. [Full report](docs/perf/muse-spark-vs-llama-cpp.md).
 
 Methods, repetitions, quality trade-offs and build limitations: [Benchmarks](docs/benchmarks.md). No new benchmark runs are claimed; these results do not qualify every backend or the published release binaries.
+
+MiniMax-M3.1-Flash on eight A40 GPUs (measured 2026-10-24, separately from the table above): [its comparison with llama.cpp](docs/benchmarks.md#minimax-m31-flash-on-eight-a40-gpus).
 
 ## Documentation
 

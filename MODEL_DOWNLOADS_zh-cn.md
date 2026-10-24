@@ -29,6 +29,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Hunyuan Dense | 腾讯稠密 Hunyuan 检查点（`hunyuan-dense`） | 任何 `general.architecture` 为 `hunyuan-dense` 的 GGUF 均可加载，例如 Hy-MT2 系列（参考对话模板取自 `tencent/Hy-MT2-1.8B`）。仅文本、单设备，没有投影器也没有草稿模型。见 [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
 | Muse-Glimmer | Muse-Glimmer-30B（稠密，支持图像） | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF)，如 `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` 或 `Muse-Glimmer-30B-Q8_0.gguf`；`general.architecture` 为 `muse-glimmer` / `muse_glimmer`。图像输入需同仓库的 `mmproj-Muse-Glimmer-30B-Q8_0.gguf`：传 `--image` 时 CLI 会在模型旁边找到它，服务端则需用 `--mmproj` 指定。可选提速产物：同仓库的 DFlash 分块 draft `dflash-kquant.gguf`，或更新的 DFlash2 draft [z-lab/Muse-Glimmer-30B-DFlash2-GGUF](https://huggingface.co/z-lab/Muse-Glimmer-30B-DFlash2-GGUF)（16 GB 显卡上优先选 `-Q4_K_M`，见 [speculative_decoding.md](docs/speculative_decoding.md#what-to-expect) 中关于 draft 大小的说明），用 `--draft-model` 加载即可无损推测解码——不要传任何采样参数，它只在纯贪心下生效 |
 | Muse Spark | Muse-Spark-Open-816B-A42B（816B-A42B MoE，支持图像） | [unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF)：每个量化档一个子目录，各为一组分片：`UD-IQ3_XXS/` 为 8 个分片、317 GiB（即实测所用的量化），`UD-Q3_K_XL/` 为 10 个分片、374 GiB，`UD-Q4_K_XL/` 为 12 个分片。同一量化档的所有分片需放在同一目录，`--model` 指向其中任意一片即可；后续分片只含切分元数据，不能单独作为模型加载。`general.architecture` 为 `muse-spark` / `muse_spark`。图像输入需用 `--mmproj` 指定仓库根目录下的 `mmproj-Q8_0.gguf`（2.2 GB）；Muse-Glimmer-30B 的投影器输出宽度不同，会被拒绝。实测配置为十张 46 GB A40，全部专家都放在显存中（见下方运行示例）。没有草稿器：投机解码只能用无权重的 n-gram |
+| MiniMax-M3.1 | MiniMax-M3.1-Flash（428B-A23B MoE，支持图像，`minimax-m3`） | [unsloth/MiniMax-M3.1-Flash-GGUF](https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF)：`UD-Q4_K_XL/` 为 7 个分片，共 249,402,105,310 字节（232.3 GiB）；`--model` 指向 `-00001-of-00007` 分片。该仓库标注为仍在制作中，尚未发布 mmproj 与 DSpark 草稿器：两者都需用 [unslothai/llama.cpp PR #320](https://github.com/unslothai/llama.cpp/pull/320)（`minimax-m31` @ `ef8f94cc`）的转换器从 [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) 转换，只需配置 / 分词器文件、第 13 与 48 个 safetensors 分片（视觉塔）以及 `dspark/`，得到 `mmproj-MiniMax-M3.1-Flash-BF16.gguf`（1.74 GB，`--mmproj`）与 `MiniMax-M3.1-Flash-DSpark-BF16.gguf`（3.93 GB，`--draft-model`）；步骤见[模型卡片](docs/models/minimax-m3_zh-cn.md#生成视觉投影器与-dspark-草稿器)。仅在 `ggml_cuda` 上运行，并且需要显式的 `--layer-split N` 或 `--tp N`（实测配置为八张 46 GB A40） |
 | DeepSeek V4.1 | DeepSeek-V4.1-Flash（`deepseek41`，384 个路由专家） | [smalinin/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/tree/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5)，固定 revision `d1de55c19f95172c882906cc83c0e55932d26a63`——`Q2_K-Q5/` 下十个分片，共 335,382,014,624 字节（312.349 GiB），Engram 表为 Q5_K，并恢复 F32 mHC 与 BF16 Engram 门控张量。所有分片放在同一目录，`--model` 指向第一个分片。原七分片 vcruz Q2 存在敏感张量量化问题，不再推荐。修复版头部与十个完整文件哈希均已校验，双卡按层切分与实验性路由专家 TP 下的有限普通/DSpark 文本/图像 HTTP 检查均已通过，回答以 EOS 完成，服务正常退出。另行进行的 24-token 普通/DSpark 文本/图像配对检查，在两种模式下均匹配 token ID 与 `max_tokens` 结束原因，DSpark 实际参与解码且进程正常退出；这些有限续写与 HTTP 的 EOS 检查分开记录。两个图像配对中 DSpark 都更慢。简短的重复文本预热对照也已完成：每种模式一次预热、三次计时，每对输入 69 token、输出 24 token，token ID 与结束原因完全一致，DSpark 实际参与解码且进程正常退出。小样本与大量磁盘换页限制了这些结果，不声明通用质量/性能、提速、跨节点执行或完整模型 TP 通过。每次重新下载仍须校验哈希。GGUF 已包含 Engram 权重与哈希常量，无需生成 Engram 或单独的 Engram 文件。`eng/dsv41-prepare-vision.py` 生成约 970 MB 的可选视觉伴随文件，图像与视频经 `--mmproj` 使用。服务后端为 `ggml_cuda`；`ggml_cpu` 与 `cpu` 是正确性与可移植性路径，而非服务路径——`--backend cpu` 用纯 C# 执行器 `DeepSeek4CpuExecutor` 跑完整的 V4.1 计算图，不依赖 ggml、原生库与 GPU；它同样直接读取内嵌的 Engram 元数据，而视觉伴随文件不会跟到这个后端上（`LoadVisionEncoder` 会抛异常），因此该后端上没有图像也没有视频。V4 的草稿模型会被拒绝；`deepseek41-dspark` 草稿模型可在 `ggml_cuda` / `ggml_cpu` 上经 `--draft-model` 加载，属于实验性路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分与实验性路由专家 TP 下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。完整流程与校验哈希见 [deepseek41](docs/models/deepseek41_zh-cn.md) |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731（284B MoE） | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)；每种量化一个子目录（`UD-Q8_K_XL/`、`UD-IQ4_XS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。仅文本 |
 | GLM 5.x | GLM-5.2（744B-A40B MoE，内嵌 NextN MTP） | [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF)；每种量化一个子目录（`UD-Q4_K_XL/`、`UD-IQ2_XXS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。**仅文本**——再往下两行的 GLM-5.3-Flash 才是支持图像的那个；中间那行的 GLM-5.3 同样仅文本。这些 GGUF 已带有 `--spec` 所需的 NextN 块——与 Qwen 3.6 不同，不存在需要挑选的独立 MTP 仓库 |
@@ -216,6 +217,31 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
 `--tp` 路径不使用投机解码。该配置下与 llama.cpp 的对比见
 [性能数据](docs/benchmarks_zh-cn.md#十块-a40-上的-muse-spark-816b)；全部选项见
 [模型卡片](docs/models/muse-spark_zh-cn.md#选项)。
+
+**MiniMax-M3.1-Flash**（428B-A23B MoE，文本 + 图像、自适应思维链、XML 工具、DSpark；`ggml_cuda` 上使用原生整模型执行器）：
+
+```bash
+# UD-Q4_K_XL 是 7 个分片、232.3 GiB。实测机器有八张 46 GB A40。
+hf download unsloth/MiniMax-M3.1-Flash-GGUF --include "UD-Q4_K_XL/*" --local-dir models/minimax-m3
+
+# 按层切分，长提示更快；--tp 8 的 decode 更快，浅深度时尤其明显。
+# 除非用 --layer-split N 或 --tp N 指定，TensorSharp 只使用一张 GPU。
+MAX_CONTEXT=73728 TS_MINIMAX_M3_PLAN_CTX_TOKENS=147456 \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+    --model models/minimax-m3/UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00001-of-00007.gguf \
+    --backend ggml_cuda --layer-split 8 --port 5000
+```
+
+Unsloth 仓库目前没有 `mmproj` 与 DSpark 草稿器；[模型卡片](docs/models/minimax-m3_zh-cn.md#生成视觉投影器与-dspark-草稿器)
+介绍了如何用 llama.cpp PR #320 的转换器从 Hugging Face 发布版转换两者。图像输入加
+`--mmproj models/minimax-m3/mmproj-MiniMax-M3.1-Flash-BF16.gguf`，DSpark 投机解码加
+`--draft-model models/minimax-m3/MiniMax-M3.1-Flash-DSpark-BF16.gguf`（仅按层切分；`--tp` 会拒绝草稿器）。
+`TS_MINIMAX_M3_PLAN_CTX_TOKENS` 按上下文乘以（并发请求数加一个共享前缀检查点）预留 K/V。GPU 较少时，
+`--n-cpu-moe N` 把第 0..N-1 层的路由专家（每个 MoE 层约 3.8 GiB；第 0-2 层为稠密层）留在系统内存，
+或用 `TS_MINIMAX_M3_CPU_MOE=auto` 只放置放不下的部分（同时请设置 `MAX_CONTEXT`；卸载未在完整检查点上测量）；`--tp` 让全部专家留在 GPU 上。`--backend` 必须是
+`ggml_cuda`（`ggml_cpu` 为正确性路径；MLX、Metal、Vulkan、直连 CUDA 与纯 C# 后端都会被拒绝）。与 llama.cpp 的对比见
+[性能数据](docs/benchmarks_zh-cn.md#八张-a40-上的-minimax-m31-flash)；全部选项见
+[环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md#矩阵外的-minimax-m31-开关)。
 
 **Gemma 4**（文本 + 图像/视频/音频、思维链、工具、可选 MTP）：
 

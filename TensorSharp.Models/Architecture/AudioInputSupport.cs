@@ -38,6 +38,14 @@ namespace TensorSharp.Models.Architecture
             "Remove the audio attachment. Images are supported once a vision projector is loaded.";
 
         /// <summary>
+        /// MiniMax-M3.1's vocabulary carries speech tokens, but the release ships a
+        /// vision projector only: there is no audio tower to put behind them.
+        /// </summary>
+        public const string MiniMaxM3Message =
+            "MiniMax-M3.1 does not support audio input: the release has no audio encoder (its projector is a " +
+            "vision tower only). Remove the audio attachment; images are supported once the vision projector is loaded.";
+
+        /// <summary>
         /// The refusal <paramref name="architecture"/> gives audio input when no
         /// optional audio tower is known to be loaded, or null when the family can
         /// consume audio or is not one this table knows (an unknown family is left
@@ -65,6 +73,9 @@ namespace TensorSharp.Models.Architecture
             if (ModelArchitectureRegistry.TryGet(architecture, out ModelArchitectureDescriptor diffusion)
                 && string.Equals(diffusion.Id, "diffusion-gemma", StringComparison.OrdinalIgnoreCase))
                 return DiffusionGemmaMessage;
+            if (ModelArchitectureRegistry.TryGet(architecture, out ModelArchitectureDescriptor minimax)
+                && string.Equals(minimax.Id, MiniMaxM3Model.ArchitectureId, StringComparison.OrdinalIgnoreCase))
+                return MiniMaxM3Message;
             if (!audioEncoderLoaded &&
                 ModelArchitectureRegistry.TryGet(architecture, out ModelArchitectureDescriptor descriptor) &&
                 string.Equals(descriptor.Id, "nemotron_h", StringComparison.OrdinalIgnoreCase))

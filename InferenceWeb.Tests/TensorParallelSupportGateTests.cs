@@ -79,6 +79,7 @@ public class TensorParallelSupportGateTests
     [InlineData("gemma4")]
     [InlineData("muse-glimmer")]
     [InlineData("muse-spark")]
+    [InlineData("minimax-m3")]
     [InlineData("glm-dsa")]
     [InlineData("glm5next")]
     public void TpCapableArchitectures_AreUntouched(string arch)

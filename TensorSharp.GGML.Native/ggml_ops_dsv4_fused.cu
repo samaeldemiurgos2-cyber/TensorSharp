@@ -892,8 +892,14 @@ static const tsg_dsv4_fused_desc * tsg_dsv4_node_desc(const ggml_tensor * node)
     if (node->op != GGML_OP_CUSTOM) return nullptr;
     ggml_custom_op_params p;
     memcpy(&p, node->op_params, sizeof(p));
+    // The scheduler asks about every custom op of the graph, and other custom
+    // ops may carry a plain value as userdata (the MiniMax-M3 / Muse Spark
+    // host-expert quantize op passes a ggml type): only an aligned address
+    // past the first page can be one of our descriptors.
+    const uintptr_t addr = (uintptr_t) p.userdata;
+    if (addr < 4096 || addr % alignof(tsg_dsv4_fused_desc) != 0) return nullptr;
     const tsg_dsv4_fused_desc * d = (const tsg_dsv4_fused_desc *) p.userdata;
-    if (!d || d->magic != TSG_DSV4_FUSED_MAGIC) return nullptr;
+    if (d->magic != TSG_DSV4_FUSED_MAGIC) return nullptr;
     return d;
 }
 
@@ -1039,6 +1045,14 @@ static enum ggml_status tsg_dsv4_backend_graph_compute(ggml_backend_t backend, g
         if (start < 0 || !work) return GGML_STATUS_SUCCESS;
         if (stats) tsg_dsv4_stat_views.fetch_add(1, std::memory_order_relaxed);
         ggml_cgraph view = ggml_graph_view(cgraph, start, end);
+        // ggml_graph_view leaves the uid 0, and ggml-cuda then compares every
+        // node of a captured CUDA graph against the view on every call (host
+        // time per launch). The scheduler gives each split a fresh uid when it
+        // splits a graph, so a view of an unchanged split is unchanged too: it
+        // gets a uid of its own, derived from the split's and its first node
+        // (tagged in the top bit, so it never equals a counter value).
+        if (cgraph->uid != 0)
+            view.uid = (1ull << 63) | (cgraph->uid << 20) | ((uint64_t) start & 0xFFFFFu);
         return ggml_backend_graph_compute_async(c->cuda_backend, &view);
     };
 
@@ -1091,6 +1105,11 @@ static enum ggml_status tsg_dsv4_backend_graph_compute(ggml_backend_t backend, g
             GGML_ASSERT(d->device_launch != nullptr);
             d->device_launch(d->object, node, (void *) stream, c->device);
             CUDA_CHECK(cudaSetDevice(c->device));
+        }
+        else if (d->kind == TSG_MSA_ATTENTION)
+        {
+            GGML_ASSERT(d->cuda_compute != nullptr);
+            d->cuda_compute(node, c->cuda_backend);
         }
         else
         {

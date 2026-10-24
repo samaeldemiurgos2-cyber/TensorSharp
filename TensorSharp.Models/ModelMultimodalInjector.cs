@@ -1246,6 +1246,113 @@ namespace TensorSharp.Models
             });
         }
 
+        internal const string MiniMaxM3ImageToken = "]<]image[>[";
+        internal const string MiniMaxM3ImageStartToken = "]<]start of image[>[";
+        internal const string MiniMaxM3ImageEndToken = "]<]end of image[>[";
+
+        /// <summary>
+        /// MiniMax-M3.1: the chat template renders one <c>]&lt;]image[&gt;[</c> per image, and
+        /// HF's processor (like llama.cpp's mtmd) turns each into
+        /// <c>]&lt;]start of image[&gt;[</c> + N x <c>]&lt;]image[&gt;[</c> + <c>]&lt;]end of image[&gt;[</c>,
+        /// N = the tower's output rows. The text tower uses plain 1-D positions, so the
+        /// image rows occupy ordinary sequential positions and the span is registered at
+        /// the absolute prompt index of its first <c>]&lt;]image[&gt;[</c> row; the wrapper
+        /// tokens keep their own embeddings.
+        /// </summary>
+        internal List<int> ProcessMiniMaxM3History(MiniMaxM3VisionEncoder encoder, List<ChatMessage> history, List<int> inputTokens)
+        {
+            var imagePaths = GetImagePathsInPromptOrder(history);
+            if (imagePaths.Count == 0)
+                return inputTokens;
+            if (encoder == null)
+                throw new InvalidOperationException(
+                    "Image input requires the MiniMax-M3.1 vision projector: pass --mmproj with the minimax_m3 mmproj GGUF.");
+
+            int imageId = _model.Tokenizer.LookupToken(MiniMaxM3ImageToken);
+            int startId = _model.Tokenizer.LookupToken(MiniMaxM3ImageStartToken);
+            int endId = _model.Tokenizer.LookupToken(MiniMaxM3ImageEndToken);
+            if (imageId < 0 || startId < 0 || endId < 0)
+                throw new InvalidOperationException("The MiniMax-M3.1 tokenizer lacks its image placeholder tokens.");
+
+            int placeholders = 0;
+            foreach (int token in inputTokens)
+                if (token == imageId) placeholders++;
+            if (placeholders != imagePaths.Count)
+                throw new InvalidOperationException(
+                    $"MiniMax-M3.1 prompt has {placeholders} image placeholders for {imagePaths.Count} attachments.");
+
+            var processor = new MiniMaxM3ImageProcessor(encoder.PatchSize, encoder.SpatialMergeSize);
+            var cached = new CachedEmbedding[imagePaths.Count];
+            var counts = new int[imagePaths.Count];
+            for (int i = 0; i < imagePaths.Count; i++)
+            {
+                cached[i] = GetOrCreateCachedEmbedding(_visionCache, imagePaths[i], fullPath =>
+                {
+                    MiniMaxM3ImagePatches image = processor.ProcessImage(fullPath);
+                    Tensor embeddings = encoder.Encode(image);
+                    return CreateCachedEmbedding(fullPath, embeddings,
+                        image.GridH / image.MergeSize, image.GridW / image.MergeSize);
+                });
+                counts[i] = cached[i].TokenCount;
+            }
+
+            List<int> expanded = ExpandMiniMaxM3ImageTokens(inputTokens, imageId, startId, endId, counts, out int[] firstRows);
+            // The rows go in at the first ]<]image[>[; the prompt extent covers both
+            // wrappers, so a context trim never keeps one wrapper without its image.
+            for (int i = 0; i < cached.Length; i++)
+                _preparedVisionEmbeddings.Add(new PreparedEmbeddingSpan(
+                    cached[i], firstRows[i], firstRows[i] - 1, firstRows[i] + counts[i] + 1));
+            return expanded;
+        }
+
+        /// <summary>
+        /// Expand the i-th <paramref name="imageId"/> placeholder into
+        /// <paramref name="startId"/> + counts[i] x <paramref name="imageId"/> + <paramref name="endId"/>
+        /// and report the index of its first image row in <paramref name="firstRows"/>.
+        /// A placeholder the prompt already brackets with the start/end tokens keeps
+        /// those and gains none, so rendering either form yields one wrapper.
+        /// </summary>
+        internal static List<int> ExpandMiniMaxM3ImageTokens(List<int> tokens, int imageId, int startId, int endId,
+            int[] counts, out int[] firstRows)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            ArgumentNullException.ThrowIfNull(counts);
+            long extra = 0;
+            foreach (int c in counts)
+            {
+                if (c <= 0)
+                    throw new ArgumentOutOfRangeException(nameof(counts), "Every image needs at least one row.");
+                extra += c + 1;
+            }
+            var result = new List<int>(checked((int)(tokens.Count + extra)));
+            firstRows = new int[counts.Length];
+            int image = 0;
+            for (int i = 0; i < tokens.Count; i++)
+            {
+                int token = tokens[i];
+                if (token != imageId)
+                {
+                    result.Add(token);
+                    continue;
+                }
+                if (image >= counts.Length)
+                    throw new InvalidOperationException(
+                        $"The prompt has more image placeholders than the {counts.Length} encoded image(s).");
+                if (i == 0 || tokens[i - 1] != startId)
+                    result.Add(startId);
+                firstRows[image] = result.Count;
+                for (int r = 0; r < counts[image]; r++)
+                    result.Add(imageId);
+                if (i + 1 >= tokens.Count || tokens[i + 1] != endId)
+                    result.Add(endId);
+                image++;
+            }
+            if (image != counts.Length)
+                throw new InvalidOperationException(
+                    $"The prompt has {image} image placeholders for {counts.Length} encoded image(s).");
+            return result;
+        }
+
         /// <summary>
         /// The prompt carries each image as rows of <c>[IMG]</c> separated by
         /// <c>[IMG_BREAK]</c> and closed by <c>[IMG_END]</c>, but the encoder returns only

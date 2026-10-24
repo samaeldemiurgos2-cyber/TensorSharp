@@ -82,7 +82,17 @@ namespace TensorSharp.Runtime.Scheduling
             // layer says the shared prompt ends, so the executor can copy the model's
             // state there and start every later new chat from that copy.
             if (_executor.PrefixCheckpointsSupported)
+            {
                 _scheduler.EnablePrefixCheckpoints();
+                if (model is ISoloPrefillBudgetModel { CheckpointGapTokens: > 0 } gapModel)
+                {
+                    _scheduler.SetCheckpointGapTokens(gapModel.CheckpointGapTokens);
+                    _logger.LogInformation(
+                        "Shared-prefix checkpoint boundaries at most {Tokens} tokens past a reused prefix do not end a " +
+                        "prefill step (the model's forward pass costs more than those tokens save a later request)",
+                        gapModel.CheckpointGapTokens);
+                }
+            }
 
             // One-time capability report: which execution paths are statically
             // available for this model+backend under the current configuration,

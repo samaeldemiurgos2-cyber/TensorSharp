@@ -81,12 +81,12 @@ public sealed partial class OpenAIChatAdapter
         return plan;
     }
 
-    private SamplingConfig? WithDeepSeek41ToolGrammar(SamplingConfig? config,
-        DeepSeek41ToolGrammar? plan, bool thinking)
+    private SamplingConfig? WithToolCallGrammar(SamplingConfig? config,
+        IToolCallGrammar? plan, bool thinking)
     {
         if (plan == null) return config;
         var tokenizer = _svc.Model?.Tokenizer
-            ?? throw new InvalidOperationException("DeepSeek V4.1 tool grammar requires a loaded tokenizer.");
+            ?? throw new InvalidOperationException("The tool-call grammar requires a loaded tokenizer.");
         var result = (config ?? SamplingConfig.Default).Clone();
         result.Grammar = plan.NewConstraint(tokenizer, thinking);
         return result;

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>基准测试 — TensorSharp 维基</title>
-  <meta name="description" content="近期记录的 TensorSharp 文本基准：DeepSeek V4.1 Flash 1017 精确与近似 prefill、Muse Spark 对应模式、条件与局限。">
+  <meta name="description" content="近期记录的 TensorSharp 文本基准：DeepSeek V4.1 Flash 1017 精确与近似 prefill、Muse Spark 对应模式、八张 A40 上的 MiniMax-M3.1-Flash、条件与局限。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -16,10 +16,10 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 基准测试</div>
   <h1>基准测试</h1>
-  <p class="lede">近期记录的 DeepSeek V4.1 Flash 1017 与 Muse Spark 对比，明确工作负载与质量局限，并介绍正确性测试框架。</p>
+  <p class="lede">近期记录的 DeepSeek V4.1 Flash 1017、Muse Spark 与 MiniMax-M3.1-Flash 对比，明确工作负载与质量局限，并介绍正确性测试框架。</p>
 
   <h2 id="head-to-head">最新记录的文本推理对比</h2>
-  <p>这里选取<strong>五张 A40 上的 DeepSeek V4.1 Flash 1017</strong>与<strong>十张 A40 上的 Muse Spark</strong>结果。每一行都保留模型、量化、放置方式、工作负载与参照模式；不同指标的最佳 TensorSharp 模式不同，不能把这些行合成总分，也不能据此推断其他硬件或模型的加速比。本次文档更新没有重新运行基准。</p>
+  <p>这里选取<strong>五张 A40 上的 DeepSeek V4.1 Flash 1017</strong>、<strong>十张 A40 上的 Muse Spark</strong>与<strong>八张 A40 上的 MiniMax-M3.1-Flash</strong>结果。每一行都保留模型、量化、放置方式、工作负载与参照模式；不同指标的最佳 TensorSharp 模式不同，不能把这些行合成总分，也不能据此推断其他硬件或模型的加速比。本次文档更新没有重新运行 DeepSeek 与 Muse Spark 的基准；MiniMax-M3.1-Flash 的数据来自 2026-10-24 的运行。</p>
 
   <h2 id="deepseek41">DeepSeek V4.1 Flash 1017：精确与近似 prefill</h2>
   <p><strong>记录于 2026-10-22–23：</strong>五张 NVIDIA A40（每张 46 GB），<code>unsloth/DeepSeek-V4.1-Flash-1017-GGUF</code>，<strong>UD-IQ2_XXS、六个分片</strong>，Hugging Face 修订 <code>60ad3651</code>。TensorSharp 使用未修改的 ggml <code>da8e2a5</code> 与 <code>--tp 5</code>；参照是 Unsloth llama.cpp <code>be836572</code> 的按层切分，使用它自带的 in-tree ggml。上下文为 32,768 token，<strong>并发 1</strong>，输出 256 token，贪心采样、关闭思考；预热后运行三次取中位数。</p>
@@ -47,6 +47,24 @@
   </table></div>
   <p>Muse Spark 的 prefill 为未缓存的提示 token 数除以流式 TTFT，与上面的 DeepSeek 内部计时指标不同。按层切分给出记录中最高的 prefill，张量并行给出记录中最高的生成吞吐。比值大于 1 表示吞吐更高，按层切分 decode 的 0.99× 也予以保留。TensorSharp 与 llama.cpp 按层切分耗时为三次重复的中位数；llama.cpp 张量并行各行只有两次。参照的短提示与 4K 张量并行行来自相同构建的较早会话。Teacher-forced 按层切分与 llama.cpp 的平均 KL 散度为 0.0026；集成校验用例不构成通用模型质量评测。</p>
   <p><strong>单台主机，没有可用的 P2P 或 NVLink：</strong>TensorSharp 通过主机内存使用 NCCL；llama.cpp 的 NCCL 构建在十张 GPU 上中止，因此参照构建未启用 NCCL，传输条件是重要限制。模型文件位于网络文件系统。图像、投机解码、CPU 专家卸载、16K 以上上下文、其他 GPU 数量与非 CUDA 后端未测量。报告没有冻结最终 TensorSharp 提交，也未提交完整原始记录；这是已记录的工作树构建对比，不是对本次文档提交的基准。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/perf/muse-spark-vs-llama-cpp.md">完整环境、逐场景结果与局限 →</a></p>
+
+  <h2 id="minimax-m3">八张 A40 上的 MiniMax-M3.1-Flash</h2>
+  <p><strong>2026-10-24 测量。</strong>Unsloth <code>MiniMax-M3.1-Flash</code> <strong>UD-Q4_K_XL，七个分片 / 232.3 GiB</strong>，八张 A40 46 GB GPU，<code>ggml_cuda</code>，未注明时为按层切分。TensorSharp 使用未修改的上游 ggml <code>da8e2a5</code>；参照为 unslothai <code>minimax-m31</code> 分支（<code>ef8f94cc</code>，PR #320）的 llama.cpp。同一台机器，两个引擎轮流运行且独占 GPU，三次重复取中位数。</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>工作负载</th><th>方法</th><th>TensorSharp</th><th>llama.cpp</th><th>比值</th></tr></thead>
+    <tbody>
+      <tr><td>prefill，512 / 8,192 / 32,768 / 65,536 token</td><td>执行器基准对 <code>llama-bench -fa 1</code></td><td>448 / 1,699 / 2,449 / 2,567 tok/s</td><td>344 / 1,312 / 681 / 262 tok/s</td><td>1.30× / 1.29× / 3.60× / 9.80×</td></tr>
+      <tr><td>decode，深度 0 / 2,048 / 8,192 / 32,768 处 128 token</td><td>执行器基准对 <code>llama-bench -fa 1</code></td><td>24.8 / 23.9 / 23.8 / 23.4 tok/s</td><td>22.5 / 19.6 / 19.1 / 17.5 tok/s</td><td>1.10× / 1.22× / 1.25× / 1.34×</td></tr>
+      <tr><td>prefill，4K / 16K / 32K / 64K token 提示</td><td>服务器场景，单序列</td><td>1,263 / 1,478 / 1,544 / 1,545 tok/s</td><td>283 / 273 / 240 / 211 tok/s</td><td>4.46× / 5.41× / 6.43× / 7.32×</td></tr>
+      <tr><td>这些提示之后的 decode</td><td>服务器场景，单序列</td><td>23.9 / 23.7 / 23.5 / 23.0 tok/s</td><td>19.2 / 18.5 / 17.7 / 16.1 tok/s</td><td>1.24× / 1.28× / 1.33× / 1.43×</td></tr>
+      <tr><td>首 token 时间，短对话</td><td>服务器场景</td><td>0.41 s</td><td>0.39 s</td><td>0.95×</td></tr>
+      <tr><td>聚合输出，4 / 8 个并发请求</td><td>服务器场景</td><td>42.1 / 53.7 tok/s</td><td>31.8 / 40.6 tok/s</td><td>1.32× / 1.32×</td></tr>
+      <tr><td>DSpark 投机 decode，代码 / 散文 / 复制的平均</td><td>服务器场景，默认门限对 <code>draft-dspark</code></td><td>32.3 tok/s</td><td>25.8 tok/s</td><td>1.25×</td></tr>
+      <tr><td>深度 0 的 decode，<code>--tp 8</code></td><td>TP 基准</td><td>35.7 tok/s</td><td>该模型没有张量切分</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <p>服务器 prefill 按未缓存提示 token 数除以流式首 token 时间计算；llama-server 使用 <code>-np 1 --no-kv-unified</code>（否则 MiniMax 稀疏注意力以稠密方式运行），引擎按 ABBA 轮换（两次启动之间未清除页缓存，因此不比较加载时间）。llama-bench 的每个 prefill 单元取 <code>-ub 512</code> 与 <code>-ub 2048</code> 中较快者，64K 单元为单次运行。短对话与并发时的首 token 时间略慢于 llama.cpp。不用草稿器时，两个引擎在这些 DSpark 提示上的 decode 分别为 22.9 与 20.5 tok/s。<code>--tp 8</code> 在深度 2,048 之后降到 26.0–26.5 tok/s，并把上下文限制为 45,824 token，因为注意力与缓存在每张 GPU 上镜像；该数字来自合并前张量并行分支的构建。</p>
+  <p><strong>限制：</strong>使用未提交的工作树构建而非冻结的提交；只有一台主机与一个检查点，没有置信区间。未测量视频、其他 GPU 数量与后端，以及完整检查点的困惑度或 KL 散度（已测量 MoE CPU 卸载：decode 1.30&times;、4K prefill 1.62&times;，两次重复）；与 llama.cpp 的 logit 一致性只在合成夹具上检查。原始记录是测量主机上的本地验证证据，未提交。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/benchmarks_zh-cn.md#八张-a40-上的-minimax-m31-flash">所有单元、方法与限制 →</a></p>
 
   <p>其他模型家族各有能力与工程说明：<a href="models-text_zh-cn.html">文本模型</a>、<a href="models-image_zh-cn.html">图像模型</a>、<a href="models-video_zh-cn.html">视频模型</a>。上述选取的文本对比不对这些工作负载作性能承诺。</p>
 

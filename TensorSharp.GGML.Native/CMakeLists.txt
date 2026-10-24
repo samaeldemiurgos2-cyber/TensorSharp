@@ -303,6 +303,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_muse_glimmer.cpp
     ggml_ops_muse_spark.cpp
     ggml_ops_muse_glimmer_vision.cpp
+    ggml_ops_minimax_m3_vision.cpp
     ggml_ops_dflash.cpp
     ggml_ops_diffusion.cpp
     ggml_ops_qwen_image.cpp
@@ -323,10 +324,19 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_glm_dsa.cpp
     ggml_ops_muse_spark_exec.cpp
     ggml_ops_muse_spark_tp.cpp
+    ggml_ops_minimax_m3_exec.cpp
+    ggml_ops_minimax_m3_tp.cpp
+    ggml_ops_minimax_m3_tp_backend.cpp
     ggml_ops_dsv4_fused_cpu.cpp
+    ggml_ops_minimax_msa_cpu.cpp
     ggml_ops_paged_attention.cpp
     ggml_ops_tensor_parallel.cpp
 )
+# MiniMax-M3's TS_MINIMAX_M3_MSA=kernel mode exists once TensorSharp's MSA
+# kernels (ggml_ops_minimax_msa.*, contract C3) are part of the library.
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ggml_ops_minimax_msa_cpu.cpp")
+    set_property(SOURCE ggml_ops_minimax_m3_exec.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_MINIMAX_MSA_KERNELS=1)
+endif()
 if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
     # Raises the process-wide default MSL version so ggml's Metal 4 tensor-API probe can compile
     # under the .NET apphost's stale recorded SDK. See the file header for the full story.
@@ -349,6 +359,7 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_q8_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu ggml_ops_deepseek41_tp_cuda.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_minimax_msa.cu)
     # Wan / Qwen-Image VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu).
     # Optional: the VAE falls back to ggml's im2col+GEMM when cuDNN is absent.
     #
@@ -653,6 +664,12 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsMuseSparkTpSplitTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(GgmlOpsMuseSparkTpSplitTest PRIVATE ggml-base)
     add_test(NAME muse-spark-tp-split-plan COMMAND GgmlOpsMuseSparkTpSplitTest)
+    # MiniMax-M3's tensor-parallel split plan and memory budget on the real
+    # checkpoint's shapes (pure planning: no GPU).
+    add_executable(GgmlOpsMiniMaxM3TpSplitTest tests/minimax_m3_tp_split_test.cpp ggml_ops_minimax_m3_tp.cpp)
+    target_include_directories(GgmlOpsMiniMaxM3TpSplitTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsMiniMaxM3TpSplitTest PRIVATE ggml-base)
+    add_test(NAME minimax-m3-tp-split-plan COMMAND GgmlOpsMiniMaxM3TpSplitTest)
     add_executable(GgmlOpsDsv41EngramGgufTest tests/dsv41_engram_gguf_test.cpp)
     target_link_libraries(GgmlOpsDsv41EngramGgufTest PRIVATE ggml-base)
     add_test(NAME deepseek41-engram-embedded-gguf COMMAND GgmlOpsDsv41EngramGgufTest)
@@ -934,6 +951,21 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_include_directories(GgmlOpsQ8ProjectionBench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsQ8ProjectionBench PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
+        # MiniMax sparse attention kernels against the CPU reference and a dense
+        # HF-semantics reference, plus the fused-backend graph node. CTest runs
+        # the reduced matrix; run the binary without arguments for the full one
+        # (minutes: 33K-200K-row CPU references) and with `--bench` for
+        # real-shape timings, never in a concurrent CTest lane.
+        add_executable(GgmlOpsMiniMaxMsaKernelTest tests/minimax_msa_kernel_test.cu
+            ggml_ops_minimax_msa.cu ggml_ops_minimax_msa_cpu.cpp ggml_ops_dsv4_fused.cu
+            ggml_ops_matmul_precision.cu ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsMiniMaxMsaKernelTest PRIVATE TSG_GGML_USE_CUDA=1 TSG_MSA_TEST_HOOKS)
+        target_include_directories(GgmlOpsMiniMaxMsaKernelTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsMiniMaxMsaKernelTest PRIVATE
+            ggml-cuda ggml-cpu ggml-base CUDA::cublas Threads::Threads)
+        add_test(NAME minimax-msa-kernels-cuda COMMAND GgmlOpsMiniMaxMsaKernelTest --quick)
+        set_tests_properties(minimax-msa-kernels-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 900)
 
     endif()
 
@@ -1056,6 +1088,72 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
         add_test(NAME moe-fused-bias-alias-metal COMMAND GgmlOpsMoeFusedBiasAliasTest metal)
         set_tests_properties(moe-fused-bias-alias-metal PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    # MiniMax-M3's whole-model executor on a fixture the test writes itself: a
+    # sequence's logits do not depend on how it is fed (chunks, decode, rewind,
+    # slot copy, batched decode, segments, forced sparse attention below the
+    # dense span) or placed (layer split, host experts).
+    add_executable(GgmlOpsMiniMaxM3ExecTest tests/minimax_m3_exec_test.cpp)
+    target_include_directories(GgmlOpsMiniMaxM3ExecTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+    )
+    target_link_libraries(GgmlOpsMiniMaxM3ExecTest PRIVATE GgmlOps)
+    add_test(NAME minimax-m3-exec-cpu COMMAND GgmlOpsMiniMaxM3ExecTest cpu)
+    set_tests_properties(minimax-m3-exec-cpu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME minimax-m3-exec-cuda COMMAND GgmlOpsMiniMaxM3ExecTest cuda)
+        add_test(NAME minimax-m3-exec-cuda-multi COMMAND GgmlOpsMiniMaxM3ExecTest cuda-multi)
+        add_test(NAME minimax-m3-exec-cuda-cpumoe COMMAND GgmlOpsMiniMaxM3ExecTest cuda-cpumoe)
+        add_test(NAME minimax-m3-exec-cuda-tp COMMAND GgmlOpsMiniMaxM3ExecTest cuda-tp)
+        set_tests_properties(minimax-m3-exec-cuda minimax-m3-exec-cuda-multi minimax-m3-exec-cuda-cpumoe minimax-m3-exec-cuda-tp
+            PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
+    endif()
+    if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
+        # TS_MINIMAX_M3_MSA=kernel is refused on a Metal GPU (the MSA kernels are CUDA's).
+        add_test(NAME minimax-m3-exec-metal COMMAND GgmlOpsMiniMaxM3ExecTest metal)
+        set_tests_properties(minimax-m3-exec-metal PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
+    endif()
+    # The executor's sparse-attention graphs (decode, verification, chunked
+    # prompt) against the MSA reference math on well-separated synthetic block
+    # scores, through the TSGgml_MiniMaxM3TestAttention hook; also against
+    # tsg_msa_attention_cpu when TensorSharp's MSA kernels are in the tree.
+    set_property(SOURCE ggml_ops_minimax_m3_exec.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    add_executable(GgmlOpsMiniMaxM3MsaGraphTest tests/minimax_m3_msa_graph_test.cpp)
+    target_include_directories(GgmlOpsMiniMaxM3MsaGraphTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src"
+    )
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ggml_ops_minimax_msa_cpu.cpp")
+        target_sources(GgmlOpsMiniMaxM3MsaGraphTest PRIVATE ggml_ops_minimax_msa_cpu.cpp)
+        target_compile_definitions(GgmlOpsMiniMaxM3MsaGraphTest PRIVATE TSG_MM3_TEST_MSA_REFERENCE=1)
+        target_link_libraries(GgmlOpsMiniMaxM3MsaGraphTest PRIVATE ggml-base)
+    endif()
+    target_link_libraries(GgmlOpsMiniMaxM3MsaGraphTest PRIVATE GgmlOps)
+    add_test(NAME minimax-m3-msa-graph-cpu COMMAND GgmlOpsMiniMaxM3MsaGraphTest cpu)
+    set_tests_properties(minimax-m3-msa-graph-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME minimax-m3-msa-graph-cuda COMMAND GgmlOpsMiniMaxM3MsaGraphTest cuda)
+        set_tests_properties(minimax-m3-msa-graph-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
+    endif()
+    # MiniMax-M3's DSpark drafter on eng/minimax-m3-fixture.py's small fixture
+    # (model.gguf + dspark.gguf in $TS_MM3_FIXTURE_DIR, generated, not checked
+    # in; skipped without it): speculative greedy == plain greedy, the drafter
+    # context after verify rollbacks, rewinds, slot copies and batched decode.
+    add_executable(GgmlOpsMiniMaxM3DsparkTest tests/minimax_m3_dspark_test.cpp)
+    target_link_libraries(GgmlOpsMiniMaxM3DsparkTest PRIVATE GgmlOps)
+    add_test(NAME minimax-m3-dspark-cpu COMMAND GgmlOpsMiniMaxM3DsparkTest cpu)
+    set_tests_properties(minimax-m3-dspark-cpu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 900)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME minimax-m3-dspark-cuda COMMAND GgmlOpsMiniMaxM3DsparkTest cuda)
+        set_tests_properties(minimax-m3-dspark-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 900)
+        # Two GPUs: taps cross GPUs and prompts prefill pipelined (skipped on one GPU).
+        add_test(NAME minimax-m3-dspark-cuda-multi COMMAND GgmlOpsMiniMaxM3DsparkTest cuda-multi)
+        set_tests_properties(minimax-m3-dspark-cuda-multi PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 900)
+        # Four GPUs, 19 micro-batches: taps skip pipeline stages (skipped below four GPUs).
+        add_test(NAME minimax-m3-dspark-cuda-multi4 COMMAND GgmlOpsMiniMaxM3DsparkTest cuda-multi4)
+        set_tests_properties(minimax-m3-dspark-cuda-multi4 PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 900)
     endif()
 
     add_executable(GgmlOpsAddmmVectorTest tests/addmm_vector_test.cpp)

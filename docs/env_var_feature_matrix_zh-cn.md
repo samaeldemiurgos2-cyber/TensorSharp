@@ -217,11 +217,11 @@ Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `TS_SPEC` | Qwen 3.5/3.6/3.8、GLM 5.2、GLM-5.3、GLM-5.3-Flash（仅 n-gram）、Gemma 4、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、Muse-Glimmer、Muse Spark（仅 n-gram，其原生 `--tp` 下不启用）（CLI + 服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
+| `TS_SPEC` | Qwen 3.5/3.6/3.8、GLM 5.2、GLM-5.3、GLM-5.3-Flash（仅 n-gram）、Gemma 4、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、Muse-Glimmer、Muse Spark（仅 n-gram，其原生 `--tp` 下不启用）、MiniMax-M3.1（DSpark 或 n-gram，仅按层切分）（CLI + 服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
 | `TS_SPEC_TYPE` | 同上全部 | 投机算法：`auto` \| `draft-head` \| `block` \| `ngram` | `auto` | 未注册 | 否 |
 | `TS_SPEC_DRAFT` | 同上全部 | 每个投机步最多起草的 token 数（1-64） | `8` | 未注册 | 否 |
 | `TS_SPEC_PMIN` | 同上全部 | 草稿置信度门限；含义随算法而定 | 按算法（`0.15` / `0.35` / `0`） | 未注册 | 否 |
-| `TS_SPEC_DRAFT_MODEL` | 草稿器以独立 GGUF 发布的模型（CLI + 服务端） | 独立草稿器的路径，按文件的架构识别：Gemma 4 的 `gemma4-assistant`、Qwen 3.8 Flash Next 的共享 MTP 头、DeepSeek V4 DSpark（或实验性的 V4.1 `deepseek41-dspark`）草稿器，或 DFlash / DFlash2 草稿器（Muse-Glimmer、Qwen 3.5 家族）。由 `--draft-model` 设置，且除非给出 `--no-spec`，它本身就会启用投机 | 无 | 未注册 | 否 |
+| `TS_SPEC_DRAFT_MODEL` | 草稿器以独立 GGUF 发布的模型（CLI + 服务端） | 独立草稿器的路径，按文件的架构识别：Gemma 4 的 `gemma4-assistant`、Qwen 3.8 Flash Next 的共享 MTP 头、DeepSeek V4 DSpark（或实验性的 V4.1 `deepseek41-dspark`）草稿器，DFlash / DFlash2 草稿器（Muse-Glimmer、Qwen 3.5 家族），或 MiniMax-M3.1 的 DSpark `dflash` 草稿器（只由其原生执行器在按层切分时加载）。由 `--draft-model` 设置，且除非给出 `--no-spec`，它本身就会启用投机 | 无 | 未注册 | 否 |
 
 这些开关背后的设计——把模型架构、投机算法与投机器权重拆成三层——记录在
 [Speculative Decoding in TensorSharp](speculative_decoding.md)（英文）。
@@ -261,6 +261,50 @@ Muse Spark 原生整模型执行器的选择与容量规划由以下开关控制
 | `TS_MUSE_SPARK_WARM_POOLS` | Muse Spark（原生，GPU） | `0` 跳过加载时的满尺寸 prefill；该 prefill 让 ggml-cuda 的内核 scratch 池在 slot 占用内存之前先长到峰值；启用流水化 prefill 时，加载还会跑一次短的流水化 prefill（`0` 同样跳过它），建好流水线的调度器并确认它能生效 | 有 GPU 时开启 | 未注册 | 否 |
 | `TS_MUSE_SPARK_PIPELINE` | Muse Spark（原生，按层切分） | 流水化 prefill：一次 prompt 调用被切成若干微批，GPU k 处理一个微批时 GPU k+1 处理前一个。未设置 = 自动（两张及以上 GPU、全部为 CUDA 系、没有主机专家、未设置 `TS_MUSE_SPARK_PROFILE`、不是 `--tp` 时开启）；`1` 强制开启（多 GPU 的非 CUDA 后端与 `--tp` 下会拒绝加载）；`0` 关闭；其他取值拒绝加载。加载日志会打印 `pipelined prefill: on (...)` 或 `off (原因)` | 自动 | 未注册 | 否 |
 | `TS_MUSE_SPARK_PIPELINE_UBATCH` | Muse Spark（原生，流水化 prefill） | 流水化 prefill 的固定微批行数，取值为 [1, `TS_MUSE_SPARK_UBATCH`] 内的整数，其他值拒绝加载。未设置 = 自适应：约为每次调用的四分之一，介于 512 行与 prefill ubatch 之间；长上下文的掩码超出暂存预算时会更小（最少 128 行） | 自适应 | 未注册 | 否 |
+
+## 矩阵外的 MiniMax-M3.1 开关
+
+MiniMax-M3.1-Flash（`minimax-m3`）只在其原生整模型执行器上运行（`ggml_cuda`；`ggml_cpu` 为正确性路径），
+下表列出执行器及其托管胶水代码读取的全部 `TS_MINIMAX_M3_*` 设置，均未在 `EnvVarMatrix.All` 中注册。
+托管侧把 `_LAYER_SPLIT`、`_UBATCH`、`_THREADS` 与 `_CPU_MOE` 作为加载参数交给执行器，并转发其余变量，
+因此在 .NET 进程内设置的值也能生效。放置参数本身
+（`--layer-split N`、`--tp N`、`--n-cpu-moe N`、`--draft-model`）见 [MiniMax-M3.1 卡片](models/minimax-m3_zh-cn.md#运行)。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描取值 | 默认是否扫描 |
+|---|---|---|---|---|---|
+| `TS_MINIMAX_M3_MSA` | MiniMax-M3.1 | 注意力路径。`auto`：最后一个位置低于 2048 的微批运行稠密 flash attention（在那里与稀疏结果完全一致），其余微批在 CUDA GPU 上用 TensorSharp 的 MSA 内核、在其他设备上用上游 ggml 算子运行稀疏注意力（`--tp` 下始终用 ggml 算子）。`dense`：处处稠密（调试用；从位置 2048 起改变结果）。`ggml`：每个微批都通过上游 ggml 算子运行稀疏注意力。`kernel`：每个微批都用 TensorSharp 的内核（纯 CPU 加载时用其 CPU 参考实现）；无法运行它们的 GPU 上以及 `--tp` 下拒绝。其他取值拒绝加载 | `auto` | 未注册 | 否 |
+| `TS_MINIMAX_M3_MSA_CHUNK_MB` | MiniMax-M3.1（ggml 路径上的稀疏提示段） | 稀疏提示段带掩码注意力的单个 token 分块的字节预算；同时计入每张 GPU 的放置预留。必须是正的 MiB 数，否则拒绝加载 | `256` | 未注册 | 否 |
+| `TS_MINIMAX_M3_INDEXER_F16` | MiniMax-M3.1 | 为 decode 形状的图（至多 8 行）使用 F32 索引器投影的 F16 副本，使每步 decode 读取的索引器字节减半；提示仍读取 F32 原件。`0` 只保留 F32 | 有 GPU 时开启，纯 CPU 加载时关闭 | 未注册 | 否 |
+| `TS_MINIMAX_M3_FUSE_QKV` | MiniMax-M3.1 | 把类型相同的 Q、K、V 投影以及索引器的 q、k 投影各拼成一个矩阵（一次权重读取、一次启动）。`0` 保持分开 | 开启 | 未注册 | 否 |
+| `TS_MINIMAX_M3_LAYER_SPLIT` | MiniMax-M3.1（按层切分） | 显式给出每张 GPU 的层数：逗号分隔的非负数，总和为 60，每张 GPU 至多一项；列表更长时会提高 GPU 数。格式错误或放不下时拒绝加载。与 `--tp` 同用会被拒绝 | 自动放置 | 未注册 | 否 |
+| `TS_MINIMAX_M3_UBATCH` | MiniMax-M3.1 | prefill 微批行数；也限定一次投机验证（草稿加锚点）的大小 | `2048` | 未注册 | 否 |
+| `TS_MINIMAX_M3_THREADS` | MiniMax-M3.1 | 纯 GPU 加载时 CPU 后端的线程数。纯 CPU 加载时使用可用的并行度；GPU 旁有主机专家时使用其一半（其 decode 受内存带宽限制，另一半让服务进程自己的线程不与专家工作线程争用核心）；`--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` 覆盖两者 | 可用并行度（有主机专家时为一半） | 未注册 | 否 |
+| `TS_MINIMAX_M3_CPU_MOE` | MiniMax-M3.1（按层切分） | `auto` 只把 GPU 放不下的路由专家栈（gate、up、down 分别放置）留在系统内存，并覆盖 `--n-cpu-moe`。它不会限制上下文（而是把专家移到主机），因此请同时设置 `MAX_CONTEXT`。`--tp` 下所有专家都留在显存 | 关闭 | 未注册 | 否 |
+| `TS_MINIMAX_M3_PLAN_CTX_TOKENS` | MiniMax-M3.1 | 放置规划为所有槽位预留的 K/V token 数；应设为上下文乘以（并发请求数加一，留给共享前缀检查点）。不是正的 token 数时会给出提示并改用默认值 | 一个完整上下文 | 未注册 | 否 |
+| `TS_MINIMAX_M3_VRAM_RESERVE_MB` | MiniMax-M3.1 | 放置规划在每张 GPU 上为计算缓冲与 ggml-cuda 暂存池保留的内存；稀疏分块预算以及 `--tp` 下的归约缓冲另计 | `2048` + ubatch / 4 | 未注册 | 否 |
+| `TS_MINIMAX_M3_DEV0_RESERVE_MB` | MiniMax-M3.1 | 在 GPU 0 上额外保留的内存，例如留给视觉编码器 | `0` | 未注册 | 否 |
+| `TS_MINIMAX_M3_KV_PAD` | MiniMax-M3.1 | 构建计算图时注意力窗口的粒度（行）：decode 在这么多个位置内复用同一图形状。会向上取整到 128 行 MSA 块的倍数，并给出警告 | `256` | 未注册 | 否 |
+| `TS_MINIMAX_M3_BD_KV_PAD` | MiniMax-M3.1（批量 decode） | 批量 decode 图的窗口粒度：N 个序列跨越窗口边界的频率是单序列的 N 倍；保持为 `TS_MINIMAX_M3_KV_PAD` 的倍数 | 2 × `TS_MINIMAX_M3_KV_PAD` | 未注册 | 否 |
+| `TS_MINIMAX_M3_SLOT_INIT_ROWS` | MiniMax-M3.1 | 序列槽位的初始 K/V 行数（按 KV 粒度取整，至多为上下文长度）；按需翻倍 | `4096` | 未注册 | 否 |
+| `TS_MINIMAX_M3_SLOT_HEADROOM_MB` | MiniMax-M3.1 | 新槽位或 KV 增长必须在每张 GPU 上留出的空闲内存 | `256` | 未注册 | 否 |
+| `TS_MINIMAX_M3_ADMIT_GRAPH_MB` | MiniMax-M3.1 | 新槽位或 KV 增长在余量之外最多为计算图保留的内存，避免一次长 prefill 的图让之后每个槽位都去驱逐保留的前缀状态 | `512` | 未注册 | 否 |
+| `TS_MINIMAX_M3_GRAPH_CACHE` | MiniMax-M3.1 | 按形状缓存的 LRU 中保留的已构建图数量。`--tp` 下只保留一张图，大于 1 的取值会拒绝加载 | `12` | 未注册 | 否 |
+| `TS_MINIMAX_M3_NODES_PER_LAYER` | MiniMax-M3.1（诊断） | 覆盖执行器根据图中各段推导出的每层图节点预算 | 推导值 | 未注册 | 否 |
+| `TS_MINIMAX_M3_PIPELINE` | MiniMax-M3.1（按层切分） | 流水线 prefill：一次提示调用被切成多个微批，GPU k 处理一个时 GPU k+1 处理前一个。未设置 = 自动（两张及以上 GPU、全部为 CUDA 系、没有主机专家、未设置 `TS_MINIMAX_M3_PROFILE`、不是 `--tp` 时开启）；`1` 强制开启（多 GPU 的非 CUDA 后端与 `--tp` 下拒绝）；`0` 关闭；其他取值拒绝加载。加载日志打印 `pipelined prefill: on (...)` 或 `off (原因)` | 自动 | 未注册 | 否 |
+| `TS_MINIMAX_M3_PIPELINE_UBATCH` | MiniMax-M3.1（流水线 prefill） | 流水线 prefill 的固定微批行数，为 [1, `TS_MINIMAX_M3_UBATCH`] 内的整数；其他取值拒绝加载。未设置 = 自适应：选取使流水线估计耗时最小的微批数（八张 A40 上 2,048 token 为 2 个、4,096 为 3 个、8,192 为 4 个），大小在 256 行到 prefill ubatch 之间，长上下文的掩码超过 96 MiB 暂存预算时更小（最小 128 行） | 自适应 | 未注册 | 否 |
+| `TS_MINIMAX_M3_WARM_POOLS` | MiniMax-M3.1（GPU） | `0` 跳过加载时的满尺寸 prefill；该 prefill 让 ggml-cuda 的内核暂存池在槽位占用内存之前先长到峰值；启用流水线 prefill 时，加载还会运行一次短的流水线 prefill（`0` 同样跳过），建好流水线的调度器并确认它能生效 | 有 GPU 时开启 | 未注册 | 否 |
+| `TS_MINIMAX_M3_HOST_NUMA` | MiniMax-M3.1（主机专家，Linux） | 有两个及以上 NUMA 节点时，把每个主机专家栈复制到读取它的绑核工作线程旁边的内存；`0` 从 GGUF 映射提供 | 两个及以上 NUMA 节点时开启 | 未注册 | 否 |
+| `TS_MINIMAX_M3_NUMA_BATCH_GB` | MiniMax-M3.1（NUMA 主机专家） | NUMA 复制每批读取的主机专家栈 GiB 数，读完后丢弃该批的文件页 | `16` | 未注册 | 否 |
+| `TS_MINIMAX_M3_HOST_MOE_TOKENS` | MiniMax-M3.1（主机专家） | 2 到 N 个 token 的批次通过 TensorSharp 的静态行内核（使用 ggml 的量化与点积）运行主机专家；`0` 保留 ggml 的 `mul_mat_id` | `16` | 未注册 | 否 |
+| `TS_MINIMAX_M3_CPU_REPACK` | MiniMax-M3.1（主机专家） | `1` 把主机专家栈重排为 ggml 的 CPU_REPACK 布局，而不是从映射提供；仅在未做 NUMA 放置时生效。`--tp` 下拒绝 | 关闭 | 未注册 | 否 |
+| `TS_MINIMAX_M3_OP_OFFLOAD` | MiniMax-M3.1 | 允许 ggml 调度器为大批次把主机权重拷贝到 GPU | 仅在没有主机专家时开启 | 未注册 | 否 |
+| `TS_MINIMAX_M3_WARM_HOST` | MiniMax-M3.1（主机专家） | 当主机映射的专家权重加 8 GiB 不超过主机内存额度（cgroup 限制）时，在加载时预取这些页；否则日志说明跳过了预取。`0` 从不预取 | 开启 | 未注册 | 否 |
+| `TS_MINIMAX_M3_LOAD_CHUNK_MB` | MiniMax-M3.1 | 权重上传的分块大小 | `64` | 未注册 | 否 |
+| `TS_MINIMAX_M3_LOAD_THREADS` | MiniMax-M3.1 | 权重上传的读取线程数（也是主机预取的线程数） | `16` | 未注册 | 否 |
+| `TS_MINIMAX_M3_DROP_UPLOAD_CACHE` | MiniMax-M3.1 | 每个分块上传到设备后释放其页缓存（Linux 用 `posix_fadvise`，macOS 用 `F_NOCACHE`；其他平台给出警告且不生效）。`0` 保留页缓存 | 开启 | 未注册 | 否 |
+| `TS_MINIMAX_M3_DSPARK_GRAPHS` | MiniMax-M3.1 DSpark 草稿器 | 保留的草稿图数量（每个序列槽位一张，按最近使用淘汰） | `4` | 未注册 | 否 |
+| `TS_MINIMAX_M3_EXEC_DEBUG` | MiniMax-M3.1（诊断） | `1` 为每次改变状态的执行器调用打印一行 stderr（调度器请求了什么、活动槽位的头位置与耗时），另含槽位增长、图构建与各阶段主机耗时 | 关闭 | 未注册 | 否 |
+| `TS_MINIMAX_M3_PROFILE` | MiniMax-M3.1（诊断） | `N` > 0 时同步计时每个图节点，并每 N 次图计算打印一次按后端、按算子的汇总。会使 CUDA graph 失效、关闭流水线 prefill，`--tp` 下拒绝 | `0` | 未注册 | 否 |
 
 ## 矩阵外的 DeepSeek V4 / V4.1 开关
 

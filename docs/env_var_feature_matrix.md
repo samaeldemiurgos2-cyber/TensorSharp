@@ -251,11 +251,11 @@ replacement.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TS_SPEC` | Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash (n-gram only), Gemma 4, Qwen 3.8 Flash Next, DeepSeek V4 / V4.1, Muse-Glimmer, Muse Spark (n-gram only, not under its native `--tp`) (CLI + server) | Enable speculative decode for solo sequences | OFF (`0`) | not registered | no |
+| `TS_SPEC` | Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash (n-gram only), Gemma 4, Qwen 3.8 Flash Next, DeepSeek V4 / V4.1, Muse-Glimmer, Muse Spark (n-gram only, not under its native `--tp`), MiniMax-M3.1 (DSpark or n-gram, layer split only) (CLI + server) | Enable speculative decode for solo sequences | OFF (`0`) | not registered | no |
 | `TS_SPEC_TYPE` | all of the above | Speculation algorithm: `auto` \| `draft-head` \| `block` \| `ngram` | `auto` | not registered | no |
 | `TS_SPEC_DRAFT` | all of the above | Max tokens drafted per speculative step (1-64) | `8` | not registered | no |
 | `TS_SPEC_PMIN` | all of the above | Draft-confidence gate; meaning is per algorithm | per algorithm (`0.15` / `0.35` / `0`) | not registered | no |
-| `TS_SPEC_DRAFT_MODEL` | models whose drafter ships as its own GGUF (CLI + server) | Path to a separate drafter, recognised from the file's architecture: Gemma 4's `gemma4-assistant`, Qwen 3.8 Flash Next's shared MTP head, a DeepSeek V4 DSpark (or experimental V4.1 `deepseek41-dspark`) drafter, or a DFlash / DFlash2 drafter (Muse-Glimmer, Qwen 3.5 family). Set by `--draft-model`, which also enables speculation unless `--no-spec` is given | none | not registered | no |
+| `TS_SPEC_DRAFT_MODEL` | models whose drafter ships as its own GGUF (CLI + server) | Path to a separate drafter, recognised from the file's architecture: Gemma 4's `gemma4-assistant`, Qwen 3.8 Flash Next's shared MTP head, a DeepSeek V4 DSpark (or experimental V4.1 `deepseek41-dspark`) drafter, a DFlash / DFlash2 drafter (Muse-Glimmer, Qwen 3.5 family), or MiniMax-M3.1's DSpark `dflash` drafter, which only its native executor loads (layer split). Set by `--draft-model`, which also enables speculation unless `--no-spec` is given | none | not registered | no |
 
 The design behind these — the three-layer split of model architecture,
 speculation algorithm and speculator weights — is documented in
@@ -299,6 +299,54 @@ path's opt-in optimizations, is in the
 | `TS_MUSE_SPARK_WARM_POOLS` | Muse Spark (native, GPUs) | `0` skips the full-size prefill at load that grows ggml-cuda's kernel-scratch pools to their peak before slots take the memory; with pipelined prefill on, the load also runs a short pipelined prefill (which `0` skips too) that builds the pipeline's scheduler and checks that it engages | ON with GPUs | not registered | no |
 | `TS_MUSE_SPARK_PIPELINE` | Muse Spark (native, layer split) | Pipelined prefill: a prompt call is cut into micro-batches, and GPU k works on one while GPU k+1 works on the one before. Unset = automatic (on with two or more GPUs, all CUDA-family, no host experts, `TS_MUSE_SPARK_PROFILE` unset, not `--tp`); `1` forces it (refused on a multi-GPU non-CUDA backend and under `--tp`); `0` turns it off; any other value refuses the load. The load log prints `pipelined prefill: on (...)` or `off (reason)` | automatic | not registered | no |
 | `TS_MUSE_SPARK_PIPELINE_UBATCH` | Muse Spark (native, pipelined prefill) | Fixed micro-batch rows for pipelined prefill, an integer in [1, `TS_MUSE_SPARK_UBATCH`]; anything else refuses the load. Unset = adaptive: about a quarter of each call, between 512 rows and the prefill ubatch, smaller (down to 128 rows) where a long context's masks would exceed the staging budget | adaptive | not registered | no |
+
+## Out-of-Matrix MiniMax-M3.1 Knobs
+
+MiniMax-M3.1-Flash (`minimax-m3`) runs only on its native whole-model executor
+(`ggml_cuda`, with `ggml_cpu` as a correctness path), and these variables are
+every `TS_MINIMAX_M3_*` setting the executor and its managed glue read. None
+are registered in `EnvVarMatrix.All`. The managed side hands `_LAYER_SPLIT`,
+`_UBATCH`, `_THREADS` and `_CPU_MOE` to the executor as load arguments and
+forwards the others, so values set inside the .NET process reach it too. The
+placement flags themselves (`--layer-split N`, `--tp N`, `--n-cpu-moe N`,
+`--draft-model`) are documented in the
+[MiniMax-M3.1 card](models/minimax-m3.md#running-it).
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_MINIMAX_M3_MSA` | MiniMax-M3.1 | Attention path. `auto`: micro-batches whose last position is below 2048 run dense flash attention (exactly the sparse result there), others run sparse attention through TensorSharp's MSA kernels on CUDA GPUs and through upstream ggml ops elsewhere (always the ggml ops under `--tp`). `dense`: dense everywhere (debugging; changes results from position 2048 on). `ggml`: sparse attention through upstream ggml ops for every micro-batch. `kernel`: TensorSharp's kernels for every micro-batch (on a CPU-only load, their CPU reference); refused on a GPU that cannot run them and under `--tp`. Any other value refuses the load | `auto` | not registered | no |
+| `TS_MINIMAX_M3_MSA_CHUNK_MB` | MiniMax-M3.1 (sparse prompt segments on the ggml path) | Byte budget of one token chunk of a sparse prompt segment's masked attention; also added to each GPU's placement reserve. Must be a positive number of MiB, or the load is refused | `256` | not registered | no |
+| `TS_MINIMAX_M3_INDEXER_F16` | MiniMax-M3.1 | F16 copies of the F32 indexer projections for decode-shaped graphs (at most 8 rows), which halves the indexer bytes a decode step reads; prompts keep reading the F32 originals. `0` keeps F32 only | on with GPUs, off on a CPU-only load | not registered | no |
+| `TS_MINIMAX_M3_FUSE_QKV` | MiniMax-M3.1 | Concatenate the same-typed Q, K and V projections, and the indexer's q and k projections, into one matrix each (one weight read and one launch). `0` keeps them separate | on | not registered | no |
+| `TS_MINIMAX_M3_LAYER_SPLIT` | MiniMax-M3.1 (layer split) | Explicit layers per GPU, comma-separated non-negative counts summing to 60 and at most one per GPU; a longer list raises the GPU count. A malformed list, or one that does not fit, refuses the load. Refused with `--tp` | automatic placement | not registered | no |
+| `TS_MINIMAX_M3_UBATCH` | MiniMax-M3.1 | Prefill micro-batch rows; also bounds one speculative verify (draft plus anchor) | `2048` | not registered | no |
+| `TS_MINIMAX_M3_THREADS` | MiniMax-M3.1 | CPU backend threads of a GPU-only load. CPU-only loads use the available parallelism; host experts beside GPUs use half of it (their decode is memory-bandwidth bound, and the other half keeps the serving process's own threads off the expert workers' cores); `--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` override both | available parallelism (half with host experts) | not registered | no |
+| `TS_MINIMAX_M3_CPU_MOE` | MiniMax-M3.1 (layer split) | `auto` places only the routed-expert stacks (gate, up and down separately) that do not fit on the GPUs in system RAM, and overrides `--n-cpu-moe`. It does not cap the context (it moves experts to the host instead), so set `MAX_CONTEXT` with it. Under `--tp` every expert stays in GPU memory | off | not registered | no |
+| `TS_MINIMAX_M3_PLAN_CTX_TOKENS` | MiniMax-M3.1 | K/V tokens the placement reserves across all slots; set to the context times the concurrent requests plus one (the shared-prefix checkpoint). A value that is not a positive token count is said and replaced by the default | one full context | not registered | no |
+| `TS_MINIMAX_M3_VRAM_RESERVE_MB` | MiniMax-M3.1 | Per-GPU memory the placement keeps for compute buffers and ggml-cuda's scratch pool, on top of which come the sparse chunk budget and, under `--tp`, the reduction buffers | `2048` + ubatch / 4 | not registered | no |
+| `TS_MINIMAX_M3_DEV0_RESERVE_MB` | MiniMax-M3.1 | Extra memory kept free on GPU 0, e.g. for the vision encoder | `0` | not registered | no |
+| `TS_MINIMAX_M3_KV_PAD` | MiniMax-M3.1 | Granularity, in rows, of the attention windows a graph is built for: decode reuses one graph shape over a stretch of this many positions. Rounded up to a multiple of the 128-row MSA block, with a warning | `256` | not registered | no |
+| `TS_MINIMAX_M3_BD_KV_PAD` | MiniMax-M3.1 (batched decode) | The window granularity of batched decode graphs, where N sequences cross window boundaries N times as often; kept a multiple of `TS_MINIMAX_M3_KV_PAD` | 2 × `TS_MINIMAX_M3_KV_PAD` | not registered | no |
+| `TS_MINIMAX_M3_SLOT_INIT_ROWS` | MiniMax-M3.1 | Initial K/V rows of a sequence slot (rounded to the KV pad, at most the context); rows double on demand | `4096` | not registered | no |
+| `TS_MINIMAX_M3_SLOT_HEADROOM_MB` | MiniMax-M3.1 | Free memory a new slot or KV growth must leave on each GPU | `256` | not registered | no |
+| `TS_MINIMAX_M3_ADMIT_GRAPH_MB` | MiniMax-M3.1 | Most graph memory a new slot or KV growth keeps free on top of the headroom, so one long prefill's graph does not make every later slot evict retained prefix state | `512` | not registered | no |
+| `TS_MINIMAX_M3_GRAPH_CACHE` | MiniMax-M3.1 | Built graphs kept in the shape-keyed LRU. Under `--tp` the cache keeps one graph, and a value above 1 refuses the load | `12` | not registered | no |
+| `TS_MINIMAX_M3_NODES_PER_LAYER` | MiniMax-M3.1 (diagnostic) | Override the graph node budget per layer that the executor otherwise derives from the graph's segments | derived | not registered | no |
+| `TS_MINIMAX_M3_PIPELINE` | MiniMax-M3.1 (layer split) | Pipelined prefill: a prompt call is cut into micro-batches, and GPU k works on one while GPU k+1 works on the one before. Unset = automatic (on with two or more GPUs, all CUDA-family, no host experts, `TS_MINIMAX_M3_PROFILE` unset, not `--tp`); `1` forces it (refused on a multi-GPU non-CUDA backend and under `--tp`); `0` turns it off; any other value refuses the load. The load log prints `pipelined prefill: on (...)` or `off (reason)` | automatic | not registered | no |
+| `TS_MINIMAX_M3_PIPELINE_UBATCH` | MiniMax-M3.1 (pipelined prefill) | Fixed micro-batch rows for pipelined prefill, an integer in [1, `TS_MINIMAX_M3_UBATCH`]; anything else refuses the load. Unset = adaptive: the micro-batch count that minimizes the pipeline's estimated time (2 for 2,048 tokens, 3 for 4,096, 4 for 8,192 on eight A40s), between 256 rows and the prefill ubatch, smaller (down to 128 rows) where a long context's masks would exceed the 96 MiB staging budget | adaptive | not registered | no |
+| `TS_MINIMAX_M3_WARM_POOLS` | MiniMax-M3.1 (GPUs) | `0` skips the full-size prefill at load that grows ggml-cuda's kernel-scratch pools to their peak before slots take the memory; with pipelined prefill on, the load also runs a short pipelined prefill (which `0` skips too) that builds the pipeline's scheduler and checks that it engages | on with GPUs | not registered | no |
+| `TS_MINIMAX_M3_HOST_NUMA` | MiniMax-M3.1 (host experts, Linux) | With two or more NUMA nodes, copy every host expert stack into memory beside the pinned worker that reads it; `0` serves them from the GGUF mapping | on with two or more NUMA nodes | not registered | no |
+| `TS_MINIMAX_M3_NUMA_BATCH_GB` | MiniMax-M3.1 (NUMA host experts) | GiB of host expert stacks the NUMA copy reads per batch before it drops that batch's file pages | `16` | not registered | no |
+| `TS_MINIMAX_M3_HOST_MOE_TOKENS` | MiniMax-M3.1 (host experts) | Batches of 2 to N tokens run host experts through TensorSharp's static-row kernel (ggml's quantization and dot products); `0` keeps ggml's `mul_mat_id` | `16` | not registered | no |
+| `TS_MINIMAX_M3_CPU_REPACK` | MiniMax-M3.1 (host experts) | `1` repacks host expert stacks into ggml's CPU_REPACK layout instead of serving them from the mapping; only without NUMA placement. Refused under `--tp` | off | not registered | no |
+| `TS_MINIMAX_M3_OP_OFFLOAD` | MiniMax-M3.1 | Let ggml's scheduler copy host weights to a GPU for large batches | on only without host experts | not registered | no |
+| `TS_MINIMAX_M3_WARM_HOST` | MiniMax-M3.1 (host experts) | Prefault the host-mapped expert weights at load when they plus 8 GiB fit the host allowance (the cgroup limit); otherwise the load logs that it skipped the prefault. `0` never prefaults | on | not registered | no |
+| `TS_MINIMAX_M3_LOAD_CHUNK_MB` | MiniMax-M3.1 | Weight-upload chunk size | `64` | not registered | no |
+| `TS_MINIMAX_M3_LOAD_THREADS` | MiniMax-M3.1 | Weight-upload reader threads (also the host-prefault threads) | `16` | not registered | no |
+| `TS_MINIMAX_M3_DROP_UPLOAD_CACHE` | MiniMax-M3.1 | Release each uploaded chunk's page cache once it is on the device (`posix_fadvise` on Linux, `F_NOCACHE` on macOS; a warned no-op elsewhere). `0` keeps the pages cached | on | not registered | no |
+| `TS_MINIMAX_M3_DSPARK_GRAPHS` | MiniMax-M3.1 DSpark drafter | Draft graphs kept (one per sequence slot, least recently used first) | `4` | not registered | no |
+| `TS_MINIMAX_M3_EXEC_DEBUG` | MiniMax-M3.1 (diagnostic) | `1` logs one stderr line per state-changing executor call (what the scheduler asked for, the active slot's head and the wall time), plus slot growth, graph builds and host time per phase | off | not registered | no |
+| `TS_MINIMAX_M3_PROFILE` | MiniMax-M3.1 (diagnostic) | `N` > 0 times every graph node synchronously and prints a per-backend, per-op summary every N graph computations. Defeats CUDA graphs, turns pipelined prefill off, and is refused under `--tp` | `0` | not registered | no |
 
 ## Out-of-Matrix DeepSeek V4 / V4.1 Knobs
 

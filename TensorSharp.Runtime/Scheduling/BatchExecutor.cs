@@ -1319,7 +1319,9 @@ namespace TensorSharp.Runtime.Scheduling
             // model supports it, so they share every weight read instead of prefilling
             // one after another. Only plain chunks qualify: a request whose holder must
             // first be created around an injected prefix, rewound from a retained
-            // state, or fed media embeddings keeps the per-sequence loop below.
+            // state (unless the model rewinds it in the batched call:
+            // BatchedPrefillRewindsHolders), or fed media embeddings keeps the
+            // per-sequence loop below.
             if (options.BatchedFusedDecodeEnabled && n >= 2)
             {
                 var prefillWork = new List<ScheduledSequenceWork>(n);
@@ -1328,7 +1330,10 @@ namespace TensorSharp.Runtime.Scheduling
                     var seq = work.Sequence;
                     if (!work.IsPrefill || (handledBatched != null && handledBatched.Contains(seq.RequestId)))
                         continue;
-                    if (_pendingRetainedFusedTruncations.ContainsKey(seq.RequestId))
+                    // A holder cloned from a longer cached state is rewound on its first step;
+                    // a model that rewinds it inside the batched call (exactly) takes it here.
+                    if (_pendingRetainedFusedTruncations.TryGetValue(seq.RequestId, out int rewindTo)
+                        && !(fused.BatchedPrefillRewindsHolders && rewindTo == seq.NumComputedTokens))
                         continue;
                     if (!fused.HasFusedSequenceCache(seq.RequestId) && (seq.NumComputedTokens > 0 || seq.UsesLiveCacheContinuation))
                         continue;
@@ -1360,6 +1365,7 @@ namespace TensorSharp.Runtime.Scheduling
                             for (int i = 0; i < pn; i++)
                             {
                                 var seq = prefillWork[i].Sequence;
+                                _pendingRetainedFusedTruncations.Remove(seq.RequestId);   // rewound by the model
                                 seq.LastLogits = outLogits[i];
                                 seq.AdvanceComputedTokens(chunks[i].Length);
                                 MaybeCheckpointSharedPrefix(seq);
@@ -3533,6 +3539,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// loop. Default false (opt-in).</summary>
         bool TryForwardBatchedFusedPrefill(
             IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] positions, float[][] outLogits) => false;
+
+        /// <summary>Whether <see cref="TryForwardBatchedFusedPrefill"/> also takes a request whose holder
+        /// still holds rows past the prefix it reused (a cached state cloned for it, otherwise rewound on its
+        /// first step): the model rewinds such a holder to <c>positions[i]</c> itself, which must then be
+        /// exact. Default false: those requests prefill in the per-sequence loop, one after another.</summary>
+        bool BatchedPrefillRewindsHolders => false;
     }
 
     /// <summary>Per-step metadata for the batched paged attention path.

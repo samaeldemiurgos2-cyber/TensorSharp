@@ -152,6 +152,8 @@ class TestRunner:
             return True, False
         if normalized.startswith("nemotronh") or normalized.startswith("nemotron"):
             return True, True
+        if normalized.startswith("minimaxm3"):
+            return True, True
         if normalized.startswith("mistral3") or normalized.startswith("mistral"):
             return False, False
         return False, False
@@ -159,7 +161,7 @@ class TestRunner:
     def _declares_reasoning_end(self, architecture):
         # Mirrors ChatProtocolRegistry.ThinkingGrammarActivationTrigger declarations.
         normalized = self._normalize_name(architecture)
-        return normalized in ("gptoss", "deepseek41", "deepseekv41", "qwen4exp", "gemma4", "museglimmer") \
+        return normalized in ("gptoss", "deepseek41", "deepseekv41", "qwen4exp", "gemma4", "museglimmer", "minimaxm3") \
             or normalized.startswith("nemotronh")
 
     def _extract_sse_tokens(self, events):
