@@ -1689,6 +1689,11 @@ namespace TensorSharp.Models
                 && residual.Sizes[0] == input.Sizes[0]
                 && input.Sizes[0] == 1
                 && _quantWeights.TryGetValue(weightName, out var qw)
+                // FusedMatMulQuantAdd takes no scale, so a weight carrying an
+                // NVFP4 scale2 sidecar would be added to the residual unscaled.
+                // Bail out and let the caller use the scale-aware LinearForward
+                // chain instead.
+                && qw.Scale == 1.0f
                 && input.Sizes[1] == qw.Ne0
                 && residual.Sizes[1] == qw.Ne1;
         }
@@ -2691,6 +2696,7 @@ namespace TensorSharp.Models
             {
                 if (_latentAccumTensor == null
                     || !_quantWeights.TryGetValue(prefix + "ffn_latent_out.weight", out var latentOutQw)
+                    || latentOutQw.Scale != 1.0f
                     || _latentAccumTensor.DimensionCount != 2
                     || _latentAccumTensor.Sizes[0] != 1
                     || _latentAccumTensor.Sizes[1] != latentOutQw.Ne0
@@ -2704,6 +2710,8 @@ namespace TensorSharp.Models
             {
                 if (!_quantWeights.TryGetValue(prefix + "ffn_up_shexp.weight", out var sharedUpQw)
                     || !_quantWeights.TryGetValue(prefix + "ffn_down_shexp.weight", out var sharedDownQw)
+                    || sharedUpQw.Scale != 1.0f
+                    || sharedDownQw.Scale != 1.0f
                     || sharedUpQw.Ne1 != sharedDownQw.Ne0
                     || sharedDownQw.Ne1 != Config.HiddenSize)
                 {
