@@ -118,6 +118,7 @@ namespace TensorSharp.Models
         // the up/down matmuls, i.e. up before and down after the non-linearity).
         // Null entry = no sidecar (e.g. IQ-quantized experts, which are self-scaling).
         private float[][] _layerExpertScale;
+        private float[][] _layerExpertUpScale;
 
         // Pre-allocated decode buffers for Mamba2
         private float[] _mamba2ConvOutBuf;
@@ -863,6 +864,7 @@ namespace TensorSharp.Models
                 return;
 
             _layerExpertScale = new float[Config.NumLayers][];
+            _layerExpertUpScale = new float[Config.NumLayers][];
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_layerTypes[l] != LayerType.FFN)
@@ -876,17 +878,22 @@ namespace TensorSharp.Models
                 if (upScale == null && downScale == null)
                 {
                     _layerExpertScale[l] = null!;
+                    _layerExpertUpScale[l] = null!;
                     continue;
                 }
 
-                var combined = new float[ne];
+                // The up scale has to be applied BEFORE the ReLU^2 non-linearity and the
+                // down scale after the down matmul. Folding both into the routing weight
+                // (ds * us * us) is algebraically equivalent but numerically unsafe: it
+                // leaves up_out too large by 1/us, and squaring that overflows to +Inf
+                // for NVFP4 experts whose scale2 is ~1e-5. Observed on Nemotron Super VL,
+                // where the resulting Inf met a ~1e-15 route weight and produced NaN by
+                // MoE layer 1. Keep them separate so each is applied at its own stage.
+                var down = new float[ne];
                 for (int e = 0; e < ne; e++)
-                {
-                    float us = upScale != null ? upScale[e] : 1.0f;
-                    float ds = downScale != null ? downScale[e] : 1.0f;
-                    combined[e] = ds * us * us;
-                }
-                _layerExpertScale[l] = combined;
+                    down[e] = downScale != null ? downScale[e] : 1.0f;
+                _layerExpertScale[l] = down;
+                _layerExpertUpScale[l] = upScale;
             }
         }
 
@@ -896,6 +903,30 @@ namespace TensorSharp.Models
                 return null;
             return tensor.GetElementsAsFloat(expectedLength);
         }
+
+        /// <summary>
+        /// Applies an expert's NVFP4 up-projection scale2 BEFORE the ReLU^2
+        /// non-linearity. This cannot be deferred into the routing weight:
+        /// squaring an up_out that is still 1/us too large overflows to +Inf
+        /// when scale2 is ~1e-5, and the Inf then propagates as NaN.
+        /// </summary>
+        private void ApplyExpertUpScale(Tensor up, int layer, int expertIdx)
+        {
+            if (up == null || _layerExpertUpScale == null || layer >= _layerExpertUpScale.Length)
+                return;
+            float[] s = _layerExpertUpScale[layer];
+            if (s == null || (uint)expertIdx >= (uint)s.Length)
+                return;
+            float us = s[expertIdx];
+            if (us != 1.0f)
+                Ops.Mul(up, up, us);
+        }
+
+        /// <summary>True when any expert on this layer needs a pre-activation up scale.</summary>
+        private bool HasExpertUpScale(int layer)
+            => _layerExpertUpScale != null
+               && layer < _layerExpertUpScale.Length
+               && _layerExpertUpScale[layer] != null;
 
         private unsafe void InitLayerInfo()
         {
@@ -1847,6 +1878,7 @@ namespace TensorSharp.Models
                         hidden = FFNBlock(hidden, layer, seqLen, isDecode);
                         break;
                 }
+
                 if (_backend == BackendType.Mlx && (layer + 1) % evalEveryN == 0
                     && layer + 1 != Config.NumLayers && hidden != null)
                 {
@@ -2478,7 +2510,13 @@ namespace TensorSharp.Models
                     // expert count exceeds 16 (e.g. Super VL at 22) split across
                     // multiple calls and the results accumulate into latentAccum.
                     bool usedBatchedMoE = false;
-                    if (isDecode && IsGgmlBackend && _expertUpQW[layer] != null && _expertDownQW[layer] != null)
+                    // The batched kernel applies ReLU^2 to the raw quantized up
+                    // projection and only scales the accumulated result, so it
+                    // cannot apply a per-expert NVFP4 up scale before the
+                    // squaring. Fall through to the per-expert path when one is
+                    // needed — deferring it overflows to +Inf (see InitExpertScales).
+                    if (isDecode && IsGgmlBackend && !HasExpertUpScale(layer)
+                        && _expertUpQW[layer] != null && _expertDownQW[layer] != null)
                     {
                         var upQw0 = _expertUpQW[layer][topExperts[0]];
                         var dnQw0 = _expertDownQW[layer][topExperts[0]];
@@ -2545,6 +2583,7 @@ namespace TensorSharp.Models
                             int expertIdx = topExperts[k];
 
                             Tensor up = LinearForward(routedInput, _expertUpKeys[layer][expertIdx]);
+                            ApplyExpertUpScale(up, layer, expertIdx);
                             ReluSquaredInPlace(up);
                             Tensor expertOut = LinearForward(up, _expertDownKeys[layer][expertIdx]);
                             up.Dispose();
@@ -2807,6 +2846,7 @@ namespace TensorSharp.Models
                     if (up == null)
                         return false;
 
+                    ApplyExpertUpScale(up, layer, expert);
                     ReluSquaredInPlace(up);
                     InvalidateTensorDeviceCache(up);
 
