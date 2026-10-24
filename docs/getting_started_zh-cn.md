@@ -1,198 +1,238 @@
-# 快速上手指南
+<a id="getting-started"></a>
+<a id="快速上手指南"></a>
 
 [English](getting_started.md) | [中文](getting_started_zh-cn.md)
 
-> [TensorSharp](../README_zh-cn.md) 文档的一部分。README 的[快速开始](../README_zh-cn.md#快速开始)是本页的精简版。
+# 快速上手
 
-## 安装与首次运行
+先得到一次文本回复：选择界面与平台 → 安装 → 下载一个模型 → 发出提示 → 检查结果。图像、视频、多 GPU 与技能在完成这一步后再选。
 
-**使用 TensorAgent 桌面应用：** 打开[最新发布](https://github.com/zhongkaifu/TensorSharp/releases/latest)，展开 **Assets**，选择 `tensoragent-desktop-<version>-osx-arm64.dmg`（Apple Silicon，macOS 14+），或 `tensoragent-desktop-<version>-win-x64-cpu.msi` / `win-x64-cuda.msi`（Windows x64）。也提供 PKG 与 ZIP。桌面包包含 .NET 运行库；Windows 缺少 WebView2 时需另外安装。权重通过 **☰ → 模型 → 下载 → 使用** 下载，内置模型最低需要 12 GB 系统内存。安装、校验、首次聊天、工具与故障排查详见[桌面版用户指南](tensoragent_desktop_zh-cn.md)。历史发布可能没有桌面资源，需等待使用更新后 Release Binaries 工作流的发布。
+<a id="choose"></a>
+<a id="when-to-try-tensorsharp"></a>
+<a id="什么时候适合尝试-tensorsharp"></a>
+## 1 · 选择界面
 
-**使用 TensorSharp CLI / 服务端：** [Releases 页面](https://github.com/zhongkaifu/TensorSharp/releases)提供自包含的 Windows x64（CPU/CUDA）、Linux x64（CPU/CUDA）与 macOS arm64 归档。下文的 SDK 与构建步骤用于源码构建。
+| 想完成什么 | 从哪里开始 |
+| --- | --- |
+| 安装后直接聊天 | [桌面安装与首次聊天](tensoragent_desktop_zh-cn.md)。Mac/Windows 安装包自带运行时；无需下文的源码构建。 |
+| 使用终端、浏览器或兼容 HTTP 客户端 | 继续下文的 CLI/服务端源码路径；使用同一个 GGUF 文本模型。 |
+| 把引擎嵌入 C# 应用 | 先完成一次文本运行，再看[包分层与集成](../DEVELOPMENT_zh-cn.md#项目--nuget-包分层)。 |
 
-**NVIDIA DGX Spark / GB10：** 请使用独立的实验性 **CUDA 13、Linux ARM64**
-[Docker 构建与归档说明](../DEVELOPMENT_zh-cn.md#gb10--dgx-spark-构建容器实验性)。
-归档后缀为 `linux-arm64-cuda13-GB10`，仅面向单个 GB10，而非通用 ARM64 GPU。
-打标签的正式发布也会附带这些归档，它们在托管的无 GPU ARM64 runner 上通过 Docker 构建。
-CLI 与服务端文本推理曾在真实硬件上做过一次历史性检查，但早于上游重新集成，不能证明当前代码；
-托管 CI 只重新检查 CPU 与归档路径。现有 x64 CUDA 归档不适用于 Spark。
+桌面路径：从发布页选择 Mac Apple Silicon DMG 或 Windows x64 MSI，安装并打开，在 **☰ → 模型 → 下载 → 使用** 后发送消息。也有 PKG/ZIP；Windows 可能需要 WebView2。内置目录从 12 GB 系统内存起步，权重另下；较早发布可能没有桌面资产。具体包校验与限制见[桌面安装与首次聊天](tensoragent_desktop_zh-cn.md)。
 
-源码构建面向 .NET 10。全新开发机器需要安装完整的 **.NET 10 SDK**；只安装 .NET Runtime 无法构建 TensorSharp：
+CLI/服务端也有 [自包含发布归档](https://github.com/zhongkaifu/TensorSharp/releases)，适用于 Windows/Linux x64 CPU/CUDA 和 macOS arm64。发布包对应自己的标签，不能据此假定包含当前源码的全部功能；下文命令是源码构建，不是对下载归档的验证。
 
-| 平台 | 安装 SDK |
-|---|---|
-| **Windows** | 在 PowerShell 中运行 `winget install Microsoft.DotNet.SDK.10`，或参阅 Microsoft 的 [Windows 安装说明](https://learn.microsoft.com/zh-cn/dotnet/core/install/windows)。 |
-| **macOS** | 使用 [.NET 10 SDK 安装程序](https://dotnet.microsoft.com/zh-cn/download/dotnet/10.0)：Apple 芯片选择 **Arm64**，Intel Mac 选择 **x64**。另见 Microsoft 的 [macOS 安装说明](https://learn.microsoft.com/zh-cn/dotnet/core/install/macos)。 |
-| **Linux** | 按照 Microsoft 的 [Linux 发行版指南](https://learn.microsoft.com/zh-cn/dotnet/core/install/linux)为当前发行版配置正确的软件源，并安装其 .NET 10 SDK 包（通常名为 `dotnet-sdk-10.0`）。 |
+<a id="prerequisites"></a>
+<a id="install-and-first-run"></a>
+<a id="安装与首次运行"></a>
+## 2 · 安装并匹配平台
 
-安装后打开新终端，确认列表中包含 `10.0.x` SDK：
+<a id="install-dotnet"></a>
+### 源码构建需要 .NET 10 SDK
+
+| 平台 | 安装与检查 |
+| --- | --- |
+| Windows | PowerShell：`winget install Microsoft.DotNet.SDK.10`。 |
+| macOS | 从 [Microsoft](https://learn.microsoft.com/zh-cn/dotnet/core/install/macos) 安装 .NET 10 SDK；Apple 芯片选 Arm64，Intel 选 x64。 |
+| Linux | 按 [发行版说明](https://learn.microsoft.com/zh-cn/dotnet/core/install/linux) 配置软件源并安装 .NET 10 SDK（通常为 `dotnet-sdk-10.0`）。 |
+
+需要完整 SDK，只有 .NET Runtime 不足以构建。安装后打开新终端，确认列表中有 `10.0.x`：
 
 ```bash
 dotnet --list-sdks
 ```
 
-更多细节见 [.NET 跨平台安装概览](https://learn.microsoft.com/zh-cn/dotnet/core/install/)或[开发 → 前置要求](../DEVELOPMENT_zh-cn.md#前置要求)。
+<a id="e4b-fast-lane"></a>
+<a id="pick-a-backend"></a>
+<a id="选择后端"></a>
+### 为这台机器选择后端
 
-然后即可在已验证的原生 GGML 快速路径（Gemma 4 E4B）上约 30 秒跑起来。其他前置包括 `git`、`curl`、[CMake](https://cmake.org/download/) 3.20+（原生 GGML 库由它来配置和构建；Windows 上 Visual Studio 的“C++ CMake tools for Windows”组件自带一份，构建脚本会自动找到），以及所选 GPU 后端的工具链（见 [开发 → 前置要求](../DEVELOPMENT_zh-cn.md#前置要求)）。推荐的公开文件是 [`gemma-4-E4B-it-Q8_0.gguf`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf)（7.48 GiB）；纯文本推理无需投影器。
+| 机器 | 下文使用的值 | 原生源码构建还需要 |
+| --- | --- | --- |
+| Apple Silicon Mac | `ggml_metal` | Git、curl、CMake 3.20+、Xcode 命令行工具。 |
+| Windows / Linux + NVIDIA | `ggml_cuda` | CMake、C++ 工具链、NVIDIA 驱动与匹配的 CUDA Toolkit；Windows 需要 Visual Studio C++ 构建工具。 |
+| Windows / Linux + Vulkan GPU | `ggml_vulkan` | CMake、C++/Vulkan 构建工具与 Vulkan 1.3 驱动。 |
+| CPU，无 GPU | `ggml_cpu` | CMake 3.20+ 与 C++ 编译器；它仍是原生构建。 |
 
-**Windows + NVIDIA（PowerShell）**
+示例默认使用 `ggml_cpu`；把运行命令的后端改成表中的一个值即可。CUDA 构建前设置 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON`；Vulkan 使用 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON`。Windows PowerShell 的写法是 `$env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA="ON"`；macOS/Linux 是 `export TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON`。Metal 不需要 CUDA 开关。完整安装、Vulkan 工具链自动配置与 MLX 的额外依赖见[后端与原生构建指南](../USAGE_zh-cn.md#计算后端)。
 
-```powershell
-git clone https://github.com/zhongkaifu/TensorSharp.git; Set-Location TensorSharp
-New-Item -ItemType Directory -Force models | Out-Null
-curl.exe -L --fail "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models\gemma-4-E4B-it-Q8_0.gguf
-'用一句话回答：TensorSharp 是什么？' | Set-Content prompt.txt
-$env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA = 'ON'
-dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true -- --model models\gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --max-tokens 128 --backend ggml_cuda
-```
-
-**macOS（Apple Silicon）** —— 去掉 CUDA 环境变量，使用 `--backend ggml_metal`。
-
-**Linux + NVIDIA** —— 在 `dotnet run` 前加 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON`，使用 `--backend ggml_cuda`。
-
-**AMD / Intel / NVIDIA Vulkan** —— 设置 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON`，使用 `--backend ggml_vulkan`。
-
-**Linux（Ubuntu）+ 多张 NVIDIA GPU —— 张量并行**
-
-张量并行把一个模型切分到 N 张 GPU 上，可运行在 Direct `cuda` 后端以及 GGML CUDA /
-Vulkan 后端（`--backend ggml_cuda`、`ggml_vulkan`）。Qwen 3.8 Flash Next 与
-DeepSeek V4 / V4.1 的按层切分改用独立的 `--layer-split N` 参数：每张 GPU 拿一段连续的完整层。
-`--tp N` 仅表示张量并行，两种模式互斥；不支持的请求会在启动时失败。
-按层切分仅支持单节点，不能与 `--tp-node-id` / `--tp-peers` 组合。
-现有按层切分命令需将 `--tp N` 改为 `--layer-split N`，或设置
-`TENSORSHARP_LAYER_SPLIT_DEGREE=N`。未配置两种模式时默认使用单设备。GLM 5.x 的 `--layer-split N` 选择整层放置，
-GGML GPU 后端上的 `--tp N` 则选择原生本地张量并行路径。
-对 Qwen-Image-2.1，`--tp N` 只切分扩散 Transformer（DiT），文本 / 视觉编码器与 VAE 留在第一张 GPU 上。请先安装 CUDA 工具包，然后：
+<a id="build"></a>
+### 取得源码
 
 ```bash
-# 在 RunPod 的 Ubuntu 24.04 镜像上，需要先让动态链接器找到 CUDA 兼容库：
-export LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
-# 较旧的 Ubuntu 版本需要从 backports PPA 安装 .NET 10 SDK：
-add-apt-repository ppa:dotnet/backports
-
-apt update && apt install dotnet-sdk-10.0
 git clone https://github.com/zhongkaifu/TensorSharp.git
 cd TensorSharp
-mkdir models
-wget "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -O models/gemma-4-E4B-it-Q8_0.gguf
-bash TensorSharp.GGML.Native/build-linux.sh
-dotnet build -c Release
-
-# 单进程内使用 2 张 GPU
-TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf \
-    --backend cuda --interactive --max-tokens 20000 --tp 2
-
-# 同样的用法也适用于 GGML CUDA 后端（可加 TENSORSHARP_TP_DEVICES=0,2 指定 GPU）
-TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf \
-    --backend ggml_cuda --interactive --max-tokens 20000 --tp 2
 ```
 
-只需再加上节点 ID 与共享的 peer 列表，同一个模型就能跨机器扩展 —— 2 节点 × 2 GPU 即全局 TP 度为 4：
+只运行下面的应用项目即可；首次运行会还原与构建，不必先构建包含桌面应用的整个解决方案。Git、curl 与网络访问用于下载源码、依赖及模型；首次原生构建会取得上游 ggml。
+
+<a id="download"></a>
+## 3 · 下载一个文本模型
+
+本例使用公开的 [Gemma 4 E4B Q8_0](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf)，文件为 **7.48 GiB**。磁盘文件大小不是运行内存需求：还要为 KV 缓存与执行预留内存。同仓库有较小的 Q4_K_M；换量化或模型前核对[Gemma 4 模型卡](models/gemma4_zh-cn.md)与[其他模型下载](../MODEL_DOWNLOADS_zh-cn.md)。**这次只输入文本，不需要 mmproj。**
+
+<details>
+<summary>Windows PowerShell 下载命令</summary>
+
+```powershell
+curl.exe --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf
+```
+
+
+</details>
+
+<details>
+<summary>macOS / Linux 下载命令</summary>
 
 ```bash
-# 节点 0
-TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --tp 2 \
-    --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
-# 节点 1（peer 列表相同，节点 ID 不同）
-TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --tp 2 \
-    --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf
 ```
 
-`TensorSharp.Server.Host` 支持同样的 `--tp`、`--tp-node-id`、`--tp-peers` 参数（也可用
-`TENSORSHARP_TP_*` 环境变量）；在多节点集群中，服务端必须是节点 `0`（对外提供 HTTP
-的 driver），其余节点各运行一个 `TensorSharp.Cli` worker。完整参考：**[张量并行与分布式推理](../USAGE_zh-cn.md#张量并行与分布式推理)**。
 
-将同一模型作为服务托管（浏览器 UI 在 <http://localhost:5000>，另有 Ollama/OpenAI API）：
+</details>
+
+<a id="first-run"></a>
+## 4 · 得到第一条文本回复
+
+在仓库根目录执行，按上表替换 `ggml_cpu`。CLI 的一次性文本提示来自 `--input` 文件；`--prompt` 是生成图像/视频的参数。下例使用贪心采样，最多输出 32 token，首次构建可能需要数分钟。
+
+<details>
+<summary>终端：Windows PowerShell</summary>
+
+```powershell
+'What is 2+2? Reply with only the number.' | Set-Content -Encoding utf8 prompt.txt
+dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cpu --temperature 0 --max-tokens 32
+```
+
+
+</details>
+
+<details>
+<summary>终端：macOS / Linux</summary>
 
 ```bash
-dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --max-tokens 512
+printf '%s\n' 'What is 2+2? Reply with only the number.' > prompt.txt
+dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cpu --temperature 0 --max-tokens 32
 ```
 
-> 服务端默认绑定 `0.0.0.0:5000`（可用 `--port` / `--host` 或 `PORT` / `HOST` 环境变量修改；macOS 上 5000 端口已被 AirPlay 接收器占用），无内置鉴权或 TLS——请置于防火墙之后，或使用带鉴权的 HTTPS 反向代理。图像/视频/音频需追加伴随文件 [`mmproj-gemma-4-E4B-it-Q8_0.gguf`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/mmproj-gemma-4-E4B-it-Q8_0.gguf)，用 `--mmproj` 指定。
 
-TensorSharp.Server.Host、TensorSharp.Cli 与 TensorAgent 默认对[支持的模型](supported_models_zh-cn.md)各表中的所有自回归家族使用共享引擎的 Radix
-KV 前缀缓存（DiffusionGemma 与图像 / 视频模型除外）。它复用公共提示前缀和每个会话的私有状态，并遵守模型与媒体边界；
-投机解码（`--spec`）不会关闭它。设置 `TS_SCHED_PREFIX_CACHE=0` 可关闭运行时前缀复用。服务端与 CLI 的 `--no-prefix-cache`
-同样会关闭前缀复用和启动预热；在服务端还会关闭磁盘上的前缀检查点持久化。
+</details>
 
-两个可执行程序在不带参数或使用 `--help` 启动时，都会打印完整的参数参考——逐项列出说明、默认值、取值范围与示例：
+想用浏览器或 HTTP？改为启动同一模型的服务端，在运行命令中选择相同后端，并让这个终端保持运行：
 
 ```bash
-dotnet run --project TensorSharp.Cli -c Release -- --help
-dotnet run --project TensorSharp.Server.Host -c Release -- --help
+dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cpu --host 127.0.0.1 --port 8080 --max-tokens 32
 ```
 
-完整命令参考：**[CLI](../USAGE_zh-cn.md#控制台应用)** · **[Server](../USAGE_zh-cn.md#web-应用)** · 更多可下载模型：**[模型下载](../MODEL_DOWNLOADS_zh-cn.md)** · 想用配置文件？**[config/](../config/README.md)**。
+打开 [http://127.0.0.1:8080/](http://127.0.0.1:8080/)，发送同一个算术问题。这里显式使用本机回环与 8080 端口；默认其实是 `0.0.0.0:5000`，macOS 的 5000 常被 AirPlay 占用。服务端没有内置鉴权或 TLS；对外部署需自己的鉴权 HTTPS 边界。
 
-## 从同一解决方案构建 TensorAgent
+<a id="verify"></a>
+## 5 · 验证这条路径
 
-`dotnet build TensorSharp.slnx -c Release` 构建引擎、CLI/服务端以及 TensorAgent.Core、TensorAgent.Sharing 和 TensorAgent.Tests。在 macOS 上还会尝试构建 Mac 应用，并在 Apple Silicon 上构建 iOS 模拟器应用；在 Windows 上会尝试构建 `win-x64` 应用。应用构建需要对应的 MAUI 工作负载与原生依赖；缺失时会警告并跳过对应应用头，其他构建错误会使解决方案构建失败。Linux 仅构建共享项目，不构建 MAUI 应用头。可用 `-p:TensorSharpSkipTensorAgentApp=true` 显式排除应用。
+| 检查 | 预期结果 |
+| --- | --- |
+| CLI 或浏览器回复 | 出现非空的助手文本；本例算术应回答 `4`。日志本身不算模型回复。 |
+| 进程与错误 | CLI 正常结束；服务端保持运行。下载、构建或模型加载报错时，先解决该阶段。 |
+| 服务端存活 | `GET /health` 返回 `TensorSharp.Server is running`；这只是存活检查，不证明模型已就绪或回复质量。 |
+| 模型与 API | `GET /v1/models` 列出配置的模型 ID。需要直接请求时，使用下方 JSON。 |
 
-构建测试项目不会执行测试。Windows 应用已有有限的 Debug/Release 聊天、合成图像与工具验证；媒体生成和更广的设备覆盖尚未验证。当前覆盖范围与应用专用脚本见 [TensorAgent 源码 / 验证指南](../TensorAgent/README.md)；安装 Mac / Windows 发布包请看[桌面版用户指南](tensoragent_desktop_zh-cn.md)。iPhone / iPad 仍需源码构建流程。
-
-## 文本与代码嵌入
-
-当前源码支持 **Snowflake Arctic Embed L v2.0** 与 **all-MiniLM-L6-v2** 的 GGUF 编码器，通过 OpenAI `/v1/embeddings` 和 Ollama `/api/embed` 提供归一化向量。以下命令在完成上面的源码构建后启动小型 MiniLM 服务：
+在另一个终端检查；Windows PowerShell 将 `curl` 改为 `curl.exe`：
 
 ```bash
-curl --create-dirs -fL -o models/embeddings/all-MiniLM-L6-v2-Q8_0.gguf \
-  https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/544f204f2eaa2d71361ffc74d6df7170285b286a/all-MiniLM-L6-v2-Q8_0.gguf
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model models/embeddings/all-MiniLM-L6-v2-Q8_0.gguf \
-  --embeddings --backend cpu --host 127.0.0.1 --port 5001 --no-webui
+curl --fail http://127.0.0.1:8080/health
+curl --fail http://127.0.0.1:8080/v1/models
+```
+
+把下面内容保存为 `request.json`；若模型 ID 不同，使用 `/v1/models` 返回的值：
+
+```json
+{
+  "model": "gemma-4-E4B-it-Q8_0",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 2+2? Reply with only the number."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 32,
+  "stream": false
+}
 ```
 
 ```bash
-curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
-  -d '{"model":"all-MiniLM-L6-v2-Q8_0","input":["read a file","open a document"]}'
+curl --fail http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" --data-binary "@request.json"
 ```
 
-使用 `cpu` 运行 100% 纯 C# 推理，无需原生推理库；或选择原生 GGML 的 `ggml_cpu`、`ggml_metal`、`ggml_cuda`。聊天与嵌入服务分别运行。完整的 Snowflake 下载、批处理、维数缩减、C# API、分词与性能验证见[嵌入指南](embeddings_zh-cn.md)。
+检查 JSON 中的 `choices[0].message.content` 有文本。正常 Web UI 部署中 `/` 打开聊天；加 `--no-webui` 或没有 Web UI 文件时，`/` 才返回存活文本。**稳定的存活路由始终是 `/health`。** 想继续终端多轮聊天，可用 CLI 的 `--interactive`；完整格式见[CLI 参考](../USAGE_zh-cn.md#控制台应用)与[HTTP API 示例](../TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md)。
 
-## 新视频、嵌入与技能工作流
+<a id="troubleshooting"></a>
+## 卡住时，按阶段排查
 
-- [LTX 2.5 Distilled](models/ltx-2.5_zh-cn.md)：五文件预设共 44.76 GB，需要获批发布方访问权限。实验性 48 GB 档位默认使用 1024×1024×17 帧与 8+3 步两阶段配方，联合生成 48 kHz 立体声音频。
-- [MiniMax-H3](models/minimax-h3_zh-cn.md)：首帧动画选择 FL2VA，身份参考选择 Ref2VA。二者均生成 32 kHz 立体声音频；当前精度与基准说明取代旧速度结论。
-- [EmbeddingGemma 2](embeddings_zh-cn.md)：使用 `--embeddings`，媒体输入另加 `--mmproj`。已实现六个后端，任务前缀、维数与测试限制随模型而异。
-- [Agent Skills](agent_skills.md)（英文）：桌面 CLI / 服务端随附 17 个技能。`find-skills` 可达且开启 `--skills-allow-network` 时，原生工具可搜索、检查、按固定版本安装并在同一请求中使用；运行脚本仍需执行权限与依赖。
+| 症状 | 下一步 |
+| --- | --- |
+| 没有 `10.0.x` SDK | 重新安装 SDK 后打开新终端，不要只安装 Runtime。 |
+| CMake、编译器或 GPU 库错误 | 核对[后端与原生构建指南](../USAGE_zh-cn.md#计算后端)；不能构建原生代码时先使用下面的托管 CLI 路径。 |
+| 模型路径或内存错误 | 确认下载完成、文件名匹配、内存不止覆盖权重大小；使用模型卡支持的量化。 |
+| 服务端无法监听 | 保持 `--host 127.0.0.1`，换一个空闲 `--port`，并同时更新请求 URL。 |
+| 有存活响应但没有模型回复 | 查看加载日志与 `/v1/models`，再按[HTTP API 示例](../TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md)检查请求；存活不是推理检查。 |
 
-## 将文件复用为知识库
+<details>
+<summary>没有原生工具链：托管 CPU CLI 路径</summary>
 
-`v2026.10.11` 源码已包含个人知识集合与回答调整；LTX 2.5、EmbeddingGemma 2 与原生技能发现需要更新的源码，选择发布前请查看[项目状态](PROJECT_STATUS_zh-cn.md)。在 TensorAgent 打开 **☰ → 知识库**，创建集合后上传文件或文件夹，或通过 **添加聊天** 导入已保存对话、可用附件和生成文件的快照。检查每个来源的抽取状态，再选择 **在此聊天中使用** 后提问；上传本身不会选择集合。回答中的引用可打开保留的原文件及相关片段。
-
-知识库支持文本、代码、数据集、部分 Office 内容和本地 PDF OCR。图像与视频采样帧需要已加载的兼容视觉模型；音频可使用已加载的音频塔或已配置的 `TS_JEV_TRANSCRIPTION_URL` 转录伴随服务。能力变化后可对原文件 **重新索引**。默认使用 BM25 检索，可选 GGUF 嵌入模型提供语义检索。覆盖范围、限制与引用详见[知识库指南](knowledge-system_zh-cn.md)。
-
-独立服务通过 `TS_KNOWLEDGE_DIRECTORY` 启用同一存储：
+`cpu` 是纯 C# 路径，与原生 `ggml_cpu` 不同。它更侧重可移植性与调试，模型/功能覆盖需核对；显式跳过两个原生构建：
 
 ```bash
-export TS_KNOWLEDGE_DIRECTORY="$HOME/TensorSharpKnowledge"
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal \
-  --host 127.0.0.1 --port 5001
+dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend cpu --temperature 0 --max-tokens 32
 ```
 
-请使用主机上可用的后端。通过 `/api/knowledge` 管理来源，并在支持的聊天请求中以 `knowledgeCollections` 传入集合 ID；见 [API 示例](../TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#个人知识库)。独立服务的浏览器界面支持回答调整，TensorAgent 则提供集合管理界面。CLI、TensorAgent 或服务端浏览器界面正在推理或回答时，可发送新指令中断并继续；**停止** 或 CLI 的 Ctrl+C 可单独中止。重定向的 CLI 输入仍按顺序完成各轮。
 
-## 选择后端
+</details>
 
-后端支持取决于模型架构。嵌入模型支持纯 C# `cpu` 与原生 `ggml_cpu`、`ggml_metal`、`ggml_cuda`；EmbeddingGemma 2 还支持直接 `cuda` 与 `mlx`；其他模型的限制见[状态矩阵](PROJECT_STATUS_zh-cn.md#状态矩阵)。
+<a id="next"></a>
+## 回复成功后，再选择下一项任务
 
-| 你的硬件 | 推荐后端 | 标志 | 说明 |
-|---|---|---|---|
-| **Apple Silicon（Mac）** | GGML Metal | `--backend ggml_metal` | 服务端在 macOS 上的默认后端；CLI 在所有系统上默认 `ggml_cpu`，使用 CLI 时需显式传入该参数。`--backend mlx` 是另一条 Apple Silicon GPU 路径。 |
-| **Windows / Linux + NVIDIA GPU** | GGML CUDA | `--backend ggml_cuda` | 测试最充分的 NVIDIA 路径。`--backend cuda` 是用于实验的 Direct PTX/cuBLAS 后端。 |
-| **Windows / Linux + AMD / Intel / NVIDIA GPU** | GGML Vulkan | `--backend ggml_vulkan` | 与厂商无关的 GPU 路径（ggml-vulkan）。机器有 Vulkan 运行时即自动构建；用 `--no-vulkan` 退出。 |
-| **无 GPU / 可移植 / 调试** | 纯 C# CPU | `--backend cpu` | 无原生依赖；matmul 跑在多核工作线程池上。连 DeepSeek V4.1 Flash 在这里也有一整套整模型执行器——它跑在纯 C# 执行器 `DeepSeek4CpuExecutor` 上，不用 ggml、不用 GPU，并在五层 F32 fixture 上以 `atol=rtol=2e-5` 对齐 PyTorch 参照实现 `eng/dsv41-reference.py`（这是与参照实现的架构级一致，而非真实 Q2_K 权重上的对齐）；它是正确性与可移植性路径，而非服务路径。需要更快的 CPU 推理可用 `--backend ggml_cpu`（原生算子）。 |
+| 任务 | 现有指南与保留的关键条件 |
+| --- | --- |
+| 图像生成与编辑 | [Qwen-Image-2.1](models/qwenimage21_zh-cn.md#lora-插件)：匹配 LoRA 的 4–8 步配方、分辨率、CFG 与许可证；部分插件不可商用，检查每个配置的来源与许可。 |
+| 视频与音频 | [MiniMax-H3](models/minimax-h3_zh-cn.md)（FL2VA/Ref2VA、32 kHz 音频、CFG 1、Turbo 参数）与 [Wan](models/wan_zh-cn.md)（检查点决定基础/蒸馏步数）。 |
+| LTX 2.5 | [两阶段配方与条件](models/ltx-2.5_zh-cn.md)：五个基础文件 43.08 GB、实验性 48 GB 层级、1024×1024×17 起步、8+3 步；基础仓库不设访问门槛，额外 Ingredients IC-LoRA 约 1.31 GB 需批准访问。 |
+| 嵌入、知识与技能 | [嵌入](embeddings_zh-cn.md) · [知识库](knowledge-system_zh-cn.md) · [Agent Skills](agent_skills.md)。先检查各自模型、提取覆盖与执行权限。 |
+| 多 GPU 与更快的服务 | [多 GPU](../USAGE_zh-cn.md#张量并行与分布式推理) · [缓存与投机解码](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。`--tp` 与 `--layer-split` 互斥，支持范围由模型决定。 |
 
-每个后端的完整说明见 [使用方法 → 计算后端](../USAGE_zh-cn.md#计算后端)。
+可用 [JSON 配置文件](../config/README.md)复用参数；文件可以下载资源，所以先检查配置内容。分支源码可能领先于发布包，选择功能前查看[项目状态](PROJECT_STATUS_zh-cn.md)。
 
-## 让它跑得更快
+<a id="reference-links"></a>
+<a id="build-tensoragent-from-the-same-solution"></a>
+<a id="从同一解决方案构建-tensoragent"></a>
+<a id="text-and-code-embeddings"></a>
+<a id="文本与代码嵌入"></a>
+<a id="new-video-embedding-and-skill-workflows"></a>
+<a id="新视频嵌入与技能工作流"></a>
+<a id="reuse-your-files-as-a-knowledge-library"></a>
+<a id="将文件复用为知识库"></a>
+<a id="make-it-fast"></a>
+<a id="让它跑得更快"></a>
+### 高级设置与参考
 
-按这个顺序选择：
+- 桌面源码构建：[TensorAgent 构建与验证](../TensorAgent/README.md)保留 MAUI 工作负载、平台应用头、`TensorSharpSkipTensorAgentApp` 与缺失依赖跳过规则；构建测试项目不会运行测试。
+- 嵌入：[独立服务指南](embeddings_zh-cn.md)保留 MiniLM/Snowflake 下载、`--embeddings`、纯 C#/原生后端及 `/v1/embeddings`、`/api/embed` 示例；与聊天服务使用不同端口。
+- 知识：[知识库指南](knowledge-system_zh-cn.md)保留 `TS_KNOWLEDGE_DIRECTORY`、`knowledgeCollections`、BM25/可选嵌入、Reindex 与媒体提取限制；上传后仍需选择“在此聊天使用”。
+- 多模态输入：[Gemma 4 模型卡](models/gemma4_zh-cn.md)保留匹配 mmproj 文件名与显式 `--mmproj` 用法；服务端不会自动发现投影器。[MiniMax-H3 的专门指南](models/minimax-h3_zh-cn.md)保留约 46 GB 配置下载、Turbo 1.38 GB、采样器约束与 `TS_VIDEO_TOKENIZER`。
+- DGX Spark / GB10：[实验性 CUDA 13 / Linux ARM64 构建](../DEVELOPMENT_zh-cn.md#gb10--dgx-spark-构建容器实验性)面向单 GB10，不能使用 x64 CUDA 包；历史硬件检查不能证明当前上游重集成，托管 CI 只检查 CPU/归档路径。
 
-1. **先选对 checkpoint。** Wan 视频优先使用 Turbo/Lightning/4-step 蒸馏 GGUF。Qwen-Image-2.1 可加上 `config/lora/` 中的步数蒸馏 [LoRA 插件](models/qwenimage21_zh-cn.md#lora-插件)（4–8 步，取代默认的 40 步）。
-2. **使用匹配的后端。** NVIDIA：`ggml_cuda`；Apple Silicon 和 iOS：`ggml_metal`；CPU：`ggml_cpu`（需要可移植性时使用纯托管 `cpu`）。
-3. **先减少工作量，再调参数。** H3 使用 `--cfg 1.0`，想少跑几步时在 FL2VA 上加 [Turbo 插件](models/minimax-h3_zh-cn.md#turbo-插件)（8 或 4 步），而不是调低基础步数；媒体任务优先降低分辨率、帧数或步数。
-4. **最后再扩展或投机。** 根据模型和负载尝试 `--draft-model` / `--spec`、`--n-cpu-moe` 或 `--tp N`。
+<details>
+<summary>已有高级部署的兼容提示</summary>
 
-详见[性能指南与快速路径](PROJECT_STATUS_zh-cn.md#让它跑得更快)、[模型卡片](models/README_zh-cn.md)和[环境变量功能矩阵](env_var_feature_matrix_zh-cn.md)。
+使用原生 ggml 源码构建时，`TENSORSHARP_GGML_NO_UPDATE=1` 跳过后续网络更新。默认 Radix 前缀缓存、`TS_SCHED_PREFIX_CACHE=0`、`--no-prefix-cache` 与服务端磁盘检查点的关系见[缓存指南](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#radix-前缀缓存)。下面保留原指南的特定 Ubuntu 环境设置，仅在匹配的 CUDA/软件源环境使用，常规首次运行不需要：
+
+```bash
+# RunPod Ubuntu 24.04 images using this CUDA compatibility directory:
+export LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
+# Older Ubuntu releases needing the .NET backports package source:
+add-apt-repository ppa:dotnet/backports
+apt update && apt install dotnet-sdk-10.0
+```
+
+
+</details>

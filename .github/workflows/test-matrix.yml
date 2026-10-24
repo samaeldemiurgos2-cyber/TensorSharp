@@ -188,7 +188,7 @@ jobs:
         working-directory: benchmarks/engine_comparison
         run: |
           python3 report.py --config benchmark_config_ci.json
-          cp ../../docs/engine_comparison_report.md "$GITHUB_WORKSPACE/engine-comparison-report.md"
+          cp ../../docs/validation/engine-comparison/report.md "$GITHUB_WORKSPACE/engine-comparison-report.md"
 
       - name: Upload report
         if: ${{ !cancelled() && steps.bench.outcome != 'skipped' }}

@@ -113,8 +113,17 @@ namespace TensorSharp.Models.Video
         /// use ImageConditions to select their exact positions and strengths.</summary>
         public IList<string> ReferenceImagePaths { get; set; }
 
-        /// <summary>Reference video clips for reference-conditioned models.</summary>
+        /// <summary>Full reference clips for models that condition on video context
+        /// (MiniMax-H3 Ref2VA). LTX 2.5 accepts this legacy request field as a
+        /// continuation source and uses each clip's exact final frame.</summary>
         public IList<string> ReferenceVideoPaths { get; set; }
+
+        /// <summary>Video clips to continue from. TensorSharp decodes the exact final
+        /// frame of the first clip as the generated video's first frame; with a second
+        /// clip, its final frame is pinned as the generated video's last frame. The
+        /// clips are frame sources, not full motion-reference conditioning. MiniMax-H3
+        /// uses its FL2VA denoiser; LTX 2.5 uses its image/keyframe conditioning path.</summary>
+        public IList<string> ContinuationVideoPaths { get; set; }
 
         /// <summary>Reference audio clips for reference-conditioned models.</summary>
         public IList<string> ReferenceAudioPaths { get; set; }
@@ -190,6 +199,69 @@ namespace TensorSharp.Models.Video
             if (EndImage != null) return EndImage;
             if (!string.IsNullOrWhiteSpace(EndImagePath)) return QwenImage.ImageIO.Load(EndImagePath);
             return null;
+        }
+
+        /// <summary>Convert explicit video-continuation sources into the models' common
+        /// first/last-frame inputs. LTX preserves <see cref="ReferenceVideoPaths"/> as
+        /// full temporal references when mode is <c>ref</c>; legacy requests using that
+        /// property in another mode continue from its ending frame. MiniMax-H3 always
+        /// retains its full-clip Ref2VA behavior for <see cref="ReferenceVideoPaths"/>.</summary>
+        internal VideoGenerationParams ResolveVideoContinuations(bool ltxReferenceVideos = false)
+        {
+            IList<string> paths = ContinuationVideoPaths;
+            bool consumedReferenceVideos = false;
+            bool fullLtxReferenceMode = ltxReferenceVideos &&
+                string.Equals(Mode?.Trim(), "ref", StringComparison.OrdinalIgnoreCase);
+            if (ltxReferenceVideos && ReferenceVideoPaths is { Count: > 0 } referenceVideos && !fullLtxReferenceMode)
+            {
+                if (paths is { Count: > 0 })
+                    throw new ArgumentException("Use continueFromVideos or referenceVideos, not both.");
+                paths = referenceVideos;
+                consumedReferenceVideos = true;
+            }
+            if (fullLtxReferenceMode && paths is { Count: > 0 })
+                throw new ArgumentException("A full reference video cannot also be used as a continuation source in the same take.");
+            if (paths is not { Count: > 0 }) return this;
+            if (paths.Count > 2)
+                throw new ArgumentException("A video continuation accepts at most two clips: the first clip's final frame starts the take, and the second clip's final frame ends it.");
+            if (Image != null || ImageBytes is { Length: > 0 } || !string.IsNullOrWhiteSpace(ImagePath))
+                throw new ArgumentException("Video continuation cannot be combined with a separate first-frame image.");
+            if (ImageConditions is { Count: > 0 } || ReferenceImagePaths is { Count: > 0 } ||
+                ReferenceAudioPaths is { Count: > 0 } || ReferenceVideoAudioPaths is { Count: > 0 } ||
+                !consumedReferenceVideos && ReferenceVideoPaths is { Count: > 0 })
+                throw new ArgumentException("Video continuation cannot be combined with other image, video-reference or audio-reference inputs.");
+            if (paths.Count == 2 && (EndImage != null || !string.IsNullOrWhiteSpace(EndImagePath)))
+                throw new ArgumentException("A second continuation clip already supplies the generated video's last frame; remove endImage.");
+
+            bool hasEnd = paths.Count == 2 || EndImage != null || !string.IsNullOrWhiteSpace(EndImagePath);
+            string resolvedMode = hasEnd ? "fl2v" : "i2v";
+            if (!string.IsNullOrWhiteSpace(Mode))
+            {
+                string requested = Mode.Trim().ToLowerInvariant();
+                bool matches = resolvedMode == "i2v"
+                    ? requested is "i2v" or "i2va" or "image" or "image-to-video" or "first-frame"
+                    : requested is "fl2v" or "fl2va" or "firstlast" or "first-last" or "first-last-frame";
+                // LTX's continuation API accepts the older ref spelling for clip endings;
+                // full temporal references are preserved above when Mode is explicitly ref.
+                if (ltxReferenceVideos && requested is ("ref" or "reference" or "ref2va" or "t2v" or "t2va" or "text" or "text-to-video"))
+                    matches = true;
+                if (!matches)
+                    throw new ArgumentException($"Video continuation needs videoMode {resolvedMode}; the supplied mode was '{Mode}'.");
+            }
+
+            var resolved = (VideoGenerationParams)MemberwiseClone();
+            resolved.Image = TensorSharp.Models.MediaHelper.ExtractLastVideoFrame(paths[0]);
+            resolved.ImageBytes = null;
+            resolved.ImagePath = null;
+            if (paths.Count == 2)
+            {
+                resolved.EndImage = TensorSharp.Models.MediaHelper.ExtractLastVideoFrame(paths[1]);
+                resolved.EndImagePath = null;
+            }
+            resolved.Mode = resolvedMode;
+            resolved.ContinuationVideoPaths = null;
+            if (consumedReferenceVideos) resolved.ReferenceVideoPaths = null;
+            return resolved;
         }
     }
 

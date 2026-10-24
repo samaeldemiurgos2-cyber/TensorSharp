@@ -321,6 +321,10 @@ def long_sparse_case(args, config, api, checks, dumped):
 
     def run(setting):
         saved = os.environ.get("TS_DSV41_SPARSE_FA")
+        # Both arms prefill the whole prompt through every layer: with YOCO
+        # bounded replay (on by default) layers 20+ would see only its tail.
+        saved_yoco = os.environ.get("TS_DSV41_YOCO_KEEP")
+        os.environ["TS_DSV41_YOCO_KEEP"] = "0"
         if setting is None:
             os.environ.pop("TS_DSV41_SPARSE_FA", None)
         else:
@@ -351,6 +355,10 @@ def long_sparse_case(args, config, api, checks, dumped):
                 os.environ.pop("TS_DSV41_SPARSE_FA", None)
             else:
                 os.environ["TS_DSV41_SPARSE_FA"] = saved
+            if saved_yoco is None:
+                os.environ.pop("TS_DSV41_YOCO_KEEP", None)
+            else:
+                os.environ["TS_DSV41_YOCO_KEEP"] = saved_yoco
 
     sparse_rows, sparse_tokens = run(None)
     tiled_rows, tiled_tokens = run("0")

@@ -22,8 +22,7 @@
   "catalog.license.qwenImage": "Licence de recherche Qwen (non commerciale) ; encodeur de texte Apache-2.0",
   "catalog.model.minimaxH3.parameters": "DiT audio-vidéo 33B (20B sans ses branches AdaLN) + encodeur de texte Qwen3-VL-32B",
   "catalog.model.minimaxH3.quantization": "Q4_K (DiT) / Q4_K_M (encodeur de texte)",
-  "catalog.model.minimaxH3Fl2va.notes": "Crée une courte vidéo avec sa propre bande-son à partir d’une description, anime une photo jointe ou relie deux photos (la première et la dernière image). Nécessite 32 Go de mémoire vive (RAM). La licence MiniMax ne couvre pas l’utilisation dans l’UE, au Royaume-Uni, en Corée du Sud ou aux États-Unis.",
-  "catalog.model.minimaxH3Ref2va.notes": "Crée une courte vidéo avec sa propre bande-son mettant en scène les personnes, objets, lieux ou sons de neuf photos, clips et enregistrements joints au maximum. Précisez qui ou quoi apparaît : la référence donne l’apparence, la description les place dans la scène. Nécessite 32 Go de mémoire vive (RAM). La licence MiniMax ne couvre pas l’utilisation dans l’UE, au Royaume-Uni, en Corée du Sud ou aux États-Unis.",
+  "catalog.model.minimaxH3.notes": "Crée une courte vidéo avec sa propre bande-son à partir d’une description, anime une photo jointe, relie une première et une dernière photo ou met en scène les personnes, objets, lieux ou sons de neuf photos, clips et enregistrements joints au maximum. Choisissez dans Video Studio le mode première et dernière image ou le mode référence. Nécessite 32 Go de mémoire vive (RAM). La licence MiniMax ne couvre pas l’utilisation dans l’UE, au Royaume-Uni, en Corée du Sud ou aux États-Unis.",
   "catalog.license.minimaxH3": "Licence communautaire MiniMax H3",
   "catalog.lora.viggleTurbo.purpose": "Images et retouches en 6 étapes au lieu de 40, avec une qualité proche du modèle complet.",
   "catalog.license.qwenResearch": "Licence de recherche Qwen (non commerciale)",
@@ -67,6 +66,6 @@
   "catalog.extended.744b40b.parameters": "744 Md (40 Md actifs)",
   "catalog.extended.384experts.parameters": "MoE, 384 experts routés",
   "catalog.extended.14bExpert.parameters": "14 Md par expert",
-  "catalog.model.ltx25.notes": "Génération expérimentale de texte/image vers vidéo avec audio stéréo 48 kHz. LTX 2.5 Distilled utilise 8 étapes Euler ancestral à mi-taille, un agrandissement latent x2 et 3 étapes d’affinage avec CFG 1 et accepte première/dernière image et plusieurs images clés avec position et intensité. Les images guident la chronologie ; les références d’identité et les adaptateurs vidéo/audio exigent d’autres checkpoints. Téléchargements figés de 43,08 Go depuis un dépôt en libre accès ; aucun compte Hugging Face n’est nécessaire. Palier prudent de 48 Go ; validé sur de courts clips 1024×1024.",
-  "catalog.license.ltx25": "Conditions LTX-2.5 et Gemma"
+  "catalog.model.ltx25.notes": "Génération expérimentale de texte/image vers vidéo avec audio stéréo 48 kHz. LTX 2.5 Distilled utilise 8 étapes Euler ancestral à mi-taille, un agrandissement latent x2 et 3 étapes d’affinage avec CFG 1, et accepte la première/dernière image et plusieurs images clés avec position et intensité. Les images guident la chronologie. L’IC-LoRA Ingredients facultative (1,31 Go) ajoute les références d’identité ; elle est soumise à une autorisation Hugging Face et nécessite un jeton. Les cinq fichiers de base sans restriction totalisent 43,08 Go. Palier prudent de 48 Go ; validé sur de courts clips 1024×1024.",
+  "catalog.license.ltx25": "Conditions LTX-2.5, Ingredients IC-LoRA et Gemma"
 }

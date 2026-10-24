@@ -9,13 +9,68 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 #include "ggml_ops_internal.h"
+#include "ggml_ops_matmul_precision.h"
+#if defined(TSG_GGML_USE_CUDA)
+#include "ggml_ops_dsv4_fused.h"
+#endif
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml_gemma4_audio_metal_precision.h"
 #endif
 
 using namespace tsg;
 
+namespace tsg {
+    void free_spark_float32_backend()
+    {
+        auto& state = dev();
+        std::lock_guard<std::mutex> lock(state.spark_float32_mutex);
+        if (state.spark_float32_backend != nullptr)
+        {
+            ggml_backend_free(state.spark_float32_backend);
+            state.spark_float32_backend = nullptr;
+        }
+    }
+
+    void free_spark_float32_backends()
+    {
+        // Include partially initialized slots, not just the published degree.
+        // As with the shared compute buffers, rank workers must be drained.
+        for (int rank = 0; rank < TSG_MAX_DEVICES; ++rank)
+        {
+            ScopedRank active(rank);
+            free_spark_float32_backend();
+        }
+    }
+}
+
 namespace {
+
+    // A new DeviceCopy is published before its first upload. Until that upload
+    // completes, abandoning this call must remove it rather than let a retry
+    // mistake uninitialized storage for a resident weight. Existing cache hits
+    // are never armed and remain usable after an unrelated graph failure.
+    struct PendingQuantizedWeightUpload
+    {
+        void* key = nullptr;
+
+        ~PendingQuantizedWeightUpload()
+        {
+            if (key != nullptr)
+                invalidate_cached_buffer(key);
+        }
+
+        PendingQuantizedWeightUpload() = default;
+        PendingQuantizedWeightUpload(const PendingQuantizedWeightUpload&) = delete;
+        PendingQuantizedWeightUpload& operator=(const PendingQuantizedWeightUpload&) = delete;
+    };
+
+#if defined(TSG_GGML_TEST_HOOKS)
+    // Native regression builds only: exercise the same return/exception cleanup
+    // as an allocation failure, without exhausting a device or depending on the
+    // contents of fresh VRAM. These controls do not exist in production builds.
+    thread_local int matmul_test_abort_after_weight_bind = 0;
+    thread_local int matmul_test_aborted_pending_device_copy = -1;
+#endif
 
     int addmm_f32_impl(
         const TensorView2DDesc& result_desc,
@@ -319,7 +374,8 @@ namespace {
     int addmm_quant_f32_impl(
         const TensorView2DDesc& result_desc,
         const TensorView2DDesc& m1_desc,
-        const QuantizedWeightDesc& m2_quant)
+        const QuantizedWeightDesc& m2_quant,
+        bool spark_float32 = false)
     {
         if (!ensure_backend())
         {
@@ -382,7 +438,7 @@ namespace {
                         const TensorView2DDesc result_slice = slice_rows_2d(result_desc, row_start, row_count);
                         const TensorView2DDesc m1_slice = slice_rows_2d(m1_desc, row_start, row_count);
 
-                        if (!addmm_quant_f32_impl(result_slice, m1_slice, m2_quant))
+                        if (!addmm_quant_f32_impl(result_slice, m1_slice, m2_quant, spark_float32))
                             return 0;
                     }
 
@@ -390,6 +446,32 @@ namespace {
                     return 1;
                 }
             }
+        }
+
+        ggml_backend_t compute_backend = g_backend;
+        std::unique_lock<std::mutex> precision_lock;
+        if (spark_float32)
+        {
+#if defined(TSG_GGML_USE_CUDA)
+            if (g_backend_type != BACKEND_TYPE_CUDA || m2_quant.ggml_type != GGML_TYPE_F32)
+            {
+                set_last_error("Spark explicit-F32 projection requires CUDA and F32 weights.");
+                return 0;
+            }
+            auto& state = dev();
+            precision_lock = std::unique_lock<std::mutex>(state.spark_float32_mutex);
+            if (state.spark_float32_backend == nullptr)
+                state.spark_float32_backend = tsg_dsv4_fused_backend_init(g_backend);
+            compute_backend = state.spark_float32_backend;
+            if (compute_backend == nullptr)
+            {
+                set_last_error("Spark explicit-F32 CUDA executor is unavailable.");
+                return 0;
+            }
+#else
+            set_last_error("Spark explicit-F32 projection requires a CUDA build.");
+            return 0;
+#endif
         }
 
         const std::size_t ctx_size = 1024 * 1024;
@@ -458,6 +540,7 @@ namespace {
         // Try cached host_ptr binding for quantized weight (stable pointer across calls)
         bool m2_bound = false;
         bool m2_needs_upload = false;
+        PendingQuantizedWeightUpload pending_upload;
         {
             ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
             if (dev != nullptr && m2_quant.raw_bytes >= 4096)
@@ -474,15 +557,35 @@ namespace {
                         addr,
                         m2_needs_upload))
                 {
+                    if (m2_needs_upload)
+                        pending_upload.key = m2_quant.data;
                     ggml_status st = ggml_backend_tensor_alloc(buf, m2_tensor, addr);
                     m2_bound = (st == GGML_STATUS_SUCCESS);
                     if (!m2_bound)
+                    {
                         invalidate_cached_buffer(m2_quant.data);
+                        pending_upload.key = nullptr;
+                    }
                 }
             }
         }
 
-        ggml_tensor* mm_tensor = tsg::bonsai_mul_mat(context.value, m2_binding.tensor, m1_binding.tensor, m2_quant.data);
+#if defined(TSG_GGML_TEST_HOOKS)
+        const int abort_mode = matmul_test_abort_after_weight_bind;
+        matmul_test_abort_after_weight_bind = 0;
+        if (abort_mode != 0)
+        {
+            matmul_test_aborted_pending_device_copy = m2_bound && m2_needs_upload ? 1 : 0;
+            if (abort_mode == 2)
+                throw std::bad_alloc();
+            set_last_error("Injected addmm_quant failure after weight binding.");
+            return 0;
+        }
+#endif
+
+        ggml_tensor* mm_tensor = spark_float32
+            ? tsg_matmul_f32(context.value, m2_binding.tensor, m1_binding.tensor)
+            : tsg::bonsai_mul_mat(context.value, m2_binding.tensor, m1_binding.tensor, m2_quant.data);
         if (mm_tensor == nullptr)
         {
             set_last_error("Failed to create ggml matmul node for addmm_quant.");
@@ -547,9 +650,10 @@ namespace {
                 std::fflush(stderr);
             }
             upload_binding(m2_binding, m2_quant.data, m2_binding.raw_bytes);
+            pending_upload.key = nullptr;
         }
 
-        ggml_status status = tsg::compute_graph(g_backend, graph);
+        ggml_status status = tsg::compute_graph(compute_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("ggml backend graph execution failed for addmm_quant.");
@@ -1320,6 +1424,19 @@ namespace {
 
 } // anonymous namespace
 
+#if defined(TSG_GGML_TEST_HOOKS)
+TSG_EXPORT void TSGgml_MatmulTestAbortAfterWeightBind(int mode)
+{
+    matmul_test_abort_after_weight_bind = mode == 1 || mode == 2 ? mode : 0;
+    matmul_test_aborted_pending_device_copy = -1;
+}
+
+TSG_EXPORT int TSGgml_MatmulTestAbortedPendingDeviceCopy()
+{
+    return matmul_test_aborted_pending_device_copy;
+}
+#endif
+
 TSG_EXPORT int TSGgml_AddmmF32(
     TensorView2DDesc result,
     TensorView2DDesc src,
@@ -1351,6 +1468,50 @@ TSG_EXPORT int TSGgml_AddmmF32PreciseMetal(
     try { return addmm_f32_impl(result, src, m1, m2, beta, alpha, true); }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("Unknown precise Metal addmm failure."); return 0; }
+}
+
+TSG_EXPORT int TSGgml_MuseSparkProjectionFloat32(
+    TensorView2DDesc result, TensorView2DDesc input, TensorView2DDesc weight)
+{
+    try
+    {
+        // The weight is a row-major [output,input] view, including an offset
+        // expert plane. Never interpret an arbitrary padded span as a matrix.
+        auto exact_rows = [](const TensorView2DDesc& d, bool packed) {
+            if (d.dim0 <= 0 || d.dim1 <= 0 || d.stride1 != 1 ||
+                d.stride0 < d.dim1 || (packed && d.stride0 != d.dim1)) return false;
+            const int64_t elements = static_cast<int64_t>(d.dim0 - 1) * d.stride0 + d.dim1;
+            return elements <= INT64_MAX / static_cast<int64_t>(sizeof(float)) &&
+                d.raw_bytes == elements * static_cast<int64_t>(sizeof(float));
+        };
+        if (!validate_desc(result, "result") || !validate_desc(input, "input") ||
+            !validate_desc(weight, "weight")) return 0;
+        if (!exact_rows(result, true) || !exact_rows(input, false) || !exact_rows(weight, true) ||
+            result.dim0 != input.dim0 || result.dim1 != weight.dim0 || input.dim1 != weight.dim1)
+        {
+            set_last_error("Spark explicit-F32 projection requires exact row-contiguous spans and row-major weights.");
+            return 0;
+        }
+        auto overlaps = [](const TensorView2DDesc& a, const TensorView2DDesc& b) {
+            const uintptr_t x = reinterpret_cast<uintptr_t>(a.data), y = reinterpret_cast<uintptr_t>(b.data);
+            return x <= y ? y - x < static_cast<uint64_t>(a.raw_bytes)
+                          : x - y < static_cast<uint64_t>(b.raw_bytes);
+        };
+        if (overlaps(result, input) || overlaps(result, weight))
+        {
+            set_last_error("Spark explicit-F32 projection output must not overlap its inputs.");
+            return 0;
+        }
+        QuantizedWeightDesc descriptor;
+        descriptor.data = weight.data;
+        descriptor.ggml_type = GGML_TYPE_F32;
+        descriptor.ne0 = weight.dim1;
+        descriptor.ne1 = weight.dim0;
+        descriptor.raw_bytes = weight.raw_bytes;
+        return addmm_quant_f32_impl(result, input, descriptor, true);
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown Spark explicit-F32 projection failure."); return 0; }
 }
 
 TSG_EXPORT int TSGgml_AddmmQuantF32(

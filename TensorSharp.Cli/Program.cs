@@ -399,6 +399,7 @@ namespace TensorSharp.Cli
             string videoMode = null;
             var refImagePaths = new List<string>();
             var refVideoPaths = new List<string>();
+            var continuationVideoPaths = new List<string>();
             var refAudioPaths = new List<string>();
             var refVideoAudioPaths = new List<string>();
             bool videoAudioEnabled = true;
@@ -458,6 +459,7 @@ namespace TensorSharp.Cli
                     case "--video-mode": videoMode = args[++i]; break;
                     case "--ref-image": refImagePaths.Add(args[++i]); break;
                     case "--ref-video": refVideoPaths.Add(args[++i]); break;
+                    case "--continue-from-video": continuationVideoPaths.Add(args[++i]); break;
                     case "--ref-audio": refAudioPaths.Add(args[++i]); break;
                     case "--ref-video-audio": refVideoAudioPaths.Add(args[++i]); break;
                     case "--no-audio": videoAudioEnabled = false; break;
@@ -1014,6 +1016,7 @@ namespace TensorSharp.Cli
                     Console.Error.WriteLine("Video generation requires --prompt \"<description>\" (or --input prompt.txt). " +
                         "Optionally --image first_frame.png, --end-image last_frame.png, " +
                         "--ref-image/--ref-video/--ref-audio (reference-conditioned models), " +
+                        "--continue-from-video (start from a clip's last frame; repeat once for an ending frame), " +
                         "--output out.mp4, --width, --height, --video-frames, --fps, --diffusion-steps, " +
                         "--cfg, --flow-shift, --negative-prompt, --diffusion-seed, --cfg-cache-stride, --no-audio.");
                     return;
@@ -1024,7 +1027,7 @@ namespace TensorSharp.Cli
                     diffusionSeedSet ? diffusionSeed : -1, flowShift, videoFps, negativePrompt,
                     videoSampler, imagePath, cfgCacheStride,
                     endImagePath, refImagePaths, refVideoPaths, refAudioPaths, videoAudioEnabled,
-                    videoMode, refVideoAudioPaths);
+                    videoMode, refVideoAudioPaths, continuationVideoPaths);
                 return;
             }
 
@@ -2239,7 +2242,7 @@ namespace TensorSharp.Cli
             string sampler = null, string imagePath = null, int cfgCacheStride = 0,
             string endImagePath = null, IList<string> refImages = null, IList<string> refVideos = null,
             IList<string> refAudios = null, bool generateAudio = true, string videoMode = null,
-            IList<string> refVideoAudios = null)
+            IList<string> refVideoAudios = null, IList<string> continuationVideos = null)
         {
             Console.WriteLine(imagePath != null ? "=== Image-to-Video ===" : "=== Text-to-Video ===");
             Console.WriteLine($"  prompt : {prompt}");
@@ -2269,6 +2272,15 @@ namespace TensorSharp.Cli
                 Console.WriteLine($"  ref-aud: {r}");
             foreach (var r in refVideoAudios ?? (IList<string>)Array.Empty<string>())
                 Console.WriteLine($"  ref-vaud: {r}");
+            foreach (var r in continuationVideos ?? (IList<string>)Array.Empty<string>())
+            {
+                if (!File.Exists(r))
+                {
+                    Console.Error.WriteLine($"Video continuation source not found: {r}");
+                    return;
+                }
+                Console.WriteLine($"  continue: {r}");
+            }
             Console.WriteLine($"  -> {outputPath}");
 
             var p = new TensorSharp.Models.Video.VideoGenerationParams
@@ -2288,6 +2300,7 @@ namespace TensorSharp.Cli
                 EndImagePath = endImagePath,
                 ReferenceImagePaths = refImages,
                 ReferenceVideoPaths = refVideos,
+                ContinuationVideoPaths = continuationVideos,
                 ReferenceAudioPaths = refAudios,
                 ReferenceVideoAudioPaths = refVideoAudios,
                 GenerateAudio = generateAudio,

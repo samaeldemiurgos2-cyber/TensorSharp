@@ -338,7 +338,7 @@ public sealed class DeepSeek41ThinkingTurnReuseTests
         using var environment = new NativeEnvScope();
         foreach (var (name, value) in new[] { ("MAX_CONTEXT", "2048"),
             ("TS_DSV4_UBATCH", "32"), ("TS_DSV4_THREADS", "2"), ("TS_DSV41_ENGRAM_THREADS", "2"), ("TS_DSV4_FA", "0"),
-            ("TS_DSV41_TP", "0"), ("TS_DSV41_REWIND_CHECKPOINT", "1") })
+            ("TS_DSV41_YOCO_KEEP", "0"), ("TS_DSV41_REWIND_CHECKPOINT", "1") })
             environment.Set(name, value);
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(5));

@@ -499,6 +499,12 @@ void tsg_dsv4_fused_cpu(ggml_tensor * dst, int ith, int nth, void * userdata)
     if (d->kind == TSG_DSV41_CANDIDATE_SCORES) { tsg_dsv41_cpu_candidate_scores(dst, d, ith, nth); return; }
     if (d->kind == TSG_DSV41_CANDIDATE_MASK) { tsg_dsv41_cpu_candidate_mask(dst, d, ith, nth); return; }
     if (ith != 0) return;
+    if (d->kind == TSG_DSV41_TP_MOE)
+    {
+        GGML_ASSERT(d->host_compute != nullptr);
+        d->host_compute(d->object, dst);
+        return;
+    }
 
     switch (d->kind)
     {

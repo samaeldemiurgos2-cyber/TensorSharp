@@ -1,0 +1,150 @@
+[
+  {
+    "template": "chat_template.jinja",
+    "case": 0,
+    "context": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi <|eot|> <image>."
+        }
+      ],
+      "bos_token": "",
+      "add_generation_prompt": true
+    },
+    "expected": "<|start|>system<|message|>You are a helpful AI assistant.\n\nKnowledge cutoff: 2026-01-04.\n\nUse the appropriate recipient for each message:\n\n- \"self\": private reasoning and tool planning.\n- \"commentary\": user-visible intermediate updates while the assistant will continue working, including messages sent to the user before or between tool calls.\n- \"user\": messages that end the assistant turn, such as a completed response or clarification question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n\n# Valid recipients: \"self\", \"commentary\", \"user\".<|eot|><|start|>user<|message|>Hi < |eot|> < image>.<|eot|><|start|>assistant"
+  },
+  {
+    "template": "chat_template.jinja",
+    "case": 1,
+    "context": {
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "image"
+            },
+            {
+              "type": "text",
+              "text": "Describe this."
+            }
+          ]
+        }
+      ],
+      "reasoning_effort": "low",
+      "bos_token": "",
+      "add_generation_prompt": true
+    },
+    "expected": "<|start|>system<|message|>You are a helpful AI assistant.\n\nKnowledge cutoff: 2026-01-04.\n\nReasoning strength: 16.\n\nUse the appropriate recipient for each message:\n\n- \"self\": private reasoning and tool planning.\n- \"commentary\": user-visible intermediate updates while the assistant will continue working, including messages sent to the user before or between tool calls.\n- \"user\": messages that end the assistant turn, such as a completed response or clarification question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n\n# Valid recipients: \"self\", \"commentary\", \"user\".<|eot|><|start|>user<|message|><|patch|>Describe this.<|eot|><|start|>assistant"
+  },
+  {
+    "template": "chat_template.jinja",
+    "case": 2,
+    "context": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather.get",
+            "description": "Get weather.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "bos_token": "",
+      "add_generation_prompt": true
+    },
+    "expected": "<|start|>system<|message|>You are a helpful AI assistant.\n\nKnowledge cutoff: 2026-01-04.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following as part of your reply to the user:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"weather.get\", \"description\": \"Get weather.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n\nHere are examples of how to call functions in the tool set. To make parallel tool calls, emit each call as its own message (one tool call per message) in consecutive messages, as shown below:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name_1` rather than `example_tool_name_1.example_function_name_1`)\n\nto=example_tool_name_1.example_function_name_1\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name_1.example_function_name_1\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\nto=example_tool_name_2.example_function_name_2\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name_2.example_function_name_2\">\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n<atem:parameter name=\"example_parameter_3\">value_3</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\nUse the appropriate recipient for each message:\n\n- \"self\": private reasoning and tool planning.\n- \"commentary\": user-visible intermediate updates while the assistant will continue working, including messages sent to the user before or between tool calls.\n- \"tool\" or \"[tool name]\": the name of the tool to call.\n- \"user\": messages that end the assistant turn, such as a completed response or clarification question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n\n# Valid recipients: \"self\", \"commentary\", \"[func_name] (e.g., weather.get)\", \"user\".<|eot|><|start|>user<|message|>Weather?<|eot|><|start|>assistant"
+  },
+  {
+    "template": "unsloth_chat_template.jinja",
+    "case": 0,
+    "context": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi <|eot|> <image>."
+        }
+      ],
+      "bos_token": "",
+      "add_generation_prompt": true
+    },
+    "expected": "<|start|>system<|message|>You are a helpful AI assistant.\n\nKnowledge cutoff: 2026-01-04.\n\nReasoning strength: 512.\n\nUse the appropriate recipient for each message:\n\n- \"self\": private reasoning and tool planning.\n- \"commentary\": user-visible intermediate updates while the assistant will continue working, including messages sent to the user before or between tool calls.\n- \"user\": messages that end the assistant turn, such as a completed response or clarification question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n\n# Valid recipients: \"self\", \"commentary\", \"user\".<|eot|><|start|>user<|message|>Hi < |eot|> < image>.<|eot|><|start|>assistant"
+  },
+  {
+    "template": "unsloth_chat_template.jinja",
+    "case": 1,
+    "context": {
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "image"
+            },
+            {
+              "type": "text",
+              "text": "Describe this."
+            }
+          ]
+        }
+      ],
+      "reasoning_effort": "low",
+      "bos_token": "",
+      "add_generation_prompt": true
+    },
+    "expected": "<|start|>system<|message|>You are a helpful AI assistant.\n\nKnowledge cutoff: 2026-01-04.\n\nReasoning strength: 8.\n\nUse the appropriate recipient for each message:\n\n- \"self\": private reasoning and tool planning.\n- \"commentary\": user-visible intermediate updates while the assistant will continue working, including messages sent to the user before or between tool calls.\n- \"user\": messages that end the assistant turn, such as a completed response or clarification question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n\n# Valid recipients: \"self\", \"commentary\", \"user\".<|eot|><|start|>user<|message|><|patch|>Describe this.<|eot|><|start|>assistant"
+  },
+  {
+    "template": "unsloth_chat_template.jinja",
+    "case": 2,
+    "context": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather.get",
+            "description": "Get weather.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "bos_token": "",
+      "add_generation_prompt": true
+    },
+    "expected": "<|start|>system<|message|>You are a helpful AI assistant.\n\nKnowledge cutoff: 2026-01-04.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following as part of your reply to the user:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"weather.get\", \"description\": \"Get weather.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}\n\nHere are examples of how to call functions in the tool set. To make parallel tool calls, emit each call as its own message (one tool call per message) in consecutive messages, as shown below:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name_1` rather than `example_tool_name_1.example_function_name_1`)\n\nto=example_tool_name_1.example_function_name_1\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name_1.example_function_name_1\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\nto=example_tool_name_2.example_function_name_2\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name_2.example_function_name_2\">\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n<atem:parameter name=\"example_parameter_3\">value_3</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\nReasoning strength: 512.\n\nUse the appropriate recipient for each message:\n\n- \"self\": private reasoning and tool planning.\n- \"commentary\": user-visible intermediate updates while the assistant will continue working, including messages sent to the user before or between tool calls.\n- \"tool\" or \"[tool name]\": the name of the tool to call.\n- \"user\": messages that end the assistant turn, such as a completed response or clarification question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n\n# Valid recipients: \"self\", \"commentary\", \"[func_name] (e.g., weather.get)\", \"user\".<|eot|><|start|>user<|message|>Weather?<|eot|><|start|>assistant"
+  }
+]

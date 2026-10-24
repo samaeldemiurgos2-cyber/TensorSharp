@@ -63,7 +63,7 @@ from the result JSONs alone.
 | `engines.py` | OpenAI streaming client + server lifecycle managers (TensorSharp.Server.Host, llama-server, vLLM connector) |
 | `scenarios.py` | per-scenario, engine-aware request builders |
 | `run_matrix.py` | orchestrator — launches one server per `(engine, backend, model, mtp, tp, cpu_moe)`, runs scenarios, writes per-cell JSON |
-| `report.py` | aggregates `results/*.json` → `docs/engine_comparison_report.md` + `results/results.csv` |
+| `report.py` | aggregates `results/*.json` → ignored `docs/validation/engine-comparison/report.md` + `results/results.csv` |
 | `downloads.py` | resumable fetcher — makes a config's model files exist locally (used automatically by `run_matrix.py`) |
 | `assets/` | long-context prompt (`long_text.txt`), prefill corpus (`prefill_corpus.txt`), `tools/weather.json` |
 | `benchmark_config_prefill.json` | **prefill-only** variant — the same long-prompt sweep (2k/4k/8k/16k/32k/64k/128k tokens) but with the multimodal / diffusion scenarios and models stripped out, for a focused prefill run; select with `--config` |
@@ -622,11 +622,12 @@ no offload, `concurrency` 1); non-default cells add a `__mtp`, `__tp<N>`,
   `BENCH_TS_PORT` or `paths.tensorsharp_port` to benchmark on another port), and
   `wait_ready` aborts with a diagnosis when the port's owner is not the process it
   launched.
-- `docs/engine_comparison_report.md` and `results/results.csv` from `report.py`.
+- `docs/validation/engine-comparison/report.md` and `results/results.csv` from `report.py`.
 
-The `results/` directory (per-cell JSONs, logs, images, CSV) is generated
-locally by each run and is **not committed** to the repository — the committed
-artifact is the generated `docs/engine_comparison_report.md`.
+The `results/` directory (per-cell JSONs, logs, images, CSV) and the report under
+`docs/validation/engine-comparison/` are generated locally by each run and are
+**not committed** to the repository. CI uploads the report and per-cell results
+as workflow artifacts; local runs do not replace a published benchmark page.
 
 ## CI (GitHub Actions)
 

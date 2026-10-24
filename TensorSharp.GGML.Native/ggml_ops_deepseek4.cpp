@@ -43,6 +43,7 @@
 #include "dsv41_engram_gguf.h"
 #include "dsv41_raw_gather.h"
 #include "dsv41_truncate.h"
+#include "dsv41_yoco.h"
 #include "dsv41_dspark.h"
 #include "ggml_ops_precision_policy.h"
 #include "dsv4_ubatch_plan.h"
@@ -193,6 +194,9 @@ struct dsv4_layer
     ggml_tensor * ffn_gate_inp = nullptr;
     ggml_tensor * ffn_gate_tid2eid = nullptr;
     ggml_tensor * ffn_exp_probs_b = nullptr;
+    // V4.1 image tokens' routing bias as llama.cpp GGUFs carry it; null when
+    // the file has none (TensorSharp's own vision companion brings it then).
+    ggml_tensor * ffn_exp_probs_b_vl = nullptr;
     ggml_tensor * ffn_norm = nullptr;
     ggml_tensor * ffn_gate_exps = nullptr;
     ggml_tensor * ffn_down_exps = nullptr;
@@ -209,6 +213,9 @@ struct dsv4_layer
     // so a handful of offloaded layers is the difference between "does not fit
     // in the visible VRAM" and "runs".
     bool cpu_moe = false;
+    // V4.1 kv source layers: bit d set when GPU d hosts layers that read this
+    // layer's shared compressed and indexer caches and keeps a mirror of them.
+    uint32_t mirror_devices = 0;
 };
 
 // Per-layer KV caches / compressor state for ONE sequence slot
@@ -233,6 +240,12 @@ struct dsv4_slot_layer
     ggml_tensor * raw_k_cp = nullptr;          // F16 [n_embd_head, ring_raw]
     ggml_tensor * comp_state_kv_cp = nullptr;  // F32, same shape as comp_state_kv
     ggml_tensor * comp_state_score_cp = nullptr;
+
+    // V4.1 kv sources: per-GPU mirrors of csa_k / lid_k for the GPUs whose
+    // layers read them (TS_DSV41_KV_MIRRORS). Append-only like the caches they
+    // copy, so they need no rewind shadow either; null means "read the source".
+    ggml_tensor * csa_k_mirror[MAX_GPUS + 1] = {};
+    ggml_tensor * lid_k_mirror[MAX_GPUS + 1] = {};
 };
 
 // One independent sequence context: its own caches + position, sharing the
@@ -290,6 +303,10 @@ struct dsv4_slot
     // before this checkpoint - so keeping the boundary state is what makes that
     // rewind possible at all. Decode steps deliberately do not move it.
     int32_t cp_n_past = -1;
+    // Positions [first, second) a YOCO-truncated call never ran through the
+    // replay layers: their sliding-window rows there were not written, so a
+    // head whose window reaches into one cannot be reused (dsv41_yoco_blocks).
+    std::vector<std::pair<int64_t, int64_t>> yoco_skipped;
     int32_t spec_begin = -1;
     int32_t spec_end = -1;
     std::vector<dsv4_slot_layer> layers;
@@ -299,6 +316,11 @@ struct dsv4_slot
     std::vector<ggml_tensor *> ds_k_cp;
     ggml_context * ctx[MAX_GPUS + 1] = {};
     ggml_backend_buffer_t buf[MAX_GPUS + 1] = {};
+    // Shared-cache mirrors live in their own buffers so a device short of
+    // memory can go without them (reads then cross GPUs) instead of failing
+    // the slot.
+    ggml_context * mirror_ctx[MAX_GPUS + 1] = {};
+    ggml_backend_buffer_t mirror_buf[MAX_GPUS + 1] = {};
 
     ~dsv4_slot()
     {
@@ -306,6 +328,8 @@ struct dsv4_slot
         {
             if (buf[i]) ggml_backend_buffer_free(buf[i]);
             if (ctx[i]) ggml_free(ctx[i]);
+            if (mirror_buf[i]) ggml_backend_buffer_free(mirror_buf[i]);
+            if (mirror_ctx[i]) ggml_free(mirror_ctx[i]);
         }
     }
 };
@@ -421,6 +445,7 @@ struct graph_inputs
     ggml_tensor * raw_idxs[MAX_GPUS + 1] = {};  // I64 [nt]
     ggml_tensor * raw_read_idxs[MAX_GPUS + 1] = {}; // V4.1 optional I32 [padded SWA] compact decode read
     ggml_tensor * raw_mask[MAX_GPUS + 1] = {};  // F16 [ring, nt]
+    ggml_tensor * raw_mask_yoco[MAX_GPUS + 1] = {};  // F16 [ring, kept]: the replay layers' window
     // decode gather: F16 [(raw ring or padded SWA) + top_k, 1], top-k tail zero
     ggml_tensor * gather_mask[MAX_GPUS + 1] = {};
     ggml_tensor * out_ids = nullptr;            // I32 [1] or [nt] (last device)
@@ -478,6 +503,10 @@ struct graph_build_result
     ggml_tensor * ds_conf = nullptr;    // F32 [block] acceptance probabilities
     bool all_logits = false;            // logits for every row (speculative verify)
     int image_tokens = 0;               // compact embedding input changes graph shape
+    // YOCO: how many of this ubatch's tokens the replay layers process (its
+    // tail); -1 for a full graph. 0 means the graph ends after the replay
+    // layer's cache writes and produces no logits.
+    int64_t yoco_kept = -1;
     bool draft = false;                 // this entry is the drafter's graph
     comp_plan plan_csa;
     comp_plan plan_hca;
@@ -544,6 +573,10 @@ struct dsv4_model
     std::atomic<bool> engram_warm_stop{false};
     std::unique_ptr<tsg_dsv41_tp::executor> moe_tp;
     std::unique_ptr<dsv41_vision_attachment> vision;
+    // general.basename / general.version of the text GGUF ("" when absent):
+    // a llama.cpp mmproj has no tokenizer fingerprint, so its own pair is
+    // matched against these instead (TSGgml_Dsv41AttachVision).
+    std::string general_basename, general_version;
 
     // backends: [0..n_gpu) GPU, [n_gpu] CPU
     ggml_backend_t backends[MAX_GPUS + 1] = {};
@@ -673,6 +706,12 @@ struct dsv4_model
 
     bool gather_env = true; // TS_DSV4_GATHER=0 disables decode index-gather
     bool compact_raw_gather = false; // V4.1 opt-in; compact raw rows before cross-GPU gather
+    bool kv_mirrors = false; // V4.1 layer split: per-GPU shared-cache mirrors (TS_DSV41_KV_MIRRORS)
+    // V4.1 YOCO bounded replay (TS_DSV41_YOCO_KEEP): layers from yoco_layer on
+    // prefill only the last yoco_keep positions of a forward call. 0 = off.
+    int64_t yoco_keep = 0;
+    int yoco_layer = -1;
+    int64_t call_start_hint = 0;   // slot n_past when the current forward call began
 
     ~dsv4_model()
     {
@@ -1684,7 +1723,11 @@ static void dsv4_reset_slot(dsv4_slot & slot)
     slot.spec_begin = slot.spec_end = -1;
     slot.engram_history.clear();
     for (int d = 0; d <= MAX_GPUS; d++)
+    {
         if (slot.buf[d]) ggml_backend_buffer_clear(slot.buf[d], 0);
+        if (slot.mirror_buf[d]) ggml_backend_buffer_clear(slot.mirror_buf[d], 0);
+    }
+    slot.yoco_skipped.clear();
 #if defined(TSG_GGML_TEST_HOOKS)
     dsv4_test_boundary_fault(1);
 #endif
@@ -1854,6 +1897,40 @@ static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
         }
         ggml_backend_buffer_clear(slot->buf[d], 0);
     }
+
+    // Shared-cache mirrors (see the loader). Their own buffers, best effort:
+    // without one, that GPU's layers keep reading the source across GPUs.
+    for (int d = 0; m.kv_mirrors && d < m.n_gpu; ++d)
+    {
+        bool wanted = false;
+        for (int il = 0; il < hp.n_layer; ++il) wanted |= (m.layers[il].mirror_devices >> d & 1) != 0;
+        if (!wanted) continue;
+        ggml_init_params mp = { (size_t) (2 * hp.n_layer + 8) * ggml_tensor_overhead(), nullptr, true };
+        slot->mirror_ctx[d] = ggml_init(mp);
+        if (!slot->mirror_ctx[d]) continue;
+        for (int il = 0; il < hp.n_layer; ++il)
+        {
+            dsv4_slot_layer & C = slot->layers[il];
+            if (!(m.layers[il].mirror_devices >> d & 1) || !C.csa_k || !C.lid_k) continue;
+            C.csa_k_mirror[d] = ggml_new_tensor_2d(slot->mirror_ctx[d], GGML_TYPE_F16, C.csa_k->ne[0], C.csa_k->ne[1]);
+            C.lid_k_mirror[d] = ggml_new_tensor_2d(slot->mirror_ctx[d], GGML_TYPE_F16, C.lid_k->ne[0], C.lid_k->ne[1]);
+            ggml_format_name(C.csa_k_mirror[d], "mirror_csa_k.%d.%d.%d", slot->id, il, d);
+            ggml_format_name(C.lid_k_mirror[d], "mirror_lid_k.%d.%d.%d", slot->id, il, d);
+        }
+        slot->mirror_buf[d] = ggml_backend_alloc_ctx_tensors(slot->mirror_ctx[d], m.backends[d]);
+        if (!slot->mirror_buf[d])
+        {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+                fprintf(stderr, "[dsv41] shared-cache mirror allocation failed on device %d; "
+                    "its layers read the source caches across GPUs\n", d);
+            for (auto & C : slot->layers) C.csa_k_mirror[d] = C.lid_k_mirror[d] = nullptr;
+            ggml_free(slot->mirror_ctx[d]);
+            slot->mirror_ctx[d] = nullptr;
+            continue;
+        }
+        ggml_backend_buffer_clear(slot->mirror_buf[d], 0);
+    }
     dsv4_init_slot_state_rows(*slot);
 
     dsv4_slot * raw = slot.get();
@@ -1930,9 +2007,52 @@ static void dsv4_upload_rope_tables(dsv4_model & m)
 // Reads the drafter GGUF's metadata and registers its tensors as an extra
 // shard, so the normal create+upload path moves them. Returns false only on a
 // malformed/mismatched file; a null path just leaves DSpark disabled.
+// llama.cpp's DSpark export (Unsloth's DeepSeek-V4.1-Flash-1017 drafters) is a
+// `dflash` GGUF: dflash.* geometry, `blk.N.` stage tensors and head tensors
+// named after llama.cpp's DFlash model. Map them onto the names the V4.1
+// drafter graph binds; nullptr means a tensor TensorSharp does not implement.
+static std::string dsv4_dflash_source_name(const char * name)
+{
+    int stage = -1, consumed = 0;
+    if (sscanf(name, "blk.%d.%n", &stage, &consumed) == 1 && consumed > 0 && stage >= 0)
+        return "mtp." + std::to_string(stage) + "." + std::string(name + consumed);
+    static const std::pair<const char *, const char *> heads[] = {
+        { "fc.weight", "dspark.main_proj.weight" },          // fc, then enc.output_norm (main_norm)
+        { "enc.output_norm.weight", "dspark.main_norm.weight" },
+        { "output_norm.weight", "dspark.norm.weight" },      // decoder final norm before the trunk's head
+        { "markov_w1.weight", "dspark.markov_w1.weight" },
+        { "markov_w2.weight", "dspark.markov_w2.weight" },
+        { "conf_proj.weight", "dspark.conf_proj.weight" },
+    };
+    for (const auto & head : heads)
+        if (strcmp(name, head.first) == 0) return head.second;
+    return std::string();
+}
+
+// What a llama.cpp-layout target GGUF records about its drafter
+// (deepseek41.dspark.*). -1 / empty means "not recorded". Read while the
+// target's metadata is still open; the drafter scan runs after it is released.
+struct dsv4_target_dspark_meta
+{
+    int32_t noise_token = -1, markov_rank = -1, block_size = -1, expert_count = -1, expert_used_count = -1;
+    std::vector<int32_t> target_layers;
+
+    static dsv4_target_dspark_meta read(gguf_context * target)
+    {
+        dsv4_target_dspark_meta meta;
+        gguf_get_u32_key(target, "deepseek41.dspark.noise_token_id", &meta.noise_token);
+        gguf_get_u32_key(target, "deepseek41.dspark.markov_rank", &meta.markov_rank);
+        gguf_get_u32_key(target, "deepseek41.dspark.block_size", &meta.block_size);
+        gguf_get_u32_key(target, "deepseek41.dspark.expert_count", &meta.expert_count);
+        gguf_get_u32_key(target, "deepseek41.dspark.expert_used_count", &meta.expert_used_count);
+        gguf_get_arr_i32(target, "deepseek41.dspark.target_layers", meta.target_layers);
+        return meta;
+    }
+};
+
 static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
                              shard_files & shards, std::map<std::string, tensor_source> & sources,
-                             size_t * out_bytes)
+                             size_t * out_bytes, const dsv4_target_dspark_meta & target)
 {
     if (out_bytes) *out_bytes = 0;
     if (!dspark_path || !*dspark_path) return true;
@@ -1967,18 +2087,70 @@ static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
         return false;
     };
 
+    const char * arch = nullptr;
+    {
+        const int64_t ai = gguf_find_key(g, "general.architecture");
+        if (ai >= 0 && gguf_get_kv_type(g, ai) == GGUF_TYPE_STRING)
+            arch = gguf_get_val_str(g, ai);
+    }
+    const bool dflash = m.hp.v41 && arch && strcmp(arch, "dflash") == 0;
+
     dsv4_dspark & ds = m.ds;
     bool ok = true;
-    ok &= kv_u32({ "dspark.block_size", "deepseek4.dspark.block_size" }, &ds.block_size);
-    ok &= kv_u32({ "dspark.markov_rank", "deepseek4.dspark.markov_rank" }, &ds.markov_rank);
-    ok &= kv_u32({ "dspark.noise_token_id", "deepseek4.dspark.noise_token_id" }, &ds.noise_token);
-    ok &= kv_u32({ "dspark.n_layers", "dspark.stage_count", "dspark.layer_count",
-                   "deepseek4.dspark.n_layers", "deepseek4.dspark.layer_count" }, &ds.n_stages);
-    ok &= kv_arr({ "dspark.target_layer_ids", "dspark.target_layers",
-                   "deepseek4.dspark.target_layer_ids", "deepseek4.dspark.target_layers" }, ds.target_layers);
     ds.n_expert = m.hp.n_expert;
     ds.n_expert_used = m.hp.n_expert_used;
-    if (m.hp.v41)
+    if (dflash)
+    {
+        // The drafter's geometry is in the dflash file; its noise token and
+        // Markov rank are recorded by the TARGET (deepseek41.dspark.*).
+        ok &= kv_u32({ "dflash.block_size" }, &ds.block_size);
+        ok &= kv_u32({ "dflash.block_count" }, &ds.n_stages);
+        ok &= kv_arr({ "dflash.target_layers" }, ds.target_layers);
+        ok &= kv_u32({ "dflash.expert_count" }, &ds.n_expert);
+        ok &= kv_u32({ "dflash.expert_used_count" }, &ds.n_expert_used);
+        ds.noise_token = target.noise_token;
+        ds.markov_rank = target.markov_rank;
+        ok &= target.noise_token >= 0 && target.markov_rank > 0;
+        auto refuse = [&](const std::string & why) {
+            fprintf(stderr, "[dsv4] %s: %s\n", dspark_path, why.c_str());
+            gguf_free(g); if (meta) ggml_free(meta);
+            return false;
+        };
+        // TensorSharp implements the V4.1 drafter as DeepSeek ships it: every
+        // block position predicts from the anchor, single-pass mHC, no hc_head.
+        bool flag = true;
+        if (gguf_get_bool_key(g, "dflash.sample_from_anchor", &flag) && !flag)
+            return refuse("dflash.sample_from_anchor=false (bonus-anchor drafters) is not implemented");
+        flag = true;
+        if (gguf_get_bool_key(g, "dflash.hyper_connection.single_pass", &flag) && !flag)
+            return refuse("dflash.hyper_connection.single_pass=false is not a DeepSeek V4.1 drafter");
+        int32_t value = 0;
+        auto same_u32 = [&](const char * draft_key, int32_t want) {
+            return !gguf_get_u32_key(g, draft_key, &value) || value == want;
+        };
+        if (!same_u32("dflash.embedding_length", m.hp.n_embd) || !same_u32("dflash.attention.head_count", m.hp.n_head) ||
+            !same_u32("dflash.attention.key_length", m.hp.n_embd_head) ||
+            !same_u32("dflash.expert_feed_forward_length", m.hp.n_ff_exp) ||
+            !same_u32("dflash.hyper_connection.count", m.hp.hc_mult))
+            return refuse("dflash geometry does not match the target model");
+        // The target's own record of its drafter must agree with this file.
+        if ((target.block_size >= 0 && target.block_size != ds.block_size) ||
+            (target.expert_count >= 0 && target.expert_count != ds.n_expert) ||
+            (target.expert_used_count >= 0 && target.expert_used_count != ds.n_expert_used) ||
+            (!target.target_layers.empty() && target.target_layers != ds.target_layers))
+            return refuse("drafter does not match the target's deepseek41.dspark metadata");
+    }
+    else
+    {
+        ok &= kv_u32({ "dspark.block_size", "deepseek4.dspark.block_size" }, &ds.block_size);
+        ok &= kv_u32({ "dspark.markov_rank", "deepseek4.dspark.markov_rank" }, &ds.markov_rank);
+        ok &= kv_u32({ "dspark.noise_token_id", "deepseek4.dspark.noise_token_id" }, &ds.noise_token);
+        ok &= kv_u32({ "dspark.n_layers", "dspark.stage_count", "dspark.layer_count",
+                       "deepseek4.dspark.n_layers", "deepseek4.dspark.layer_count" }, &ds.n_stages);
+        ok &= kv_arr({ "dspark.target_layer_ids", "dspark.target_layers",
+                       "deepseek4.dspark.target_layer_ids", "deepseek4.dspark.target_layers" }, ds.target_layers);
+    }
+    if (m.hp.v41 && !dflash)
     {
         ok &= kv_u32({ "dspark.expert_count" }, &ds.n_expert);
         ok &= kv_u32({ "dspark.expert_used_count" }, &ds.n_expert_used);
@@ -2008,14 +2180,8 @@ static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
         }
     }
 
-    const char * arch = nullptr;
-    {
-        const int64_t ai = gguf_find_key(g, "general.architecture");
-        if (ai >= 0 && gguf_get_kv_type(g, ai) == GGUF_TYPE_STRING)
-            arch = gguf_get_val_str(g, ai);
-    }
     const bool correct_arch = m.hp.v41
-        ? arch && strcmp(arch, "deepseek41-dspark") == 0
+        ? dflash || (arch && strcmp(arch, "deepseek41-dspark") == 0)
         : !arch || strcmp(arch, "deepseek4-dspark") == 0 || strcmp(arch, "deepseek_v4_flash_dspark_draft") == 0;
     if (!correct_arch)
     {
@@ -2035,13 +2201,25 @@ static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
         const char * name = gguf_get_tensor_name(g, ti);
         ggml_tensor * mt = ggml_get_tensor(meta, name);
         if (!mt) continue;
+        // dflash names overlap the target's (blk.N., output_norm); store them
+        // under the drafter spellings so neither can shadow the other.
+        const std::string source_name = dflash ? dsv4_dflash_source_name(name) : std::string(name);
+        if (source_name.empty() || (dflash && sources.count(source_name)))
+        {
+            fprintf(stderr, "[dsv4] %s: drafter tensor %s is %s\n", dspark_path, name,
+                    source_name.empty() ? "not implemented by the V4.1 drafter" : "a duplicate");
+            shards.paths.pop_back();
+            gguf_free(g);
+            if (meta) ggml_free(meta);
+            return false;
+        }
         tensor_source src;
         src.shard = si;
         src.offset = data_off + gguf_get_tensor_offset(g, ti);
         src.size = ggml_nbytes(mt);
         src.type = mt->type;
         for (int d = 0; d < 4; d++) src.ne[d] = mt->ne[d];
-        sources[name] = src;
+        sources[source_name] = src;
         if (out_bytes) *out_bytes += src.size;
     }
 
@@ -2412,6 +2590,38 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         ggml_free(meta);
     }
 
+    if (hp.v41 && tsg_dsv41::has_combined_engram_metadata(g0))
+    {
+        // llama.cpp layout: every Engram table lives in one tensor. Each
+        // layer's buckets are a contiguous row range of it, so expose them as
+        // that layer's own table source -- a byte range of the same file. The
+        // placement, upload, host mapping and warming below then treat it like
+        // TensorSharp's per-layer layout and never see the combined tensor.
+        const auto it = sources.find(tsg_dsv41::combined_engram_table);
+        if (it == sources.end())
+            throw std::runtime_error(std::string("DeepSeek V4.1 Engram metadata names ") +
+                tsg_dsv41::combined_engram_table + " but no shard holds it");
+        const tensor_source table = it->second;
+        if (table.ne[2] != 1 || table.ne[3] != 1)
+            throw std::runtime_error(std::string(tsg_dsv41::combined_engram_table) + " must be two-dimensional");
+        const size_t row_bytes = ggml_row_size(table.type, table.ne[0]);
+        for (const auto & slice : tsg_dsv41::combined_engram_slices(g0, (uint64_t) table.ne[1]))
+        {
+            if (slice.id >= hp.n_layer)
+                throw std::runtime_error("V4.1 Engram layer exceeds layer count");
+            const std::string name = "blk." + std::to_string(slice.id) + ".engram_embd.weight";
+            if (sources.count(name))
+                throw std::runtime_error("DeepSeek V4.1 GGUF has both " + name + " and a combined Engram table");
+            tensor_source src = table;
+            src.offset = table.offset + (size_t) slice.first_row * row_bytes;
+            src.size = (size_t) slice.rows * row_bytes;
+            src.ne[1] = (int64_t) slice.rows;
+            sources[name] = src;
+            layer_engram_bytes[slice.id] += src.size;
+        }
+        root_bytes -= table.size;
+        sources.erase(tsg_dsv41::combined_engram_table);
+    }
     if (hp.v41)
     {
         m->engram = tsg_dsv41::load_engram_gguf(g0, [&](const std::string & name) {
@@ -2434,6 +2644,13 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         if (hp.swiglu_clamp_exp.empty()) hp.swiglu_clamp_exp.assign(hp.n_layer, 10.0f);
         if (hp.swiglu_clamp_shexp.empty()) hp.swiglu_clamp_shexp = hp.swiglu_clamp_exp;
     }
+    const dsv4_target_dspark_meta target_dspark = dsv4_target_dspark_meta::read(g0);
+    for (auto [key, out] : { std::pair<const char *, std::string *>{ "general.basename", &m->general_basename },
+                             std::pair<const char *, std::string *>{ "general.version", &m->general_version } })
+    {
+        const int64_t id = gguf_find_key(g0, key);
+        if (id >= 0 && gguf_get_kv_type(g0, id) == GGUF_TYPE_STRING) *out = gguf_get_val_str(g0, id);
+    }
     metadata_owner.reset();
     metadata_tensors_owner.reset();
 
@@ -2451,7 +2668,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     // Draft metadata includes a vocabulary-bounded noise token. Validate it
     // only after the target embedding has established the real vocabulary.
     size_t dspark_bytes = 0;
-    if (!dsv4_scan_dspark(*m, dspark_path, shards, sources, &dspark_bytes))
+    if (!dsv4_scan_dspark(*m, dspark_path, shards, sources, &dspark_bytes, target_dspark))
         return nullptr;
     // The drafter lands entirely on the output-head device, so it has to weigh
     // on the split: counted as root bytes it pushes whole layers onto the
@@ -2848,6 +3065,28 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             dsv4_warm_pread() ? dsv4_load_thread_count() : 0);
         fprintf(stderr, "[dsv41] routed-MoE tensor parallelism: %d ranks, sharded gate/up/down weights; "
                 "attention and shared experts use layer placement; exact F32 activation/output gathers\n", tp_ranks);
+        // The strip uploads read every routed expert through the page cache and
+        // never read it again, while the host-mapped Engram tables are read
+        // after them and on every token. Same rule as the ordinary upload (see
+        // PAGE CACHE at dsv4_upload_parallel): release the sources when they
+        // and the host mappings cannot both stay cached.
+        uint64_t tp_source_bytes = 0, mapped_bytes = 0;
+        for (int il = 0; il < hp.n_layer; ++il)
+        {
+            if (m->layers[il].cpu_moe) continue;
+            for (const char * suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
+            {
+                const auto found = sources.find("blk." + std::to_string(il) + "." + suffix);
+                if (found != sources.end()) tp_source_bytes += found->second.size;
+            }
+        }
+        if (!m->engram_on_device) for (const size_t bytes : layer_engram_bytes) mapped_bytes += bytes;
+        const uint64_t allowance = dsv4_host_mem_allowance();
+        const tsg_dsv4::drop_cache_decision drop = tsg_dsv4::decide_drop_cache(
+            getenv("TS_DSV4_LOAD_DROP_CACHE"), tp_source_bytes, mapped_bytes, allowance);
+        fprintf(stderr, "[dsv41-tp] expert source page cache: %s\n",
+                tsg_dsv4::describe_drop_cache(drop, tp_source_bytes, mapped_bytes, allowance).c_str());
+        m->moe_tp->set_drop_source_cache(drop.drop);
     }
 
     auto tp_source = [&](int il, const char * suffix)
@@ -2946,9 +3185,20 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 // get_rows; otherwise the table stays a host mapping (context
                 // n_gpu) that the executor reads and dequantizes per token.
                 L.engram_embd = W(m->engram_on_device ? d : n_gpu, "blk.%d.engram_embd.weight", il);
-                L.engram_k = W(d, "blk.%d.engram_k.weight", il);
-                L.engram_q = W(d, "blk.%d.engram_q.weight", il);
-                L.engram_wkv = W(d, "blk.%d.engram_wkv.weight", il);
+                if (has("engram_gate.weight"))
+                {
+                    // llama.cpp layout: engram.py only ever uses q_weight *
+                    // k_weight, so the file stores that product once as
+                    // engram_gate and the key keeps its plain RMS norm.
+                    L.engram_q = W(d, "blk.%d.engram_gate.weight", il);
+                    L.engram_wkv = W(d, "blk.%d.engram_kv.weight", il);
+                }
+                else
+                {
+                    L.engram_k = W(d, "blk.%d.engram_k.weight", il);
+                    L.engram_q = W(d, "blk.%d.engram_q.weight", il);
+                    L.engram_wkv = W(d, "blk.%d.engram_wkv.weight", il);
+                }
             }
         }
         else if (ratio != 0)
@@ -2973,6 +3223,8 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             L.ffn_gate_tid2eid = W(d, "blk.%d.ffn_gate_tid2eid.weight", il);
         else
             L.ffn_exp_probs_b = W(d, "blk.%d.exp_probs_b.bias", il);
+        if (hp.v41 && sources.count("blk." + std::to_string(il) + ".exp_probs_b_vl.bias"))
+            L.ffn_exp_probs_b_vl = W(d, "blk.%d.exp_probs_b_vl.bias", il);
         L.ffn_norm = W(d, "blk.%d.ffn_norm.weight", il);
         // Offloaded layers put ONLY the routed experts on the host context
         // (index n_gpu): the router, the norms and the always-active shared
@@ -3168,13 +3420,96 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 throw std::runtime_error("V4.1 Engram layer list does not match checkpoint tensors");
             if (L.engram_embd && (L.engram_embd->ne[0] != m->engram.head_dim ||
                 (uint64_t) L.engram_embd->ne[1] != m->engram.layers[L.engram_index].rows ||
-                !L.engram_k || !L.engram_q || !L.engram_wkv ||
-                L.engram_k->ne[0] != hp.n_embd || L.engram_k->ne[1] != hp.hc_mult ||
+                !L.engram_q || !L.engram_wkv ||
+                // engram_k is absent when engram_q holds the fused q*k product.
+                (L.engram_k && (L.engram_k->ne[0] != hp.n_embd || L.engram_k->ne[1] != hp.hc_mult)) ||
                 L.engram_q->ne[0] != hp.n_embd || L.engram_q->ne[1] != hp.hc_mult ||
                 L.engram_wkv->ne[0] != m->engram.hash_columns() * m->engram.head_dim ||
                 L.engram_wkv->ne[1] != (hp.hc_mult + 1) * hp.n_embd))
                 throw std::runtime_error("V4.1 Engram tensor dimensions do not match embedded metadata");
         }
+
+        // Shared-cache mirrors. Under a layer split the GPUs after a kv source
+        // read its compressed and indexer caches across PCIe: decode copied the
+        // selected rows of every such layer through the host, and prefill the
+        // whole visible cache. A mirror on each reading GPU takes just the rows
+        // written per step instead; its bytes equal the source's, so attention
+        // reads the same values.
+        const char * mirrors = getenv("TS_DSV41_KV_MIRRORS");
+        if (mirrors && strcmp(mirrors, "0") != 0 && strcmp(mirrors, "1") != 0)
+            throw std::runtime_error("TS_DSV41_KV_MIRRORS must be 0 or 1 (unset enables mirrors on a layer split)");
+        m->kv_mirrors = !cpu_only && n_gpu > 1 && !(mirrors && strcmp(mirrors, "0") == 0);
+        if (m->kv_mirrors)
+        {
+            std::string described;
+            for (int il = 0; il < hp.n_layer; ++il)
+            {
+                const auto & L = m->layers[il];
+                if (L.kv_source >= 0 && L.device < n_gpu && L.device != m->layers[L.kv_source].device)
+                    m->layers[L.kv_source].mirror_devices |= 1u << L.device;
+            }
+            for (int il = 0; il < hp.n_layer; ++il)
+            {
+                const uint32_t mask = m->layers[il].mirror_devices;
+                if (!mask) continue;
+                described += (described.empty() ? "" : "; ") + std::string("layer ") + std::to_string(il) + " ->";
+                for (int d = 0; d < n_gpu; ++d) if (mask >> d & 1) described += " " + std::to_string(d);
+            }
+            if (!described.empty())
+                fprintf(stderr, "[dsv41] shared-cache mirrors: %s (TS_DSV41_KV_MIRRORS=0 reads across GPUs)\n",
+                    described.c_str());
+        }
+
+        // YOCO bounded replay (dsv41_yoco.h): on by default with DeepInfer's
+        // keep of 140. TS_DSV41_YOCO_KEEP=0 runs every layer over every
+        // position. A layout that cannot run it falls back to exact prefill
+        // with one note when the value is the default, and is refused when the
+        // value was given explicitly.
+        {
+            const tsg_dsv41_yoco::setting setting =
+                tsg_dsv41_yoco::parse(getenv("TS_DSV41_YOCO_KEEP"), hp.n_swa);
+            if (!setting.error.empty()) throw std::runtime_error(setting.error);
+            tsg_dsv41_yoco::layout layout;
+            layout.n_layer = hp.n_layer;
+            layout.compress_ratios.assign(hp.compress_ratios.begin(), hp.compress_ratios.begin() + hp.n_layer);
+            for (int il = 0; il < hp.n_layer; ++il) layout.kv_source.push_back(m->layers[il].kv_source);
+            for (const auto & engram_layer : m->engram.layers) layout.engram_layers.push_back(engram_layer.id);
+            layout.candidate_source = hp.candidate_source;
+            if (m->ds.loaded) layout.drafter_targets.assign(m->ds.target_layers.begin(), m->ds.target_layers.end());
+            std::string reason;
+            const int first = tsg_dsv41_yoco::replay_layer(layout, reason);
+            if (setting.keep == 0)
+                fprintf(stderr, "[dsv41] YOCO bounded replay: off (TS_DSV41_YOCO_KEEP=0); every layer runs over every "
+                        "position\n");
+            else if (first < 0 && setting.explicit_value)
+                throw std::runtime_error("TS_DSV41_YOCO_KEEP=" + std::to_string(setting.keep) +
+                    " cannot run on this checkpoint: " + reason + "; set it to 0 or unset it");
+            else if (first < 0)
+                fprintf(stderr, "[dsv41] YOCO bounded replay: off for this checkpoint (%s); every layer runs over "
+                        "every position\n", reason.c_str());
+            else if (m->n_ubatch <= 1 && setting.explicit_value)
+                throw std::runtime_error("TS_DSV41_YOCO_KEEP=" + std::to_string(setting.keep) +
+                    " needs a prefill micro-batch of at least 2 tokens (TS_DSV4_UBATCH=1 never narrows one)");
+            else if (m->n_ubatch <= 1)
+                // One-token micro-batches are never narrowed (tsg_dsv41_yoco::kept).
+                fprintf(stderr, "[dsv41] YOCO bounded replay: inactive with a 1-token prefill micro-batch "
+                        "(TS_DSV4_UBATCH=1); every layer runs over every position\n");
+            else
+            {
+                m->yoco_keep = setting.keep;
+                m->yoco_layer = first;
+                fprintf(stderr, "[dsv41] YOCO bounded replay%s: layers %d..%d prefill only the last %lld positions "
+                    "of a call, their sliding window cut to that replay (approximate; TS_DSV41_YOCO_KEEP=0 runs "
+                    "every layer over every position)\n", setting.explicit_value ? "" : " (default)", first,
+                    hp.n_layer - 1, (long long) setting.keep);
+            }
+        }
+    }
+    else if (const char * keep = getenv("TS_DSV41_YOCO_KEEP"))
+    {
+        // V4 has no compressed-cache layout to replay over; say so rather than
+        // accept the setting and do nothing.
+        fprintf(stderr, "[dsv4] TS_DSV41_YOCO_KEEP=%s is ignored: bounded replay applies to DeepSeek V4.1 only\n", keep);
     }
 
     // rope cos/sin tables for the fused table-driven kernels (per device)
@@ -3416,7 +3751,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 TSG_DSV41_SPARSE_MIN_KEYS, hp.n_swa, hp.indexer_top_k, getenv("TS_DSV41_SPARSE_FA")) > 0;
             fprintf(stderr, "[dsv4] V4.1 CUDA precision: TensorSharp F32 matmul; attention=%s\n",
                 m->flash_attn ? (sparse_prefill
-                    ? "TensorSharp F32 (streaming decode and verify; sparse prefill for queries>8, keys>=8192, "
+                    ? "TensorSharp F32 (streaming decode and verify; sparse prefill for queries>8, keys>=2048, "
                       "window+top-k; tiled otherwise; TS_DSV41_SPARSE_FA=0 selects tiled)"
                     : "TensorSharp F32 (streaming decode, tiled prefill; TS_DSV41_SPARSE_FA=0)") :
                     "TensorSharp F32 decomposed (FA=0 or unavailable)");
@@ -4813,8 +5148,14 @@ struct graph_builder
 
         if (m.moe_tp && m.moe_tp->has_layer(il))
         {
-            ggml_tensor * routed = m.moe_tp->build(ctx, il, cur, weights, selected);
-            pin(routed, m.n_gpu);
+            // On the layer device's fused backend the ranks are enqueued behind
+            // this device's stream (a launch node, then the shared expert on this
+            // device while the ranks run, then a gather node); without the fused
+            // backend a single CPU node drives the ranks synchronously.
+            const bool resident = m.fused && m.moe_tp->device_resident();
+            ggml_tensor * routed = m.moe_tp->build(ctx, il, cur, weights, selected, resident ? shexp : nullptr);
+            pin(routed, resident ? dev : m.n_gpu);
+            if (resident) pin(routed->src[0], dev);
             ggml_tensor * out = ggml_add(ctx, routed, shexp);
             pin(out, dev);
             return out;
@@ -5175,6 +5516,7 @@ struct graph_builder
             if (L.device != (il > 0 ? m.layers[il - 1].device : m.input_device()))
                 pin(inpL, L.device);
 
+            v41_flush_mirror_writes(dev);
             inpL = build_engram(il, inpL);
             ggml_tensor * residual = inpL;
             ggml_tensor * post = nullptr;
@@ -5401,6 +5743,14 @@ struct graph_builder
             inp.raw_idxs[d] = new_input_i64(nt, nb, d);
             snprintf(nb, sizeof(nb), "inp_raw_mask.%d", d);
             inp.raw_mask[d] = new_input_mask(m.ring_raw, GGML_TYPE_F16, nb, d);
+            if (res.yoco_kept > 0)
+            {
+                snprintf(nb, sizeof(nb), "inp_raw_mask_yoco.%d", d);
+                inp.raw_mask_yoco[d] = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m.ring_raw, res.yoco_kept);
+                ggml_set_input(inp.raw_mask_yoco[d]);
+                ggml_set_name(inp.raw_mask_yoco[d], nb);
+                pin(inp.raw_mask_yoco[d], d);
+            }
             if (hp.v41 ? dsv41_use_gather(m, nt, p0)
                        : dsv4_use_gather(m, nt, std::max(m.pos_end_hint, p0 + nt)))
             {
@@ -5464,6 +5814,9 @@ struct graph_builder
         inpL = ggml_repeat_4d(ctx, inpL, hp.n_embd, hc, nt, 1);
 
         std::vector<ggml_tensor *> ds_feats;
+        // YOCO with no kept token in this ubatch: the graph ends after the
+        // replay layer's cache writes; a later ubatch of the call has the tail.
+        bool yoco_ended = false;
 
         for (int il = 0; il < hp.n_layer; il++)
         {
@@ -5478,6 +5831,7 @@ struct graph_builder
             if (L.device != (il > 0 ? m.layers[il - 1].device : m.input_device()))
                 pin(inpL, L.device);
 
+            if (hp.v41) v41_flush_mirror_writes(dev);
             if (hp.v41) inpL = build_engram(il, inpL);
             trace_v41(inpL, il, "engram_output");
             if (hp.v41 && m.ds.loaded &&
@@ -5495,7 +5849,29 @@ struct graph_builder
             ggml_tensor * cur = build_hc_pre(inpL, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, &post, &comb, dev,
                 hp.v41 ? &attn_pre : nullptr, delayed_pre);
             cur = rms(cur, L.attn_norm);
+            if (hp.v41 && il == m.yoco_layer && res.yoco_kept >= 0)
+            {
+                // YOCO: this layer's compressed and indexer rows come from its
+                // attention input, so write them for every position; then the
+                // replay layers continue with the kept tail only.
+                v41_source_writes(il, cur);
+                if (res.yoco_kept == 0)
+                {
+                    v41_flush_mirror_writes(-1);
+                    yoco_ended = true;
+                    break;
+                }
+                const int64_t kept = res.yoco_kept;
+                cur = yoco_tail(cur, kept);
+                residual = yoco_tail(residual, kept);
+                post = yoco_tail(post, kept);
+                comb = yoco_tail(comb, kept);
+                attn_pre = yoco_tail(attn_pre, kept);
+                yoco_narrow(kept);
+                v41_skip_source_writes = true;
+            }
             cur = hp.v41 ? build_attention_v41(il, cur, inp.pos[dev]) : build_attention(il, cur, inp.pos[dev]);
+            v41_skip_source_writes = false;
             inpL = build_hc_post(cur, residual, post, comb);
 
             residual = inpL;
@@ -5523,29 +5899,33 @@ struct graph_builder
             }
         }
 
-        if (m.ds.loaded && ds_feats.size() == m.ds.target_layers.size())
-            build_dspark_ring_update(ds_feats, inp.pos[m.ds.dev], inp.raw_idxs[m.ds.dev]);
+        if (!yoco_ended)
+        {
+            if (m.ds.loaded && ds_feats.size() == m.ds.target_layers.size())
+                build_dspark_ring_update(ds_feats, inp.pos[m.ds.dev], inp.raw_idxs[m.ds.dev]);
 
-        // gather output row(s)
-        ggml_tensor * flat = ggml_reshape_2d(ctx, inpL, hp.n_embd * hc, nt);
-        flat = ggml_get_rows(ctx, flat, inp.out_ids);
-        const int64_t n_out = res.all_logits ? nt : 1;
-        inpL = ggml_reshape_3d(ctx, flat, hp.n_embd, hc, n_out);
+            // gather output row(s)
+            ggml_tensor * flat = ggml_reshape_2d(ctx, inpL, hp.n_embd * hc, nt);
+            flat = ggml_get_rows(ctx, flat, inp.out_ids);
+            const int64_t n_out = res.all_logits ? nt : 1;
+            inpL = ggml_reshape_3d(ctx, flat, hp.n_embd, hc, n_out);
 
-        ggml_tensor * cur = hp.v41
-            ? build_hc_pre_op(inpL, ggml_get_rows(ctx, ggml_cont(ctx, delayed_pre), inp.out_ids))
-            : build_hc_head(inpL);
-        pin(cur, dev_last);
-        cur = rms(cur, m.output_norm);
-        pin(cur, dev_last);
-        cur = ggml_mul_mat(ctx, m.output, cur);
-        pin(cur, dev_last);
-        ggml_set_output(cur);
-        ggml_set_name(cur, "logits");
-        trace_v41(cur, hp.n_layer, "logits");
-        res.logits = cur;
+            ggml_tensor * cur = hp.v41
+                ? build_hc_pre_op(inpL, ggml_get_rows(ctx, ggml_cont(ctx, delayed_pre), inp.out_ids))
+                : build_hc_head(inpL);
+            pin(cur, dev_last);
+            cur = rms(cur, m.output_norm);
+            pin(cur, dev_last);
+            cur = ggml_mul_mat(ctx, m.output, cur);
+            pin(cur, dev_last);
+            ggml_set_output(cur);
+            ggml_set_name(cur, "logits");
+            trace_v41(cur, hp.n_layer, "logits");
+            res.logits = cur;
 
-        ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, cur);
+        }
+        yoco_restore();
         if (hp.v41)
         {
             // TF32 truncation can move cache quantization and sparse routing
@@ -5735,6 +6115,38 @@ static void dsv4_trim_graph_cache(dsv4_model & m)
 // graphs captured by ggml-cuda. Fresh entries device-synchronize on their
 // arena allocation — TSGgml_Dsv4Forward pre-acquires the first two prefill
 // chunks so this happens while the devices are idle.
+// First position of the current call that the YOCO replay layers process, or -1
+// when this call runs every layer over every position.
+static int64_t dsv41_yoco_start(const dsv4_model & m)
+{
+    if (!m.hp.v41) return -1;
+    return tsg_dsv41_yoco::start(m.yoco_keep, m.call_start_hint, m.pos_end_hint);
+}
+
+// How many of this ubatch's tokens (its tail) the replay layers process, or -1
+// for a full graph. Speculative verify (per-row logits), image ubatches and
+// single-token steps always run every layer.
+static int64_t dsv41_yoco_kept(const dsv4_model & m, int64_t nt, int64_t p0, bool all_logits, int image_tokens)
+{
+    return tsg_dsv41_yoco::kept(dsv41_yoco_start(m), nt, p0, all_logits, image_tokens);
+}
+
+// True when a head at `target` would read replay-layer window rows for
+// positions a YOCO-truncated call skipped: (target - n_swa, target), since the
+// next forward writes row `target` before its first query reads it.
+static bool dsv41_yoco_blocks(const dsv4_slot & slot, int64_t target, int64_t n_swa)
+{
+    if (!tsg_dsv41_yoco::blocks(slot.yoco_skipped, target, n_swa)) return false;
+    // A rewind this deep re-prefills instead of reusing the cache. Say why
+    // once: with bounded replay on by default it is a serving cost.
+    static std::atomic<bool> noted{false};
+    if (!noted.exchange(true))
+        fprintf(stderr, "[dsv41] YOCO bounded replay: a rewind to a position whose sliding window reaches positions "
+                "an earlier prompt skipped in the replay layers re-prefills instead of reusing the cache "
+                "(TS_DSV41_YOCO_KEEP=0 keeps every position)\n");
+    return true;
+}
+
 static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64_t p0, bool pipeline, bool * out_reuse,
                                               bool all_logits = false, int image_tokens = 0)
 {
@@ -5780,6 +6192,9 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
         sig ^= 0xd6e8feb86659fd93ull;
     if (image_tokens)
         sig = (sig ^ 0x7adb9c312d4508e1ull) * 1099511628211ull ^ (uint64_t) image_tokens;
+    const int64_t yoco_kept = dsv41_yoco_kept(m, nt, p0, all_logits, image_tokens);
+    if (yoco_kept >= 0)
+        sig = (sig ^ 0x3c6ef372fe94f82bull) * 1099511628211ull ^ (uint64_t) yoco_kept;
 
     graph_build_result * res_p = nullptr;
     bool reuse = false;
@@ -5814,6 +6229,7 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
         r.plan_lid = plan_lid;
         r.all_logits = all_logits;
         r.image_tokens = image_tokens;
+        r.yoco_kept = yoco_kept;
         r.sched = ggml_backend_sched_new(m.sched_backends, m.sched_bufts, m.n_sched_backends, 32768, false, true);
         if (!r.sched)
         {
@@ -6042,7 +6458,8 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
         }
         else
         {
-            out_ids.assign(1, (int32_t) (nt - 1));
+            // A YOCO graph's last rows are the kept tail; logits come from its end.
+            out_ids.assign(1, (int32_t) ((res.yoco_kept > 0 ? res.yoco_kept : nt) - 1));
         }
         std::vector<int32_t> meta;
 
@@ -6162,6 +6579,24 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
             fill_plan(res.inp.csa[d], res.plan_csa, mk_csa);
             fill_plan(res.inp.hca[d], res.plan_hca, mk_hca);
             fill_plan(res.inp.lid[d], res.plan_lid, mk_lid);
+        }
+        if (res.yoco_kept > 0)
+        {
+            // The replay layers' window: like `mask` for the kept tail, but a
+            // ring row is visible only for positions the replay itself wrote.
+            const int64_t start = dsv41_yoco_start(m), kept = res.yoco_kept;
+            std::vector<ggml_fp16_t> ymask((size_t) m.ring_raw * kept, NEG_INF16);
+            for (int64_t r = 0; r < kept; r++)
+            {
+                const int64_t p = p0 + nt - kept + r;
+                for (int64_t s = 0; s < m.ring_raw; s++)
+                {
+                    const int64_t t = p_last - ((p_last - s) % m.ring_raw + m.ring_raw) % m.ring_raw;
+                    if (t >= start && t <= p && t > p - hp.n_swa)
+                        ymask[(size_t) r * m.ring_raw + s] = ZERO16;
+                }
+            }
+            for (int d = 0; d <= m.n_gpu; d++) set_f16(res.inp.raw_mask_yoco[d], ymask);
         }
         set_i32(res.inp.out_ids, out_ids);
         if (image_tokens)
@@ -6633,6 +7068,19 @@ static bool dsv4_forward_batched_decode(
         fprintf(stderr, "[dsv4] batched graph compute failed\n");
         return false;
     }
+    if (m.moe_tp)
+    {
+        // A failed rank fills its layer's routed output with NaNs. Every
+        // batched slot then holds caches written from them: none may decode
+        // again before a reset, and the logits must not be returned.
+        const auto error = m.moe_tp->error();
+        if (!error.empty())
+        {
+            fprintf(stderr, "[dsv41] tensor-parallel compute failed: %s\n", error.c_str());
+            for (int i = 0; i < n; ++i) m.slots.at(slot_ids[i])->v41_failed = true;
+            return false;
+        }
+    }
 
     ggml_backend_tensor_get(res.logits, logits_out, 0, (size_t) n * hp.n_vocab * sizeof(float));
     writes.complete = true;
@@ -6944,6 +7392,7 @@ TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_t
     {
         slot->spec_begin = slot->spec_end = -1;
         m->pos_end_hint = (int64_t) slot->n_past + n_tokens;
+        m->call_start_hint = slot->n_past;
         if (m->moe_tp) m->moe_tp->begin_forward();
 
         // Pre-acquisition allocates graph metadata and device arenas. It must
@@ -6970,18 +7419,30 @@ TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_t
             }
         }
         int done = 0;
+        // Positions the replay layers skipped: each micro-batch the graph
+        // narrows skips its head (a one-token micro-batch is never narrowed).
+        int64_t skipped_begin = -1, skipped_end = -1;
         while (done < n_tokens)
         {
             const int nt = std::min(m->n_ubatch, n_tokens - done);
             const bool last = (done + nt == n_tokens);
+            const int64_t kept = tsg_dsv4::dsv41_yoco_kept(*m, nt, slot->n_past, false, 0);
             if (!tsg_dsv4::dsv4_forward_ubatch(*m, tokens + done, nt, slot->n_past, last, last ? logits_out : nullptr))
             {
                 slot->v41_failed = true;
                 return -3;
             }
+            if (kept >= 0 && kept < nt)
+            {
+                if (skipped_begin >= 0 && skipped_end != slot->n_past)
+                    slot->yoco_skipped.emplace_back(skipped_begin, skipped_end);
+                if (skipped_begin < 0 || skipped_end != slot->n_past) skipped_begin = slot->n_past;
+                skipped_end = (int64_t) slot->n_past + nt - kept;
+            }
             slot->n_past += nt;
             done += nt;
         }
+        if (skipped_begin >= 0) slot->yoco_skipped.emplace_back(skipped_begin, skipped_end);
 
         // Only multi-token calls publish prompt-boundary rewind checkpoints.
         // A copy failure can leave a partial shadow, so it also requires reset.
@@ -7072,8 +7533,10 @@ TSG_EXPORT int TSGgml_Dsv4SlotCanReuse(void * handle, int slot_id, int cached_he
     if (!TSGgml_Dsv4SlotStatus(handle, slot_id, &head, &checkpoint, &healthy) ||
         !healthy || head != cached_head) return 0;
     auto * m = (tsg_dsv4::dsv4_model *) handle;
-    return dsv41_plan_truncate(target, head, checkpoint, m->rewind_span, m->truncate_align)
-        != dsv41_truncate_route::refuse;
+    const dsv41_truncate_route route = dsv41_plan_truncate(target, head, checkpoint, m->rewind_span, m->truncate_align);
+    if (route == dsv41_truncate_route::live || route == dsv41_truncate_route::checkpoint)
+        return !tsg_dsv4::dsv41_yoco_blocks(*m->slots.at(slot_id), target, m->hp.n_swa);
+    return route != dsv41_truncate_route::refuse;
 }
 
 TSG_EXPORT int TSGgml_Dsv4SlotReleaseGraphs(void * handle, int slot_id)
@@ -7270,6 +7733,8 @@ TSG_EXPORT int TSGgml_Dsv4ForwardBatchedDecode(
             if (slot_ids[j] == slot_ids[i]) return -2;
     }
 
+    // One failure record per request, as in the single-slot entry point.
+    if (m->moe_tp) m->moe_tp->begin_forward();
     try
     {
         if (!tsg_dsv4::dsv4_forward_batched_decode(*m, n, slot_ids, tokens, positions, logits_out))
@@ -7326,6 +7791,8 @@ TSG_EXPORT int TSGgml_Dsv4ForwardSpec(void * handle, const int32_t * tokens, int
     {
         slot.spec_begin = slot.spec_end = -1;
         m->pos_end_hint = (int64_t) slot.n_past + n_tokens;
+        // A verify scores every row: no bounded replay (all_logits also says so).
+        m->call_start_hint = m->pos_end_hint;
         if (m->moe_tp) m->moe_tp->begin_forward();
         if (tsg_dsv4::dsv4_forward_ubatch(*m, tokens, n_tokens, slot.n_past, true, logits_out, /*all_logits*/ true))
         {
@@ -7428,6 +7895,10 @@ TSG_EXPORT int TSGgml_Dsv4Truncate(void * handle, int n_past)
 
     if (route == dsv41_truncate_route::refuse) return 0;
     if (route == dsv41_truncate_route::none) return 1;
+    // The replay layers' window at the new head must not reach positions a
+    // YOCO-truncated call skipped; the caller re-prefills instead.
+    if ((route == dsv41_truncate_route::live || route == dsv41_truncate_route::checkpoint) &&
+        tsg_dsv4::dsv41_yoco_blocks(*slot, n_past, m->hp.n_swa)) return 0;
 
     // Reset/restore may already have changed buffers when an allocation or
     // backend exception is raised. Contain it at this C ABI as well as Reset.
@@ -7453,6 +7924,11 @@ TSG_EXPORT int TSGgml_Dsv4Truncate(void * handle, int n_past)
         // branch. Subsequent single-token decoding does not refresh it, so it
         // must not later restore old rings alongside the new Engram history.
         if (slot->cp_n_past > n_past) slot->cp_n_past = -1;
+        // Skipped spans beyond the head belong to the abandoned branch.
+        auto & skipped = slot->yoco_skipped;
+        skipped.erase(std::remove_if(skipped.begin(), skipped.end(),
+            [&](const std::pair<int64_t, int64_t> & span) { return span.first >= n_past; }), skipped.end());
+        for (auto & span : skipped) span.second = std::min<int64_t>(span.second, n_past);
         writes.complete = true;
         return 1;
     }

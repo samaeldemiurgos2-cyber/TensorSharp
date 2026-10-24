@@ -4,8 +4,10 @@
 
 TensorSharp implements native text-to-video and image-conditioned video with jointly
 generated 48 kHz stereo audio for the LTX 2.5 Distilled checkpoint. The experimental TensorAgent entry is
-**LTX 2.5 Distilled — UD-Q4_K_XL + BF16**; Download installs all five pinned files,
-and Use activates the video model.
+**LTX 2.5 Distilled — UD-Q4_K_XL + BF16**; Download installs the five pinned base
+files, and Use activates the video model. The optional Ingredients IC-LoRA enables
+identity/appearance references and is included when TensorAgent's optional downloads
+are enabled (the default).
 
 ## Files and startup
 
@@ -17,6 +19,15 @@ x2 spatial latent upscaler and audio VAE by commit and SHA-256. They total
 `ac3c540c6025903784336e99b2dc179385c4c3b7`. No Hugging Face account is needed.
 The companions are byte-identical to the Lightricks files; the config also lists
 their gated originals as fallback URLs.
+
+The config also lists the optional `ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors`
+at `${ltxRoot}/loras/`, pinned to Lightricks revision
+`12040e4091ac2008d3906a594e31a7fb1ab9d546` (1,308,787,472 bytes; SHA-256
+`ff873a5beada3c579a8137c7c53343916f78bcc9a529ba910143073fe8715e95`). This repo is
+gated. Accept the LTX-2.x terms and configure `HF_TOKEN` or a Hugging Face token file
+to download it. Config expansion fetches it before model loading when authorized and
+continues without it otherwise; Video Studio then enables reference mode automatically
+when the file is present.
 
 Use `distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf`, installed directly in
 `ltx25/` beside its companion folders. The repository root holds the **dev**
@@ -97,8 +108,12 @@ optionally the first; a last frame alone becomes one appended guide at the final
 frame (strength 1.0). `i2v` needs a frame-zero image and refuses an end image alone. Ordered reference-image lists
 become evenly spaced keyframes; one image anchors frame zero. These references
 control the timeline. Character/prop/location identity references use `Mode = "ref"` and the optional
-Ingredients IC-LoRA described below. Reference video/audio, retake/refinement,
-HDR/EXR, generated keyframe slots and multi-GPU splitting remain unavailable. Disabling audio decode still runs the trained joint
+Ingredients IC-LoRA described below. For video continuation, `ContinuationVideoPaths`
+(or the HTTP `continueFromVideos` field) uses the exact last frame of the first clip as
+frame zero; a second clip pins the new take's last frame. `ReferenceVideoPaths` (HTTP
+`referenceVideos`) in `Mode = "ref"` instead supplies a full temporal reference clip.
+Reference audio, retake/refinement, HDR/EXR, generated
+keyframe slots and multi-GPU splitting remain unavailable. Disabling audio decode still runs the trained joint
 AV denoiser.
 The native audio length can be slightly shorter than the video duration; the
 original decoder/export rule crops excess samples and does not pad short tracks.
@@ -298,6 +313,7 @@ The model API offers the following inputs:
 | `EndImage`, `EndImagePath` | Last output frame. |
 | `ReferenceImagePaths` | Ordered, evenly spaced keyframes by default; identity sheet panels in `Mode = "ref"`. Cannot be combined with the other image inputs, except one frame-0 `ImageConditions` guide in `Mode = "ref"` ([starting on a first frame](#starting-on-a-first-frame)). |
 | `ImageConditions` | `VideoImageCondition` entries with an image, `FrameIndex`, and `Strength`. `-1` selects the last frame. |
+| `ContinuationVideoPaths` | One or two video files. Their exact final frames pin the new take's first frame and, optionally, its last frame. |
 
 ```csharp
 var request = new VideoGenerationParams
@@ -354,11 +370,17 @@ and [keyframe conditioning](https://github.com/Lightricks/LTX-2/blob/be6d6d0a69d
 The publisher's [Ingredients adapter](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Ingredients)
 uses a composite reference sheet to preserve characters, props, and locations.
 Install `ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors` in the denoiser's sibling
-`loras/` directory, or set `TS_LTX25_INGREDIENTS_LORA` to its path. The approved
-file is 1,308,787,472 bytes with SHA-256
+`loras/` directory, or set `TS_LTX25_INGREDIENTS_LORA` to its path. The shipped
+config downloads it there before the first model load when Hugging Face access is
+approved. Accept the gated repository terms and configure `HF_TOKEN` or a Hugging
+Face token file; see the [official Lightricks Ingredients repo](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Ingredients).
+The adapter is 1,308,787,472 bytes with SHA-256
 `ff873a5beada3c579a8137c7c53343916f78bcc9a529ba910143073fe8715e95`.
-TensorAgent offers **Identity references (Ingredients)** when this adapter is
-installed; the ordinary upload flow continues to use timeline image guides.
+TensorAgent downloads the optional adapter by default when access is approved and
+offers **Identity references (Ingredients)** after loading it. The ordinary upload
+flow continues to use timeline image guides. A running server reads this config at
+startup, so apply the updated preset on the next server launch; after that, reference
+images are available on the initial model load.
 
 ```csharp
 var request = new VideoGenerationParams
@@ -387,6 +409,14 @@ video description. TensorSharp retains an ordinary prompt verbatim under those
 labels and adds only the known sheet panel inventory. Explicit structured prompts
 are preserved. Describe the subjects and requested action clearly; preserving
 appearance and following the requested motion are separate quality checks.
+
+One full reference clip can also be supplied with `ReferenceVideoPaths` in
+`Mode = "ref"`. Studio exposes existing project clips as references when the
+Ingredients adapter is loaded. The clip is encoded as temporal reference latents;
+it is not reduced to a still. To continue from a clip's ending frame, use
+`ContinuationVideoPaths` (HTTP `continueFromVideos`) instead. Studio keeps that
+continuation action separate because the validated Ingredients workflow does not
+reliably keep a pinned first frame while reference conditioning is active.
 
 For better reference sheets, use clean subject or object images without text,
 logos or unrelated collage elements. Describe each panel by its actual position

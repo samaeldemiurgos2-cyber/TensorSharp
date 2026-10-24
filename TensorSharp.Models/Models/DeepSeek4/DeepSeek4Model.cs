@@ -69,6 +69,8 @@ namespace TensorSharp.Models
                 // would print the same line twice.
                 if (DeepSeek41Architecture.DescribeCpuBackendChoice(backend) is string cpuNote)
                     Console.Error.WriteLine(cpuNote);
+                if (DeepSeek41Architecture.DescribeYocoAbsence(backend) is string yocoNote)
+                    Console.Error.WriteLine(yocoNote);
             }
             else if (DescribeCpuBackendChoice(backend) is string v4CpuNote)
             {

@@ -562,6 +562,19 @@ public sealed class ModelsPage : ContentPage
         addDraft.SetBinding(IsVisibleProperty, nameof(ModelRow.CanAddDraft));
         addDraft.Clicked += (s, _) => OnDraftAction(((Button)s!).BindingContext as ModelRow);
 
+        var addIngredients = new Button
+        {
+            FontSize = 14,
+            Margin = new Thickness(0, 0, 8, 8),
+            Padding = new Thickness(14, 6),
+            BackgroundColor = Theme.Accent,
+            TextColor = Colors.White,
+            CornerRadius = 8,
+        };
+        addIngredients.SetBinding(Button.TextProperty, nameof(ModelRow.AddIngredientsLabel));
+        addIngredients.SetBinding(IsVisibleProperty, nameof(ModelRow.CanAddIngredients));
+        addIngredients.Clicked += (s, _) => OnIngredientsAction(((Button)s!).BindingContext as ModelRow);
+
         var remove = new Button
         {
             Text = Loc.T("models.action.delete"),
@@ -578,7 +591,7 @@ public sealed class ModelsPage : ContentPage
         foreach (Button button in new[] { action, addVision, remove })
             button.Margin = new Thickness(0, 0, 8, 8);
         var buttons = new FlexLayout { Wrap = Microsoft.Maui.Layouts.FlexWrap.Wrap,
-            Children = { action, addVision, addDraft, remove } };
+            Children = { action, addVision, addDraft, addIngredients, remove } };
 
         var card = new Border
         {
@@ -743,6 +756,29 @@ public sealed class ModelsPage : ContentPage
 
         row.BeginDownload();
         _app.Downloads.Start(row.Model, new[] { CatalogFileRole.Draft });
+    }
+
+    /// <summary>Add the gated LTX Ingredients adapter to an already installed model.</summary>
+    private async void OnIngredientsAction(ModelRow? row)
+    {
+        if (row is null || !row.CanAddIngredients)
+            return;
+
+        AppSettings settings = _app.Settings.Load();
+        if (!settings.AllowCellularDownloads && Services.DeviceState.IsOnCellularOnly())
+        {
+            await DisplayAlert(
+                Loc.T("models.alert.cellular.title"),
+                Loc.T("models.alert.cellular.ingredients",
+                    ("model", row.Model.DisplayName),
+                    ("size", (row.IngredientsBytesRemaining / 1e9).ToString("0.0", Loc.Culture)),
+                    ("setting", Loc.T("settings.downloads.cellular.title"))),
+                Loc.T("common.ok"));
+            return;
+        }
+
+        row.BeginDownload();
+        _app.Downloads.Start(row.Model, new[] { CatalogFileRole.IngredientsLora });
     }
 
     /// <summary>
@@ -962,6 +998,7 @@ public sealed class ModelRow : BindableObject
             OnPropertyChanged(nameof(CanDelete));
             OnPropertyChanged(nameof(CanAddVision));
             OnPropertyChanged(nameof(CanAddDraft));
+            OnPropertyChanged(nameof(CanAddIngredients));
         }
     }
     public bool CanAct => Runnable && (IsDownloading || (!SelectionInProgress && !IsBusy));
@@ -987,6 +1024,9 @@ public sealed class ModelRow : BindableObject
     public long DraftBytesRemaining { get; private set; }
     public bool DraftActivationRequired { get; }
     public string AddDraftLabel => Loc.T("models.action.addDraft", ("size", Gb(DraftBytesRemaining)));
+    public bool NeedsIngredients { get; private set; }
+    public long IngredientsBytesRemaining { get; private set; }
+    public string AddIngredientsLabel => Loc.T("models.action.addIngredients", ("size", Gb(IngredientsBytesRemaining)));
 
     public string Title => IsSelected ? Loc.T("models.row.inUse", ("model", Model.DisplayName)) : Model.DisplayName;
 
@@ -1045,12 +1085,13 @@ public sealed class ModelRow : BindableObject
 
     public string Status { get => _status; private set { _status = value; OnPropertyChanged(); } }
     public double Fraction { get => _fraction; private set { _fraction = value; OnPropertyChanged(); } }
-    public bool IsBusy { get => _busy; private set { _busy = value; OnPropertyChanged(); OnPropertyChanged(nameof(CanAct)); OnPropertyChanged(nameof(CanDelete)); OnPropertyChanged(nameof(CanAddVision)); OnPropertyChanged(nameof(CanAddDraft)); } }
+    public bool IsBusy { get => _busy; private set { _busy = value; OnPropertyChanged(); OnPropertyChanged(nameof(CanAct)); OnPropertyChanged(nameof(CanDelete)); OnPropertyChanged(nameof(CanAddVision)); OnPropertyChanged(nameof(CanAddDraft)); OnPropertyChanged(nameof(CanAddIngredients)); } }
     public string ActionLabel { get => _actionLabel; private set { _actionLabel = value; OnPropertyChanged(); OnPropertyChanged(nameof(ActionDescription)); } }
     public string ActionDescription => ActionLabel + ": " + Model.DisplayName + " · " + Model.Quantization;
     public bool CanDelete => IsInstalled && !IsBusy && !SelectionInProgress;
     public bool CanAddVision => Runnable && NeedsVisionProjector && !IsBusy && !SelectionInProgress;
     public bool CanAddDraft => Runnable && NeedsDraft && !IsBusy && !SelectionInProgress;
+    public bool CanAddIngredients => Runnable && NeedsIngredients && !IsBusy && !SelectionInProgress;
 
     public void BeginDownload()
     {
@@ -1121,6 +1162,7 @@ public sealed class ModelRow : BindableObject
         OnPropertyChanged(nameof(CanDelete));
         OnPropertyChanged(nameof(CanAddVision));
         OnPropertyChanged(nameof(CanAddDraft));
+        OnPropertyChanged(nameof(CanAddIngredients));
     }
 
     public void Cancelled(ModelStore store)
@@ -1134,6 +1176,7 @@ public sealed class ModelRow : BindableObject
         Status = Loc.T("models.status.stopped", ("state", DescribeState(store)));
         OnPropertyChanged(nameof(CanAddVision));
         OnPropertyChanged(nameof(CanAddDraft));
+        OnPropertyChanged(nameof(CanAddIngredients));
     }
 
     public void Failed(ModelStore store, string message)
@@ -1148,6 +1191,7 @@ public sealed class ModelRow : BindableObject
         Status = message;
         OnPropertyChanged(nameof(CanAddVision));
         OnPropertyChanged(nameof(CanAddDraft));
+        OnPropertyChanged(nameof(CanAddIngredients));
     }
 
     private string InstalledActionLabel => !Model.IsAvailable ? Loc.T("models.action.unavailable")
@@ -1212,7 +1256,15 @@ public sealed class ModelRow : BindableObject
             && store.CompanionPath(Model, CatalogFileRole.Draft) is null;
         DraftBytesRemaining = NeedsDraft
             ? store.RemainingBytes(Model, new[] { CatalogFileRole.Draft }) : 0;
+        NeedsIngredients = IsInstalled
+            && Model.Family == CatalogFamily.Ltx25
+            && Model.Files.Any(f => f.Role == CatalogFileRole.IngredientsLora && f.Optional)
+            && store.CompanionPath(Model, CatalogFileRole.IngredientsLora) is null;
+        IngredientsBytesRemaining = NeedsIngredients
+            ? store.RemainingBytes(Model, new[] { CatalogFileRole.IngredientsLora }) : 0;
         OnPropertyChanged(nameof(AddDraftLabel));
+        OnPropertyChanged(nameof(AddIngredientsLabel));
+        OnPropertyChanged(nameof(CanAddIngredients));
     }
 
     private static string Gb(long bytes) => (bytes / 1e9).ToString("0.00", Loc.Culture);

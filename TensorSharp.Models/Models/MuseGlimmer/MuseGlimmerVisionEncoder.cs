@@ -201,6 +201,10 @@ namespace TensorSharp.Models
             foreach (var kv in gguf.Tensors)
             {
                 var info = kv.Value;
+                // Spark packages vision and audio in one file. The vision tower
+                // must not allocate or upload the unrelated audio pyramid.
+                if (info.Name.StartsWith("a.", StringComparison.Ordinal))
+                    continue;
                 byte[] raw = gguf.ReadTensorData(info);
 
                 // Keep the big 2D matmul weights in their GGUF quantization and let

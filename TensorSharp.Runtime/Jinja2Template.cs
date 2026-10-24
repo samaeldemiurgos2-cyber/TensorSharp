@@ -864,12 +864,31 @@ namespace TensorSharp.Runtime
                 return EvalExpr(expr.Substring(1, expr.Length - 2), ctx);
 
             // Apply filters: expr | filter
-            int pipeIdx = FindTopLevelOp(expr, "|");
-            if (pipeIdx > 0)
+            var filters = SplitTopLevel(expr, "|");
+            if (filters.Count > 1)
             {
-                string baseExpr = expr.Substring(0, pipeIdx).Trim();
-                string filter = expr.Substring(pipeIdx + 1).Trim();
-                return ApplyFilter(EvalPrimary(baseExpr, ctx), filter, ctx);
+                object? value = EvalPrimary(filters[0], ctx);
+                for (int f = 1; f < filters.Count; f++) value = ApplyFilter(value, filters[f], ctx);
+                return value;
+            }
+
+            // The Spark template appends a schema property to (p | tojson)[:-1].
+            // Parenthesized values can be indexed just like a named variable.
+            if (expr[0] == '(')
+            {
+                int close = FindClosing(expr, 0, '(', ')');
+                string suffix = expr.Substring(close + 1).Trim();
+                if (suffix.StartsWith('[') || suffix.StartsWith('.'))
+                {
+                    object? value = EvalExpr(expr.Substring(1, close - 1), ctx);
+                    ctx.Push();
+                    try
+                    {
+                        ctx.Set("__tensorsharp_parenthesized", value!);
+                        return EvalAccessChain("__tensorsharp_parenthesized" + suffix, ctx);
+                    }
+                    finally { ctx.Pop(); }
+                }
             }
 
             // String literal
@@ -1410,9 +1429,42 @@ namespace TensorSharp.Runtime
                     if (val is IList<object> ll && ll.Count > 0) return ll[ll.Count - 1];
                     return null;
                 case "default" or "d":
-                    if (val == null || (val is string ds && ds.Length == 0))
-                        return filterArgs != null ? EvalExpr(filterArgs, ctx) : null;
+                {
+                    var args = filterArgs == null ? new List<string>() : SplitArgs(filterArgs);
+                    bool useFalsyDefault = args.Count > 1 && Truthy(EvalExpr(args[1], ctx));
+                    if (val == null || (val is string ds && ds.Length == 0) || (useFalsyDefault && !Truthy(val)))
+                        return args.Count > 0 ? EvalExpr(args[0], ctx) : null;
                     return val;
+                }
+                case "replace":
+                {
+                    var args = filterArgs == null ? new List<string>() : SplitArgs(filterArgs);
+                    if (args.Count < 2) return val;
+                    string source = Stringify(val);
+                    string oldValue = Stringify(EvalExpr(args[0], ctx));
+                    string newValue = Stringify(EvalExpr(args[1], ctx));
+                    int count = args.Count > 2 ? (int)ToNumber(EvalExpr(args[2], ctx)) : int.MaxValue;
+                    if (count < 0) count = int.MaxValue;
+                    if (oldValue.Length == 0)
+                    {
+                        var result = new StringBuilder();
+                        for (int i = 0; i <= source.Length; i++)
+                        {
+                            if (count-- > 0) result.Append(newValue);
+                            if (i < source.Length) result.Append(source[i]);
+                        }
+                        return result.ToString();
+                    }
+                    if (count == int.MaxValue) return source.Replace(oldValue, newValue, StringComparison.Ordinal);
+                    var replaced = new StringBuilder();
+                    int offset = 0, match;
+                    while (count-- > 0 && (match = source.IndexOf(oldValue, offset, StringComparison.Ordinal)) >= 0)
+                    {
+                        replaced.Append(source, offset, match - offset).Append(newValue);
+                        offset = match + oldValue.Length;
+                    }
+                    return replaced.Append(source, offset, source.Length - offset).ToString();
+                }
                 case "list":
                     return ToList(val);
                 case "int":
@@ -1571,6 +1623,7 @@ namespace TensorSharp.Runtime
             for (int i = openPos + 1; i < s.Length; i++)
             {
                 char c = s[i];
+                if (c == '\\' && (inSingle || inDouble)) { i++; continue; }
                 if (c == '\'' && !inDouble) inSingle = !inSingle;
                 else if (c == '"' && !inSingle) inDouble = !inDouble;
                 else if (!inSingle && !inDouble)
@@ -1589,6 +1642,7 @@ namespace TensorSharp.Runtime
             for (int i = 0; i <= s.Length - kw.Length; i++)
             {
                 char c = s[i];
+                if (c == '\\' && (inSingle || inDouble)) { i++; continue; }
                 if (c == '\'' && !inDouble) { inSingle = !inSingle; continue; }
                 if (c == '"' && !inSingle) { inDouble = !inDouble; continue; }
                 if (inSingle || inDouble) continue;
@@ -1607,6 +1661,7 @@ namespace TensorSharp.Runtime
             for (int i = 0; i <= s.Length - op.Length; i++)
             {
                 char c = s[i];
+                if (c == '\\' && (inSingle || inDouble)) { i++; continue; }
                 if (c == '\'' && !inDouble) { inSingle = !inSingle; continue; }
                 if (c == '"' && !inSingle) { inDouble = !inDouble; continue; }
                 if (inSingle || inDouble) continue;
@@ -1647,6 +1702,7 @@ namespace TensorSharp.Runtime
             for (int i = 0; i < s.Length; i++)
             {
                 char c = s[i];
+                if (c == '\\' && (inSingle || inDouble)) { i++; continue; }
                 if (c == '\'' && !inDouble) inSingle = !inSingle;
                 else if (c == '"' && !inSingle) inDouble = !inDouble;
                 else if (!inSingle && !inDouble)

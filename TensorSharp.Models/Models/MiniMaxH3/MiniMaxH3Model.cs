@@ -48,6 +48,8 @@ namespace TensorSharp.Models.MiniMaxH3
         internal static Action<MiniMaxH3LoraSet> LoraLoadedHookForTest;
 
         private readonly string _ditPath;
+        private readonly string _firstLastDitPath;
+        private readonly string _referenceDitPath;
         private readonly string _tePath;
         private readonly string _vaePath;
         private readonly string _audioVaePath;
@@ -79,6 +81,27 @@ namespace TensorSharp.Models.MiniMaxH3
                 DitConfig = MiniMaxH3Config.Detect(probe.Tensors);
             }
             Partition = MiniMaxH3Config.PartitionFromFileName(ggufPath);
+            string alternatePath = ResolveAlternateDenoiser(ggufPath, Partition);
+            if (alternatePath != null)
+            {
+                try
+                {
+                    using var alternate = new GgufFile(alternatePath);
+                    MiniMaxH3Config alternateConfig = MiniMaxH3Config.Detect(alternate.Tensors);
+                    if (!SameDenoiserShape(DitConfig, alternateConfig))
+                    {
+                        Console.WriteLine($"MiniMax-H3 alternate denoiser ignored (incompatible tensor shapes): {alternatePath}");
+                        alternatePath = null;
+                    }
+                }
+                catch (Exception e) when (e is IOException or InvalidOperationException or ArgumentException)
+                {
+                    Console.WriteLine($"MiniMax-H3 alternate denoiser ignored ({e.Message}): {alternatePath}");
+                    alternatePath = null;
+                }
+            }
+            _firstLastDitPath = Partition == MiniMaxH3Partition.FirstLastFrame ? ggufPath : alternatePath;
+            _referenceDitPath = Partition == MiniMaxH3Partition.Reference ? ggufPath : alternatePath;
             Config = new ModelConfig { Architecture = ArchitectureId, VocabSize = 0 };
 
             _tePath = ResolveCompanion("TS_VIDEO_TEXT_ENCODER", dir,
@@ -91,7 +114,8 @@ namespace TensorSharp.Models.MiniMaxH3
                 new[] { "minimax_h3_audio_vae_fp32.safetensors" },
                 n => n.Contains("audio_vae") && n.EndsWith(".safetensors"));
 
-            Console.WriteLine($"MiniMax-H3 ({Partition}): DiT={Path.GetFileName(ggufPath)}");
+            Console.WriteLine($"MiniMax-H3 ({Partition}): DiT={Path.GetFileName(ggufPath)}"
+                + (alternatePath == null ? string.Empty : $", alternate={Path.GetFileName(alternatePath)}"));
             Console.WriteLine($"  {DitConfig}");
             Console.WriteLine($"  text-encoder = {_tePath ?? "<missing>"}");
             Console.WriteLine($"  video VAE    = {_vaePath ?? "<missing>"}");
@@ -130,6 +154,38 @@ namespace TensorSharp.Models.MiniMaxH3
                 throw;
             }
         }
+
+        private static string ResolveAlternateDenoiser(string primaryPath, MiniMaxH3Partition primaryPartition)
+        {
+            string directory = Path.GetDirectoryName(Path.GetFullPath(primaryPath));
+            string primaryName = Path.GetFileName(primaryPath);
+            string marker = primaryPartition == MiniMaxH3Partition.Reference ? "ref2va" : "fl2va";
+            int markerAt = primaryName.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (markerAt < 0) return null;
+            string alternateMarker = primaryPartition == MiniMaxH3Partition.Reference ? "fl2va" : "ref2va";
+            string expectedName = primaryName[..markerAt] + alternateMarker + primaryName[(markerAt + marker.Length)..];
+            string expectedPath = Path.Combine(directory, expectedName);
+            if (File.Exists(expectedPath)) return expectedPath;
+
+            // Keep custom quantized pairs usable when they follow the published filename
+            // pattern, while refusing to guess if a folder contains multiple alternatives.
+            string[] candidates = Directory.Exists(directory)
+                ? Directory.EnumerateFiles(directory, "*.gguf", SearchOption.TopDirectoryOnly)
+                    .Where(path => !string.Equals(Path.GetFullPath(path), Path.GetFullPath(primaryPath), StringComparison.Ordinal)
+                        && MiniMaxH3Config.PartitionFromFileName(path) != primaryPartition)
+                    .ToArray()
+                : Array.Empty<string>();
+            return candidates.Length == 1 ? candidates[0] : null;
+        }
+
+        private static bool SameDenoiserShape(MiniMaxH3Config a, MiniMaxH3Config b) =>
+            a.HiddenSize == b.HiddenSize && a.NumLayers == b.NumLayers
+            && a.TokenRefinerLayers == b.TokenRefinerLayers && a.NumAttentionHeads == b.NumAttentionHeads
+            && a.AttentionHeadDim == b.AttentionHeadDim && a.FfnHiddenSize == b.FfnHiddenSize
+            && a.VideoLatentChannels == b.VideoLatentChannels && a.AudioLatentChannels == b.AudioLatentChannels
+            && a.TextDim == b.TextDim && a.RopeInvFreqLength == b.RopeInvFreqLength
+            && a.TimeEmbedding == b.TimeEmbedding && a.TimeEmbedDim == b.TimeEmbedDim
+            && a.AdaLnCurveGrid == b.AdaLnCurveGrid;
 
         // ---- LoRA plug-ins (ILoraPluginHost) ----
 
@@ -247,7 +303,34 @@ namespace TensorSharp.Models.MiniMaxH3
 
         internal MiniMaxH3TextEncoder CreateTextEncoder() => new(_tePath, null, Backend, _allocator);
         internal MiniMaxH3DiT CreateDiT() => new(_ditPath, Backend, _allocator);
+        internal MiniMaxH3DiT CreateDiT(MiniMaxH3Partition partition) => new(DenoiserPathFor(partition), Backend, _allocator);
         internal MiniMaxH3VideoVae CreateVideoVae() => new(_vaePath, Backend, _allocator);
+
+        /// <summary>Whether this installation has the denoiser for a generation mode.</summary>
+        public bool SupportsPartition(MiniMaxH3Partition partition) =>
+            partition == MiniMaxH3Partition.FirstLastFrame ? _firstLastDitPath != null : _referenceDitPath != null;
+
+        /// <summary>Choose the installed denoiser for the supplied mode. The shared text encoder
+        /// and VAEs stay attached to this loaded model; only the denoiser changes between clips.</summary>
+        public MiniMaxH3Partition PartitionFor(VideoGenerationParams parameters)
+        {
+            MiniMaxH3Partition partition = MiniMaxH3ModeResolver.PartitionFor(parameters, Partition);
+            if (!SupportsPartition(partition))
+            {
+                string name = partition == MiniMaxH3Partition.Reference ? "Ref2VA" : "FL2VA";
+                string file = partition == MiniMaxH3Partition.Reference ? "minimax_h3_ref2va_pruned-*.gguf" : "minimax_h3_fl2va_pruned-*.gguf";
+                throw new InvalidOperationException($"MiniMax-H3 {name} conditioning needs {file} beside the loaded denoiser. Download the complete MiniMax-H3 model entry to enable both modes.");
+            }
+            return partition;
+        }
+
+        /// <summary>The installed denoiser path for the requested conditioning partition.</summary>
+        public string DenoiserPathFor(MiniMaxH3Partition partition) => partition switch
+        {
+            MiniMaxH3Partition.FirstLastFrame => _firstLastDitPath ?? _ditPath,
+            MiniMaxH3Partition.Reference => _referenceDitPath ?? _ditPath,
+            _ => throw new ArgumentOutOfRangeException(nameof(partition)),
+        };
 
         /// <summary>Pull a weight file through the OS file cache in one sequential pass.
         ///
@@ -353,15 +436,18 @@ namespace TensorSharp.Models.MiniMaxH3
         // ---- IVideoGenerationModel ----
         string IVideoGenerationModel.VideoModelFamily => ArchitectureId;
         int IVideoGenerationModel.DefaultPreviewFrames => 22;
+        int IVideoGenerationModel.FrameCountMultiple => 17;
+        int IVideoGenerationModel.FrameCountOffset => 5;
+        int IVideoGenerationModel.DefaultPreviewFps => MiniMaxH3Geometry.Fps;
+        int IVideoGenerationModel.DefaultOutputWidth => 640;
+        int IVideoGenerationModel.DefaultOutputHeight => 384;
+        int IVideoGenerationModel.ResolutionMultiple => 32;
         // The joint audio stream is generated either way; only its decode needs the VAE.
         bool IVideoGenerationModel.SupportsAudio => _audioVaePath != null;
-        bool IVideoGenerationModel.SupportsImageConditioning => true;
-        bool IVideoGenerationModel.SupportsEndImageConditioning =>
-            Partition == MiniMaxH3Partition.FirstLastFrame;
-        bool IVideoGenerationModel.SupportsReferenceConditioning =>
-            Partition == MiniMaxH3Partition.Reference;
-        int IVideoGenerationModel.MaxReferenceImages =>
-            Partition == MiniMaxH3Partition.Reference ? MiniMaxH3Geometry.MaxReferences : 0;
+        bool IVideoGenerationModel.SupportsImageConditioning => SupportsPartition(MiniMaxH3Partition.FirstLastFrame);
+        bool IVideoGenerationModel.SupportsEndImageConditioning => SupportsPartition(MiniMaxH3Partition.FirstLastFrame);
+        bool IVideoGenerationModel.SupportsReferenceConditioning => SupportsPartition(MiniMaxH3Partition.Reference);
+        int IVideoGenerationModel.MaxReferenceImages => SupportsPartition(MiniMaxH3Partition.Reference) ? MiniMaxH3Geometry.MaxReferences : 0;
 
         // ---- not an autoregressive model ----
         protected override float[] ForwardCore(int[] tokens) =>

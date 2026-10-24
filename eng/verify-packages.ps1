@@ -87,9 +87,15 @@ $PublicPackages = @(
         EmbeddedAssemblies = @()
     },
     @{
+        Id = "TensorSharp.Studio"
+        Project = "TensorSharp.Studio/TensorSharp.Studio.csproj"
+        TensorSharpDependencies = @()
+        EmbeddedAssemblies = @()
+    },
+    @{
         Id = "TensorSharp.Chat"
         Project = "TensorSharp.Chat/TensorSharp.Chat.csproj"
-        TensorSharpDependencies = @("TensorSharp.Runtime", "TensorSharp.Runtime.Logging", "TensorSharp.AgentHost", "TensorSharp.Models", "TensorSharp.Backends.GGML", "TensorSharp.Knowledge")
+        TensorSharpDependencies = @("TensorSharp.Runtime", "TensorSharp.Runtime.Logging", "TensorSharp.AgentHost", "TensorSharp.Models", "TensorSharp.Backends.GGML", "TensorSharp.Knowledge", "TensorSharp.Studio")
         EmbeddedAssemblies = @()
     },
     @{
@@ -218,6 +224,8 @@ function Read-Nupkg {
         )
 
         return [pscustomobject] @{
+            Id = [string] $nuspec.package.metadata.id
+            Version = [string] $nuspec.package.metadata.version
             Entries = $entries
             Dependencies = $dependencies
         }
@@ -246,6 +254,48 @@ function Assert-SameSet {
     }
 }
 
+function Assert-PackageManifest {
+    param([object[]] $Packages)
+
+    $ids = @($Packages | ForEach-Object { $_.Id })
+    if (@($ids | Sort-Object -Unique).Count -ne $ids.Count) {
+        throw "Public package manifest contains duplicate package IDs."
+    }
+    foreach ($package in $Packages) {
+        foreach ($dependencyId in $package.TensorSharpDependencies) {
+            if ($ids -notcontains $dependencyId) {
+                throw "$($package.Id) depends on $dependencyId, which is missing from the public package manifest."
+            }
+        }
+    }
+}
+
+function Assert-PackageClosure {
+    param([hashtable] $PackagesById)
+
+    foreach ($package in $PackagesById.Values) {
+        if (-not (Test-Path -LiteralPath $package.Path -PathType Leaf)) {
+            throw "Missing package artifact for $($package.Id): $($package.Path)"
+        }
+        foreach ($dependency in $package.Dependencies) {
+            if ($dependency.Id -ne "AdvUtils" -and $dependency.Id -notlike "TensorSharp.*") {
+                continue
+            }
+            if (-not $PackagesById.ContainsKey($dependency.Id)) {
+                throw "$($package.Id) depends on $($dependency.Id), which has no verified package artifact."
+            }
+            $targetVersion = $PackagesById[$dependency.Id].Version
+            # SDK pack emits a minimum version; also accept its explicit range
+            # and exact-version forms. Every internal edge must name the version
+            # built in this run, rather than silently resolving an older release.
+            if ($dependency.Version -notin @($targetVersion, "[$targetVersion, )", "[$targetVersion]")) {
+                throw "$($package.Id) dependency $($dependency.Id) has version '$($dependency.Version)'; expected '$targetVersion'."
+            }
+        }
+    }
+}
+
+Assert-PackageManifest -Packages $PublicPackages
 New-Item -ItemType Directory -Force -Path $PackageOutput | Out-Null
 
 # Capture the override into a distinctly-named variable: PowerShell variable
@@ -279,6 +329,7 @@ if ($SkipNativeBuild) {
     $ExtraPackArgs += "-p:TensorSharpSkipMlxNative=true"
 }
 
+$VerifiedPackages = @{}
 foreach ($package in $PublicPackages) {
     $projectPath = Join-Path $RepoRoot $package.Project
     $properties = Get-ProjectPackageProperties $projectPath
@@ -312,6 +363,10 @@ foreach ($package in $PublicPackages) {
     }
 
     $nupkg = Read-Nupkg $nupkgPath
+    $actualVersion = Get-NormalizedNuGetVersion $nupkg.Version
+    if ($nupkg.Id -ne $packageId -or $actualVersion -ne $normalizedVersion) {
+        throw "$nupkgPath has unexpected package identity '$($nupkg.Id) $($nupkg.Version)'; expected '$packageId $normalizedVersion'."
+    }
     $internalDependencies = @(
         $nupkg.Dependencies |
             Where-Object { $_.Id -eq "AdvUtils" -or $_.Id -like "TensorSharp.*" } |
@@ -319,6 +374,13 @@ foreach ($package in $PublicPackages) {
     )
 
     Assert-SameSet -PackageId $packageId -Actual $internalDependencies -Expected $package.TensorSharpDependencies
+
+    $VerifiedPackages[$packageId] = [pscustomobject] @{
+        Path = $nupkgPath
+        Id = $nupkg.Id
+        Version = $actualVersion
+        Dependencies = $nupkg.Dependencies
+    }
 
     foreach ($assemblyName in $package.EmbeddedAssemblies) {
         $assemblyEntry = $nupkg.Entries | Where-Object { $_ -like "lib/*/$assemblyName" } | Select-Object -First 1
@@ -330,4 +392,5 @@ foreach ($package in $PublicPackages) {
     Write-Host "Verified $packageId $packageVersion"
 }
 
+Assert-PackageClosure -PackagesById $VerifiedPackages
 Write-Host "Package verification succeeded. Output: $PackageOutput"

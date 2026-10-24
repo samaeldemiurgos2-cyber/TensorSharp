@@ -23,7 +23,6 @@ public sealed class CatalogTests
             "qwen-image-2.1-turbo-q5ks",
             "qwen-image-2.1-turbo-q8-0",
             "minimax-h3-fl2va-q4k",
-            "minimax-h3-ref2va-q4k",
             "ltx-2.5-distilled-q4kxl",
             "gemma-4-26b-a4b-qat-q4kxl",
             "gemma-4-31b-q4-0",
@@ -234,7 +233,6 @@ public sealed class CatalogTests
         "qwen-image-2.1-turbo-q5ks",
         "qwen-image-2.1-turbo-q8-0",
         "minimax-h3-fl2va-q4k",
-        "minimax-h3-ref2va-q4k",
     };
 
     [Fact]
@@ -263,7 +261,6 @@ public sealed class CatalogTests
     [InlineData("qwen-image-2.1-turbo-q5ks", 24)]
     [InlineData("qwen-image-2.1-turbo-q8-0", 32)]
     [InlineData("minimax-h3-fl2va-q4k", 32)]
-    [InlineData("minimax-h3-ref2va-q4k", 32)]
     [InlineData("qwen3.8-flash-next-q2kxl", 48)]
     [InlineData("qwen3.8-flash-next-iq1m", 32)]
     public void TheDesktopTiersHoldTheModelsNoPhoneCanRunWell(string id, int tier)
@@ -348,8 +345,7 @@ public sealed class CatalogTests
         // memory peaked at 20 GB with the decode (denoiser + video VAE) on top of the system's.
         // A photo (keyframe or reference) is what takes the footprint to its highest: the
         // video VAE's encoder converts its kernels to F32 in managed memory.
-        ["minimax-h3-fl2va-q4k"] = (18.22, 2.24, "chat-e2e.py's film and animate in the Mac app, 22 frames, 20 steps"),
-        ["minimax-h3-ref2va-q4k"] = (18.22, 2.23, "chat-e2e.py's reference in the Mac app, 22 frames, 20 steps"),
+        ["minimax-h3-fl2va-q4k"] = (18.22, 2.24, "chat-e2e.py's MiniMax-H3 video scenarios in the Mac app, 22 frames, 20 steps"),
         // Measured 2026-10-01 in the Debug Mac app: the files are what stays resident (the dense
         // half and the 15 layers' experts the engine keeps on the GPU); the rest is read from the
         // SSD (CatalogModel.WeightsPagedFromDiskBytes). The footprint is phys_footprint_peak over

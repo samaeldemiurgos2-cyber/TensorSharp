@@ -50,6 +50,12 @@ internal static class GgmlBackendTestInitializer
         if (Environment.GetEnvironmentVariable("TS_TEACHER_TOKEN_EXPORT") == "1")
             return;
 
+        // Muse Spark on a GGML GPU backend defaults to its native whole-model
+        // executor. The suite's Muse Spark component tests cover the managed
+        // per-op reference path; MuseSparkNativeExecutorTests opts back in.
+        if (Environment.GetEnvironmentVariable("TS_MUSE_SPARK_NATIVE") == null)
+            Environment.SetEnvironmentVariable("TS_MUSE_SPARK_NATIVE", "0");
+
         // Shared with TestGates.GgmlPinSkip, which skips tests that construct
         // a different GGML backend than the one pinned here.
         GgmlBackendType backend = TestGates.PinnedGgmlBackendType;

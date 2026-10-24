@@ -46,7 +46,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_KV_HOLDER_POOL_MAX` | 具有 per-request fused holder 的模型（Qwen 3.5/3.6/3.8、Gemma 4、GPT-OSS） | 已释放的 holder 最多可停放多少个以待复用而不是释放；每个停放的 holder 都占用其完整 K/V 分配 | `64` | 不适用 | 否 |
 | `TS_SCHED_DISABLE_BATCHED` | 全部 | `1` 让所有模型都走按序列 KV-swap 路径，投机解码也一样（`--no-continuous-batching`） | 关闭 | `0`, `1` | 是 |
 | `TS_SCHED_PREFIX_CACHE` | 全部自回归模型 | `0` 关闭准入时的全部提示复用（Radix 前缀缓存：页面、保留的终态与公共检查点在同一个索引里）。`--no-prefix-cache`（CLI 与服务端）会设置它，并同时跳过共享提示的启动预热，以及服务端的检查点文件 | 启用（`1`） | 未注册 | 否 |
-| `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | 全部 | 调度器预算：每步 token 数、同时运行的序列数、有 decode 在跑时的 prefill 分块（服务端 `--prefill-chunk-size`）、solo prefill 分块、块池块数、每块 token 数（只靠页面做跨请求复用的家族为 16，其余为 256）、decode 时间片。见[配置表](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#配置) | `4096` / `16` / `256` / `8192` / `256` / `16` 或 `256` / `256` | 未注册 | 否 |
+| `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | 全部 | 调度器预算：每步 token 数、同时运行的序列数、有 decode 在跑时的 prefill 分块（服务端 `--prefill-chunk-size`）、solo prefill 分块、块池块数、每块 token 数（只靠页面做跨请求复用的家族为 16，其余为 256）、decode 时间片。有自己单请求步长的模型——启用流水化 prefill 的 Muse Spark：8192——在未设置 `TS_SCHED_SOLO_PREFILL_CHUNK` 时自行决定步长；设置了该变量则按文档生效并关闭模型自己的步长，只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会关闭它。见[配置表](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#配置) | `4096` / `16` / `256` / `8192` / `256` / `16` 或 `256` / `256` | 未注册 | 否 |
 | `TS_SCHED_STOP_REPETITION` | 全部 | `0` 时陷入循环的生成会一直跑到 token 上限，而不是以 `repetition` 结束原因停止 | 启用（`1`） | 未注册 | 否 |
 
 本节的 executor 级开关（`TS_SCHED_DISABLE_BATCHED`、`TS_PER_SEQ_FUSED`、
@@ -217,7 +217,7 @@ Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `TS_SPEC` | Qwen 3.5/3.6/3.8、GLM 5.2、GLM-5.3、GLM-5.3-Flash（仅 n-gram）、Gemma 4、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、Muse-Glimmer（CLI + 服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
+| `TS_SPEC` | Qwen 3.5/3.6/3.8、GLM 5.2、GLM-5.3、GLM-5.3-Flash（仅 n-gram）、Gemma 4、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、Muse-Glimmer、Muse Spark（仅 n-gram，其原生 `--tp` 下不启用）（CLI + 服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
 | `TS_SPEC_TYPE` | 同上全部 | 投机算法：`auto` \| `draft-head` \| `block` \| `ngram` | `auto` | 未注册 | 否 |
 | `TS_SPEC_DRAFT` | 同上全部 | 每个投机步最多起草的 token 数（1-64） | `8` | 未注册 | 否 |
 | `TS_SPEC_PMIN` | 同上全部 | 草稿置信度门限；含义随算法而定 | 按算法（`0.15` / `0.35` / `0`） | 未注册 | 否 |
@@ -245,6 +245,23 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_SPEC_ADAPTIVE` | 投机解码（所有草稿器） | `0` 关闭成本调节器，于是起草不再与普通 baseline 做对比、也永远不会被暂停。用于 A/B 测量：调节器每一轮的 baseline 步骤都是普通 decode，它们并不免费 | 开 | 未注册 | 否 |
 | `TS_GGML_LOG_DEBUG` | GGML 后端 | `1` 把 ggml 的 DEBUG 日志通道透传出来而不是丢弃。它承载 CUDA 后端的 "CUDA graph warmup complete" / "reset" 这两行，而这是唯一能看出一张图是否真的被 CUDA graph 捕获的途径 | 关 | 未注册 | 否 |
 
+## 矩阵外的 Muse Spark 开关
+
+Muse Spark 原生整模型执行器的选择与容量规划由以下开关控制，均未在 `EnvVarMatrix.All`
+中注册。完整列表（包括逐算子路径的可选优化）见 [Muse Spark 卡片](models/muse-spark_zh-cn.md)。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描取值 | 默认是否扫描 |
+|---|---|---|---|---|---|
+| `TS_MUSE_SPARK_NATIVE` | Muse Spark | `0` 选择逐算子路径；`1` 让 `ggml_cpu` 也运行原生执行器。`ggml_cuda` 上的 `--tp N` 由原生执行器通过 ggml 的 meta 后端在前 N 张 CUDA GPU 上做张量并行（用 `CUDA_VISIBLE_DEVICES` 选择；`TENSORSHARP_TP_DEVICES` 会被拒绝）；`0` 保留逐算子 TP 路径，`ggml_vulkan` 上的 `--tp` 总是走该路径 | `ggml_cuda` / `ggml_vulkan` 上开启 | 未注册 | 否 |
+| `TS_MUSE_SPARK_CPU_MOE` | Muse Spark（原生） | `auto` 逐个放置专家栈，尽可能多地留在 GPU 上、让主机上的字节尽可能少；覆盖 `--n-cpu-moe`。原生 `--tp` 下所有专家都留在显存中 | 关闭 | 未注册 | 否 |
+| `TS_MUSE_SPARK_PLAN_SLOTS` | Muse Spark（原生） | 放置规划中预留的滑动窗口环数；设为并发数再加一（留给共享前缀检查点） | `1` | 未注册 | 否 |
+| `TS_MUSE_SPARK_UBATCH` | Muse Spark（原生） | prefill 微批行数；放不下的计算图会把该次调用拆成减半的微批 | `2048` | 未注册 | 否 |
+| `TS_MUSE_SPARK_DEV0_RESERVE_MB` | Muse Spark（原生） | 在 GPU 0 上额外预留的内存，例如给视觉编码器 | `0` | 未注册 | 否 |
+| `TS_MUSE_SPARK_HOST_NUMA` | Muse Spark（原生） | `0` 让主机专家保留在 GGUF 映射中，而不是复制到 NUMA 本地并由绑核工作线程计算 | 有两个及以上 NUMA 节点时开启 | 未注册 | 否 |
+| `TS_MUSE_SPARK_WARM_POOLS` | Muse Spark（原生，GPU） | `0` 跳过加载时的满尺寸 prefill；该 prefill 让 ggml-cuda 的内核 scratch 池在 slot 占用内存之前先长到峰值；启用流水化 prefill 时，加载还会跑一次短的流水化 prefill（`0` 同样跳过它），建好流水线的调度器并确认它能生效 | 有 GPU 时开启 | 未注册 | 否 |
+| `TS_MUSE_SPARK_PIPELINE` | Muse Spark（原生，按层切分） | 流水化 prefill：一次 prompt 调用被切成若干微批，GPU k 处理一个微批时 GPU k+1 处理前一个。未设置 = 自动（两张及以上 GPU、全部为 CUDA 系、没有主机专家、未设置 `TS_MUSE_SPARK_PROFILE`、不是 `--tp` 时开启）；`1` 强制开启（多 GPU 的非 CUDA 后端与 `--tp` 下会拒绝加载）；`0` 关闭；其他取值拒绝加载。加载日志会打印 `pipelined prefill: on (...)` 或 `off (原因)` | 自动 | 未注册 | 否 |
+| `TS_MUSE_SPARK_PIPELINE_UBATCH` | Muse Spark（原生，流水化 prefill） | 流水化 prefill 的固定微批行数，取值为 [1, `TS_MUSE_SPARK_UBATCH`] 内的整数，其他值拒绝加载。未设置 = 自适应：约为每次调用的四分之一，介于 512 行与 prefill ubatch 之间；长上下文的掩码超出暂存预算时会更小（最少 128 行） | 自适应 | 未注册 | 否 |
+
 ## 矩阵外的 DeepSeek V4 / V4.1 开关
 
 这些变量配置 DeepSeek 的整模型执行器。V4 有三套（Direct CUDA、原生 ggml、纯 C#）；
@@ -260,7 +277,7 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TS_DSV4_PERF` | V4 与 V4.1 | `1` 打印分阶段耗时 | 关 | 否 |
 | `TS_DSV4_VRAM_RESERVE_MB` / `TS_DSV4_GRAPH_CACHE` / `TS_DSV4_LOAD_THREADS` / `TS_DSV4_LOAD_CHUNK_MB` / `TS_DSV4_MOE_MMAP` | V4 与 V4.1 | 放置余量、计算图缓存深度、权重加载并行度，以及驻留主机的专家是否直接在 GGUF 映射上就地相乘 | 见各卡片 | 否 |
 | `TS_DSV41_RETAINED_CACHE_MB` | V4.1，原生执行器 | 为已结束会话的下一轮保留原生槽位的预算（保留始终开启，只在加载了 DSpark 草稿器时不生效）；不是正数的值保持默认 | `2048` | 否 |
-| `TS_DSV41_TP_HOST_TOKENS` | V4.1 CUDA routed-MoE TP | `0`–`4096` 的整数：不超过此 token 数的批次使用精确 pinned 主机激活拼接，更大批次使用可用的私有 F32 NCCL。`0` 强制使用可用的设备拼接。自动阈值仅在 NCCL 选择 `NCCL_P2P_DISABLE=1` 时取 `16`，依据六张 A40 的配对实测；其他配置取 `0`。`TS_GGML_TP_F32_NCCL=0` 仍使全部批次回退到主机。 | 自动 | 否 |
+| `TS_DSV41_TP_HOST_TOKENS` | V4.1 CUDA routed-MoE TP，仅主机驱动节点（`TS_DSV4_FUSED=0`） | 默认的 `--tp` 路径在融合 CUDA 后端上把每次 rank 交换都经 pinned 内存放在各 GPU 自己的队列上完成，不读取此变量。主机驱动节点上：`0`–`4096` 的整数：不超过此 token 数的批次使用精确 pinned 主机激活拼接，更大批次使用可用的私有 F32 NCCL。`0` 强制使用可用的设备拼接。自动阈值仅在 NCCL 选择 `NCCL_P2P_DISABLE=1` 时取 `16`，依据六张 A40 的配对实测；其他配置取 `0`。`TS_GGML_TP_F32_NCCL=0` 仍使全部批次回退到主机。 | 自动 | 否 |
 | `TS_DSV41_ENGRAM_DEVICE` | V4.1 | `1` 要求 Engram 表驻留 GPU，放不下就失败；`0` 强制主机映射，需要与 CPU oracle 逐位一致时也用它。不设置则自动且保守：只要不会因此逼出路由专家的 CPU 卸载，就放在 GPU 上 | 自动（放得下就驻留 GPU） | 否 |
 | `TS_DSV41_ENGRAM_WARM` | V4.1，仅主机映射 | 读入 Engram 表页，使查表变成一次内存读取而不是一次存储往返。未设置时在模型开始服务后于**后台**预热（默认）；`1` 与此前一致在加载期间同步预热；`0` 从不预热。八卡 A40、Q4_K_M 上 prefill 从 200–252 提升到 452–492 tok/s，decode 从 23–26 提升到 31–33 tok/s；在默认的 GPU 驻留路径上无意义。代价是表本身的主机页缓存（Q2_K 60 GiB，Q4_K_M 103 GiB）以及读表的时间：七卡 A40 通道上同步形式用旧的逐页遍历读 103 GiB 花了 311.3 s；`pread` 预热（`TS_DSV4_WARM_PREAD`）在该存储上实测 2.24–2.54 GiB/s，即约 41–46 s 的读取 | 后台预热 | 否 |
 | `TS_DSV4_GRAPH_CACHE_HEADROOM_MB` | V4 与 V4.1 | 图缓存必须为下一张图留出的设备内存，叠加在它持有的最大条目之上。会逐个释放最久未使用的条目直到满足。`0` 回到纯条目数上限，而四个并发的 10.8k token prefill 曾因此耗尽显存 | `1024` | 否 |
@@ -270,8 +287,11 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TS_DSV4_WARM_PREAD` | V4 与 V4.1 主机映射；V4.1 TP 路由权重加载 | 控制主机专家预取（`--n-cpu-moe`）、同步/后台 Engram 预热，以及 V4.1 TP 在上传 GPU 前对当前层路由 gate/up/down 源权重的预读。未设置或 `1` 使用有界并行 `pread`，线程数由 `TS_DSV4_LOAD_THREADS` 决定；跳过 `mincore` 报告已驻留的区间，读取错误包含分片与偏移。TP 在打开当前层的源映射后仅预读该层，不预读整个检查点，也不通过此路径预热 Engram 表。`0` 关闭 TP 源预读，并恢复既有主机专家/Engram 逐页触碰遍历（预取为 256 MiB 段，Engram 为 8 MiB 块）。历史七卡 A40 的 8 GiB 区间测试中，`pread` 为 2.24–2.54 GiB/s，逐页遍历为 0.62–0.74 GiB/s；这不是 TP 模型加载提速的测量，也不保证冷存储性能 | 开 | 否 |
 | `TS_DSV4_LOAD_DROP_CACHE` | V4 与 V4.1 的普通逐层上传 | 每个权重分块上传到设备后是否释放它的页缓存。V4.1 的专用 TP 路由专家上传路径不使用此设置，已上传的源数据页仍保留在可回收的文件缓存中。未设置时自动判断：当上传字节数加上主机映射的权重（专家、Engram 表）再加 8 GiB 超过主机额度（cgroup 上限）时释放，否则保留，额度未知时也保留，因此纯 GPU 驻留的检查点重新加载时仍是热的；加载时会打印这一判断及三个数值。`1` 总是释放，`0` 从不释放（此前的默认）。七卡 A40 通道（上传 263.0 GiB + 映射 151.2 GiB，对比 326.9 GiB）会释放。在 MooseFS 挂载上释放每个已驻留的 64 MiB 分块耗时 5.9–7.3 ms，也无法让上传本身变快；预期收益在其后的预取与 Engram 预热上 | 自动 | 否 |
 | `TS_DSV41_REWIND_CHECKPOINT` | V4.1，原生执行器 | `0` 去掉逐槽位的回退检查点（在每个 prompt 边界对原始滑动窗口环与压缩器状态环做的影子拷贝）。没有它，部分 KV 复用最多只能回退到活动环还覆盖的位置——发布的 checkpoint 上是 385 个位置——多轮思考对话因此会重新 prefill。每个序列槽位约占 21 MiB 显存 | 开 | 否 |
-| `TS_DSV41_SPARSE_FA` | V4.1 | 稀疏 prefill attention。在自有 F32 CUDA 路径上**默认开启**，作用于超过 8 个 query、至少 8,192 个 key 的调用：每个 query 只关注它的滑动窗口加索引器选中的行（最多 640 个 key），而不是全部 key。A40 上 512 个 query × 33,536 个 key 实测 34 ms，分块（tiled）为 1,548 ms，二者与 F32 参考的偏差都在 1.5e-7 以内；decode、DSpark verify 与更短的提示词保持稠密内核、逐位不变。`0` 恢复分块 prefill。`1` 另外让 ggml flash attention 路径（非 CUDA GPU、CPU 后端）在单个 query 或至少 16,384 个 key 时使用其掩码压缩内核，该内核有已记录的 F16 差异 | 自有 CUDA 路径默认开；ggml flash attention 默认关 | 否 |
+| `TS_DSV41_SPARSE_FA` | V4.1 | 稀疏 prefill attention。在自有 F32 CUDA 路径上**默认开启**，作用于超过 8 个 query、至少 2,048 个 key 的调用：每个 query 只关注它的滑动窗口加索引器选中的行（最多 640 个 key），而不是全部 key。CUDA 用 MQA 内核执行这类调用，每个 key 分块只加载一次、供四个头共用：A40 上 1,024 个 query 恒为 16.1–16.3 ms，而分块（tiled）在 2,560 个 key 时为 22.5 ms、6,656 个 key 时为 63.8 ms（512 × 8,960：8.0 ms，分块 108 ms），与 F32 参考的相对 L2 偏差在 5.3e-7 以内；decode、DSpark verify 与低于阈值的提示词保持稠密内核、逐位不变。`0` 恢复分块 prefill。`1` 另外让 ggml flash attention 路径（非 CUDA GPU、CPU 后端）在单个 query 或至少 16,384 个 key 时使用其掩码压缩内核，该内核有已记录的 F16 差异 | 自有 CUDA 路径默认开；ggml flash attention 默认关 | 否 |
 | `TS_DSV41_COMPACT_RAW_GATHER` | V4.1 | `1` 为原始滑动窗口选择紧凑 gather。同样需显式开启，同样有浮点差异 | 关 | 否 |
+| `TS_DSV41_MQA_DECODE` | V4.1 自有 F32 CUDA attention | V4.1 的 64 个头共用一个宽 512 的 F16 K=V 头，因此 CUDA 用 MQA 内核执行这类 attention：一个 block 每个 key 分块只加载一次、供四个头共用，可见 key 分到四个流上处理，被掩码的 key 根本不加载。decode 级调用（1–8 个 query）与压缩 prefill 都使用它，全程 F32，跨调用宽度仍逐位一致。A40 上一层 decode 实测 171 -> 42 us（稀疏 prefill 512 × 8,960 个 key：34.4 -> 8.0 ms）。`0` 恢复逐头内核，用于 A/B 与诊断 | 开 | 否 |
+| `TS_DSV41_KV_MIRRORS` | V4.1 多 GPU（层切分，以及 attention 仍按层放置的 `--tp`） | 在每个读取共享压缩 / 索引器 cache 的 GPU 上各保留一份副本（每步只复制源层新写入的行），使层读取本 GPU 的副本，而不是经主机把选中的行或整个可见 cache 跨 PCIe 拉过来。两种方式 logits 逐位相同；5x A40 上 2K 上下文的 decode 从 32.6 提到 34.5 tok/s。无法分配的副本会被跳过并给出警告。`0` 跨 GPU 读取 | 开（多 GPU） | 否 |
+| `TS_DSV41_YOCO_KEEP` | V4.1 prefill（ggml 执行器：ggml_cuda、ggml_cpu） | 有界重放，参照 DeepInfer 的 YOCO prefill 截断。**默认开启**，取 DeepInfer 的 140。从第一个 ratio 为 1 的层（40 层中的第 20 层）起，每一层读取的都是第 20 层由其 attention 输入写入的压缩 cache，因此一次多 token 调用只让这些层处理最后 N 个位置，每个重放位置的滑动窗口被截到重放范围之内，所以 prefill 是**近似**的：`0` 让每一层处理每个位置；其他值至少为滑动窗口 + 8（136）。decode 步、DSpark 验证、含图像 token 的调用与单 token 的 prefill 微批始终让每一层处理每个位置（`TS_DSV4_UBATCH=1` 时默认值提示重放不生效，显式设值则拒绝加载）。滑动窗口宽于 132 的检查点默认至少保留窗口 + 8。回退到一次长调用被跳过的位置（比其末尾早 13 个 token 以上，且在其起点之后）会重新 prefill 而不是复用 cache，并记录一行日志。服务端按每次 prefill 调用（即长提示的每个分块，最多 4,096 个 token，并发时更少）分别应用。布局无法重放的检查点（第 20 层之后自带压缩 cache 的层、位于第 20 层或更深层的 Engram 表、索引器候选源早于第 20 层、DSpark 草稿器读取第 20 层或更早的层）在默认值下以一条提示改走精确 prefill，显式设值则拒绝加载。`--backend cuda` 与 `--backend cpu` 未实现它：各提示一次，并拒绝显式的非零值。5x A40（UD-IQ2_XXS，随机 token）上取 140：`--layer-split 5` 时 2,048 个 token 的 prefill 由 463.5 提到 844.3 tok/s，8,192 个 token 由 444.3 提到 906.2；`--tp 5` 时分别由 562.9 提到 1,046.7、由 540.8 提到 1,082.7。wikitext-2 4,608 token 窗口（prefill 2,304 个，其余逐 token 打分，10 段）：PPL 2.4820 -> 2.4970（+0.6%），相对 llama.cpp 的平均 KLD 0.0160 -> 0.0172，集中在提示之后最先生成的 token 上（前 128 个为 0.026，精确 prefill 为 0.015） | `140`（开） | 否 |
 | `TS_DSV41_ALLOW_NON_CUDA_GPU` | V4.1 | `1` 允许 `ggml_vulkan` / `ggml_metal`：普通计算图跑在 GPU 上，只有架构专属算子回退到 CPU 后端，每次都要一次主机往返。之所以需要显式开启，是因为它解除的那道拒绝原本挡住的是*静默*回退 | 关 | 否 |
 | `TS_DSV41_VISION_FA` / `TS_DSV41_VISION_BF16_GEMM` | V4.1 视觉伴随文件 | `TS_DSV41_VISION_FA=1` 让图像编码器使用 F16 中间量的 flash attention（真实图像上的特征差异更大）；`TS_DSV41_VISION_BF16_GEMM=0` 选择诊断用的 F32 提升矩阵路径 | 稠密 F32 注意力，BF16 GEMM + F32 累加 | 否 |
 | `TS_DSV41_TRACE_DIR` / `TS_DSV41_VISION_TRACE_DIR` | V4.1（诊断） | 文本计算图与视觉编码器的张量转储目录。两者都会保留中间张量并增加设备传输——跑基准时保持不设置 | 未设置 | 否 |
@@ -315,7 +335,7 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TENSORSHARP_TP_DEGREE` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 把模型切分到本机多少张 GPU（Megatron-LM 列/行并行） | `1`（单 GPU） | 未注册 | 否 |
 | `TENSORSHARP_LAYER_SPLIT_DEGREE` | 支持按层切分的架构 | 本地整层放置的 GPU 数，等价于 `--layer-split N`；与 TP 参数互斥 | `1` | 未注册 | 否 |
 | `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next 的共享 GGML 按层执行器 | 逗号分隔的设备序号，例如 `0,2`；独立于 `TENSORSHARP_TP_DEVICES`；原生 GLM/DeepSeek 使用 `CUDA_VISIBLE_DEVICES` | `0..N-1` | 未注册 | 否 |
-| `TENSORSHARP_TP_DEVICES` | GGML 后端上的本地 TP | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`） | `0..tp-1` | 未注册 | 否 |
+| `TENSORSHARP_TP_DEVICES` | GGML 后端上的本地 TP | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`）。Muse Spark 的原生 `--tp` 使用前 N 张 CUDA GPU，设置了该变量时拒绝加载；那里请用 `CUDA_VISIBLE_DEVICES` | `0..tp-1` | 未注册 | 否 |
 | `TENSORSHARP_TP_NODE_ID` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 多节点分布式 TP 中本节点的 0 起始编号；必须与 `TENSORSHARP_TP_PEERS` 一起设置 | 未设置（关闭） | 未注册 | 否 |
 | `TENSORSHARP_TP_PEERS` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔）；必须与 `TENSORSHARP_TP_NODE_ID` 一起设置 | 未设置（关闭） | 未注册 | 否 |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 仅分布式 TP | 各节点向 peer 重试连接多久后放弃 | `120` 秒 | 未注册 | 否 |

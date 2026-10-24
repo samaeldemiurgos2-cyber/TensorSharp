@@ -98,6 +98,46 @@ __global__ void vector_f32(const char * weights, const char * input, float * out
         if (lane == 0) output[index] = sum;
     }
 }
+// Narrow decode projections leave vector_f32 on a few SMs: V4.1's
+// hyper-connection mixes are 24 outputs over 20,480 inputs, 24 warps in all.
+// Here a whole block reduces one output in a fixed order (thread pairs, then
+// warps, then the warp sums in order): 256 threads, or 1,024 from 8,192 inputs
+// so the 24 mixes keep 32 warps each. Both the kernel and its block size are
+// chosen by the inner size alone, so a column still reduces identically at
+// every launch width.
+constexpr int64_t VECTOR_SPLIT_MIN_INNER = 2048, VECTOR_SPLIT_WIDE_INNER = 8192;
+
+template <int THREADS>
+__global__ __launch_bounds__(THREADS) void vector_split_f32(const char * weights, const char * input, float * output,
+        tensor_layout a, tensor_layout b, int type, int64_t count) {
+    constexpr int WARPS = THREADS / 32;
+    __shared__ float partial[WARPS];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    for (int64_t index = blockIdx.x; index < count; index += gridDim.x) {
+        int64_t rest = index;
+        const int64_t row = rest % a.ne[1]; rest /= a.ne[1];
+        const int64_t column = rest % b.ne[1]; rest /= b.ne[1];
+        const int64_t i2 = rest % b.ne[2], i3 = rest / b.ne[2];
+        const char * aw = weights + row * a.nb[1] + (i2 / (b.ne[2] / a.ne[2])) * a.nb[2]
+            + (i3 / (b.ne[3] / a.ne[3])) * a.nb[3];
+        const char * bx = input + column * b.nb[1] + i2 * b.nb[2] + i3 * b.nb[3];
+        float sum = 0;
+        for (int64_t k = 2 * tid; k < a.ne[0]; k += 2 * THREADS) {
+            sum = fmaf(load(aw + k * a.nb[0], type), load(bx + k * b.nb[0], GGML_TYPE_F32), sum);
+            if (k + 1 < a.ne[0])
+                sum = fmaf(load(aw + (k + 1) * a.nb[0], type), load(bx + (k + 1) * b.nb[0], GGML_TYPE_F32), sum);
+        }
+        for (int shift = 16; shift > 0; shift /= 2) sum += __shfl_down_sync(0xffffffff, sum, shift);
+        if (lane == 0) partial[warp] = sum;
+        __syncthreads();
+        if (tid == 0) {
+            float total = partial[0];
+            for (int w = 1; w < WARPS; ++w) total += partial[w];
+            output[index] = total;
+        }
+        __syncthreads();
+    }
+}
 } // namespace
 
 struct tsg_matmul_cuda_state {
@@ -110,6 +150,14 @@ struct tsg_matmul_cuda_state {
 
 namespace {
 void reserve_scratch(tsg_matmul_cuda_state * state, size_t needed, const ggml_tensor * node) {
+#if defined(TSG_GGML_TEST_HOOKS)
+    // Fail every reservation on one CUDA device ("all": every device), grown
+    // or not, so a test can target one rank whatever its scratch need does.
+    if (const char * fault = std::getenv("TS_TP_TEST_FAIL_SCRATCH_DEVICE"))
+        if (std::strcmp(fault, "all") == 0 || (fault[0] && std::atoi(fault) == state->device))
+            throw std::runtime_error("Injected TensorSharp CUDA matmul scratch failure on device " +
+                                     std::to_string(state->device));
+#endif
     if (needed <= state->capacity) return;
     // Fused nodes run between captured graph views. Scratch belongs to this
     // TensorSharp backend and persists across nodes; no ggml private pool or
@@ -330,6 +378,17 @@ void tsg_matmul_cuda_compute(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     // the single-token decode it stands in for (see the policy header).
     if (b->ne[1] <= TSG_PRECISION_DECODE_COLUMNS) {
         const int64_t count = ggml_nelements(dst);
+        if (a->ne[0] >= VECTOR_SPLIT_MIN_INNER) {
+            const unsigned blocks = unsigned(std::min<int64_t>(count, 65535));
+            if (a->ne[0] >= VECTOR_SPLIT_WIDE_INNER)
+                vector_split_f32<1024><<<blocks, 1024, 0, state->stream>>>(static_cast<const char *>(a->data),
+                    static_cast<const char *>(b->data), static_cast<float *>(dst->data), layout(a), layout(b), a->type, count);
+            else
+                vector_split_f32<256><<<blocks, 256, 0, state->stream>>>(static_cast<const char *>(a->data),
+                    static_cast<const char *>(b->data), static_cast<float *>(dst->data), layout(a), layout(b), a->type, count);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         const unsigned blocks = unsigned(std::min<int64_t>((count + 3) / 4, 65535));
         vector_f32<<<blocks, 128, 0, state->stream>>>(static_cast<const char *>(a->data),
             static_cast<const char *>(b->data), static_cast<float *>(dst->data),

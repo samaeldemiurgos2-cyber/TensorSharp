@@ -110,9 +110,16 @@ jobs:
       TENSORSHARP_GGML_NO_UPDATE: "1"
       # Pin the native macOS deployment floor, rather than the runner's OS.
       MACOSX_DEPLOYMENT_TARGET: "14.0"
-    # The CUDA ggml build (multiple SASS targets + PTX) and the macOS MLX build
-    # (builds mlx-c from source) are minutes-long; give them headroom.
-    timeout-minutes: 120
+      # Reuse compiler outputs across Windows CUDA releases/retries. sccache
+      # hashes the compiler, source, headers and flags (including architectures);
+      # ggml's existing GGML_CCACHE integration also wraps our GgmlOps sources.
+      # Uses the job's Actions cache token, with no additional credentials.
+      SCCACHE_GHA_ENABLED: ${{ matrix.name == 'win-x64-cuda' && 'true' || 'false' }}
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+    # A cold Windows CUDA publish takes ~90-100 minutes before desktop packaging
+    # and uploads. The old 120-minute limit repeatedly canceled valid builds
+    # near the end; allow a cold cache/toolchain update without restarting them.
+    timeout-minutes: ${{ matrix.name == 'win-x64-cuda' && 180 || 120 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -301,6 +308,14 @@ jobs:
           # also sets VCToolsInstallDir, which the TensorSharp.Backends.Cuda
           # PTX compile uses to point nvcc at the right cl.exe.
           toolset: "14.44"
+
+      - name: Set up Windows CUDA compiler cache
+        if: ${{ runner.os == 'Windows' && matrix.cuda }}
+        # Cache provisioning is an optimization; a miss/outage can build cold.
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+        with:
+          version: "v0.18.0"
 
       - uses: actions/setup-python@v5
         with:

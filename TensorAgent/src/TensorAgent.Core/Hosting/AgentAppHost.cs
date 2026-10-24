@@ -112,6 +112,15 @@ public sealed class AgentAppHost : IDisposable
             paths.SettingsFile,
             paths.DeviceClass == DeviceClass.Desktop ? AppSettings.DesktopDefaults : null);
         AppSettings settings = Settings.Load();
+        // Ref2VA used to be a separate selectable catalog row. Keep that choice when
+        // upgrading by loading the unified entry, which now carries both denoisers.
+        if (settings.SelectedModelId is { Length: > 0 } oldModelId
+            && ModelCatalog.Successors.TryGetValue(oldModelId, out string? successorId)
+            && ModelCatalog.Find(successorId) is not null)
+        {
+            settings.SelectedModelId = successorId;
+            Settings.Save(settings);
+        }
         // First, so every string built from here on -- the host's own messages, then the
         // native screens and the page -- is in the language the user gets.
         Localization.Loc.Apply(settings);
@@ -294,7 +303,7 @@ public sealed class AgentAppHost : IDisposable
         if (settings.SelectedModelId is { Length: > 0 } startupId && ModelCatalog.Find(startupId) is { IsAvailable: true } startupModel)
             Options.RepointSamplingDefaults(SamplingDefaultsFor(startupModel));
 
-        // A diffusion entry is four files, not one: the DiT plus the companions the
+        // A diffusion entry can have several files, not just its main weights: the DiT plus the companions the
         // pipeline otherwise finds only by scanning next to the weights. Publishing them
         // here — before anything can ask for a load — is what makes the catalog's file
         // list the whole story rather than a naming convention. See DiffusionCompanions.
@@ -323,6 +332,14 @@ public sealed class AgentAppHost : IDisposable
             {
                 ImageTurns.Preparation p = forClip ? PrepareVideoTurn() : PlanClipLoras();
                 return p.Error is null ? p.Specs : throw new InvalidOperationException(p.Error);
+            },
+            ensureLtxIngredients: ltx =>
+            {
+                CatalogModel? model = LoadedCatalogModel();
+                if (!ReferenceEquals(ModelService.Model, ltx) || model?.Family != CatalogFamily.Ltx25)
+                    return;
+                if (Models.CompanionPath(model, CatalogFileRole.IngredientsLora) is { } path)
+                    _ = ltx.TryLoadIngredientsAdapter(path);
             }), TensorSharp.Chat.Studio.StudioHostOptions.Create(Options.UploadMaxFileBytes,
                 diagnostic => _loggerFactory.CreateLogger("TensorAgent.Studio").LogError("{Diagnostic}", diagnostic)));
         Chat.Studio = Studio;

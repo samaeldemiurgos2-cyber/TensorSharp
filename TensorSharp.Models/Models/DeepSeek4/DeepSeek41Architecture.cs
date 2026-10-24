@@ -72,7 +72,7 @@ namespace TensorSharp.Models
             if (draft != null)
             {
                 using var file = GgufFile.OpenWithoutSiblingShards(draft);
-                ValidateDsparkArchitecture(file.GetString("general.architecture"));
+                ValidateDsparkDraft(file.GetString("general.architecture"), file.Metadata.ContainsKey);
             }
 
             // Routed-MoE TP shards expert dimensions across GPUs, so the native
@@ -99,6 +99,21 @@ namespace TensorSharp.Models
                     ? "TS_DSV41_ENGRAM_DEVICE=1 needs a GPU to place the Engram tables on and cannot be combined " +
                       $"with --backend {name}, where they are always host mappings. Unset it or run on ggml_cuda."
                     : "TS_DSV41_ENGRAM_DEVICE must be 0 or 1 (unset selects automatically).");
+            }
+
+            // YOCO bounded replay (TS_DSV41_YOCO_KEEP, on by default) lives in
+            // the native ggml executor. The direct-CUDA engine and the pure C#
+            // executor run every layer over every position, so an explicit
+            // non-zero value would be accepted and then ignored there. `=0`
+            // asks for what those paths already do, so it is allowed.
+            if ((backend == BackendType.Cuda || backend == BackendType.Cpu) &&
+                Environment.GetEnvironmentVariable(YocoKeepVariable) is string yocoKeep && yocoKeep != "0")
+            {
+                string name = backend == BackendType.Cuda ? "cuda" : "cpu";
+                throw new NotSupportedException(
+                    $"{YocoKeepVariable}={yocoKeep}: YOCO bounded replay is implemented by the ggml executor " +
+                    $"(--backend ggml_cuda or ggml_cpu), not by --backend {name}, which runs every layer over every " +
+                    $"position. Unset it, set it to 0, or run on ggml_cuda.");
             }
 
 
@@ -134,6 +149,24 @@ namespace TensorSharp.Models
             _ => null,
         };
 
+        /// <summary>The native executor's switch for YOCO bounded replay
+        /// (dsv41_yoco.h): unset is on with DeepInfer's 140, 0 is off.</summary>
+        internal const string YocoKeepVariable = "TS_DSV41_YOCO_KEEP";
+
+        /// <summary>
+        /// Null unless the run uses an executor without YOCO bounded replay while
+        /// the setting is at its default, in which case the operator gets told
+        /// that this backend's prefill is the exact one. Emitted once per load by
+        /// the DeepSeek4Model constructor, like <see cref="DescribeCpuBackendChoice"/>.
+        /// </summary>
+        internal static string DescribeYocoAbsence(BackendType backend) =>
+            (backend == BackendType.Cuda || backend == BackendType.Cpu) &&
+            Environment.GetEnvironmentVariable(YocoKeepVariable) == null
+                ? $"[dsv41] --backend {(backend == BackendType.Cuda ? "cuda" : "cpu")}: every layer prefills every " +
+                  "position. YOCO bounded replay, on by default on ggml_cuda and ggml_cpu, is not implemented here, " +
+                  "so this backend's prefill logits are the exact ones and can differ slightly from ggml_cuda's."
+                : null;
+
         /// <summary>The routed-MoE tensor-parallel rank count the native loader is
         /// given: <c>--tp</c>'s degree, or 0 (layer placement) without one.</summary>
         internal static int ResolveTensorParallelRanks(int tpDegree)
@@ -148,7 +181,23 @@ namespace TensorSharp.Models
         {
             if (!string.Equals(architecture, "deepseek41-dspark", StringComparison.Ordinal))
                 throw new NotSupportedException(
-                    "DeepSeek V4.1 DSpark requires a deepseek41-dspark artifact; V4 and other draft architectures are incompatible.");
+                    "DeepSeek V4.1 DSpark requires a deepseek41-dspark artifact or llama.cpp's DeepSeek V4.1 dflash " +
+                    "export; V4 and other draft architectures are incompatible.");
+        }
+
+        /// <summary>
+        /// llama.cpp's DSpark export (Unsloth's DeepSeek-V4.1-Flash-1017 drafters) is a
+        /// <c>dflash</c> GGUF. Other families' block-diffusion drafters share that name,
+        /// so accept one only when it carries V4.1's hyper-connections and grouped
+        /// output projection; the native loader then checks its geometry and tensors
+        /// against the target.
+        /// </summary>
+        internal static void ValidateDsparkDraft(string architecture, Func<string, bool> hasKey)
+        {
+            if (string.Equals(architecture, "dflash", StringComparison.Ordinal) &&
+                hasKey("dflash.hyper_connection.count") && hasKey("dflash.attention.output_group_count"))
+                return;
+            ValidateDsparkArchitecture(architecture);
         }
 
         /// <summary>The <c>--layer-split N</c> placement line.</summary>

@@ -142,7 +142,8 @@ def main():
     settings = dict(CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7", TS_DSV4_FA="1",
                     TS_DSV4_FUSED="1", TS_DSV4_GATHER="1", TS_DSV41_SPARSE_FA="0",
                     TS_DSV41_COMPACT_RAW_GATHER="0", TS_CPU_MOE_THREADS="24",
-                    TS_DSV41_ENGRAM_THREADS="16", TS_DSV41_ENGRAM_WARM="0")
+                    TS_DSV41_ENGRAM_THREADS="16", TS_DSV41_ENGRAM_WARM="0",
+                    TS_DSV41_YOCO_KEEP="0")
     environment.update(settings)
     output.mkdir(parents=True)
     report_path = output / "smoke.json"

@@ -3,7 +3,8 @@ namespace TensorSharp.Studio;
 
 /// <summary>What a request's images MEAN. The same picture is the animated first frame
 /// in i2v, the pinned last frame (optionally with a pinned first frame) in fl2v, a timed
-/// guide in keyframes, and an identity/appearance reference for a new scene in ref. Each
+/// guide in keyframes, and an identity/appearance reference for a new scene in ref. Still
+/// images and full clips can both be references when the checkpoint supports them. Each
 /// mode accepts exactly its own inputs, so Studio never reinterprets an image the user
 /// placed for another purpose.
 /// <para>First and last frames are each optional, as on MiniMax-H3's FL2VA checkpoint
@@ -45,8 +46,8 @@ public static class StudioGenerationModes
     /// <summary>The mode a request without an explicit one implies. Requests saved before
     /// modes were explicit carry only their inputs; this matches how they ran then.</summary>
     public static string Infer(StudioGenerationRequest request) =>
-        request.ReferenceAssetIds.Count > 0 ? Reference
-        : request.TemporalConditions.Count > 0 ? Keyframes
+        (request.ReferenceAssetIds?.Count ?? 0) > 0 || (request.ReferenceVideoAssetIds?.Count ?? 0) > 0 ? Reference
+        : (request.TemporalConditions?.Count ?? 0) > 0 ? Keyframes
         : request.EndConditioningAssetId != null ? FirstLastFrame
         : request.ConditioningAssetId != null ? ImageToVideo
         : TextToVideo;
@@ -57,6 +58,8 @@ public static class StudioGenerationModes
     public static string Resolve(StudioGenerationRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        if (request.TemporalConditions == null || request.ReferenceAssetIds == null || request.ReferenceVideoAssetIds == null)
+            throw new StudioException("invalid_mode_inputs", "Conditioning and reference collections cannot be null.");
         if (request.Mode != null)
         {
             request.Mode = request.Mode.Trim().ToLowerInvariant();
@@ -65,11 +68,11 @@ public static class StudioGenerationModes
         }
         string mode = request.Mode ?? Infer(request);
         bool first = request.ConditioningAssetId != null, last = request.EndConditioningAssetId != null;
-        int guides = request.TemporalConditions.Count, references = request.ReferenceAssetIds.Count;
+        int guides = request.TemporalConditions.Count, references = request.ReferenceAssetIds.Count + request.ReferenceVideoAssetIds.Count;
         string? error = mode switch
         {
             TextToVideo when first || last || guides > 0 || references > 0 =>
-                "Text-to-video (t2v) takes no images. Choose i2v, fl2v, keyframes or ref to use them.",
+                "Text-to-video (t2v) takes no conditioning media. Choose i2v, fl2v, keyframes or ref to use it.",
             ImageToVideo when !first => "Image-to-video (i2v) needs a first-frame image to animate.",
             ImageToVideo when last || guides > 0 || references > 0 =>
                 "Image-to-video (i2v) uses only a first-frame image. Choose fl2v to pin the last frame, or ref for identity references " +
@@ -79,14 +82,16 @@ public static class StudioGenerationModes
                 "First-and-last-frame (fl2v) pins only the first and last frames. Choose keyframes for timed guides, or ref for identity references.",
             Keyframes when guides == 0 => "Keyframes mode needs at least one timed image guide.",
             Keyframes when references > 0 => "Identity references cannot be combined with temporal image guidance.",
-            Reference when references == 0 => "Reference mode (ref) needs at least one identity/appearance reference image.",
+            Reference when references == 0 => "Reference mode (ref) needs at least one identity/appearance reference image or video.",
             Reference when last || guides > 0 =>
-                "Reference images are not frames: ref mode can start on a first frame, but cannot also pin a last or timed frame.",
+                "Reference media are not frames: ref mode can start on a first frame, but cannot also pin a last or timed frame.",
             _ => null,
         };
         if (error != null) throw new StudioException("invalid_mode_inputs", error);
-        if (request.ReferenceAssetIds.Distinct(StringComparer.Ordinal).Count() != references)
+        if (request.ReferenceAssetIds.Distinct(StringComparer.Ordinal).Count() != request.ReferenceAssetIds.Count)
             throw new StudioException("invalid_mode_inputs", "Each reference image can be selected once.");
+        if (request.ReferenceVideoAssetIds.Distinct(StringComparer.Ordinal).Count() != request.ReferenceVideoAssetIds.Count)
+            throw new StudioException("invalid_mode_inputs", "Each reference video can be selected once.");
         return mode;
     }
 }

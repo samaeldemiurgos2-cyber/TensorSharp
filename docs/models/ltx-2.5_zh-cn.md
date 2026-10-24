@@ -4,7 +4,8 @@
 
 TensorSharp 原生实现 LTX 2.5 Distilled 的文生视频、图像条件视频及联合生成的
 **48 kHz 立体声音频**。TensorAgent 的实验条目为
-**LTX 2.5 Distilled — UD-Q4_K_XL + BF16**，Download 下载五个固定文件，Use 激活模型。
+**LTX 2.5 Distilled — UD-Q4_K_XL + BF16**，Download 下载五个固定基础文件，Use 激活模型。
+可选 Ingredients IC-LoRA 可启用身份/外观参考；TensorAgent 默认会一并下载可选文件。
 48 GB 目录档位是保守起点，并非已证明的最低要求或任意分辨率/时长保证。
 
 ## 文件与启动
@@ -15,6 +16,12 @@ UD-Q4_K_XL 去噪器、带投影的专用 Gemma 4 编码器、卷积视频 VAE�
 音频 VAE。全部来自无访问限制的 [Unsloth 仓库](https://huggingface.co/unsloth/LTX-2.5-GGUF)，
 固定修订为 `ac3c540c6025903784336e99b2dc179385c4c3b7`，无需 Hugging Face 账号。
 伴随文件与 Lightricks 原文件逐字节相同，配置还保留受限的官方地址作为备用。
+
+配置还声明可选的 Ingredients IC-LoRA，保存到 `${ltxRoot}/loras/`，固定于 Lightricks
+修订 `12040e4091ac2008d3906a594e31a7fb1ab9d546`（1,308,787,472 字节，SHA-256
+`ff873a5beada3c579a8137c7c53343916f78bcc9a529ba910143073fe8715e95`）。该仓库受限，需先接受
+LTX-2.x 条款并设置 `HF_TOKEN` 或 Hugging Face token 文件。授权时，配置会在加载模型前下载；
+无权限时会跳过，普通视频生成仍可使用，Video Studio 会在文件存在时自动启用身份参考。
 
 应下载 `distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf`，直接放在 `ltx25/` 下与伴随文件夹并列。
 仓库根目录的 **dev** 检查点使用另一套配方（30 步、CFG 3）；TensorSharp 拒绝文件名标注 dev 的文件，
@@ -163,9 +170,12 @@ Managed 和仅 Apple 媒体提供器尚未实现此变换，因此不声明时�
 [Ingredients IC-LoRA](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Ingredients)
 使用组合参考板来保留人物、物件和场景。将
 `ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors` 放在去噪器旁的 `loras/`，
-或设置 `TS_LTX25_INGREDIENTS_LORA`。固定文件大小 1,308,787,472 字节，SHA-256 为
+或设置 `TS_LTX25_INGREDIENTS_LORA`。授权后，随附配置会在首次加载模型前下载该文件。
+需先接受受限仓库条款并设置 `HF_TOKEN` 或 Hugging Face token 文件。文件大小
+1,308,787,472 字节，SHA-256 为
 `ff873a5beada3c579a8137c7c53343916f78bcc9a529ba910143073fe8715e95`。
-它不包含在五文件默认下载中；安装后 TensorAgent 提供 **Identity references (Ingredients)**。
+TensorAgent 默认也会下载此可选文件，并在加载后提供 **Identity references (Ingredients)**。
+服务端启动时读取配置；更新后下次启动即可在首次模型加载时启用参考图。
 
 ```csharp
 var request = new VideoGenerationParams

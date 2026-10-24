@@ -1329,9 +1329,12 @@ namespace TensorSharp.Server
         /// How many leading tokens of <paramref name="promptTokens"/> are the prefix
         /// every conversation shares: the leading system/developer messages plus the
         /// tool declarations, rendered on their own and matched against the prompt.
-        /// Zero when there is no such prefix, when it is too short to be worth a
-        /// checkpoint, or when anything about working it out fails — the engine then
-        /// simply takes no checkpoint, which is what it did before this existed.
+        /// A family whose template opens with a fixed preamble
+        /// (<see cref="ChatProtocol.SharesTemplatePreamble"/>) shares that preamble
+        /// even without either. Zero when there is no such prefix, when it is too
+        /// short to be worth a checkpoint, or when anything about working it out
+        /// fails — the engine then simply takes no checkpoint, which is what it did
+        /// before this existed.
         /// </summary>
         internal int ComputeSharedPrefixTokens(
             ModelBase model, List<ChatMessage> history, List<int> promptTokens,
@@ -1341,15 +1344,16 @@ namespace TensorSharp.Server
             {
                 if (model?.Tokenizer == null || history == null || promptTokens == null)
                     return 0;
+                var protocol = ChatProtocolRegistry.For(arch);
                 // Only a family that renders the level has a prefix that depends on it.
-                if (ChatProtocolRegistry.For(arch)?.RendersReasoningEffort != true)
+                if (protocol?.RendersReasoningEffort != true)
                     reasoningEffort = null;
                 int leading = 0;
                 while (leading < history.Count
                     && (history[leading].Role == "system" || history[leading].Role == "developer"))
                     leading++;
                 bool hasTools = tools is { Count: > 0 };
-                if (leading == 0 && !hasTools)
+                if (leading == 0 && !hasTools && protocol?.SharesTemplatePreamble != true)
                     return 0;
                 // Media in the leading messages would make the prefix depend on the
                 // attachment, which the checkpoint deliberately ignores.

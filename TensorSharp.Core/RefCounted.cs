@@ -103,6 +103,7 @@ namespace TensorSharp
         {
             int original;
             int curRefCount;
+            int desiredRefCount;
             SpinWait spin = new SpinWait();
             while (true)
             {
@@ -112,7 +113,9 @@ namespace TensorSharp
                     throw new InvalidOperationException("Cannot release object - object has already been destroyed");
                 }
 
-                int desiredRefCount = refCount - 1;
+                // Derived from the value the exchange compares against: re-reading refCount here let a
+                // concurrent AddRef/Release pair in between store a count one too low.
+                desiredRefCount = curRefCount - 1;
                 original = Interlocked.CompareExchange(ref refCount, desiredRefCount, curRefCount);
                 if (original == curRefCount)
                 {
@@ -122,7 +125,9 @@ namespace TensorSharp
                 spin.SpinOnce();
             }
 
-            if (refCount <= 0)
+            // Only the release that took the count to zero destroys; re-reading refCount let two
+            // concurrent final releases both see zero.
+            if (desiredRefCount == 0)
             {
                 Destroy();
             }

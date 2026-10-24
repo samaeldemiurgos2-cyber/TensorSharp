@@ -715,20 +715,23 @@ static bool init_glm_tp_comm(glm_model & m)
 
 #ifdef TSG_GGML_USE_CUDA
     const char * reg_name = reg0 ? ggml_backend_reg_name(reg0) : nullptr;
-    if (reg_name && strcmp(reg_name, "CUDA") == 0 && getenv("GGML_CUDA_ALLREDUCE") == nullptr)
+    const bool choose_allreduce = getenv("GGML_CUDA_ALLREDUCE") == nullptr;
+    if (reg_name && strcmp(reg_name, "CUDA") == 0)
     {
         // The native loader takes the first N devices of the requested backend,
         // so its rank order is the CUDA ordinal order seen by this process.
         int devices[MAX_GPUS];
         for (int r = 0; r < m.tp; r++) devices[r] = r;
 
-        if (getenv("NCCL_P2P_DISABLE") == nullptr &&
+        if (choose_allreduce && getenv("NCCL_P2P_DISABLE") == nullptr &&
             tsg::tp_probe_cuda_peer_access(devices, m.tp) == 0)
         {
             glm_setenv_default("NCCL_P2P_DISABLE", "1");
             fprintf(stderr, "[glm] TP peer access is non-functional; NCCL will use shared-memory transport\n");
         }
-        if (tsg::tp_probe_cuda_collective(devices, m.tp) == 0)
+        // Also when the operator chose NCCL: correctness, not transport.
+        tsg::tp_cuda_respect_vmm_peer_limit(devices, m.tp);
+        if (choose_allreduce && tsg::tp_probe_cuda_collective(devices, m.tp) == 0)
         {
             // The backend's pinned-host device pipeline is a good two-rank
             // fallback and still avoids 90 explicit tensor downloads/uploads.

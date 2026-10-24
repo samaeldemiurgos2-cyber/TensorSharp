@@ -31,6 +31,22 @@ env:
   DOTNET_NOLOGO: "true"
 
 jobs:
+  packages:
+    name: Managed package verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Test package verification guards
+        shell: pwsh
+        run: ./eng/tests/verify-packages-tests.ps1
+      - name: Pack and verify the complete public package graph
+        shell: pwsh
+        run: ./eng/verify-packages.ps1 -PackageVersion 0.0.0-ci -SkipNativeBuild
+
   unit-tests:
     name: CPU correctness (${{ matrix.os }})
     strategy:

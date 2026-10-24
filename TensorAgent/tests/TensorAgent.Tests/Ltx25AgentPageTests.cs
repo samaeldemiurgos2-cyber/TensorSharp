@@ -157,7 +157,7 @@ public sealed partial class WebUiPageTests
             }; });
             """);
         Assert.False(result.TryGetProperty("error", out JsonElement error), error.ToString());
-        Assert.Equal("Describe a video… attach image keyframes to guide its timeline", result.GetProperty("placeholder").GetString());
+        Assert.Equal("Describe a video… attach a video to continue from its last frame, or a photo for frame guidance", result.GetProperty("placeholder").GetString());
         Assert.Equal(0, result.GetProperty("masks").GetInt32());
         Assert.Equal(0, result.GetProperty("reads").GetInt32());
         Assert.Empty(Strings(result, "notices"));

@@ -152,6 +152,7 @@
         <li><a href="models-text_zh-cn.html#mistral3">Mistral 3</a></li>
         <li><a href="models-text_zh-cn.html#hunyuan-dense">Hunyuan Dense</a></li>
         <li><a href="models-text_zh-cn.html#muse-glimmer">Muse-Glimmer</a></li>
+        <li><a href="models-text_zh-cn.html#muse-spark">Muse Spark</a></li>
       </ul>
     </div>
     <div class="model-group">
@@ -195,7 +196,7 @@
     </div>
     <aside class="home-benchmarks" aria-labelledby="benchmarks">
       <h3 id="benchmarks">可核查的性能数据</h3>
-      <p>与 llama.cpp 的对比使用相同 GGUF 文件和相同硬件，分别测量预填充、解码与首 token 延迟，同时记录领先结果和仍有差距的场景。</p>
+      <p>近期记录：DeepSeek V4.1 Flash 1017 在五张 A40 上，约 1.8K 提示的精确 TP5 prefill 为参照的 3.23×；Muse Spark 在十张 A40 上，单请求 TP decode 为对应参照模式的 1.40×。模型、量化与计时方法不同；查看完整条件及默认近似 YOCO 的质量代价。</p>
       <a class="home-card-link" href="benchmarks_zh-cn.html#head-to-head">查看测量结果与方法 →</a>
     </aside>
   </section>

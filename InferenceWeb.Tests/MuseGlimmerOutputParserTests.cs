@@ -146,6 +146,33 @@ public class MuseGlimmerOutputParserTests
         Assert.Empty(calls);
     }
 
+    [Theory]
+    [InlineData("muse-glimmer", 1)]
+    [InlineData("muse-glimmer", 1000)]
+    [InlineData("muse_glimmer", 1)]
+    [InlineData("muse_glimmer", 1000)]
+    public void ToolNamedCommentaryRemainsAFunctionForGlimmer(string architecture, int chunkSize)
+    {
+        var parser = OutputParserFactory.Create(architecture);
+        parser.Init(false, [new() { Name = "commentary" }]);
+        const string generated = " to=commentary<|message|><atem:function_calls>"
+            + "<atem:invoke name=\"commentary\"><atem:parameter name=\"text\">hello</atem:parameter>"
+            + "</atem:invoke></atem:function_calls><|eot|>";
+        var content = new StringBuilder();
+        var calls = new List<ToolCall>();
+        for (int offset = 0; offset < generated.Length; offset += chunkSize)
+        {
+            int count = Math.Min(chunkSize, generated.Length - offset);
+            var parsed = parser.Add(generated.Substring(offset, count), offset + count == generated.Length);
+            content.Append(parsed.Content);
+            if (parsed.ToolCalls != null) calls.AddRange(parsed.ToolCalls);
+        }
+        Assert.Equal("", content.ToString());
+        var call = Assert.Single(calls);
+        Assert.Equal("commentary", call.Name);
+        Assert.Equal("hello", call.Arguments["text"]);
+    }
+
     // ---- Headerless replies (campaign 2026-09-16, B6) -----------------------------
     //
     // A structured-output grammar armed from token 0 forbids the " to=user<|message|>"

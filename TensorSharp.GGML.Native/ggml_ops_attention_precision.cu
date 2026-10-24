@@ -5,7 +5,10 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda/common.cuh"
+#include <atomic>
 #include <climits>
+#include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <math_constants.h>
@@ -216,6 +219,211 @@ __global__ void partial_kernel(view q, view k, view v, view mask, view compact, 
     }
 }
 
+// Decode-class attention whose heads all share one F16 K=V head of width 512:
+// DeepSeek V4.1's MLA decode and DSpark verify. partial_kernel gives every head
+// its own block, so each one re-reads the same keys (64x the K/V traffic) and
+// serializes softmax on one thread. Here a block owns one query, one key
+// partition and four heads: each K/V tile is loaded into shared memory once for
+// all four, and only the partition's visible keys are loaded at all.
+//
+// A decode step sees few visible keys, packed into few partitions, so a block
+// also splits its own keys over four streams of four warps (one per head):
+// stream s takes every fourth 16-key tile of the visible list, keeps its own
+// online-softmax state, and the streams merge in stream order at the end. A
+// key is scored by a lane pair, each half over 256 dimensions with four
+// interleaved F32 accumulators combined in a fixed order; softmax and the V sum
+// stay F32. Partition, tile/stream assignment and every reduction order depend
+// only on the key extent and the query's own mask, never on the launch width,
+// so verify rows equal decode rows bit for bit. Output rows use
+// partial_kernel's layout; finish_kernel is shared.
+constexpr int MQA_WIDTH = 512, MQA_HEADS = 4, MQA_STREAMS = 4, MQA_TILE = 16, MQA_WINDOW = 128;
+constexpr int MQA_STREAM_THREADS = MQA_HEADS * 32, MQA_THREADS = MQA_STREAMS * MQA_STREAM_THREADS;
+constexpr int MQA_ROW_BYTES = MQA_WIDTH * 2 + 16;   // 1040: 16-byte loads hit distinct banks
+constexpr size_t MQA_TILE_BYTES = size_t(MQA_TILE) * MQA_ROW_BYTES;
+constexpr size_t MQA_SHARED = size_t(MQA_HEADS) * MQA_WIDTH * sizeof(float) + MQA_STREAMS * MQA_TILE_BYTES;
+static_assert(MQA_TILE_BYTES >= size_t(MQA_HEADS) * (MQA_WIDTH + 2) * sizeof(float), "stream state must fit its tile");
+
+__device__ __forceinline__ void mqa_stream_barrier(int stream) {
+    asm volatile("bar.sync %0, %1;" :: "r"(stream + 1), "r"(MQA_STREAM_THREADS) : "memory");
+}
+
+// SPARSE: the keys are each query's compacted visible list (TSG_ATTN_MASK_COMPACT),
+// as partial_kernel's sparse prefill reads them; an overflowing or exceptional
+// row takes the full key range instead, exactly like partial_kernel.
+template <bool SPARSE>
+__global__ __launch_bounds__(MQA_THREADS) void mqa_partial_kernel(view q, view kv, view mask, view compact, bool masked,
+                                                                  float scale, int chunk, int splits, float * output) {
+    extern __shared__ __align__(16) unsigned char mqa_shared[];
+    float * qs = reinterpret_cast<float *>(mqa_shared);
+    __shared__ int keys[MQA_WINDOW];
+    __shared__ float biases[MQA_WINDOW];
+    __shared__ int warp_counts[MQA_WINDOW / 32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int head_slot = warp % MQA_HEADS, stream = warp / MQA_HEADS, stream_tid = tid % MQA_STREAM_THREADS;
+    unsigned char * tile = mqa_shared + size_t(MQA_HEADS) * MQA_WIDTH * sizeof(float) + stream * MQA_TILE_BYTES;
+    const int key_lane = lane & (MQA_TILE - 1), half_index = lane / MQA_TILE;
+    const int64_t split = blockIdx.x, h = int64_t(blockIdx.y) * MQA_HEADS + head_slot;
+    const int64_t query = blockIdx.z % q.ne[1], batch = blockIdx.z / q.ne[1];
+    const int64_t kb = batch / (q.ne[3] / kv.ne[3]);
+    const char * base = kv.data + kb * kv.nb[3];
+    for (int i = tid; i < MQA_HEADS * MQA_WIDTH; i += MQA_THREADS)
+        qs[i] = read(q, i % MQA_WIDTH, query, int64_t(blockIdx.y) * MQA_HEADS + i / MQA_WIDTH, batch);
+    const int32_t * list = nullptr;
+    int64_t extent = kv.ne[1];
+    if constexpr (SPARSE) {
+        const auto * candidate = reinterpret_cast<const int32_t *>(compact.data) +
+            (query + q.ne[1] * (batch % compact.ne[3])) * compact.ne[0];
+        if (candidate[0] >= 0 && candidate[0] < compact.ne[0]) {
+            extent = candidate[0];
+            list = candidate + 1;
+            chunk = int(max(int64_t(16), ((extent + splits - 1) / splits + 15) / 16 * 16));
+        }
+    }
+    // Dense: a key range. Sparse: a range of positions in the query's list.
+    const int64_t begin = split * chunk, end = min(extent, begin + chunk);
+    float maximum = -CUDART_INF_F, denominator = 0;
+    float values[16] = {};
+    int tile_index = 0;   // across windows, so stream assignment follows the visible-key order
+    for (int64_t window = begin; window < end; window += MQA_WINDOW) {
+        __syncthreads();   // the previous window's list is no longer read
+        if (warp < MQA_WINDOW / 32) {
+            const int64_t entry = window + tid;
+            const int64_t key = entry < end && list ? int64_t(list[entry]) : entry;
+            const float bias = entry < end ? (masked ? read(mask, key, query, 0, batch % mask.ne[3]) : 0) : -CUDART_INF_F;
+            const bool visible = bias != -CUDART_INF_F;
+            const unsigned bits = __ballot_sync(0xffffffffu, visible);
+            if (lane == 0) warp_counts[warp] = __popc(bits);
+            // Each warp stores its own run after the counts are visible.
+            asm volatile("bar.sync %0, %1;" :: "r"(MQA_STREAMS + 1), "r"(MQA_WINDOW) : "memory");
+            int offset = __popc(bits & ((1u << lane) - 1u));
+            for (int i = 0; i < warp; ++i) offset += warp_counts[i];
+            if (visible) { keys[offset] = int(key); biases[offset] = bias; }
+        }
+        __syncthreads();
+        int count = 0;
+        for (int i = 0; i < MQA_WINDOW / 32; ++i) count += warp_counts[i];
+        const int tiles = (count + MQA_TILE - 1) / MQA_TILE;
+        for (int t = 0; t < tiles; ++t, ++tile_index) {
+            if (tile_index % MQA_STREAMS != stream) continue;
+            const int first = t * MQA_TILE, n = min(MQA_TILE, count - first);
+            // 64 uint4 per 1 KiB row; the stream's 128 threads fill two rows per pass.
+            for (int i = stream_tid; i < MQA_TILE * (MQA_WIDTH / 8); i += MQA_STREAM_THREADS) {
+                const int r = i / (MQA_WIDTH / 8), c = i % (MQA_WIDTH / 8);
+                uint4 chunk_data = make_uint4(0, 0, 0, 0);
+                if (r < n) chunk_data = *reinterpret_cast<const uint4 *>(base + int64_t(keys[first + r]) * kv.nb[1] + c * 16);
+                *reinterpret_cast<uint4 *>(tile + r * MQA_ROW_BYTES + c * 16) = chunk_data;
+            }
+            mqa_stream_barrier(stream);
+            float score = -CUDART_INF_F;
+            {
+                // Lane pair (j, j + 16) scores key j: halves [0, 256) and [256, 512).
+                const float * qh = qs + head_slot * MQA_WIDTH + half_index * (MQA_WIDTH / 2);
+                const unsigned char * row = tile + key_lane * MQA_ROW_BYTES + half_index * MQA_WIDTH;
+                float acc[4] = {};
+#pragma unroll 4
+                for (int c = 0; c < MQA_WIDTH / 16; ++c) {
+                    const uint4 packed = *reinterpret_cast<const uint4 *>(row + c * 16);
+                    const half2 * k2 = reinterpret_cast<const half2 *>(&packed);
+                    const float4 qa = *reinterpret_cast<const float4 *>(qh + c * 8);
+                    const float4 qb = *reinterpret_cast<const float4 *>(qh + c * 8 + 4);
+                    const float2 k0 = __half22float2(k2[0]), k1 = __half22float2(k2[1]);
+                    const float2 k2v = __half22float2(k2[2]), k3 = __half22float2(k2[3]);
+                    acc[0] = fmaf(qa.x, k0.x, acc[0]); acc[0] = fmaf(qa.y, k0.y, acc[0]);
+                    acc[1] = fmaf(qa.z, k1.x, acc[1]); acc[1] = fmaf(qa.w, k1.y, acc[1]);
+                    acc[2] = fmaf(qb.x, k2v.x, acc[2]); acc[2] = fmaf(qb.y, k2v.y, acc[2]);
+                    acc[3] = fmaf(qb.z, k3.x, acc[3]); acc[3] = fmaf(qb.w, k3.y, acc[3]);
+                }
+                const float part = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+                const float other = __shfl_xor_sync(0xffffffffu, part, MQA_TILE);
+                const float dot = half_index == 0 ? part + other : other + part;
+                if (key_lane < n) score = __fmul_rn(dot, scale) + biases[first + key_lane];
+            }
+            float tile_max = score;
+            for (int shift = MQA_TILE / 2; shift; shift /= 2) tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, shift));
+            const float next = fmaxf(maximum, tile_max);
+            const float correction = next == -CUDART_INF_F ? 1 : expf(maximum - next);
+            const float weight = score == -CUDART_INF_F ? 0 : expf(score - next);
+            float tile_sum = weight;
+            for (int shift = MQA_TILE / 2; shift; shift /= 2) tile_sum += __shfl_xor_sync(0xffffffffu, tile_sum, shift);
+            denominator = fmaf(denominator, correction, tile_sum);
+            maximum = next;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) values[i] *= correction;
+            for (int j = 0; j < n; ++j) {
+                const float w = __shfl_sync(0xffffffffu, weight, j);
+                const unsigned char * row = tile + j * MQA_ROW_BYTES;
+#pragma unroll
+                for (int part = 0; part < 2; ++part) {
+                    const uint4 packed = *reinterpret_cast<const uint4 *>(row + (lane + 32 * part) * 16);
+                    const half2 * v2 = reinterpret_cast<const half2 *>(&packed);
+#pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        const float2 v = __half22float2(v2[p]);
+                        values[part * 8 + 2 * p] = fmaf(w, v.x, values[part * 8 + 2 * p]);
+                        values[part * 8 + 2 * p + 1] = fmaf(w, v.y, values[part * 8 + 2 * p + 1]);
+                    }
+                }
+            }
+            mqa_stream_barrier(stream);   // the stream's next tile overwrites its rows
+        }
+    }
+    // Merge the streams in stream order. Each stream parks its state in its
+    // own (now idle) tile buffer; stream 0 combines and writes the partial row.
+    __syncthreads();
+    float * state = reinterpret_cast<float *>(tile) + head_slot * (MQA_WIDTH + 2);
+#pragma unroll
+    for (int part = 0; part < 2; ++part)
+#pragma unroll
+        for (int p = 0; p < 8; ++p) state[(lane + 32 * part) * 8 + p] = values[part * 8 + p];
+    if (lane == 0) { state[MQA_WIDTH] = maximum; state[MQA_WIDTH + 1] = denominator; }
+    __syncthreads();
+    if (stream != 0) return;
+    const unsigned char * tiles_base = mqa_shared + size_t(MQA_HEADS) * MQA_WIDTH * sizeof(float);
+    float merged_max = -CUDART_INF_F;
+    for (int s2 = 0; s2 < MQA_STREAMS; ++s2)
+        merged_max = fmaxf(merged_max, reinterpret_cast<const float *>(tiles_base + s2 * MQA_TILE_BYTES)[head_slot * (MQA_WIDTH + 2) + MQA_WIDTH]);
+    float merged_den = 0, merged[16] = {};
+    for (int s2 = 0; s2 < MQA_STREAMS; ++s2) {
+        const float * other = reinterpret_cast<const float *>(tiles_base + s2 * MQA_TILE_BYTES) + head_slot * (MQA_WIDTH + 2);
+        const float factor = other[MQA_WIDTH] == -CUDART_INF_F ? 0 : expf(other[MQA_WIDTH] - merged_max);
+        merged_den = fmaf(other[MQA_WIDTH + 1], factor, merged_den);
+#pragma unroll
+        for (int part = 0; part < 2; ++part)
+#pragma unroll
+            for (int p = 0; p < 8; ++p)
+                merged[part * 8 + p] = fmaf(other[(lane + 32 * part) * 8 + p], factor, merged[part * 8 + p]);
+    }
+    float * result = output + (split + splits * (h + q.ne[2] * (query + q.ne[1] * batch))) * (MQA_WIDTH + 2);
+#pragma unroll
+    for (int part = 0; part < 2; ++part)
+#pragma unroll
+        for (int p = 0; p < 8; ++p) result[(lane + 32 * part) * 8 + p] = merged[part * 8 + p];
+    if (lane == 0) {
+        result[MQA_WIDTH] = merged_max;
+        result[MQA_WIDTH + 1] = merged_den;
+    }
+}
+
+// DeepSeek V4.1's MLA shape: every head shares one F16 K=V head of width 512.
+bool mqa_shape(const view & q, const view & k, const view & v) {
+    return k.data == v.data && k.type == GGML_TYPE_F16 && k.ne[0] == MQA_WIDTH && v.ne[0] == MQA_WIDTH &&
+        q.ne[0] == MQA_WIDTH && k.ne[2] == 1 && v.ne[2] == 1;
+}
+
+bool mqa_enabled() {
+    // TS_DSV41_MQA_DECODE=0 keeps partial_kernel for A/B and diagnosis.
+    static const bool enabled = [] { const char * e = std::getenv("TS_DSV41_MQA_DECODE"); return !e || std::atoi(e) != 0; }();
+    return enabled;
+}
+
+// The MQA kernel's preconditions; anything else keeps partial_kernel.
+bool mqa_eligible(const view & q, const view & k, const view & v, const view & mask, const view & compact, bool masked) {
+    return mqa_enabled() && mqa_shape(q, k, v) && k.nb[0] == 2 && k.nb[1] % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(k.data) % 16 == 0 && q.ne[2] % MQA_HEADS == 0 && q.ne[2] / MQA_HEADS <= 65535 &&
+        q.ne[3] % k.ne[3] == 0 && q.ne[1] * q.ne[3] <= 65535 && (!masked || mask.ne[2] == 1) &&
+        (!compact.data || (masked && compact.ne[2] == 1 && compact.ne[1] == q.ne[1]));
+}
+
 // A stable, block-local prefix sum emits selected positions in key order.
 // Count every visible entry even after capacity is exhausted; consumers then
 // take the full-mask fallback for that row. No host readback is required.
@@ -250,7 +458,7 @@ __global__ void compact_kernel(view mask, int keys, int queries, int capacity, i
 
 __global__ void finish_kernel(const float * partial, view sinks, bool has_sinks, int width, int heads, int splits,
                               float * output) {
-    __shared__ float scales[16], reciprocal;
+    __shared__ float scales[64], reciprocal;
     const int64_t row = blockIdx.x;
     const float * p = partial + row * splits * (width + 2);
     if (threadIdx.x == 0) {
@@ -353,6 +561,34 @@ void tsg_attention_cuda_compute(ggml_tensor * dst, ggml_backend_t backend) {
         const unsigned blocks = unsigned(rows);
         const size_t shared = q.ne[0] * sizeof(float);
         auto * out = static_cast<float *>(dst->data);
+        const bool mqa = mqa_eligible(q, k, v, mask, compact, desc.i0 != 0);
+        if (!mqa && mqa_enabled() && mqa_shape(q, k, v)) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+                std::fprintf(stderr, "[dsv41] an MLA attention launch cannot use the MQA kernel (layout: alignment, "
+                    "head count or per-head mask); it runs the per-head kernel, several times slower\n");
+        }
+        if (mqa) {
+            // Over 48 KiB of dynamic shared memory needs a per-device opt-in.
+            static std::atomic<uint64_t> configured{0};
+            const uint64_t bit = uint64_t(1) << (context->device & 63);
+            if (!(configured.load() & bit)) {
+                CUDA_CHECK(cudaFuncSetAttribute(mqa_partial_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    int(MQA_SHARED)));
+                CUDA_CHECK(cudaFuncSetAttribute(mqa_partial_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    int(MQA_SHARED)));
+                configured.fetch_or(bit);
+            }
+            const dim3 grid(unsigned(dst->ne[1]), unsigned(q.ne[2] / MQA_HEADS), unsigned(q.ne[1] * q.ne[3]));
+            if (compact.data)
+                mqa_partial_kernel<true><<<grid, MQA_THREADS, MQA_SHARED, stream>>>(q, k, mask, compact, desc.i0 != 0,
+                    desc.f0, desc.i2, int(dst->ne[1]), out);
+            else
+                mqa_partial_kernel<false><<<grid, MQA_THREADS, MQA_SHARED, stream>>>(q, k, mask, compact, desc.i0 != 0,
+                    desc.f0, desc.i2, int(dst->ne[1]), out);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
 #define TSG_LAUNCH_ATTN(W)                                                                                             \
     if (compact.data)                                                                                                  \
         partial_kernel<W, true><<<blocks, 128, shared, stream>>>(q, k, v, mask, compact, desc.i0 != 0, desc.f0, desc.i2, int(dst->ne[1]), out); \
@@ -373,7 +609,7 @@ void tsg_attention_cuda_compute(ggml_tensor * dst, ggml_backend_t backend) {
     } else {
         GGML_ASSERT(desc.kind == TSG_ATTN_F32_FINISH);
         const int64_t rows = ggml_nelements(dst) / dst->ne[0];
-        GGML_ASSERT(rows <= INT_MAX && dst->src[0]->ne[1] <= 16);
+        GGML_ASSERT(rows <= INT_MAX && dst->src[0]->ne[1] <= 64);
         finish_kernel<<<unsigned(rows), 128, 0, stream>>>(
             static_cast<const float *>(dst->src[0]->data), tensor_view(dst->src[1]), desc.i1 != 0, int(dst->ne[0]),
             int(dst->ne[1]), int(dst->src[0]->ne[1]), static_cast<float *>(dst->data));

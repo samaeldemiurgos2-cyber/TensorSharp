@@ -92,6 +92,10 @@ public sealed class StudioTurboTests : IDisposable
     private static MiniMaxH3Model H3(MiniMaxH3Partition partition, MiniMaxH3SamplingRecipe recipe = null)
     {
         var model = WithProperty((MiniMaxH3Model)RuntimeHelpers.GetUninitializedObject(typeof(MiniMaxH3Model)), nameof(MiniMaxH3Model.Partition), partition);
+        typeof(MiniMaxH3Model).GetField("_firstLastDitPath", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(model, partition == MiniMaxH3Partition.FirstLastFrame ? "metadata-only-fl2va.gguf" : null);
+        typeof(MiniMaxH3Model).GetField("_referenceDitPath", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(model, partition == MiniMaxH3Partition.Reference ? "metadata-only-ref2va.gguf" : null);
         return recipe == null ? model : WithProperty(model, nameof(MiniMaxH3Model.SamplingRecipe), recipe);
     }
 

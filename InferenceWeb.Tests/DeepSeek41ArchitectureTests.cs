@@ -430,6 +430,22 @@ public class DeepSeek41ArchitectureTests : IDisposable
     public void V41DraftArchitectureReachesNativeTensorValidation()
         => DeepSeek41Architecture.ValidateDsparkArchitecture("deepseek41-dspark");
 
+    [Fact]
+    public void LlamaCppV41DflashExportReachesNativeTensorValidation()
+    {
+        var keys = new HashSet<string> { "dflash.hyper_connection.count", "dflash.attention.output_group_count" };
+        DeepSeek41Architecture.ValidateDsparkDraft("dflash", keys.Contains);
+        DeepSeek41Architecture.ValidateDsparkDraft("deepseek41-dspark", _ => false);
+    }
+
+    [Theory]
+    [InlineData("dflash.hyper_connection.count")]
+    [InlineData("dflash.attention.output_group_count")]
+    [InlineData(null)]
+    public void OtherDflashDraftersAreRefusedForV41(string? onlyKey)
+        => Assert.Throws<NotSupportedException>(() =>
+            DeepSeek41Architecture.ValidateDsparkDraft("dflash", key => key == onlyKey));
+
     [Theory]
     [InlineData(BackendType.Cpu)]
     [InlineData(BackendType.Cuda)]

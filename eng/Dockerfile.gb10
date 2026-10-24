@@ -46,6 +46,7 @@ fi
 printf '%s\n' "${cuda_version}"
 CHECK_GB10_CUDA
 
+# Keep the unmodified upstream pin on the precision-aware MMQ API used by our Q8 kernels.
 ENV DOTNET_ROOT=/usr/share/dotnet \
     DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
@@ -55,7 +56,7 @@ ENV DOTNET_ROOT=/usr/share/dotnet \
     TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES=121a-real \
     TENSORSHARP_CUDA_ARCH=compute_121 \
     TENSORSHARP_CUDNN=OFF \
-    TENSORSHARP_GGML_GIT_REF=456172ec733a135778adcd32d00e576a58232e45 \
+    TENSORSHARP_GGML_GIT_REF=da8e2a54b919557b816b1c2beb432ccb766f7ce0 \
     TENSORSHARP_GGML_NO_UPDATE=1
 
 ARG GGML_BUILD_JOBS=2

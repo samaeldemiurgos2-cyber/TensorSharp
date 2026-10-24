@@ -34,8 +34,11 @@ namespace TensorSharp.Runtime
             OrderDeepSeek41ToolResults(normalized);
 
             // Tool results share the user role. Merge before applying the history
-            // policy, because a tool result also establishes the last user turn.
+            // policy. A merged user turn that holds only tool results does not
+            // start a new turn (the 1017 reference encoder's find_last_user_index),
+            // so the reasoning of the assistant that called those tools stays current.
             var turns = new List<ChatMessage>();
+            var toolOnlyTurns = new HashSet<ChatMessage>(ReferenceEqualityComparer.Instance);
             foreach (ChatMessage message in normalized)
             {
                 bool mergeable = message.Role is "user" or "tool";
@@ -43,19 +46,25 @@ namespace TensorSharp.Runtime
                     ? "<tool_result>" + (message.Content ?? "") + "</tool_result>"
                     : message.Content ?? "";
                 if (mergeable && turns.Count > 0 && turns[^1].Role == "user")
+                {
                     turns[^1].Content += "\n\n" + content;
+                    if (message.Role == "user") toolOnlyTurns.Remove(turns[^1]);
+                }
                 else if (mergeable)
+                {
                     turns.Add(new ChatMessage { Role = "user", Content = content });
+                    if (message.Role == "tool") toolOnlyTurns.Add(turns[^1]);
+                }
                 else
                     turns.Add(message);
             }
 
             bool effectiveDropThinking = dropThinking && !hasTools;
-            int lastUser = FindLastDeepSeek41User(turns);
+            int lastUser = FindLastDeepSeek41User(turns, toolOnlyTurns);
             if (enableThinking && effectiveDropThinking)
             {
                 turns = turns.Where((m, i) => i >= lastUser || m.Role != "developer").ToList();
-                lastUser = FindLastDeepSeek41User(turns);
+                lastUser = FindLastDeepSeek41User(turns, toolOnlyTurns);
             }
 
             var sb = new StringBuilder("<｜begin▁of▁sentence｜>");
@@ -116,10 +125,11 @@ namespace TensorSharp.Runtime
             return sb.ToString();
         }
 
-        private static int FindLastDeepSeek41User(List<ChatMessage> messages)
+        private static int FindLastDeepSeek41User(List<ChatMessage> messages, HashSet<ChatMessage> toolOnlyTurns)
         {
             for (int i = messages.Count - 1; i >= 0; i--)
-                if (messages[i].Role is "user" or "developer" || messages[i].Role == "system" && i > 0)
+                if ((messages[i].Role is "user" or "developer" || messages[i].Role == "system" && i > 0) &&
+                    !toolOnlyTurns.Contains(messages[i]))
                     return i;
             return -1;
         }

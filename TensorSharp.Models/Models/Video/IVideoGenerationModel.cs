@@ -21,10 +21,38 @@ namespace TensorSharp.Models.Video
         /// <summary>Short family id for UI and telemetry, e.g. "wan" or "minimax-h3".</summary>
         string VideoModelFamily { get; }
 
+        /// <summary>Whether this checkpoint accepts text-to-video without an input frame.</summary>
+        bool SupportsTextToVideo => true;
+
         /// <summary>Recommended frame count for a short interactive preview, on this
         /// model's temporal grid. Zero leaves the frame count to the model's generation
         /// default. Hosts must not infer a frame grid from another model's family.</summary>
         int DefaultPreviewFrames => 0;
+
+        /// <summary>The temporal frame-count grid accepted by this model. Valid requests have
+        /// <c>FrameCountOffset + n * FrameCountMultiple</c> frames. The server and clients use
+        /// these values to offer the same usable clip lengths without guessing a model family.</summary>
+        int FrameCountMultiple => 1;
+
+        /// <summary>Offset of the temporal frame-count grid.</summary>
+        int FrameCountOffset => 1;
+
+        /// <summary>Frame rate used when a request does not specify one.</summary>
+        int DefaultPreviewFps => 24;
+
+        /// <summary>Default output width offered by clients when the user has not selected a
+        /// custom canvas. Zero leaves the output size to the model.</summary>
+        int DefaultOutputWidth => 0;
+
+        /// <summary>Default output height offered by clients when the user has not selected a
+        /// custom canvas. Zero leaves the output size to the model.</summary>
+        int DefaultOutputHeight => 0;
+
+        /// <summary>Pixel grid for output width and height choices shown by clients.</summary>
+        int ResolutionMultiple => 16;
+
+        /// <summary>Minimum frame count required by the model's reference workflow, or zero.</summary>
+        int MinimumReferenceFrames => 0;
 
         /// <summary>True when the model generates an audio track jointly with the video.</summary>
         bool SupportsAudio { get; }

@@ -292,6 +292,114 @@ public class ContinuousBatchSchedulerTests
     }
 
     [Fact]
+    public void Scheduler_SoloPrefillPolicy_AppliesOnlyToALoneRequest()
+    {
+        // A model that pipelines its prefill across devices sizes a lone prompt's
+        // steps itself, past the batched-token budget, from the prompt position;
+        // the ordinary budget returns the moment a second request is in the system.
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 16,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 4,
+            NumBlocks = 64,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = false,
+        };
+        var pool = NewPool(cfg.NumBlocks);
+        var sched = new ContinuousBatchScheduler(cfg, pool, NullLogger.Instance);
+        var policy = new SoloPolicyStub(step: 64);
+        sched.SetSoloPrefillPolicy(policy);
+        var lone = NewSequence("lone", promptLen: 100, maxNew: 4);
+        sched.Submit(lone);
+        var first = Assert.Single(sched.Schedule().ScheduledWork);
+        Assert.Equal(64, first.NumScheduledTokens);
+        Assert.Equal((0, 100), policy.Calls[^1]);
+        lone.AdvanceComputedTokens(first.NumScheduledTokens);
+
+        // The next step asks again, from where the prompt now is.
+        var second = Assert.Single(sched.Schedule().ScheduledWork);
+        Assert.Equal(36, second.NumScheduledTokens);
+        Assert.Equal((64, 36), policy.Calls[^1]);
+        lone.AdvanceComputedTokens(second.NumScheduledTokens);
+
+        sched.Submit(NewSequence("other", promptLen: 100, maxNew: 4));
+        int asked = policy.Calls.Count;
+        var shared = sched.Schedule();
+        Assert.True(shared.ScheduledWork.Sum(w => w.NumScheduledTokens) <= cfg.MaxNumBatchedTokens);
+        Assert.Equal(asked, policy.Calls.Count);
+    }
+
+    [Fact]
+    public void Scheduler_SoloPrefillPolicy_WithoutAPreferenceKeepsTheScheduledStep()
+    {
+        // 0 means "the scheduler's own step" (e.g. a context too long to pipeline).
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 16, MaxNumRunningSequences = 4, MaxPrefillChunkSize = 4,
+            NumBlocks = 64, BlockSize = BlockSize, EnablePrefixCaching = false,
+        };
+        var sched = new ContinuousBatchScheduler(cfg, NewPool(cfg.NumBlocks), NullLogger.Instance);
+        sched.SetSoloPrefillPolicy(new SoloPolicyStub(step: 0));
+        sched.Submit(NewSequence("lone", promptLen: 100, maxNew: 4));
+        Assert.Equal(16, Assert.Single(sched.Schedule().ScheduledWork).NumScheduledTokens);
+    }
+
+    [Fact]
+    public void Scheduler_SoloPrefillPolicy_KeepsItsOwnStepForImageRows()
+    {
+        // A step carrying image rows runs one micro-batch at a time on a model that
+        // pipelines text prefill, so it keeps the scheduler's budget-bounded size.
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 16, MaxNumRunningSequences = 4, MaxPrefillChunkSize = 4,
+            NumBlocks = 64, BlockSize = BlockSize, EnablePrefixCaching = false,
+        };
+        var sched = new ContinuousBatchScheduler(cfg, NewPool(cfg.NumBlocks), NullLogger.Instance);
+        sched.SetSoloPrefillPolicy(new SoloPolicyStub(step: 64));
+        var tokens = Enumerable.Range(1, 100).ToList();
+        var image = new SequenceState("img", tokens, 4, BlockSize, SamplingConfig.Default,
+            mediaSpans: new[] { new PromptMediaSpan(40, 50, "image-1") });
+        sched.Submit(image);
+        var first = Assert.Single(sched.Schedule().ScheduledWork);
+        Assert.Equal(16, first.NumScheduledTokens);
+    }
+
+    [Fact]
+    public void Engine_SoloPrefillPolicy_YieldsToAChosenSoloChunk()
+    {
+        var policy = new SoloPolicyStub(step: 16384);
+        var defaults = new SchedulerConfig { MaxNumBatchedTokens = 4096, NumBlocks = 64, BlockSize = BlockSize };
+        Assert.False(defaults.SoloPrefillChunkSizeChosen);
+        var sched = new ContinuousBatchScheduler(defaults, NewPool(64), NullLogger.Instance);
+        Assert.Same(policy, InferenceEngine.AttachSoloPrefillPolicy(policy, defaults, sched, NullLogger.Instance));
+
+        // A chosen size, in code or from TS_SCHED_SOLO_PREFILL_CHUNK, applies as documented; it
+        // survives the engine's own copies of the configuration.
+        var chosen = new SchedulerConfig { MaxNumBatchedTokens = 4096, SoloPrefillChunkSize = 2048, NumBlocks = 64 }
+            .WithBlockSize(BlockSize);
+        Assert.True(chosen.SoloPrefillChunkSizeChosen);
+        Assert.Equal(2048, chosen.SoloPrefillChunkSize);
+        Assert.Null(InferenceEngine.AttachSoloPrefillPolicy(policy, chosen, sched, NullLogger.Instance));
+        Assert.True(defaults.WithSoloPrefillChunkSize(4096).SoloPrefillChunkSizeChosen);
+        Assert.False(defaults.WithBlockSize(BlockSize).SoloPrefillChunkSizeChosen);
+
+        // A model with no preference at all (pipelined prefill off) attaches nothing.
+        Assert.Null(InferenceEngine.AttachSoloPrefillPolicy(new SoloPolicyStub(step: 0), defaults, sched, NullLogger.Instance));
+    }
+
+    private sealed class SoloPolicyStub(int step) : ISoloPrefillBudgetModel
+    {
+        public List<(int Start, int Remaining)> Calls { get; } = new();
+
+        public int PreferredSoloPrefillTokens(int start, int remaining)
+        {
+            Calls.Add((start, remaining));
+            return step <= 0 ? 0 : Math.Min(step, remaining);
+        }
+    }
+
+    [Fact]
     public void Scheduler_PreemptedSequenceIsNotReadmittedInTheSameOutput()
     {
         // A/B/C initially occupy 1/1/2 blocks. At the next decode step A needs

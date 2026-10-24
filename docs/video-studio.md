@@ -173,13 +173,17 @@ The **Generate** tab reads top to bottom:
    exchanges them. A line under the slots says what the take will do ("The take
    ends on the last frame."). A slot the loaded model cannot use stays visible
    and says why (Wan, for example, cannot pin a last frame).
-4. **Keep a character the same (optional).** Reference photos of who or what
-   should look the same, each with **Remove**. **+ Add reference photo** adds
-   one, as does **As character reference** on a library photo. With reference
-   photos the take is a `ref` take: a new scene with that character. Starting on
-   a first frame as well needs a model that keeps references with one, which no
-   installed model does; the section says why for the loaded one. A last frame
-   cannot join reference photos. See
+4. **Keep a character the same (optional).** Reference photos or full video
+   clips of who or what should look the same, each with **Remove**. **+ Add
+   reference photo** and **+ Add full video reference** choose existing project
+   assets; library cards also have **As character reference** and **Use as full
+   video reference** actions. Full clips remain temporal references rather than
+   being reduced to their final frame. With references the take is a `ref` take:
+   a new scene guided by those assets. MiniMax-H3 needs its Ref2VA checkpoint and
+   LTX 2.5 needs the Ingredients adapter. Starting on a first frame as well needs
+   a model that keeps references with one, which these workflows do not offer in
+   Studio; the section says why for the loaded one. Continue from last frame is a
+   separate action. See
    [Keep a character across segments](#keep-a-character-across-segments).
 5. **Other ways to use photos** (only when the model offers more than one):
    **Hit photos at set moments** (timed keyframes) and **Keep someone or
@@ -248,30 +252,38 @@ What each loaded checkpoint runs:
 
 | Model | Text only | First frame | Last frame only | First + last | Keyframes | References | References + first frame |
 |---|---|---|---|---|---|---|---|
-| MiniMax-H3 FL2VA (`minimax_h3_fl2va_*`) | Yes | Yes | Yes | Yes | No | Needs the Ref2VA file | No |
-| MiniMax-H3 Ref2VA (`minimax_h3_ref2va_*`) | Yes | Needs the FL2VA file | Needs the FL2VA file | Needs the FL2VA file | No | Yes, up to 9 images | No |
+| MiniMax-H3 (FL2VA + Ref2VA) | Yes | Yes | Yes | Yes | No | Yes, up to 9 images | No |
 | LTX 2.5 Distilled | Yes | Yes | Yes | Yes | Yes, up to 16 images | With the Ingredients IC-LoRA: up to 16 images, at least 121 frames | No (the pipeline composes it, but validation cut to the reference photos) |
 | Wan2.2 TI2V-5B | Yes | Yes | No | No | No | No | No |
 | Wan2.2 I2V-A14B | No (a first frame is required) | Yes | No | No | No | No | No |
 | Wan 2.1 / Wan2.2 T2V | Yes | No | No | No | No | No | No |
 
-The slots and uses come from the loaded checkpoint. One it cannot use stays
-visible with the reason underneath. MiniMax-H3's FL2VA and Ref2VA are separate
-files rather than settings, so load the other file through the model controls;
-a Ref2VA checkpoint opens Generate on reference photos. LTX finds the
-Ingredients adapter at `loras/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors`
+The slots and uses come from the installed checkpoint files. A mode a model cannot use stays
+visible with the reason underneath. The TensorAgent MiniMax-H3 entry includes both FL2VA
+and Ref2VA denoisers. Choose first/last-frame or reference mode in Video Studio; it swaps
+only the active denoiser between takes and keeps the host model and shared components
+loaded. LTX finds the Ingredients adapter at `loras/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors`
 beside the checkpoint, or through `TS_LTX25_INGREDIENTS_LORA`. LTX's image modes
 also need the desktop FFmpeg/libx264 image transform. Wan never reads a last
 frame: through the server, the CLI and the API, an end image on Wan is refused
 instead of being dropped.
+
+The shipped `ltx-2.5-distilled.json` config includes this adapter as an optional
+download and fetches it before the model loads when approved Hugging Face access
+is configured. Start the server with that config to have identity references
+available on the first model load. TensorAgent includes the adapter in its default
+optional downloads; both paths need the gated repository terms accepted and an HF token.
 
 Recipes depend on the mode. LTX's ref mode, with or without a first frame, is
 one full-size pass rather than the two-stage recipe, and choosing references
 raises the length to 121 frames when it is lower, saying so. Studio references
 and frames are still images. A frame taken from a video is one too: Studio puts
 it in the library as a still that records the video and frame it came from.
-MiniMax-H3 reference video clips and soundtracks remain available through chat,
-the CLI and the HTTP API.
+MiniMax-H3 and LTX 2.5 can use full clips as `ref` inputs in Video Studio when
+their reference checkpoint or adapter is loaded. A full clip provides temporal
+reference context. **Continue from last frame** extracts the exact ending frame
+and starts a separate take from it; Studio does not combine that opening frame
+with reference mode for these models.
 
 Takes made before modes were explicit reopen in the mode their inputs imply and
 run unchanged. Shot plans saved by the Studio assistant may name a `mode`. Studio

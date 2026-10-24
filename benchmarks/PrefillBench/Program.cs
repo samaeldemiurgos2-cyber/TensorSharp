@@ -13,7 +13,7 @@
 //   TS_PREFILL_LENS     comma list of prompt token counts (default 512,1024,2048,4096)
 //   TS_PREFILL_ITERS    timed iterations per length (default 3)
 //   TS_PREFILL_CONC     comma list of concurrency levels for a fixed 1024-token prompt (default 1,2,4)
-//   TS_SCHED_PREFILL_CHUNK / TS_SCHED_MAX_BATCHED_TOKENS honoured by SchedulerConfig below.
+//   TS_SCHED_PREFILL_CHUNK / TS_SCHED_MAX_BATCHED_TOKENS / TS_SCHED_SOLO_PREFILL_CHUNK honoured by SchedulerConfig below.
 using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
@@ -98,12 +98,13 @@ var cfg = new SchedulerConfig
     MaxNumBatchedTokens = EnvInt("TS_SCHED_MAX_BATCHED_TOKENS", 8192),
     MaxNumRunningSequences = 16,
     MaxPrefillChunkSize = EnvInt("TS_SCHED_PREFILL_CHUNK", 2048),
-    SoloPrefillChunkSize = EnvInt("TS_SCHED_SOLO_PREFILL_CHUNK", 8192),
     NumBlocks = EnvInt("TS_SCHED_NUM_BLOCKS", 512),
     BlockSize = blockSize,
     EnablePrefixCaching = false, // force full prefill every run
     DecodeQuantumTokens = blockSize,
 };
+// Set only when given, as the server does: a chosen size replaces a model's own lone-prompt steps.
+if (EnvInt("TS_SCHED_SOLO_PREFILL_CHUNK", 0) is var solo && solo > 0) cfg = cfg.WithSoloPrefillChunkSize(solo);
 using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
 
 // Submit one sequence and return the wall time until its FIRST token arrives

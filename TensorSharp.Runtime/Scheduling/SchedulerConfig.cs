@@ -47,8 +47,21 @@ namespace TensorSharp.Runtime.Scheduling
         /// feeding it whole. Matching the CLI (which never sub-divides a solo
         /// prompt below ~5120 tokens) recovers full prefill throughput. Bounded
         /// by <see cref="MaxNumBatchedTokens"/> for activation-memory safety.
-        /// Default 8192. Env: <c>TS_SCHED_SOLO_PREFILL_CHUNK</c>.</summary>
-        public int SoloPrefillChunkSize { get; init; } = 8192;
+        /// Default 8192. Env: <c>TS_SCHED_SOLO_PREFILL_CHUNK</c>.
+        /// <para>A model that implements <see cref="ISoloPrefillBudgetModel"/> (Muse Spark with
+        /// pipelined prefill) chooses a lone prompt's steps itself, possibly above
+        /// <see cref="MaxNumBatchedTokens"/>, unless this value was set (in code or through the
+        /// environment variable): a chosen value always applies as documented above.</para></summary>
+        public int SoloPrefillChunkSize
+        {
+            get => _soloPrefillChunkSize;
+            init { _soloPrefillChunkSize = value; SoloPrefillChunkSizeChosen = true; }
+        }
+        private readonly int _soloPrefillChunkSize = 8192;
+
+        /// <summary><see cref="SoloPrefillChunkSize"/> was set rather than left at its default, so a
+        /// model's own lone-prompt steps (<see cref="ISoloPrefillBudgetModel"/>) are not used.</summary>
+        public bool SoloPrefillChunkSizeChosen { get; private init; }
 
         /// <summary>Number of physical KV blocks in the pool. The total KV-cache
         /// budget is <c>NumBlocks * BlockSize</c> tokens. When the model exposes
@@ -111,12 +124,17 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>This configuration with the block size the engine resolved.</summary>
         internal SchedulerConfig WithBlockSize(int blockSize) => Copy(blockSize, Speculation);
 
-        private SchedulerConfig Copy(int blockSize, SpeculationOptions speculation) => new()
+        /// <summary>This configuration with a chosen <see cref="SoloPrefillChunkSize"/>.</summary>
+        public SchedulerConfig WithSoloPrefillChunkSize(int tokens) => Copy(BlockSize, Speculation, tokens);
+
+        private SchedulerConfig Copy(int blockSize, SpeculationOptions speculation, int? soloPrefillChunk = null) => new()
         {
             MaxNumBatchedTokens = MaxNumBatchedTokens,
             MaxNumRunningSequences = MaxNumRunningSequences,
             MaxPrefillChunkSize = MaxPrefillChunkSize,
-            SoloPrefillChunkSize = SoloPrefillChunkSize,
+            // Assigned in this order: the copy keeps whether the size was chosen.
+            SoloPrefillChunkSize = soloPrefillChunk ?? SoloPrefillChunkSize,
+            SoloPrefillChunkSizeChosen = soloPrefillChunk.HasValue || SoloPrefillChunkSizeChosen,
             NumBlocks = NumBlocks,
             BlockSize = blockSize,
             EnablePrefixCaching = EnablePrefixCaching,
@@ -136,7 +154,6 @@ namespace TensorSharp.Runtime.Scheduling
                 MaxNumBatchedTokens = ReadInt("TS_SCHED_MAX_BATCHED_TOKENS", 4096),
                 MaxNumRunningSequences = ReadInt("TS_SCHED_MAX_RUNNING_SEQS", 16),
                 MaxPrefillChunkSize = ReadInt("TS_SCHED_PREFILL_CHUNK", 256),
-                SoloPrefillChunkSize = ReadInt("TS_SCHED_SOLO_PREFILL_CHUNK", 8192),
                 NumBlocks = ReadInt("TS_SCHED_NUM_BLOCKS", 256),
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 0),
                 EnablePrefixCaching = ReadBool("TS_SCHED_PREFIX_CACHE", true),
@@ -144,7 +161,9 @@ namespace TensorSharp.Runtime.Scheduling
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
                 Speculation = SpeculationOptions.FromEnvironment(),
             };
-            return cfg;
+            // Only a value the user gave counts as chosen (see SoloPrefillChunkSize).
+            int solo = ReadInt("TS_SCHED_SOLO_PREFILL_CHUNK", 0);
+            return solo > 0 ? cfg.WithSoloPrefillChunkSize(solo) : cfg;
         }
 
         private static int ReadInt(string name, int fallback)

@@ -6,9 +6,11 @@
 #include "ggml_ops_dsv4_fused.h"
 #include "ggml_ops_matmul_precision.h"
 
+#include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <utility>
 
@@ -53,6 +55,154 @@ std::vector<float> read_vector(std::ifstream & input, const gguf_context * file,
     }
     for (float value : values) require(std::isfinite(value), "nonfinite vector " + name);
     return values;
+}
+std::string read_string(const gguf_context * file, const std::string & name) {
+    const int64_t key = gguf_find_key(file, name.c_str());
+    return key >= 0 && gguf_get_kv_type(file, key) == GGUF_TYPE_STRING ? gguf_get_val_str(file, key) : std::string();
+}
+bool read_bool(const gguf_context * file, const std::string & name) {
+    const int64_t key = gguf_find_key(file, name.c_str());
+    require(key >= 0 && gguf_get_kv_type(file, key) == GGUF_TYPE_BOOL, "missing or invalid metadata " + name);
+    return gguf_get_val_bool(file, key);
+}
+float read_float(const gguf_context * file, const std::string & name) {
+    const int64_t key = gguf_find_key(file, name.c_str());
+    require(key >= 0 && gguf_get_kv_type(file, key) == GGUF_TYPE_FLOAT32, "missing or invalid metadata " + name);
+    return gguf_get_val_f32(file, key);
+}
+std::vector<float> read_floats(const gguf_context * file, const std::string & name) {
+    const int64_t key = gguf_find_key(file, name.c_str());
+    require(key >= 0 && gguf_get_kv_type(file, key) == GGUF_TYPE_ARRAY &&
+        gguf_get_arr_type(file, key) == GGUF_TYPE_FLOAT32, "missing or invalid metadata " + name);
+    const auto * data = static_cast<const float *>(gguf_get_arr_data(file, key));
+    return std::vector<float>(data, data + gguf_get_arr_n(file, key));
+}
+
+// One encoder weight under the name the graph uses, assembled from file
+// tensors concatenated along ne1 and converted to `type` while uploading.
+struct planned_weight {
+    ggml_type type = GGML_TYPE_F32;
+    int64_t ne[4] = {1, 1, 1, 1};
+    std::vector<int64_t> parts;
+};
+
+// TensorSharp's companion (eng/dsv41-prepare-vision.py): the official names,
+// BF16 or F32 as stored.
+std::map<std::string, planned_weight> plan_companion(const gguf_context * file, ggml_context * tensors) {
+    std::map<std::string, planned_weight> plan;
+    for (int64_t i = 0; i < gguf_get_n_tensors(file); ++i) {
+        const std::string name = gguf_get_tensor_name(file, i);
+        if (name.rfind("vision.", 0) != 0 && name.rfind("aligner.", 0) != 0) continue;
+        auto * original = ggml_get_tensor(tensors, name.c_str());
+        require(original && (original->type == GGML_TYPE_BF16 || original->type == GGML_TYPE_F32), "vision matrix must be BF16 or F32: " + name);
+        auto & planned = plan[name];
+        planned.type = original->type;
+        std::copy(std::begin(original->ne), std::end(original->ne), planned.ne);
+        planned.parts.push_back(i);
+    }
+    return plan;
+}
+
+// llama.cpp's mmproj for V4.1 (general.architecture clip, projector
+// deepseek41v), which unsloth publishes beside its V4.1 GGUFs: the same
+// encoder and aligner under clip names, in F16 or BF16. It records neither
+// the vision RoPE theta, the 1024-token budget nor the (absent) aspect limit;
+// llama.cpp's converter asserts those config values and clip.cpp fixes them,
+// as here. The visual router biases are in the text GGUF instead.
+void read_clip_metadata(const gguf_context * file, metadata & m) {
+    require(read_string(file, "clip.projector_type") == "deepseek41v", "a clip companion must be a deepseek41v projector");
+    require(read_bool(file, "clip.has_vision_encoder") && read_bool(file, "clip.use_silu"),
+        "a deepseek41v companion needs its SwiGLU vision encoder");
+    m.layers = read_int(file, "clip.vision.block_count");
+    m.dim = read_int(file, "clip.vision.embedding_length");
+    m.heads = read_int(file, "clip.vision.attention.head_count");
+    m.intermediate = read_int(file, "clip.vision.feed_forward_length");
+    m.patch_size = read_int(file, "clip.vision.patch_size");
+    m.downsample_ratio = read_int(file, "clip.vision.projector.scale_factor");
+    m.min_pixels = read_int(file, "clip.vision.image_min_pixels");
+    m.text_dim = read_int(file, "clip.vision.projection_dim");
+    m.max_image_tokens = 1024;
+    m.max_wh_ratio = 0;
+    m.rope_theta = 10000.0f;
+    // The checkpoint config's image_token_id. The managed loader checks that
+    // the tokenizer's image placeholder is this token.
+    m.image_token_id = 129264;
+    // norm() and the managed image processor hard-code these.
+    require(read_float(file, "clip.vision.attention.layer_norm_epsilon") == 1e-6f,
+        "a deepseek41v companion must use RMS norm epsilon 1e-6");
+    for (const char * key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
+        const auto values = read_floats(file, key);
+        require(values.size() == 3 && std::all_of(values.begin(), values.end(), [](float v) { return v == 0.5f; }),
+            std::string("a deepseek41v companion must normalize pixels with 0.5: ") + key);
+    }
+    m.router_bias_in_text = true;
+    m.source_basename = read_string(file, "general.basename");
+    m.source_version = read_string(file, "general.version");
+}
+
+std::map<std::string, planned_weight> plan_clip(const gguf_context * file, ggml_context * tensors,
+                                                const metadata & m, std::vector<bool> & used) {
+    std::map<std::string, planned_weight> plan;
+    auto source = [&](const std::string & name) {
+        const int64_t index = gguf_find_tensor(file, name.c_str());
+        auto * tensor = ggml_get_tensor(tensors, name.c_str());
+        require(index >= 0 && tensor != nullptr, "missing tensor " + name);
+        require(tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16 || tensor->type == GGML_TYPE_F32,
+            "deepseek41v tensor must be F16, BF16 or F32: " + name);
+        used[size_t(index)] = true;
+        return std::make_pair(index, tensor);
+    };
+    // Matrices load as BF16, the checkpoint's own type, whatever width the
+    // file stores: llama.cpp keeps the patch convolution in F32 even in a BF16
+    // mmproj, and an F16 copy converts back exactly except for weights in
+    // F16's subnormal range (about 0.02% of them). A BF16 patch weight is
+    // also what makes the encoder round activations to BF16 as the official
+    // model computes (bf16_activations). Vectors are F32.
+    auto add = [&](const std::string & name, std::initializer_list<std::string> parts, int64_t ne0, int64_t ne1) {
+        auto & planned = plan[name];
+        planned.ne[0] = ne0;
+        planned.ne[1] = ne1;
+        int64_t rows = 0;
+        for (const auto & part : parts) {
+            const auto [index, tensor] = source(part);
+            require(tensor->ne[0] == ne0 && tensor->ne[2] == 1 && tensor->ne[3] == 1, "unexpected tensor dimensions for " + part);
+            rows += tensor->ne[1];
+            planned.parts.push_back(index);
+        }
+        require(rows == ne1, "unexpected tensor dimensions for " + name);
+        planned.type = ne1 == 1 ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+    };
+    const int p = m.patch_size, dim = m.dim, ratio = m.downsample_ratio;
+    {
+        // Conv weight [p, p, 3, dim]: the official Linear over flattened (3, p, p) patches.
+        const auto [index, tensor] = source("v.patch_embd.weight");
+        require(tensor->ne[0] == p && tensor->ne[1] == p && tensor->ne[2] == 3 && tensor->ne[3] == dim,
+            "unexpected tensor dimensions for v.patch_embd.weight");
+        auto & planned = plan["vision.patch_embed.proj.weight"];
+        planned.ne[0] = 3 * p * p;
+        planned.ne[1] = dim;
+        planned.type = GGML_TYPE_BF16;
+        planned.parts.push_back(index);
+    }
+    add("vision.patch_embed.proj.bias", {"v.patch_embd.bias"}, dim, 1);
+    for (int layer = 0; layer < m.layers; ++layer) {
+        const std::string from = "v.blk." + std::to_string(layer) + ".", to = "vision.blocks." + std::to_string(layer) + ".";
+        add(to + "norm1.weight", {from + "ln1.weight"}, dim, 1);
+        add(to + "norm2.weight", {from + "ln2.weight"}, dim, 1);
+        add(to + "attn.wqkv.weight", {from + "attn_qkv.weight"}, dim, 3 * dim);
+        add(to + "attn.wqkv.bias", {from + "attn_qkv.bias"}, 3 * dim, 1);
+        add(to + "attn.wo.weight", {from + "attn_out.weight"}, dim, dim);
+        add(to + "attn.wo.bias", {from + "attn_out.bias"}, dim, 1);
+        // The official fused SwiGLU w1 is [gate; up] along its output rows.
+        add(to + "mlp.w1.weight", {from + "ffn_gate.weight", from + "ffn_up.weight"}, dim, 2 * m.intermediate);
+        add(to + "mlp.w2.weight", {from + "ffn_down.weight"}, m.intermediate, dim);
+    }
+    add("vision.norm.weight", {"v.post_ln.weight"}, dim, 1);
+    add("aligner.w1.weight", {"mm.1.weight"}, int64_t(dim) * ratio * ratio, m.text_dim);
+    add("aligner.w1.bias", {"mm.1.bias"}, m.text_dim, 1);
+    add("aligner.w2.weight", {"mm.2.weight"}, m.text_dim, m.text_dim);
+    add("aligner.w2.bias", {"mm.2.bias"}, m.text_dim, 1);
+    return plan;
 }
 } // namespace
 
@@ -291,40 +441,53 @@ std::shared_ptr<encoder> encoder::load(const std::string & path, const std::stri
     source.file = gguf_init_from_file(path.c_str(), {true, &source.tensors});
     require(source.file != nullptr, "cannot open companion " + path);
     auto * file = source.file;
-    const int64_t architecture = gguf_find_key(file, "general.architecture");
-    require(architecture >= 0 && gguf_get_kv_type(file, architecture) == GGUF_TYPE_STRING &&
-        std::string(gguf_get_val_str(file, architecture)) == "deepseek41_vision", "invalid companion architecture");
-    const std::string vp = "deepseek41.vision.";
-    m.layers = read_int(file, vp + "num_hidden_layers"); m.dim = read_int(file, vp + "hidden_size");
-    m.heads = read_int(file, vp + "num_attention_heads"); m.intermediate = read_int(file, vp + "intermediate_size");
-    m.patch_size = read_int(file, vp + "patch_size"); m.downsample_ratio = read_int(file, vp + "downsample_ratio");
-    m.max_image_tokens = read_int(file, vp + "max_image_tokens"); m.min_pixels = read_int(file, vp + "min_pixels");
-    m.max_wh_ratio = read_int(file, vp + "max_wh_ratio");
-    const int64_t theta = gguf_find_key(file, (vp + "rope_theta").c_str());
-    require(theta >= 0 && gguf_get_kv_type(file, theta) == GGUF_TYPE_FLOAT32, "missing or invalid vision rope theta");
-    m.rope_theta = gguf_get_val_f32(file, theta);
-    m.text_dim = read_int(file, "deepseek41.hidden_size"); m.text_layers = read_int(file, "deepseek41.num_hidden_layers");
-    m.image_token_id = read_int(file, "deepseek41.image_token_id");
-    const int64_t fingerprint = gguf_find_key(file, "deepseek41.tokenizer_hash");
-    require(fingerprint >= 0 && gguf_get_kv_type(file, fingerprint) == GGUF_TYPE_UINT64, "missing or invalid parent tokenizer fingerprint");
-    m.tokenizer_hash = gguf_get_val_u64(file, fingerprint);
+    const std::string architecture = read_string(file, "general.architecture");
+    const bool clip = architecture == "clip";
+    require(clip || architecture == "deepseek41_vision", "invalid companion architecture");
+    if (clip) read_clip_metadata(file, m);
+    else {
+        const std::string vp = "deepseek41.vision.";
+        m.layers = read_int(file, vp + "num_hidden_layers"); m.dim = read_int(file, vp + "hidden_size");
+        m.heads = read_int(file, vp + "num_attention_heads"); m.intermediate = read_int(file, vp + "intermediate_size");
+        m.patch_size = read_int(file, vp + "patch_size"); m.downsample_ratio = read_int(file, vp + "downsample_ratio");
+        m.max_image_tokens = read_int(file, vp + "max_image_tokens"); m.min_pixels = read_int(file, vp + "min_pixels");
+        m.max_wh_ratio = read_int(file, vp + "max_wh_ratio");
+        m.rope_theta = read_float(file, vp + "rope_theta");
+        m.text_dim = read_int(file, "deepseek41.hidden_size"); m.text_layers = read_int(file, "deepseek41.num_hidden_layers");
+        m.image_token_id = read_int(file, "deepseek41.image_token_id");
+        const int64_t fingerprint = gguf_find_key(file, "deepseek41.tokenizer_hash");
+        require(fingerprint >= 0 && gguf_get_kv_type(file, fingerprint) == GGUF_TYPE_UINT64, "missing or invalid parent tokenizer fingerprint");
+        m.tokenizer_hash = gguf_get_val_u64(file, fingerprint);
+    }
     require(m.layers > 0 && m.layers <= 128 && m.dim > 0 && m.dim <= 8192 && m.heads > 0 &&
         m.dim % m.heads == 0 && (m.dim / m.heads) % 4 == 0 && m.intermediate > 0 && m.intermediate <= 65536 &&
         m.patch_size > 0 && m.patch_size <= 64 && m.downsample_ratio > 0 && m.downsample_ratio <= 8 &&
         m.max_image_tokens >= 4 && m.max_image_tokens <= 8192 && m.rope_theta > 0 && std::isfinite(m.rope_theta) &&
-        m.text_dim > 0 && m.text_dim <= 65536 && m.text_layers > 0 && m.text_layers <= 128,
+        m.text_dim > 0 && m.text_dim <= 65536 && (m.router_bias_in_text || (m.text_layers > 0 && m.text_layers <= 128)),
         "invalid companion geometry");
     std::ifstream input(path, std::ios::binary);
     require(bool(input), "cannot read companion");
-    state.start = read_vector(input, file, source.tensors, "image_start");
-    state.end = read_vector(input, file, source.tensors, "image_end");
-    state.newline = read_vector(input, file, source.tensors, "image_newline");
+    std::vector<bool> used(size_t(gguf_get_n_tensors(file)), false);
+    auto sentinel = [&](const char * companion_name, const char * clip_name) {
+        const char * name = clip ? clip_name : companion_name;
+        if (const int64_t index = gguf_find_tensor(file, name); index >= 0) used[size_t(index)] = true;
+        return read_vector(input, file, source.tensors, name);
+    };
+    state.start = sentinel("image_start", "v.token_embd.img_start");
+    state.end = sentinel("image_end", "v.token_embd.img_end");
+    state.newline = sentinel("image_newline", "v.image_newline");
     require(state.start.size() == size_t(m.text_dim) && state.end.size() == size_t(m.text_dim) && state.newline.size() == size_t(m.text_dim), "delimiter dimensions do not match text model");
     for (int layer = 0; layer < m.text_layers; ++layer) {
         state.biases.push_back(read_vector(input, file, source.tensors, "layers." + std::to_string(layer) + ".ffn.gate.bias_vl"));
         if (layer == 0) m.n_experts = int(state.biases.back().size());
         require(m.n_experts > 0 && m.n_experts <= 4096 && state.biases.back().size() == size_t(m.n_experts), "inconsistent router bias dimensions");
     }
+    const auto plan = clip ? plan_clip(file, source.tensors, m, used) : plan_companion(file, source.tensors);
+    // A clip file is consumed whole: a tensor this mapping does not know is a
+    // format this encoder would silently compute without.
+    if (clip)
+        for (int64_t i = 0; i < gguf_get_n_tensors(file); ++i)
+            require(used[size_t(i)], std::string("unexpected tensor in deepseek41v companion: ") + gguf_get_tensor_name(file, i));
     require(device >= 0, "negative backend device index");
     std::string name = backend_name;
     std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::toupper(c)); });
@@ -352,14 +515,10 @@ std::shared_ptr<encoder> encoder::load(const std::string & path, const std::stri
         state.backend = wrapped;
     }
 #endif
-    state.weights_ctx = ggml_init({size_t(gguf_get_n_tensors(file) + 1) * ggml_tensor_overhead() + 4096, nullptr, true});
+    state.weights_ctx = ggml_init({(plan.size() + 1) * ggml_tensor_overhead() + 4096, nullptr, true});
     require(state.weights_ctx != nullptr, "cannot allocate weight metadata");
-    for (int64_t i = 0; i < gguf_get_n_tensors(file); ++i) {
-        const std::string tensor_name = gguf_get_tensor_name(file, i);
-        if (tensor_name.rfind("vision.", 0) != 0 && tensor_name.rfind("aligner.", 0) != 0) continue;
-        auto * original = ggml_get_tensor(source.tensors, tensor_name.c_str());
-        require(original && (original->type == GGML_TYPE_BF16 || original->type == GGML_TYPE_F32), "vision matrix must be BF16 or F32: " + tensor_name);
-        auto * tensor = ggml_dup_tensor(state.weights_ctx, original);
+    for (const auto & [tensor_name, planned] : plan) {
+        auto * tensor = ggml_new_tensor(state.weights_ctx, planned.type, 4, planned.ne);
         ggml_set_name(tensor, tensor_name.c_str());
         state.weights.emplace(tensor_name, tensor);
     }
@@ -369,16 +528,36 @@ std::shared_ptr<encoder> encoder::load(const std::string & path, const std::stri
     state.weights_buffer = ggml_backend_alloc_ctx_tensors(state.weights_ctx, state.backend);
     require(state.weights_buffer != nullptr, "cannot allocate vision weights on selected device");
     ggml_backend_buffer_set_usage(state.weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    std::vector<char> staging(16 * 1024 * 1024);
-    for (const auto & [tensor_name, tensor] : state.weights) {
-        const auto index = gguf_find_tensor(file, tensor_name.c_str());
-        input.seekg(gguf_get_data_offset(file) + gguf_get_tensor_offset(file, index));
-        for (size_t offset = 0; offset < ggml_nbytes(tensor);) {
-            const size_t bytes = std::min(staging.size(), ggml_nbytes(tensor) - offset);
-            require(bool(input.read(staging.data(), bytes)), "truncated tensor " + tensor_name);
-            ggml_backend_tensor_set(tensor, staging.data(), offset, bytes);
-            offset += bytes;
+    std::vector<char> staging(16 * 1024 * 1024), converted;
+    std::vector<float> values;
+    for (const auto & [tensor_name, planned] : plan) {
+        auto * tensor = state.weights.at(tensor_name);
+        const size_t out_size = ggml_type_size(planned.type);
+        size_t written = 0;
+        for (const int64_t index : planned.parts) {
+            const auto * part = ggml_get_tensor(source.tensors, gguf_get_tensor_name(file, index));
+            const size_t in_size = ggml_type_size(part->type);
+            const int64_t count = ggml_nelements(part), chunk = int64_t(staging.size() / in_size);
+            input.seekg(gguf_get_data_offset(file) + gguf_get_tensor_offset(file, index));
+            for (int64_t done = 0; done < count;) {
+                const int64_t n = std::min(chunk, count - done);
+                require(bool(input.read(staging.data(), n * in_size)), "truncated tensor " + tensor_name);
+                const char * data = staging.data();
+                if (part->type != planned.type) {
+                    values.resize(size_t(n));
+                    if (part->type == GGML_TYPE_F32) std::memcpy(values.data(), staging.data(), size_t(n) * sizeof(float));
+                    else ggml_get_type_traits(part->type)->to_float(staging.data(), values.data(), n);
+                    converted.resize(size_t(n) * out_size);
+                    if (planned.type == GGML_TYPE_F32) std::memcpy(converted.data(), values.data(), size_t(n) * sizeof(float));
+                    else ggml_fp32_to_bf16_row(values.data(), reinterpret_cast<ggml_bf16_t *>(converted.data()), n);
+                    data = converted.data();
+                }
+                ggml_backend_tensor_set(tensor, data, written, size_t(n) * out_size);
+                written += size_t(n) * out_size;
+                done += n;
+            }
         }
+        require(written == ggml_nbytes(tensor), "internal size mismatch while loading " + tensor_name);
     }
     return result;
 }

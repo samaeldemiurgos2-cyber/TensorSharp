@@ -17,7 +17,7 @@ public sealed class DeepSeekNativeRetentionFixtureTests
     {
         string path = TestGates.FindGguf(Environment.GetEnvironmentVariable("TS_TEST_DSV41_FIXTURE_DIR"), "deepseek41-fixture");
         string[] keys = { "TS_DSV41_RETAINED_CACHE_MB", "MAX_CONTEXT",
-            "TS_DSV4_UBATCH", "TS_DSV4_THREADS", "TS_DSV41_ENGRAM_THREADS", "TS_DSV4_FA" };
+            "TS_DSV4_UBATCH", "TS_DSV4_THREADS", "TS_DSV41_ENGRAM_THREADS", "TS_DSV4_FA", "TS_DSV41_YOCO_KEEP" };
         string[] values = { "2048", "512", "3", "2", "2", "0", "0" };
         var old = keys.Select(Environment.GetEnvironmentVariable).ToArray();
         try
@@ -76,7 +76,7 @@ public sealed class DeepSeekNativeRetentionFixtureTests
     {
         string path = TestGates.FindGguf(Environment.GetEnvironmentVariable("TS_TEST_DSV41_FIXTURE_DIR"), "deepseek41-fixture");
         string[] keys = { "TS_DSV41_RETAINED_CACHE_MB", "MAX_CONTEXT",
-            "TS_DSV4_UBATCH", "TS_DSV4_THREADS", "TS_DSV41_ENGRAM_THREADS", "TS_DSV4_FA" };
+            "TS_DSV4_UBATCH", "TS_DSV4_THREADS", "TS_DSV41_ENGRAM_THREADS", "TS_DSV4_FA", "TS_DSV41_YOCO_KEEP" };
         string[] values = { "2048", "512", "3", "2", "2", "0", "0" };
         var old = keys.Select(Environment.GetEnvironmentVariable).ToArray();
         try

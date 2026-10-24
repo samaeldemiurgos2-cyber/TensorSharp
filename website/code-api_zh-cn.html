@@ -35,7 +35,7 @@
       <tr><td><code>TensorSharp.Backends.Cuda</code></td><td><code>TensorSharp.Cuda</code></td><td>直接 CUDA 分配器、存储、cuBLAS GEMM、PTX 内核、量化 CUDA 运算。</td></tr>
       <tr><td><code>TensorSharp.Backends.MLX</code></td><td><code>TensorSharp.MLX</code></td><td>Apple Silicon MLX 后端（mlx-c / Metal）。</td></tr>
       <tr><td><code>TensorSharp.Knowledge</code></td><td><code>TensorSharp.Knowledge</code></td><td>独立个人存储、原文件、文档提取、版本化片段、BM25 与可选嵌入检索。<a href="knowledge_zh-cn.html">知识库指南</a>。</td></tr>
-      <tr><td><code>TensorSharp.Chat</code></td><td><code>TensorSharp.Chat</code></td><td>与宿主无关的聊天流水线——<code>ModelService</code>、会话、生成、技能循环、Web UI 请求/流式契约。不依赖 ASP.NET Core；由服务器、CLI 与 iOS 应用共用。</td></tr>
+      <tr><td><code>TensorSharp.Chat</code></td><td><code>TensorSharp.Chat</code></td><td>与宿主无关的聊天流水线——<code>ModelService</code>、会话、生成、技能循环、Web UI 请求/流式契约。不依赖 ASP.NET Core；服务器与 TensorAgent 使用其流水线。CLI 引用共享类型，但通过自己的循环直接驱动 Runtime。</td></tr>
       <tr><td><code>TensorSharp.Server</code></td><td><code>TensorSharp.Server</code></td><td>ASP.NET Core 库：OpenAI/Ollama 适配器、基于 TensorSharp.Chat 的 HTTP 传输、Web UI 资源。它是库——单独构建不产生可执行文件。</td></tr>
       <tr><td><code>TensorSharp.Server.Host</code></td><td><code>TensorSharp.Server.Host</code></td><td>基于该库的可运行 Web 应用：<code>Program.cs</code>、宿主装配、<code>wwwroot/</code> 与命令行。实际运行的是它。</td></tr>
       <tr><td><code>TensorSharp.Cli</code></td><td><code>TensorSharp.Cli</code></td><td>控制台宿主与调试 / 批处理工具。</td></tr>

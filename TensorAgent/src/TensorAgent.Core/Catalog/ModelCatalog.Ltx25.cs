@@ -2,11 +2,13 @@ namespace TensorAgent.Core.Catalog;
 
 public static partial class ModelCatalog
 {
-    // Exact files used by the native distilled text/image-to-video/audio pipeline, all from
-    // unsloth/LTX-2.5-GGUF at ac3c540c (read on 2026-10-18), which is not gated. The denoiser is
-    // Unsloth's Dynamic 2.0 mixed-precision 4-bit file from the distilled/ folder (the repository
-    // root holds the dev checkpoint, which the engine refuses); the companions are the
-    // publisher's Lightricks/LTX-2.5 files byte for byte, mirrored there.
+    // Exact files used by the native distilled text/image-to-video/audio pipeline. The five
+    // base files are from unsloth/LTX-2.5-GGUF at ac3c540c (read on 2026-10-18), which is not
+    // gated. The optional Ingredients IC-LoRA is the official gated Lightricks release pinned
+    // to its 2026-09-10 commit; HF_TOKEN or an accepted Hugging Face token file is required.
+    // The denoiser is Unsloth's Dynamic 2.0 mixed-precision 4-bit file from the distilled/ folder
+    // (the repository root holds the dev checkpoint, which the engine refuses); companions are
+    // publisher files mirrored byte for byte in the Unsloth repository.
     private const string Ltx25Repository = "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/";
 
     private static CatalogModel Ltx25Distilled() => new()
@@ -37,6 +39,11 @@ public static partial class ModelCatalog
             new CatalogFile(CatalogFileRole.LatentUpscaler, "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
                 Ltx25Repository + "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
                 995_778_752, "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8"),
+            // Keep the gated optional file after all base assets: if access is denied,
+            // the downloaded model remains usable for ordinary video generation.
+            new CatalogFile(CatalogFileRole.IngredientsLora, "ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors",
+                "https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Ingredients/resolve/12040e4091ac2008d3906a594e31a7fb1ab9d546/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors",
+                1_308_787_472, "ff873a5beada3c579a8137c7c53343916f78bcc9a529ba910143073fe8715e95", Optional: true),
         },
         Modalities = CatalogModalities.Image | CatalogModalities.VideoOutput | CatalogModalities.AudioOutput,
         // Conservative device tier; initial full-generation validation uses short clips.

@@ -1,0 +1,44 @@
+A hash table (also called a hash map, dictionary, associative array) is a data structure that implements an associative array abstract data type: a structure that can map keys to values. It is one of the most important and widely used data structures in computer science, forming the basis for Python `dict`, Java `HashMap`, JavaScript `Object`/`Map`, Go `map`, C++ `unordered_map`, etc.
+
+This explanation will cover the core idea, hash functions, collisions and resolution strategies, resizing/rehashing, complexity analysis, and a detailed worked example.
+
+### 1. The Core Idea: Array + Hash Function
+
+An array gives O(1) access by index: `array[3]` is instant. But arrays only work with integer indices 0, 1, 2, ...
+
+We want to do `map["apple"] = 5` or `map[123456789] = "hello"` - to use arbitrary keys (strings, objects, large numbers) with array-like speed.
+
+The trick is to **translate** an arbitrary key into an array index. This is done by a **hash function**.
+
+Conceptually:
+
+```
+key -> hash_function(key) -> integer -> compress to array index -> store value there
+```
+
+Formally, we have:
+
+1.  An underlying array (often called `buckets`, `slots`, or `table`) of size `m` (capacity). Each slot can hold 0 or more entries.
+2.  A hash function `h(k)` that takes a key `k` and returns an integer (the hash code), typically in a very large range (e.g., 0 to 2^64 - 1).
+3.  A compression function to map that large integer into the range `[0, m-1]`. The most common is modulo: `index = h(k) mod m`.
+
+So to insert `(key, value)`:
+```
+index = h(key) % m
+table[index] = value  // (simplified, ignoring collisions for now)
+```
+
+To lookup `key`:
+```
+index = h(key) % m
+return table[index]
+```
+
+If there were no collisions, this would be perfect O(1) time.
+
+### 2. The Hash Function
+
+A good hash function is critical. It should be:
+
+1.  **Deterministic:** `h(k)` must always return the same value for the same `k`. Otherwise we can't find it again.
+2.  **Uniform / Well-distributed:**

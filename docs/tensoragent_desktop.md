@@ -211,11 +211,13 @@ time, and shares the text encoder, VAE and vision files with Qwen-Image 2.1, so 
 both downloads them once; it offers only the style plug-ins validated on it.
 
 **Make a video.** Download and **Use MiniMax-H3**, then describe a short clip or
-attach a starting photo. **MiniMax-H3 References** accepts reference photos, clips
-and recordings. **LTX 2.5 Distilled** adds text/image-to-video with 48 kHz stereo
-audio and image keyframes. It is experimental, needs the 48 GB system RAM tier
-and 44.76 GB of pinned files, and official companions require approved Hugging
-Face access. Its default is a short 17-frame preview; with image guides attached,
+attach a starting photo. In chat, attach a video to continue from its exact last frame;
+in Video Studio, choose a video's last frame as the next take's start. Reference photos
+and recordings use MiniMax-H3 reference mode, which can switch without reloading the model.
+**LTX 2.5 Distilled** adds text/image-to-video with 48 kHz stereo
+audio and image keyframes. It is experimental and needs the 48 GB system RAM tier.
+Its five ungated base files total 43.08 GB; the optional gated Ingredients IC-LoRA
+adds 1.31 GB and requires approved Hugging Face access. Its default is a short 17-frame preview; with image guides attached,
 the composer offers longer clips and per-image frame position/strength. Timeline
 keyframes work with the catalog entry; identity references require a separate
 IC-LoRA checkpoint. Read the [LTX 2.5 guide](models/ltx-2.5.md) for setup and

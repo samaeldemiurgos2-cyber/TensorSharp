@@ -128,7 +128,8 @@ internal static class StudioChatScope
             take = r == null ? null : new
             {
                 mode = r.Mode != null ? Truncate(r.Mode, 16) : r.ReferenceAssetIds != null && r.TemporalConditions != null ? StudioGenerationModes.Infer(r) : null,
-                firstFrameAssetId = r.ConditioningAssetId == null ? null : Truncate(r.ConditioningAssetId, 64), referenceCount = r.ReferenceAssetIds?.Count ?? 0,
+                firstFrameAssetId = r.ConditioningAssetId == null ? null : Truncate(r.ConditioningAssetId, 64),
+                referenceCount = r.ReferenceAssetIds?.Count ?? 0, referenceVideoCount = r.ReferenceVideoAssetIds?.Count ?? 0,
                 r.FrameCount, r.Fps, shotId = r.ShotId == null ? null : Truncate(r.ShotId, 64),
             },
         };

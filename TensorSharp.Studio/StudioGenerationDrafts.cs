@@ -35,8 +35,9 @@ public sealed partial class StudioService
     public async Task<StudioGenerationDraft> CreateGenerationDraftAsync(string projectId, long expectedRevision,
         StudioGenerationRequest request, string summary, StudioFrameSelector? firstFrameFrom, CancellationToken cancellationToken = default)
     {
-        if (request == null || request.TemporalConditions == null || request.ReferenceAssetIds == null || request.ProjectId == null
-            || request.Prompt == null || summary == null || request.TemporalConditions.Any(condition => condition == null))
+        if (request == null || request.TemporalConditions == null || request.ReferenceAssetIds == null || request.ReferenceVideoAssetIds == null || request.ProjectId == null
+            || request.Prompt == null || summary == null || request.TemporalConditions.Any(condition => condition == null) ||
+            request.ReferenceAssetIds.Any(id => id == null) || request.ReferenceVideoAssetIds.Any(id => id == null))
             throw new StudioException("invalid_draft", "Generation plans require non-null request fields, conditioning arrays, and a summary.");
         request = StudioJson.Clone(request);
         await projectGate.WaitAsync(cancellationToken);

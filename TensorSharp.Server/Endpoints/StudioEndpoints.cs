@@ -26,7 +26,8 @@ public static class StudioEndpoints
         {
             var chat = sp.GetRequiredService<WebUiAdapter>().Chat;
             var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Studio");
-            var service = new StudioService(root, new NativeStudioGenerationAdapter(sp.GetRequiredService<ModelService>(), chat),
+            var service = new StudioService(root, new NativeStudioGenerationAdapter(sp.GetRequiredService<ModelService>(), chat,
+                ensureLtxIngredients: ltx => ltx.TryLoadIngredientsAdapterIfPresent()),
                 StudioHostOptions.Create(sp.GetRequiredService<ServerHostingOptions>().UploadMaxFileBytes,
                     diagnostic => logger.LogError("{Diagnostic}", diagnostic)));
             chat.Studio = service;

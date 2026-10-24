@@ -28,6 +28,7 @@ namespace TensorSharp.GGML
         private const int DefaultInitialBlockCount = 4;
         private const int CudaInitialBlockCount = 0;
         private const int CudaMaxPooledBlocks = 8;
+        private const int CudaTpMaxPooledBlocks = 128;
         private const long CudaMaxRetainedBlockSize = 8L * 1024 * 1024;
         // Apple Silicon (Metal, integrated GPU, unified memory) and the GGML CPU backend
         // both benefit from short-lived intermediate buffers (KV cache append, attention
@@ -55,11 +56,15 @@ namespace TensorSharp.GGML
         private readonly bool _useVirtualAlloc;
         private readonly int _pageSize;
         private readonly int _initialBlockCount;
-        private readonly int _maxPooledBlocks;
+        private readonly GgmlBackendType _backendType;
+        private int _maxPooledBlocks;
         private readonly nuint _maxRetainedBlockSize;
+        private long _poolHits, _freshAllocations, _systemFrees, _systemFreeFailures;
+        private long _retainedBytes, _peakRetainedBytes;
 
         public GgmlMemoryPool(GgmlBackendType backendType)
         {
+            _backendType = backendType;
             int systemPageSize = Environment.SystemPageSize;
             _pageSize = IsAppleOS()
                 ? Math.Max(MetalPageSize, systemPageSize)
@@ -80,6 +85,29 @@ namespace TensorSharp.GGML
                 _maxPooledBlocks = IntegratedMaxPooledBlocks;
                 _maxRetainedBlockSize = (nuint)IntegratedMaxRetainedBlockSize;
             }
+        }
+
+        // Explicit owner opt-in; constructing a multi-device context alone does
+        // not change retention for other models or sequential layer placement.
+        internal bool ConfigureCudaTensorParallel(int degree)
+        {
+            if (degree <= 0) throw new ArgumentOutOfRangeException(nameof(degree));
+            lock (_lock)
+            {
+                if (_closed || _backendType != GgmlBackendType.Cuda || degree == 1)
+                    return false;
+                _maxPooledBlocks = Math.Max(_maxPooledBlocks,
+                    CudaMaxPooledBlocks * Math.Min(degree, CudaTpMaxPooledBlocks / CudaMaxPooledBlocks));
+                return true;
+            }
+        }
+
+        internal GgmlMemoryPoolStatistics GetStatistics()
+        {
+            lock (_lock)
+                return new GgmlMemoryPoolStatistics(_poolHits, _freshAllocations, _systemFrees,
+                    _systemFreeFailures, _available.Count, _outstanding.Count, _retainedBytes,
+                    _peakRetainedBytes, _maxPooledBlocks, (long)_maxRetainedBlockSize, _closed);
         }
 
         public IntPtr Allocate(long byteLength)
@@ -111,6 +139,8 @@ namespace TensorSharp.GGML
                 {
                     PoolBlock block = _available[bestIdx];
                     _available.RemoveAt(bestIdx);
+                    _retainedBytes -= (long)block.Size;
+                    _poolHits++;
                     _outstanding[block.Ptr] = block;
                     return block.Ptr;
                 }
@@ -119,6 +149,7 @@ namespace TensorSharp.GGML
             PoolBlock fresh = AllocateNew(alignedSize);
             lock (_lock)
             {
+                _freshAllocations++;
                 _outstanding[fresh.Ptr] = fresh;
             }
             return fresh.Ptr;
@@ -144,11 +175,13 @@ namespace TensorSharp.GGML
                     _available.Count < _maxPooledBlocks)
                 {
                     _available.Add(block);
+                    _retainedBytes += (long)block.Size;
+                    _peakRetainedBytes = Math.Max(_peakRetainedBytes, _retainedBytes);
                     return;
                 }
             }
 
-            FreeToSystem(block);
+            ReleaseToSystem(block);
         }
 
         private bool _closed;
@@ -190,12 +223,13 @@ namespace TensorSharp.GGML
                     return 0;
                 release = new List<PoolBlock>(_available);
                 _available.Clear();
+                _retainedBytes = 0;
             }
             long bytes = 0;
             foreach (PoolBlock block in release)
             {
                 bytes += (long)block.Size;
-                FreeToSystem(block);
+                ReleaseToSystem(block);
             }
             return bytes;
         }
@@ -218,18 +252,31 @@ namespace TensorSharp.GGML
             return new PoolBlock(Marshal.AllocHGlobal((nint)alignedSize), alignedSize, isVirtual: false);
         }
 
-        private static void FreeToSystem(in PoolBlock block)
+        private void ReleaseToSystem(in PoolBlock block)
+        {
+            // The OS operation remains outside the pool lock. Count completed
+            // releases separately from failed unmaps; never claim a failed
+            // release was reclaimed. Snapshots are exact once workers join.
+            bool freed = FreeToSystem(block);
+            lock (_lock)
+            {
+                if (freed) _systemFrees++;
+                else _systemFreeFailures++;
+            }
+        }
+
+        private static bool FreeToSystem(in PoolBlock block)
         {
             if (block.IsVirtual)
             {
                 // If munmap/VirtualFree fails (e.g. vm.max_map_count exhausted),
                 // leaking the mapping is the only safe outcome — this pointer
                 // did not come from the C heap, so it must NEVER reach free().
-                FreeVirtual(block.Ptr, block.Size);
-                return;
+                return FreeVirtual(block.Ptr, block.Size);
             }
 
             Marshal.FreeHGlobal(block.Ptr);
+            return true;
         }
 
         internal void EnsureInitialBlocks()
@@ -237,7 +284,13 @@ namespace TensorSharp.GGML
             lock (_lock)
             {
                 while (_available.Count < _initialBlockCount)
-                    _available.Add(AllocateNew((nuint)BlockSize));
+                {
+                    PoolBlock block = AllocateNew((nuint)BlockSize);
+                    _available.Add(block);
+                    _freshAllocations++;
+                    _retainedBytes += (long)block.Size;
+                    _peakRetainedBytes = Math.Max(_peakRetainedBytes, _retainedBytes);
+                }
             }
         }
 

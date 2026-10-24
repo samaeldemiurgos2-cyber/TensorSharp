@@ -800,8 +800,9 @@
     if (previousModel !== state.model) modelChanged();
     // A foreground capability refresh must not discard an unsent clip's
     // length or image semantics. A different checkpoint starts a fresh choice.
-    if (previousModel === state.model && state.video && state.video.supportsKeyframeConditioning
-        && previousVideo && previousVideo.supportsKeyframeConditioning) {
+    if (previousModel === state.model && state.video && state.video.supportsImageConditioning
+        && state.video.supportsReferenceConditioning && previousVideo
+        && previousVideo.supportsImageConditioning && previousVideo.supportsReferenceConditioning) {
       if (Number.isInteger(previousVideo.clipFrames)) state.video.clipFrames = previousVideo.clipFrames;
       if (state.video.supportsReferenceConditioning && previousVideo.referenceMode) state.video.referenceMode = true;
     }
@@ -839,11 +840,12 @@
   // plug-ins). Which plug-ins, if any, the host says (WebUiRoutes.MapLoras).
   function takesLoras() { return makesImages() || makesVideo(); }
 
-  // The keyframes checkpoint starts the clip from a photo (and ends it on a second
-  // one); the references checkpoint puts the people, things and sounds it is shown
-  // into a scene of its own. The composer says which, before anything is attached.
+  // MiniMax-H3 can choose between its first/last-frame and reference denoisers without
+  // changing the loaded model. LTX also offers the shared selector for timed guides.
   function videoPlaceholder(v) {
-    if (v.supportsKeyframeConditioning && v.referenceMode) return t('page.composer.videoWithIdentityReferences');
+    if (v.supportsImageConditioning && v.supportsReferenceConditioning && v.referenceMode) return t('page.composer.videoWithIdentityReferences');
+    if (v.family === 'minimax-h3' || v.family === 'ltx-2.5') return t('page.composer.videoWithContinuations');
+    if (v.supportsImageConditioning && v.supportsReferenceConditioning) return t('page.composer.videoWithKeyframes');
     if (v.supportsKeyframeConditioning) return t('page.composer.videoWithKeyframes');
     if (v.supportsReferenceConditioning) return t('page.composer.videoWithReferences');
     if (v.supportsImageConditioning) return t('page.composer.videoFromPhoto');
@@ -1601,8 +1603,11 @@
     if (textParts.length) msg.content = textParts.join('\n\n') + '\n\n' + msg.content;
     if (imagePaths.length) msg.imagePaths = imagePaths;
     if (stillImagePaths.length) msg.stillImagePaths = stillImagePaths;
-    if (state.video && state.video.supportsKeyframeConditioning && state.video.clipFrames) msg.videoFrames = state.video.clipFrames;
-    if (stillImagePaths.length && state.video && state.video.supportsKeyframeConditioning && state.video.referenceMode) {
+    if (state.video && (state.video.supportsKeyframeConditioning
+        || state.video.supportsImageConditioning && state.video.supportsReferenceConditioning)
+        && state.video.clipFrames) msg.videoFrames = state.video.clipFrames;
+    if (stillImagePaths.length && state.video && state.video.supportsImageConditioning
+        && state.video.supportsReferenceConditioning && state.video.referenceMode) {
       msg.videoMode = 'ref';
     } else if (state.video && state.video.supportsKeyframeConditioning) {
       var conditions = videoImageConditions(atts, state.video.clipFrames || state.video.defaultPreviewFrames || 17);
@@ -2894,10 +2899,14 @@
     });
     var imageIndex = 0;
     var imageCount = state.attachments.filter(function (a) { return a.mediaType === 'image'; }).length;
-    if (imageCount && state.video && state.video.supportsKeyframeConditioning && !state.video.referenceMode) {
+    if (imageCount && state.video && (state.video.supportsKeyframeConditioning
+        || state.video.supportsImageConditioning && state.video.supportsReferenceConditioning) && !state.video.referenceMode) {
       var lengthLabel = el('label', 'video-keyframe-controls', t('page.chips.clipLength') + ' ');
       var lengthChoice = el('select', 'video-clip-length'); lengthChoice.setAttribute('aria-label', t('page.chips.clipLength'));
-      [[17, t('page.chips.previewLength')], [33, '1.4 s'], [97, '4 s'], [121, '5 s']].forEach(function (pair) {
+      var lengths = state.video.family === 'minimax-h3'
+        ? [[22, t('page.chips.previewLength')], [39, '1.6 s'], [56, '2.3 s'], [107, '4.5 s']]
+        : [[17, t('page.chips.previewLength')], [33, '1.4 s'], [97, '4 s'], [121, '5 s']];
+      lengths.forEach(function (pair) {
         var option = el('option', null, pair[1]); option.value = String(pair[0]); lengthChoice.appendChild(option);
       });
       lengthChoice.value = String(state.video.clipFrames || state.video.defaultPreviewFrames || 17);
@@ -2905,11 +2914,13 @@
       lengthChoice.addEventListener('change', function () { state.video.clipFrames = Number(lengthChoice.value); paintChips(); });
       lengthLabel.appendChild(lengthChoice); box.appendChild(lengthLabel);
     }
-    if (imageCount && state.video && state.video.supportsKeyframeConditioning && state.video.supportsReferenceConditioning) {
+    if (imageCount && state.video && state.video.supportsImageConditioning && state.video.supportsReferenceConditioning) {
       var label = el('label', 'video-keyframe-controls', t('page.chips.guidanceMode') + ' ');
       var choice = el('select', 'video-guidance-mode'); choice.setAttribute('aria-label', t('page.chips.guidanceMode'));
       choice.disabled = state.generating || state.visionChecking;
-      [['keyframes', t('page.chips.temporalGuides')], ['ref', t('page.chips.identityGuides')]].forEach(function (pair) {
+      var h3Modes = state.video.family === 'minimax-h3';
+      [['keyframes', h3Modes ? t('page.chips.firstLastFrames') : t('page.chips.temporalGuides')],
+        ['ref', h3Modes ? t('page.chips.referenceMode') : t('page.chips.identityGuides')]].forEach(function (pair) {
         var option = el('option', null, pair[1]); option.value = pair[0]; choice.appendChild(option);
       });
       choice.value = state.video.referenceMode ? 'ref' : 'keyframes';
@@ -2925,7 +2936,8 @@
         // Qwen is loading or another model is selected; Send checks compatibility.
         var ordinal = imageIndex++, active = ordinal === 0;
         c.classList.add('editable-image');
-        var keyframe = state.video && state.video.supportsKeyframeConditioning;
+        var keyframe = state.video && state.video.supportsImageConditioning && !state.video.referenceMode
+          || state.video && state.video.supportsKeyframeConditioning;
         if (keyframe && !state.video.referenceMode) c.appendChild(videoKeyframeControls(a, ordinal, imageCount));
         else if (keyframe) { /* Identity sheets do not have temporal frame controls. */ }
         else {

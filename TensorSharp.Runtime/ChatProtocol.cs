@@ -182,6 +182,15 @@ namespace TensorSharp.Runtime
         /// </summary>
         public bool RendersReasoningEffort { get; init; }
 
+        /// <summary>
+        /// True when this family's template opens every conversation with the same
+        /// preamble even without system messages or tools (Muse Spark's system header
+        /// with its knowledge cutoff, date and reasoning level). That preamble is then
+        /// the shared prefix a new conversation can start from a checkpoint of, instead
+        /// of prefilling it again; it holds no request text.
+        /// </summary>
+        public bool SharesTemplatePreamble { get; init; }
+
         /// <summary>Trained single token that may close this family's open
         /// reasoning channel at its budget. Null retains the host's hard stop.</summary>
         public string? ThinkingBudgetEndToken { get; init; }

@@ -431,9 +431,12 @@ static void check(ggml_backend_t allocator, ggml_backend_t backend, const test_c
 // speculative verify (block_size + 1 columns) stands in for single-token
 // decode steps. The widest decode-class launch is the reference; every
 // narrower prefix of the same columns must reproduce it exactly.
-static void check_column_invariance(ggml_backend_t allocator, ggml_backend_t backend, ggml_type weights, bool indexed)
+// inner=20480, rows=24 is DeepSeek V4.1's hyper-connection mix, which CUDA
+// reduces with its widest block per output; it must keep the same guarantee.
+static void check_column_invariance(ggml_backend_t allocator, ggml_backend_t backend, ggml_type weights, bool indexed,
+                                    int inner = 4096, int rows = 96)
 {
-    const int inner = 4096, rows = 96, experts = 4, used = 2;
+    const int experts = 4, used = 2;
     const int widest = int(TSG_PRECISION_DECODE_COLUMNS);
     std::vector<float> reference;
     for (int tokens = widest; tokens >= 1; --tokens)
@@ -492,6 +495,7 @@ static void run(ggml_backend_t allocator, ggml_backend_t backend)
 {
     for (bool indexed : {false, true}) for (ggml_type weights : {GGML_TYPE_F32, GGML_TYPE_F16})
         check_column_invariance(allocator, backend, weights, indexed);
+    check_column_invariance(allocator, backend, GGML_TYPE_F32, false, 20480, 24);
     for (bool indexed : {false, true}) for (int tokens : {1, 4, 5, 16, 31})
     for (ggml_type weights : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16})
     for (bool precise : {false, true})

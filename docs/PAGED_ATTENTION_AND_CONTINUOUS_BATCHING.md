@@ -109,6 +109,7 @@ BlockPool + PagedKvStorage   (managed host memory)
 | `ManagedPagedAttention` | `TensorSharp.Runtime/Paged/ManagedPagedAttention.cs` | Pure C# correctness fallback for paged attention. |
 | `SequenceState` | `TensorSharp.Runtime/Scheduling/SequenceState.cs` | Mutable per-request status, tokens, blocks, logits, and sampling state. |
 | `ContinuousBatchScheduler` | `TensorSharp.Runtime/Scheduling/ContinuousBatchScheduler.cs` | Iteration-level scheduler with prefix caching and preemption. |
+| `ISoloPrefillBudgetModel` | `TensorSharp.Runtime/Scheduling/ISoloPrefillBudgetModel.cs` | Optional model contract: sizes a lone request's prefill steps (Muse Spark with pipelined prefill), unless `TS_SCHED_SOLO_PREFILL_CHUNK` is set. |
 | `BatchExecutor` | `TensorSharp.Runtime/Scheduling/BatchExecutor.cs` | Executes the planned step, samples, and captures KV blocks. |
 | `ExecutionPlanner` | `TensorSharp.Runtime/Scheduling/ExecutionPlanner.cs` | Pure-function path selection: capabilities + options + step features → `ExecutionPlan`. |
 | `ExecutionCapabilities` | `TensorSharp.Runtime/Scheduling/ExecutionCapabilities.cs` | Declared capability snapshot of the loaded model × backend combination. |
@@ -349,8 +350,8 @@ Speculation engages only where the model declares it profitable
 (`SpeculationProfitable`), and each model decides: Qwen 3.5/3.6/3.8 and GLM 5.2 /
 GLM-5.3 on every backend; Gemma 4 on the ggml backends (`ggml_cpu` included) and
 the pure-C# `cuda` backend; Qwen 3.8 Flash Next on its GGML token-graph path;
-GLM-5.3-Flash where its KDA rollback is available; DeepSeek V4 / V4.1 and
-Muse-Glimmer only with their drafter loaded. Nemotron-H refuses it outright (`SpeculationRefusal`). GPT OSS,
+GLM-5.3-Flash where its KDA rollback is available; Muse Spark on the GGML
+backends (n-gram only), except under its native `--tp`; DeepSeek V4 / V4.1 and Muse-Glimmer only with their drafter loaded. Nemotron-H refuses it outright (`SpeculationRefusal`). GPT OSS,
 Mistral 3 and Hunyuan Dense implement no speculative trunk and
 serve standard decode for every algorithm, n-gram included. Concurrent batches
 never speculate — when more than one sequence is running, every sequence uses the
@@ -376,6 +377,7 @@ the per-sequence path.
 | GLM 5.x | No `ForwardBatch`: MLA keeps one compressed row per token and the DSA indexer scores against that same contiguous history, so there is no paged-KV layout to batch over. Concurrency runs on native **sequence slots** instead (`TSGgml_GlmSlotAlloc` / `SetActiveSlot` / `SlotFree`) — binding a request switches the active slot without moving KV bytes, and each slot's graphs are cached and captured independently. A default-on batched fused decode (one graph, one token per sequence, weights read once for the batch) is implemented on top: 1.81x aggregate decode at 4 concurrent requests. Batching changes GEMM shapes, and a 2-bit MoE can amplify that into different expert picks. | `TS_BATCHED_FUSED_DECODE=0` disables the batched decode. |
 | Hunyuan Dense | Default `ForwardBatch` path on F32 paged buffers. A block-quantized (`q8_0` / `q4_0`) KV cache keeps the KV-snapshot swap path, which serves those dtypes exactly. | — |
 | Muse-Glimmer | No `ForwardBatch` (it is not an `IBatchedPagedModel`): concurrent requests run on the per-sequence KV-swap fallback, which snapshots each sequence's K/V to host memory, also under `--tp`. A Radix page family (host-slab pages). Speculates only while its DFlash drafter is loaded (`--draft-model`). | No batched opt-out; the `TS_MUSE_GLIMMER_*` switches are kernel A/B toggles (see [the Muse-Glimmer card](models/muse-glimmer.md#7-environment-variables)). |
+| Muse Spark | On `ggml_cuda` / `ggml_vulkan` the native whole-model executor serves concurrency on its own **sequence slots** (per-slot F16 K/V on each layer's GPU, or split by KV group across the GPUs under `--tp N` on `ggml_cuda`; a ring for the 46 sliding-window layers): decode steps of every running request share one graph with per-sequence masks, text prompts that arrive together are prefilled in one graph, and image embeddings replace their placeholder rows in the graph. A finished slot is retained and donated to the request that continues the conversation (it may be rewound first), and the template preamble and shared system prompt are checkpointed into a slot cloned into new conversations. When its layer split pipelines prefill across CUDA GPUs, a lone prompt prefills in steps the model chooses (8,192 tokens; see `TS_SCHED_SOLO_PREFILL_CHUNK` below). The per-op path (`TS_MUSE_SPARK_NATIVE=0`, and `--tp` on `ggml_vulkan`) is a Radix page family; its packed paged `ForwardBatch` needs F32 KV and text-only requests. | `TS_MUSE_SPARK_NATIVE=0` selects the per-op path; `TS_MUSE_SPARK_PLAN_SLOTS` reserves slots in the placement plan; `TS_MUSE_SPARK_PIPELINE=0` turns pipelined prefill off (see [the Muse Spark card](models/muse-spark.md#options)). |
 | DeepSeek V4 / V4.1 | No `ForwardBatch`: the compressed attention caches have no paged layout. Concurrency runs on the native executor's sequence slots (the pure-C# `cpu` and direct-CUDA `cuda` executors stay serial). A default-on token-batched fused decode reads the weights once per step for up to 16 sequences, in windows beyond that; it is declined while a DSpark drafter is loaded. V4.1 retains a finished conversation's slot for its next turn (not while a DSpark drafter is loaded). | `TS_BATCHED_FUSED_DECODE=0`; `TS_DSV41_RETAINED_CACHE_MB` (default 2048) budgets V4.1's retained slots. |
 | Qwen 3.8 Flash Next (`qwen4exp`) | No `ForwardBatch`: concurrency runs through per-sequence state holders on the GGML fused span path, decoded one sequence at a time (no token-batched fused decode). Finished conversations are retained and the shared prompt prefix is checkpointed and cloned into new chats, exact-prefix only. `--layer-split N` places whole layers, with retention and checkpoints across the split. `--tp N` shards FFN channels and replicates recurrent state across local GGML devices; speculative rollback restores every rank. The shared MTP head (`--draft-model`) speculates for a solo request prefilled from position 0. | `TS_Q4E_RETAINED_CACHE_MB` is the shared budget of retention and checkpoints (default: half the measured memory headroom; `0` retains nothing). |
 | DiffusionGemma | Separate text-diffusion path. `Forward(int[] tokens)` is intentionally unsupported; generation iteratively denoises fixed-length canvas blocks. Web UI requests share `DiffusionBatchScheduler`, which admits concurrent requests between blocks and can optionally batch active canvases. | `DIFFUSION_STEPS`, `DIFFUSION_MAX_BATCH`, `DIFFUSION_BATCHED_FORWARD`; `DIFFUSION_NO_FUSED_DECODE=1` disables the GGML whole-model diffusion decode. |
@@ -560,7 +562,7 @@ request reused nothing, the first specific reason a source declined.
 | `TS_SCHED_MAX_BATCHED_TOKENS` | `4096` | Per-step token budget. |
 | `TS_SCHED_MAX_RUNNING_SEQS` | `16` | Maximum in-flight sequences. |
 | `TS_SCHED_PREFILL_CHUNK` | `256` | Per-request prefill cap while a decode is active. Prefill-only steps divide the full token budget fairly. Server flag: `--prefill-chunk-size N`. |
-| `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | Per-step prefill cap for a solo (uncontended) request — feeds the prompt through the fused whole-graph prefill path in big chunks. Bounded by `TS_SCHED_MAX_BATCHED_TOKENS`. |
+| `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | Per-step prefill cap for a solo (uncontended) request — feeds the prompt through the fused whole-graph prefill path in big chunks. Bounded by `TS_SCHED_MAX_BATCHED_TOKENS`. A model with its own lone-prompt steps (`ISoloPrefillBudgetModel`) — Muse Spark with pipelined prefill: 8192 tokens, a remainder of at most 2048 joined to the step before it — sizes them unless this variable is set, and its steps may exceed `TS_SCHED_MAX_BATCHED_TOKENS`; a set value applies as described here and turns the model's steps off. `TS_SCHED_MAX_BATCHED_TOKENS` alone does not. The engine log names which rule is in force. |
 | `TS_SCHED_NUM_BLOCKS` | `256` | Physical blocks in the engine pool. |
 | `TS_SCHED_BLOCK_SIZE` | `16` for a page-only family (Hunyuan Dense, Mistral 3, Muse-Glimmer), `256` otherwise | Tokens per block. A family whose only cross-request reuse is whole pages reuses at this granularity: at 256, a turn shorter than a block reused nothing. |
 | `TS_SCHED_PREFIX_CACHE` | `1` | Set `0` to disable all admission-time prompt reuse: Radix pages, end states and checkpoints. `--no-prefix-cache` (CLI and server) sets it. |
@@ -596,7 +598,9 @@ file-backed store, keeping at most two files per model; it is what makes the fir
 message after a launch as fast as the second. The server attaches it for its startup
 model under `prefix-cache/<model-file-stem>-<hash>/` beside the binary (moved with
 `TENSORSHARP_PREFIX_CACHE_DIR`, turned off with `--no-prefix-cache`) and warms the
-shared prompt before it accepts requests; TensorAgent attaches one per model in the
+Web UI's shared prompt before it accepts requests. `--no-webui` skips this prompt
+prefill while retaining model kernel warmup and normal API prefix reuse.
+TensorAgent attaches one per model in the
 app's cache directory. The CLI keeps checkpoints in memory only.
 
 

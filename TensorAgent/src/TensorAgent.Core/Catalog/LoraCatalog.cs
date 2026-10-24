@@ -126,9 +126,9 @@ public static class LoraCatalog
     /// to both, with image-validation scope recorded separately; speed adapters never do.</summary>
     public static readonly IReadOnlyList<string> QwenImageTurbo = new[] { "qwen-image-2.1-turbo-q5ks", "qwen-image-2.1-turbo-q8-0" };
 
-    /// <summary>MiniMax-H3's first-and-last-frame (FL2VA) entry, the one checkpoint its Turbo
-    /// plug-ins are for: the references (Ref2VA) entry has the same tensor shapes, and the engine
-    /// refuses them there by the checkpoint's file name.</summary>
+    /// <summary>The MiniMax-H3 catalog id, whose primary FL2VA denoiser is the one its Turbo
+    /// plug-ins target. The unified entry also includes Ref2VA, where the engine refuses them
+    /// based on the active denoiser's file name.</summary>
     public const string MiniMaxH3Keyframes = "minimax-h3-fl2va-q4k";
 
     /// <summary>The commit of <c>lightx2v/Minimax-h3-Turbo</c> the MiniMax-H3 plug-ins are pinned to.</summary>
@@ -405,7 +405,7 @@ public static class LoraCatalog
             Purpose = "catalog.lora.animeConsistency.purpose",
             License = "Apache-2.0",
         },
-        // MiniMax-H3 Turbo: step distillation for the keyframes checkpoint, applied unmerged per
+        // MiniMax-H3 Turbo: step distillation for FL2VA clips, applied unmerged per
         // clip. The config fixes the step count, the linspace grid, video shift 6 / audio 3,
         // Euler and CFG 1, and a clip that asks for anything else is refused, never overridden;
         // the app never puts steps, a shift or a sampler in a clip's request (VideoTurns).
@@ -461,7 +461,7 @@ public static class LoraCatalog
 
     /// <summary>
     /// The plug-ins the LoRA sheet lists: those that apply to the loaded image or video model, so
-    /// a Qwen-Image 2.1 Turbo entry is never offered a speed plug-in and MiniMax-H3 References,
+    /// a Qwen-Image 2.1 Turbo entry is never offered a speed plug-in and MiniMax-H3 reference mode,
     /// LTX 2.5 or Wan none; with no image or video model loaded, every plug-in of a model in
     /// <paramref name="offered"/>.
     /// </summary>

@@ -115,7 +115,7 @@ DSpark and unavailable GPU counts are not covered by this run.
 
 The results below are historical measurements of the revisions recorded with
 each artifact. For current setup, download the GGUF with embedded Engram
-constants using the [model-card instructions](models/deepseek41.md#download-the-q2_k-checkpoint).
+constants using the [model-card instructions](models/deepseek41.md#download-the-repaired-q2_kq5_k-checkpoint).
 The current download revision is `58d8ac86298fdf85a2440defee08b1abcad32e45`;
 its first shard differs from the older files used in the original tests. No
 Engram generation or separate Engram file is required. Historical passes and

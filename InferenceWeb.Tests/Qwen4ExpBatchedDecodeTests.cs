@@ -569,22 +569,36 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         var handles = prompts.Select((prompt, i) => engine.SubmitRequest(new SequenceState(
             "engine-" + i, prompt.ToList(), count, config.BlockSize, SamplingConfig.Greedy))).ToArray();
         var streams = await Task.WhenAll(handles.Select(Drain));
+        int nearTieDivergences = 0;
         for (int i = 0; i < streams.Length; ++i)
         {
+            Assert.Equal(expected[i].Count, streams[i].Count);
             for (int t = 0; t < Math.Min(expected[i].Count, streams[i].Count); ++t)
             {
                 if (expected[i][t] == streams[i][t]) continue;
                 float[] logits = serialLogits[i][t];
                 int[] top = Enumerable.Range(0, logits.Length).OrderByDescending(j => logits[j]).Take(5).ToArray();
-                output.WriteLine($"Stream {i} first mismatch at {t}: expected={expected[i][t]}, actual={streams[i][t]}, " +
-                    $"serial margin={logits[top[0]] - logits[top[1]]:R}, actual token serial score={logits[streams[i][t]]:R}; " +
+                float serialMargin = logits[top[0]] - logits[top[1]];
+
+                // Serial and batched GGML CPU matmuls can use different vector
+                // reductions. If their top two logits are effectively tied,
+                // either greedy token is valid; later tokens on this stream
+                // are no longer comparable after the first choice diverges.
+                Assert.True(backend == BackendType.GgmlCpu && expected[i][t] == top[0] &&
+                    streams[i][t] == top[1] && serialMargin <= .02f,
+                    $"Stream {i} diverged at token {t} outside a near-tie: expected={expected[i][t]}, " +
+                    $"actual={streams[i][t]}, serial margin={serialMargin:R}, " +
                     "serial top5=" + string.Join(", ", top.Select(j => $"{j}:{logits[j]:R}")));
+                ++nearTieDivergences;
+                output.WriteLine($"Stream {i} diverged at token {t} on a near-tied greedy choice " +
+                    $"(margin={serialMargin:R}; expected={expected[i][t]}, actual={streams[i][t]}). " +
+                    "Subsequent tokens follow different histories.");
                 break;
             }
-            Assert.Equal(expected[i], streams[i]);
         }
         Assert.True(model.ArenaBatchedDecodeSteps > 0, "Parallel requests never executed a batched graph.");
-        output.WriteLine($"{backend}, hostLayers={offloadLayers}: three parallel 8-token streams matched independent serial greedy; {model.ArenaBatchedDecodeSteps} arena steps.");
+        output.WriteLine($"{backend}, hostLayers={offloadLayers}: three parallel 8-token streams matched independent serial greedy " +
+            $"with {nearTieDivergences} near-tied CPU choice(s); {model.ArenaBatchedDecodeSteps} arena steps.");
     }
 
     private static async Task<List<int>> Drain(InferenceRequestHandle handle)

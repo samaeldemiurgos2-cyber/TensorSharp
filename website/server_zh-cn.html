@@ -17,58 +17,70 @@
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 服务器与 Web UI</div>
   <h1>服务器与 Web UI</h1>
   <p class="lede"><code>TensorSharp.Server.Host</code>（基于 <code>TensorSharp.Server</code> 库）是一个 ASP.NET Core 应用，托管单个 GGUF 模型，并在同一端口上暴露浏览器聊天 UI 以及兼容 Ollama 和 OpenAI 的 REST API。连续批处理引擎负责并发。</p>
+  <nav aria-label="页面阅读路线"><ol>
+    <li><a href="#start">启动本地服务器</a></li>
+    <li><a href="#use">使用浏览器或 API</a></li>
+    <li><a href="#operate">配置与运维</a></li>
+  </ol></nav>
+  <p>下方先给出聊天服务的首次运行；若目标是其他模型或协议，可直接选择<a href="#service-modes">嵌入、Jev、智能体或视频服务</a>。全部参数保留在<a href="#reference">参考表</a>中，可按需展开。</p>
+
+  <h2 id="start">1. 启动本地服务器</h2>
+  <h3 id="e4b-fast-lane">快速开始（Gemma 4 E4B）</h3>
+  <p><a href="getting-started_zh-cn.html#install-dotnet">按平台安装 .NET 10 SDK</a>、Git、CMake 与 <code>curl</code>，然后在终端粘贴下面的命令。请为 7.48 GiB 模型下载与首次还原/构建预留时间，耗时取决于网络与机器性能。它会通过原生 GGML 桥接托管示例使用的 Gemma 4 E4B Q8_0，使用推荐的公开 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>ggml-org</code> 文件</a>。下面的代码块面向 Linux + NVIDIA（CUDA 构建还需要 CUDA Toolkit）：</p>
+  <div class="callout warn"><div class="ic">🔐</div><p>独立服务器没有内置 API Key 身份验证。下面的命令使用 HTTP（没有 TLS），并显式绑定 <code>127.0.0.1</code> 供本机访问。省略 <code>--host</code> 时默认监听所有接口（<code>0.0.0.0</code>）。远程访问应经过主机防火墙与带身份验证的 HTTPS 反向代理；不要直接向不可信网络开放服务端口。</p></div>
+  <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
+curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf
+dotnet run --project TensorSharp.Server.Host -c Release --no-build -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --host 127.0.0.1</code></pre>
+  <p>Apple Silicon 请省略 CUDA 环境变量并使用 <code>ggml_metal</code>；受支持的 Windows/Linux Vulkan GPU 请改为请求 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> 并使用 <code>ggml_vulkan</code>；没有受支持的 GPU 时可省略该环境变量并使用 <code>ggml_cpu</code>。占用内存更低的 <code>gemma-4-E4B-it-Q4_K_M.gguf</code> 位于同一仓库。纯文本不需要投影器；图像、视频或音频还需匹配的 <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code>，并通过 <code>--mmproj</code> 传入。Windows PowerShell 与完整平台语法见<a href="getting-started_zh-cn.html#e4b-fast-lane">快速开始</a>。</p>
+  <p>等待启动日志显示监听地址后，在第二个终端先检查存活与已加载模型，再发出一次聊天请求：</p>
+  <pre data-lang="bash"><code>curl -sS http://127.0.0.1:5000/health
+curl -sS http://127.0.0.1:5000/v1/models</code></pre>
+  <pre data-lang="bash"><code>curl -s http://127.0.0.1:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'</code></pre>
+  <p>API 基址是 <strong><code>http://127.0.0.1:5000</code></strong>。内置 <code>wwwroot/</code> 存在且启用时，<strong><a href="http://127.0.0.1:5000/"><code>GET /</code></a></strong> 会返回其中的 <code>index.html</code> 聊天界面。<code>GET /health</code> 始终返回存活响应 <code>"TensorSharp.Server is running"</code>；这不检查模型是否就绪。Web UI 未启用或 <code>index.html</code> 不存在时，<code>/</code> 才回退为同一个存活响应。</p>
+  <div class="callout note"><div class="ic">📌</div><p>推理必须在启动时传入 <code>--model</code>。服务器只托管启动时指定的 GGUF，以及可选且必须显式传入的 <code>--mmproj</code>；它不会扫描模型目录或自动探测投影器。<code>/api/models/load</code> 只能用其他受支持后端重新加载同一启动组合。无模型进程不能在运行时选择 GGUF。默认监听地址是 <code>http://0.0.0.0:5000</code>；<code>--port</code>、<code>--host</code> 与 <code>--urls</code>（环境变量 <code>PORT</code> / <code>HOST</code> / <code>ASPNETCORE_URLS</code>）可以改变它。</p></div>
+
+  <h3 id="built-source">已构建的源码目录</h3>
+  <details>
+    <summary>已有构建或其他后端？展开启动示例</summary>
+
+  <p>构建完成后，从仓库根目录运行这些命令。它们会调用 <code>TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll</code>；该输出目录也包含复制好的原生库与 <code>wwwroot/</code>。<a href="https://github.com/zhongkaifu/TensorSharp/releases" target="_blank" rel="noopener">Releases 页面</a>也附带面向受支持平台的自包含 CLI 与服务器压缩包。</p>
+  <pre data-lang="bash"><code># Apple Silicon / Metal
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_metal --host 127.0.0.1
+
+# NVIDIA / GGML CUDA
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_cuda --host 127.0.0.1
+
+# AMD、Intel 或 NVIDIA / Vulkan；先查看设备索引
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --list-gpus
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_vulkan --gpu-device 1 --host 127.0.0.1
+
+# 多模态：投影器始终显式指定
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda --host 127.0.0.1</code></pre>
+  </details>
+
+  <h2 id="use">2. 使用浏览器或 API</h2>
+  <div class="table-scroll"><table>
+    <thead><tr><th>目标</th><th>下一步</th><th>需要区分</th></tr></thead>
+    <tbody>
+      <tr><td>在浏览器中聊天</td><td>打开 <code>http://127.0.0.1:5000/</code>，再看<a href="#webui">界面功能</a>。</td><td>需要启用并部署 <code>wwwroot/index.html</code>。</td></tr>
+      <tr><td>使用 OpenAI 兼容客户端</td><td>API 基址为 <code>http://127.0.0.1:5000/v1</code>；见<a href="http-api_zh-cn.html#openai">Chat Completions 与 Responses</a>。</td><td>是否支持工具、思考与媒体取决于模型及端点。</td></tr>
+      <tr><td>使用 Ollama 兼容客户端</td><td>见<a href="http-api_zh-cn.html#ollama">Ollama 请求示例</a>。</td><td><code>/api/chat/ollama</code> 是兼容路由；<code>/api/chat</code> 使用 Web UI 的 SSE 协议。</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="webui">Web UI 功能</h3>
+  <p>打开 <code>http://127.0.0.1:5000/</code>。浏览器界面支持：</p>
+  <details>
+    <summary>界面功能、上传与生成流程</summary>
   <figure class="page-shot">
     <img src="assets/screenshots/tensorsharp-webui.png" alt="TensorSharp Web UI：Qwen3.8 27B 编写并运行 Python 脚本比较两种房贷，用表格和一句建议作答，并提供脚本与 CSV 下载" width="1760" height="1129" loading="lazy">
     <figcaption>Qwen3.8 27B（UD-Q4_K_XL）运行于 <code>ggml_metal</code>，以 <code>--code-exec</code> 启动，机器为 Apple M5 Pro。模型编写了 Python 脚本，在 macOS 沙箱中运行，核对两份还款计划都在余额 $0 处结束，用表格作答，并提供脚本和 540 行的 CSV 下载。</figcaption>
   </figure>
 
-  <h2 id="embeddings">嵌入服务</h2>
-  <p>使用 <code>--model encoder.gguf --embeddings</code> 托管 Snowflake、MiniLM 或 EmbeddingGemma 2。<code>POST /v1/embeddings</code> 与 <code>POST /api/embed</code> 返回归一化向量；EmbeddingGemma 2 配合 <code>--mmproj</code> 还支持图像/音频/视频与混合内容序列。后端与验证范围依模型而定。 <a href="embeddings_zh-cn.html">配方、API 与验证 →</a></p>
-
-  <h2 id="jev">Jev 类型化决策</h2>
-  <p>托管一个 DiffusionGemma GGUF（例如使用 <code>config/jev-diffusiongemma-q4.json</code>），<code>POST /v1/systemone</code> 就会应答与 Jev 兼容的类型化决策请求：请求体携带状态与类型化问题（<code>noul</code>、<code>choice</code>、<code>score</code>），响应返回在一次去噪步之后读出的概率、选项与期望分数。<code>model</code> 可以写已加载模型的名称，或别名 <code>jev-latest</code> / <code>jev-preview</code>（它们不是独立的权重）。请求只接受 JSON；用 <code>--mmproj</code> 加载视觉塔后，请求还可以在 <code>images</code> 数组中内联最多 8 张图像（base64 或 <code>data:</code> URL）。<code>TS_JEV_MAX_BODY_MB</code>（默认 8，1–64）、<code>TS_JEV_MAX_CANVAS</code>（默认 64，8–4096）与 <code>TS_JEV_MAX_PENDING</code>（默认可接纳 32 个请求，1–1024）限定工作量。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev_zh-cn.md" target="_blank" rel="noopener">字段、限制与状态码 →</a></p>
-
-  <h2 id="start">启动服务器</h2>
-  <h3 id="e4b-fast-lane">约 30 秒快速开始（Gemma 4 E4B）</h3>
-  <p><a href="getting-started_zh-cn.html#install-dotnet">按平台安装 .NET 10 SDK</a>、Git、CMake 与 <code>curl</code>，然后在终端粘贴下面的命令。复制并运行这些命令约需 30 秒；7.48 GiB 的模型下载与首次还原/构建耗时更长，取决于网络速度与机器性能。它会通过原生 GGML 桥接托管仓库基准已验证的 Gemma 4 E4B Q8_0，使用推荐的公开 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>ggml-org</code> 文件</a>。下面的代码块面向 Linux + NVIDIA（CUDA 构建还需要 CUDA Toolkit）：</p>
-  <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
-cd TensorSharp
-TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
-curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf
-dotnet run --project TensorSharp.Server.Host -c Release --no-build -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda</code></pre>
-  <p>Apple Silicon 请省略 CUDA 环境变量并使用 <code>ggml_metal</code>；受支持的 Windows/Linux Vulkan GPU 请改为请求 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> 并使用 <code>ggml_vulkan</code>；没有受支持的 GPU 时可省略该环境变量并使用 <code>ggml_cpu</code>。占用内存更低的 <code>gemma-4-E4B-it-Q4_K_M.gguf</code> 位于同一仓库。纯文本不需要投影器；图像、视频或音频还需匹配的 <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code>，并通过 <code>--mmproj</code> 传入。Windows PowerShell 与完整平台语法见<a href="getting-started_zh-cn.html#e4b-fast-lane">快速开始</a>。</p>
-  <p>在第二个终端中验证 OpenAI 兼容端点：</p>
-  <pre data-lang="bash"><code>curl -s http://localhost:5000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'</code></pre>
-  <p>API 基址是 <strong><code>http://localhost:5000</code></strong>。内置 <code>wwwroot/</code> 存在且启用时，<strong><a href="http://localhost:5000/"><code>GET /</code></a></strong> 会返回其中的 <code>index.html</code> 聊天界面。稳定的纯文本存活检查是 <code>GET /health</code>；只有未启用 Web UI 的无界面部署才会让根路径 <code>/</code> 回退为同一个健康响应。</p>
-  <div class="callout note"><div class="ic">📌</div><p>推理必须在启动时传入 <code>--model</code>。服务器只托管启动时指定的 GGUF，以及可选且必须显式传入的 <code>--mmproj</code>；它不会扫描模型目录或自动探测投影器。<code>/api/models/load</code> 只能用其他受支持后端重新加载同一启动组合。无模型进程不能在运行时选择 GGUF。默认监听地址是 <code>http://0.0.0.0:5000</code>；<code>--port</code>、<code>--host</code> 与 <code>--urls</code>（环境变量 <code>PORT</code> / <code>HOST</code> / <code>ASPNETCORE_URLS</code>）可以改变它。</p></div>
-  <div class="callout warn"><div class="ic">🔐</div><p>服务端没有内置 API Key 身份验证或 TLS，并监听所有网络接口。本机使用时请依靠主机防火墙；需要远程访问时应置于带身份验证的 HTTPS 反向代理之后，不要把 5000 端口直接暴露给不可信网络。</p></div>
-
-  <h3>已构建的源码目录</h3>
-  <p>构建完成后，从仓库根目录运行这些命令。它们会调用 <code>TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll</code>；该输出目录也包含复制好的原生库与 <code>wwwroot/</code>。<a href="https://github.com/zhongkaifu/TensorSharp/releases" target="_blank" rel="noopener">Releases 页面</a>也附带面向受支持平台的自包含 CLI 与服务器压缩包。</p>
-  <pre data-lang="bash"><code># Apple Silicon / Metal
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_metal
-
-# NVIDIA / GGML CUDA
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_cuda
-
-# AMD、Intel 或 NVIDIA / Vulkan；先查看设备索引
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --list-gpus
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_vulkan --gpu-device 1
-
-# 多模态：投影器始终显式指定
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda</code></pre>
-
-  <h3>服务器级默认采样</h3>
-  <p>默认值会填补请求未提供的任何字段。开箱即用的默认值与 Ollama 一致：temperature <code>0.8</code>、top-k <code>40</code>、top-p <code>0.9</code>、min-p <code>0</code>、在最近 <code>64</code> 个 token 上的重复惩罚 <code>1.1</code>、存在/频率惩罚 <code>0</code>、seed <code>-1</code>。你显式配置过的参数还会<em>覆盖</em>客户端为其发来的值 —— 很多聊天客户端（如 VS Code Copilot Chat）会把 <code>temperature</code>/<code>top_p</code> 硬编码进每一次请求。加上 <code>--sampling-precedence request</code> 可把控制权交还给客户端。</p>
-  <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_metal \
-    --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
-    --presence-penalty 0.0 --frequency-penalty 0.0 --seed 42 \
-    --stop "&lt;/s&gt;" --stop "&lt;|endoftext|&gt;"</code></pre>
-
-  <h2 id="webui">Web UI 功能</h2>
-  <p>打开 <code>http://localhost:5000/</code>。浏览器界面支持：</p>
   <ul>
     <li>多轮对话，带流式 token 生成（SSE）。</li>
     <li>回答按 Markdown 渲染：表格、代码块、列表、标题与链接。页面把它们构建为元素，而不是把模型文本当作 HTML 解析，因此回复无法注入标记或脚本；链接只对 <code>http(s)</code>、<code>mailto</code> 与服务器自身的文件下载保留目标地址。</li>
@@ -86,73 +98,27 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
   </ul>
 
   <p><strong>选区图像编辑：</strong>附加照片，在编辑目标上选择<strong>选择区域</strong>，保存选区并描述修改。Qwen-Image 2.1 保持原始尺寸并保护选区外像素。结果提供<strong>比较原图</strong>与<strong>再次编辑</strong>；其他附加照片保留为参考图。<a href="models-image_zh-cn.html#mask-editing">选区编辑器与蒙版 API →</a></p>
+  </details>
 
-  <h3 id="steering">生成时引导回答</h3>
+  <h4 id="steering">生成时引导回答</h4>
   <p>回答生成过程中输入并发送新消息，宿主会取消并清理旧生成，保留已产生的回答，再生成新一轮；单独的<strong>停止</strong>按钮仍可取消。此功能需要 <code>v2026.10.10</code> 后的构建。</p>
-  <h3 id="knowledge">个人知识库</h3>
+  <h4 id="knowledge">个人知识库</h4>
   <p>启动前设置 <code>TS_KNOWLEDGE_DIRECTORY</code>，启用 <code>/api/knowledge</code> 存储与管理 API。支持的聊天请求显式传入 <code>knowledgeCollections</code>；缺失或空选择不检索。独立服务器 Chat 页面没有 TensorAgent 的知识库管理面板，应使用 API/SDK。TensorAgent 应用另有集合、文件夹和聊天导入界面。<a href="knowledge_zh-cn.html#server">配置、支持路由与限制 →</a></p>
-  <h2 id="agentic">Agentic Work 与代码执行</h2>
-  <p>在能够完整往返工具调用的模型家族上，服务器让已加载的模型在进程内执行「生成 → 工具 → 再生成」循环。Agent Skills 可以在不执行脚本的情况下被发现与读取；运维者需另行传入 <code>--skills-allow-exec</code> 才允许运行技能自带脚本。<code>--code-exec</code> 则显式开启由宿主处理的 <code>read_file</code>、<code>write_file</code>、<code>apply_patch</code> 与沙箱化 <code>shell</code> 工具。Web UI 聊天会话会在各轮之间保留私有工作区；无状态 API 请求各自获得隔离的请求工作区，并在结束后删除。</p>
-  <p>同一个模型还可以委派任务：在 <code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/api/chat/ollama</code> 与 Web UI 的 <code>/api/chat</code> 上，对能渲染工具声明并解析工具调用的家族（Mistral 3、Hunyuan Dense 与 DiffusionGemma 除外），子智能体委派<strong>默认开启</strong>。是否调用 <code>spawn_agent</code>、<code>wait_agent</code>、<code>send_input</code>、<code>close_agent</code> 与 <code>list_agents</code> 由模型决定；它既不依赖技能，也不依赖 <code>--code-exec</code>。每个子智能体都是同一模型上的独立对话，拥有自己的 KV 状态副本；explorer 与 reviewer 子智能体只读。<code>--no-multi-agent</code> 可关闭委派，下方的 <code>--agents-*</code> 选项为它设定上限，请求也可以用 <code>"multi_agent": false</code> 退出。项目没有发布它的延迟或质量测量数据。→ <a href="agentic_zh-cn.html#sub-agents">子智能体</a></p>
-  <div class="callout warn"><div class="ic">🔒</div><p>执行类工具在运维者开启前保持关闭，但一旦开启，系统不会再逐条命令弹出审批。沙箱模式默认是 <code>required</code>，无法安全隔离时直接拒绝：macOS 使用 Seatbelt，Linux 要求 bubblewrap 0.12.0 或更新版本。Windows Job Object 只能约束后代进程，不能隔离文件系统或网络，因此技能脚本需要显式选择更弱的沙箱模式，而模型生成的命令需要 <code>--code-exec-unconfined</code>。同一请求的子智能体树中，宿主工具调用一次只执行一个；<code>worker</code> 子智能体只有在 <code>--agents-allow-worker-tools</code> 下才能使用父智能体的可写工具。完整参数、模型家族限制、工作区生命周期与安全边界见 <a href="agentic_zh-cn.html">Agentic Work、Skills 与沙箱</a>。</p></div>
+  <h2 id="operate">3. 配置与运维</h2>
+  <p>先固定可工作的本地启动方式，再把配置、访问边界与存储策略写进部署。<a href="#options">选项表</a>、<a href="#env">环境变量</a>与<a href="#tunables">调度器参数</a>保留完整细节。</p>
+  <ul>
+    <li><strong>访问边界：</strong>示例只绑定回环地址；跨机器访问前配置身份验证、HTTPS 反向代理与防火墙。</li>
+    <li><strong>进程与模型：</strong><code>/health</code> 是存活检查；用 <code>/v1/models</code> 和一次有界推理请求确认模型服务。<code>--no-webui</code> 仅关闭界面，API 与 <code>/uploads</code> 仍可用。</li>
+    <li><strong>日志与状态：</strong>通过 <code>TENSORSHARP_LOG_DIR</code>、<code>TENSORSHARP_UPLOAD_DIR</code> 和 <code>TENSORSHARP_PREFIX_CACHE_DIR</code> 选择持久目录。<code>--no-prefix-cache</code> 会关闭运行时前缀复用、启动提示准备和跨启动持久化。</li>
+  </ul>
 
-  <p><strong>LTX 2.5:</strong> 使用 <code>--config config/ltx-2.5-distilled.json</code>；NVIDIA 用 <code>cuda</code>/<code>ggml_cuda</code>，Apple 用 <code>mlx</code>/<code>ggml_metal</code>（实际为 MLX），CPU 别名选择直接 CPU。默认 1024×1024×17、24 fps，宽高为 64 倍数、帧数 <code>8k+1</code>；8 步半尺寸加 3 步精修，CFG 1。 <a href="models-video_zh-cn.html#ltx-25">五文件、音频、条件与限制 →</a></p>
-
-  <h2 id="video">视频生成：网页界面能设什么，什么只能靠 API</h2>
-  <p>托管一个视频生成模型（LTX 2.5、MiniMax-H3 或 Wan），网页界面就变成了一个视频生成器。这些接口判断的是 <code>IVideoGenerationModel</code> 接缝而不是架构字符串，因此其他模型会返回 <code>400</code> 与 <code>The loaded model is not a video-generation model.</code>。有必要清楚地知道浏览器实际控制了请求中多小的一部分：一次视频任务可能跑几分钟，也可能跑几小时，而浏览器在任务开始后无法再改变这一点。</p>
-  <pre data-lang="bash"><code># MiniMax-H3：画面与它的 32 kHz 立体声音轨在同一个潜变量里一起去噪。
-# 不设尺寸参数：文生视频为 640×384，上传的关键帧按 MiniMax 的 768p 配方决定画布；
-# --video-width/--video-height 会把所有模式固定为同一尺寸
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-    --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
-    --video-steps 20 --video-frames 22
-
-# 换另一个权重：用身份 / 外观参考生成一个新场景，尺寸为 640×384
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-    --model ./models/minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_cuda \
-    --video-steps 20 --video-frames 22</code></pre>
-  <p>FL2VA 与 Ref2VA 是两个权重文件，而不是两档设置：加载哪一个决定了附上的图像被当作关键帧还是参考，<code>/api/models</code> 报给浏览器的也正是这一点。<code>config/minimax-h3-fl2va.json</code> 把尺寸交给模型，<code>config/minimax-h3-ref2va.json</code> 固定 640×384；两者都会在首次运行时下载去噪器、共享的 Qwen3-VL-32B 文本编码器与两个 VAE —— 但不包括分词器，因为它不是一个命令行参数：请把上游 <code>MiniMaxAI/MiniMax-H3</code> 仓库 <code>processor/</code> 目录下的 <code>vocab.json</code> 与 <code>merges.txt</code> 放到编码器旁边，或让 <code>TS_VIDEO_TOKENIZER</code> 指向存放它们的目录。</p>
-  <p>要让 FL2VA 按 LightX2V 的 8 步或 4 步 Turbo 配方提供服务，加上它的插件配置即可。此后每段片段都按插件的调度采样，所以请不设 <code>--video-steps</code>（或设为插件的步数），请求也不要带 <code>steps</code>，与 Web UI 一样：与之冲突的 <code>--video-steps</code> 会在下载任何文件之前终止启动，冲突的请求返回 <code>400</code>（流式路由则是 <code>{done, error}</code> 事件）。权重（1.38 GB）在首次使用时下载；4 步配方为推断所得。→ <a href="models-video_zh-cn.html#h3-turbo">Turbo 插件</a></p>
-  <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
-    --lora config/lora/minimax-h3-fl2v-turbo-8step.json</code></pre>
-  <div class="callout warn"><div class="ic">⏱️</div><p><strong>浏览器发送的是提示词，外加所加载模型声明支持的条件输入</strong> —— 首帧、尾帧，或最多 <code>maxReferenceImages</code> 张参考图，以及随附的参考片段与音轨 —— 这份请求体是按 <code>GET /api/models</code> 返回的 <code>video</code> 能力对象拼出来的，而不是靠架构名去猜。帧数、fps、分辨率、去噪步数、seed、flow shift、采样器、负向提示词与引导缓存<em>都没有</em>在界面上暴露：它们来自启动参数或模型自身的配方。引导则根本没有对应的启动参数 —— <strong>服务端完全没有 <code>--cfg</code></strong> —— 只能在请求里设置，而 MiniMax-H3 会拒绝任何大于 <code>1.0</code> 的取值，因为它出厂就是 CFG 蒸馏过的。若要按请求设置这些值，请直接调用 <a href="http-api_zh-cn.html#video-api"><code>POST /api/video-generate</code></a> 或 <code>/v1/videos/generations</code>。</p></div>
-  <p>进程在启动时就已决定的部分：</p>
-  <div class="table-scroll">
-  <table>
-    <thead><tr><th>由什么决定</th><th>设置项</th><th>说明</th></tr></thead>
-    <tbody>
-      <tr><td><code>--model</code>（进程内固定）</td><td>属于哪个家族，以及去噪前向次数</td><td><strong>最大的单项成本因素。</strong>MiniMax-H3 经过 CFG 蒸馏，每一步都只是一次无引导前向 —— 默认 20 步；它的步数蒸馏调度来自插件，而不是另一个权重（见下一行）。基础的 Wan2.2-TI2V-5B 走官方配方 50 步 × 2 次 CFG = 100 次 DiT 前向；步数蒸馏的 <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> 权重会从文件名被识别出来，只跑 4 次无引导前向。在 M5 Pro 上、1088×832 × 121 帧的同一个请求，这就是约 3 h 30 m 与 17 m 30 s 的差别。→ <a href="benchmarks_zh-cn.html#minimax-h3">H3 实测</a> · <a href="benchmarks_zh-cn.html#wan">Wan 实测</a> · <a href="models-video_zh-cn.html">下载</a></td></tr>
-      <tr><td><code>--lora &lt;插件&gt;</code>（进程内固定）</td><td>MiniMax-H3 的步数蒸馏调度</td><td>FL2VA 检查点的 <a href="models-video_zh-cn.html#h3-turbo">LightX2V Turbo 插件</a>——<code>config/lora/minimax-h3-fl2v-turbo-8step.json</code> 与 <code>-4step.json</code>——让每段片段按锁定的配方只跑 8 或 4 次无引导前向，而不是 20 次（4 步配方为推断所得）。Ref2VA 不接受它们。尚无 Turbo 片段的耗时记录。</td></tr>
-      <tr><td><code>--video-width N</code> / <code>--video-height N</code></td><td>默认输出尺寸</td><td><strong>服务端最主要的画质杠杆</strong>，因为网页界面自己不发送尺寸：不设它们，每段视频都按模型默认尺寸生成。MiniMax-H3 建议两个都不设：文生视频与参考为 640×384，图生视频与首尾帧按 MiniMax 的 768p 配方由第一个关键帧决定画布（3:2 照片为 1152×768，16:9 为 1344×768）。这两种模式保留关键帧的构图，在 640×384 下远景人物的脸会糊掉；配方尺寸要多花数倍时间。两个都设会对所有模式（包括关键帧）固定同一尺寸，并关闭 Studio 的“按首帧（模型推荐配置）”尺寸；只给出宽高之一时，H3 会按条件图像的宽高比推出另一个。别名：<code>--width</code> / <code>--height</code>。</td></tr>
-      <tr><td><code>--video-steps N</code></td><td>默认去噪步数</td><td>分辨率之后第二重要的质量/耗时取舍。MiniMax-H3 默认 20 步；16–24 步明显更干净，超过约 30 步收益很小，更少的步数则来自 Turbo 插件（见上一行）。请求中的 <code>steps</code> 会覆盖它；在 Turbo 插件下两者都必须不设或等于插件的步数，否则会被拒绝（启动时拒绝，或返回 <code>400</code>）。</td></tr>
-      <tr><td><code>--video-mode &lt;mode&gt;</code></td><td>默认条件模式</td><td>为未带 <code>videoMode</code> 的请求钉住 <code>t2v</code> / <code>i2v</code> / <code>fl2v</code> / <code>ref</code>。不传它，每个请求会按自身携带的内容推断模式，通常这才是你想要的；只提供单一模式的部署才需要钉住它。</td></tr>
-      <tr><td><code>--video-frames N</code></td><td>默认帧数</td><td>这是服务端范围的<em>默认值</em>，不是上限：请求里带 <code>frames</code> 就会覆盖它。数值会对齐到模型自身的时间网格 —— Wan 为 <code>4k+1</code>，MiniMax-H3 为 <code>17k+5</code>。不传该参数时按模型配方来 —— Wan2.2-TI2V 为 49 帧，其余 Wan 权重为 33 帧，MiniMax-H3 为 22 帧。</td></tr>
-      <tr><td><code>--fps N</code></td><td>默认播放帧率</td><td>同样是默认值，可被请求中的 <code>fps</code> 独立覆盖。不传时配方给出 Wan2.2-TI2V 24 fps、其余 16 fps；MiniMax-H3 以固定 24 fps 训练，会覆盖任何其他取值。fps 只改变播放速度，不改变计算量。</td></tr>
-      <tr><td><code>--audio-vae &lt;path&gt;</code></td><td>是否会返回音轨</td><td>只对与视频联合生成音频的模型有意义（<code>minimax_h3_audio_vae_fp32.safetensors</code>）。不传它，MiniMax-H3 照样能跑并产出视频，只是没有声音 —— 而 <code>/api/models</code> 上的 <code>supportsAudio</code> 会报 <code>false</code>。</td></tr>
-      <tr><td>请求本身（仅 API）</td><td>其余全部</td><td><code>width</code>、<code>height</code>、<code>frames</code>、<code>steps</code>、<code>cfg</code>、<code>cfg2</code>、<code>seed</code>、<code>fps</code>、<code>flowShift</code>、<code>sampler</code>、<code>negativePrompt</code>、<code>cfgCacheStride</code>、<code>videoMode</code>、<code>generateAudio</code>、<code>endImage</code>、<code>referenceImages</code>、<code>referenceVideos</code>、<code>referenceAudios</code>、<code>referenceVideoAudios</code>。</td></tr>
-    </tbody>
-  </table>
-  </div>
-  <p>Web UI 形态的接口按上述 JSON 字段名接收参数；同一个请求体在 <code>/api/video-generate</code>（返回一个 MP4）与 <code>/api/video-generate/stream</code>（SSE 去噪进度）上都可用。视频生成在进程内串行执行，同一时刻只跑一个任务：</p>
-  <pre data-lang="bash"><code>curl -s http://localhost:5000/api/video-generate \
-  -H "Content-Type: application/json" \
-  -d '{
-        "prompt": "a red fox trotting through falling snow, cinematic",
-        "width": 640, "height": 384,
-        "frames": 22, "fps": 24,
-        "steps": 8, "cfg": 1.0, "seed": 42,
-        "videoMode": "t2v",
-        "generateAudio": true
-      }'</code></pre>
-  <p>返回体是 <code>{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }</code>；<code>audioUrl</code> 指向旁挂的 WAV，当模型没有产出音轨时为 <code>null</code>。Wan 使用同样的请求体，只是换成它自己的旋钮 —— <code>"flowShift": 5.0</code>、<code>"sampler": "unipc"</code>、<code>"negativePrompt"</code>、<code>"cfgCacheStride": 2</code> —— 这些 MiniMax-H3 一个都不需要，因为它在 <code>"cfg": 1.0</code> 下无引导运行（在 Turbo 插件下，与插件不同的 <code>flowShift</code> 或 <code>sampler</code> 会被拒绝）。</p>
-  <p><code>"image"</code> 字段可直接携带 base64 条件帧（允许带 <code>data:…;base64,</code> 前缀）；<code>"imagePath"</code>、<code>"endImage"</code> 以及每一个 <code>reference*</code> 条目都是 Web UI 使用的形式，必须引用 <code>/api/upload</code> 已经返回过的文件 —— 任何解析到上传目录之外的路径都会被拒绝。OpenAI 形态的 <code>POST /v1/videos/generations</code> 接收同样的参数，但尺寸写作 <code>"size": "832x480"</code>、负向提示词写作 <code>"negative_prompt"</code>。完整的请求/响应结构见 <a href="http-api_zh-cn.html#video-api">HTTP API</a> 页。</p>
-  <div class="callout tip"><div class="ic">💡</div><p><strong>开跑长任务之前，先估算规模。</strong>开销主要由 DiT token 数决定（<code>latent_frames × (h/2) × (w/2)</code>），而自注意力是 O(token²)，因此帧数与帧面积的影响远大于步数。在 MiniMax-H3 上的顺序是分辨率、帧数、步数 —— 它本来就不用引导，唯一的蒸馏杠杆是 <a href="models-video_zh-cn.html#h3-turbo">Turbo 插件</a>（仅 FL2VA），只跑 8 或 4 次前向而不是 20 次。在 Wan 上：换用步数蒸馏权重、减少帧数、减小帧面积（但不要低于约 0.3 MP）、在基础权重上减少步数，最后是 <code>"cfgCacheStride": 2</code> 或 <code>3</code>（1.30× / 1.43×）。480p（约 0.4 MP）是 Wan 训练过的分辨率，属于真正的输出档位，而非降级模式。</p></div>
-
-  <h2 id="config">配置文件（<code>--config</code>）</h2>
-  <p>可以用 <code>--config</code> 传入一个 JSON 文件，取代冗长的命令行；<a href="cli_zh-cn.html">CLI</a> 读取相同格式。<strong>命令行参数始终优先</strong>——命令行自己设置了某个单值参数时，文件中该参数的条目会在解析之前被丢弃（不展开、不替换其中的变量、也永远不会发起其下载），因此可以在多台主机上复用同一个文件，只覆盖需要变化的部分。每个被覆盖的参数会在 stderr 上打印一行 <code>[config] --X is set on the command line, so the value from '&lt;file&gt;' is ignored …</code>。<code>--gpu-device</code> 与 <code>--kv-cache-dtype</code> 同样如此。<code>--config</code> 可重复以叠加多个文件（后出现的文件中的条目以同样方式取代先前的条目）。可重复的参数——<code>--stop</code>、<code>--skills-dir</code>、<code>--skill</code>、<code>--lora</code>、<code>--lora-scale</code>、<code>--lora-config</code>、<code>--image</code> 与各个 <code>--ref-*</code> 输入——则保留文件中的值并把命令行的值追加在后面。允许注释与尾随逗号。</p>
-  <pre data-lang="bash"><code># 从文件读取全部参数；本次仅覆盖后端
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json --backend ggml_cpu</code></pre>
+  <h3 id="config">配置文件（<code>--config</code>）</h3>
+  <details>
+    <summary>配置优先级、变量与自动下载</summary>
+  <p>可以用 <code>--config</code> 传入一个 JSON 文件，取代冗长的命令行；<a href="cli_zh-cn.html">CLI</a> 读取相同格式。<strong>命令行参数始终优先</strong>——命令行自己设置了某个单值参数时，文件中该参数的条目会在解析之前被丢弃（不展开、不替换其中的变量、也永远不会发起其下载），因此可以在多台主机上复用同一个文件，只覆盖需要变化的部分。每个被覆盖的参数会在 stderr 上打印一行 <code>[config] --X is set on the command line, so the value from '&lt;file&gt;' is ignored …</code>。<code>--gpu-device</code> 与 <code>--kv-cache-dtype</code> 同样如此。<code>--config</code> 可重复以叠加多个文件（后出现的文件中的条目以同样方式取代先前的条目）。<code>--skills-dir</code> 由获胜来源替换整份根目录列表，获胜来源内部的重复值保留。会累加的参数——<code>--stop</code>、<code>--skill</code>、<code>--lora</code>、<code>--lora-scale</code>、<code>--lora-config</code>、<code>--image</code> 与各个 <code>--ref-*</code> 输入——则保留文件中的值并把命令行的值追加在后面。允许注释与尾随逗号。</p>
+  <pre data-lang="bash"><code># 从文件读取参数；绑定回环地址，并按主机覆盖后端
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json --host 127.0.0.1
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json --backend ggml_cpu --host 127.0.0.1</code></pre>
   <p>键名与下方长选项名相同（可带或不带前缀 <code>--</code>）。字符串/数字展开为 <code>--key value</code>，<code>true</code> 展开为裸开关 <code>--key</code>，数组展开为重复的标志（如 <code>"stop": ["&lt;/s&gt;", "&lt;|eot|&gt;"]</code>）。<code>false</code> 与 <code>null</code> 不产生任何参数，因此要关闭默认开启的选项，请写它的否定形式（<code>"no-continuous-batching": true</code>）。<code>lora-scale</code> 与 <code>lora-config</code> 不能写成数组，已移除的选项作为键也会被拒绝。由于服务端会拒绝未知选项，仅 CLI 使用的键（如 <code>interactive</code> 或 <code>input</code>）会让它在启动时报错；惩罚窗口在两个宿主上都叫 <code>repeat-last-n</code>。</p>
   <p><strong>变量。</strong> 在 <code>"variables"</code>（别名 <code>"vars"</code>）中定义一次共享值，用 <code>${name}</code> 在任意字符串值中引用，或用 <code>${name:-fallback}</code> 附带默认值（未定义的名称回退到同名环境变量）。可以定义任意多个根路径——位于不同目录的模型各用一个。</p>
   <p><strong>自动下载。</strong> 任何文件参数都可以写成带本地 <code>path</code> 与一个或多个 <code>urls</code>（或单个 <code>url</code>）的对象。相对 <code>path</code> 以配置文件所在目录为基准解析。若 <code>path</code> 不存在，则从第一个可用 URL 下载（镜像按顺序尝试），保存到该路径，之后复用；进度打印到 stderr，可选的 <code>sha256</code> 只校验新下载的文件（已存在的文件直接使用）。命令行（或后出现的文件）也设置了同一参数的下载条目，会在解析之前被丢弃，因此在命令行上传 <code>--mmproj none</code> 既会停用已配置的投影器，也会跳过它的下载。</p>
@@ -166,8 +132,114 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
   "mmproj": { "path": "${modelRoot}/gemma-4-E4B-mmproj-F16.gguf", "urls": [ "${repo}/mmproj-F16.gguf" ] }
 }</code></pre>
   <p>开箱即用的示例见仓库 <code>config/</code> 目录（<code>cli-basic.json</code>、<code>server-basic.json</code>、<code>variables.json</code>、<code>auto-download.json</code>、<code>qwen-image-2.1.json</code>）——每个都使用真实、公开、无需授权的 URL，因此在全新机器上也能直接运行。完整说明见 <code>config/README.md</code>。</p>
+  </details>
 
-  <h2 id="options">服务器选项</h2>
+  <h3 id="sampling">服务器级默认采样</h3>
+  <details>
+    <summary>默认采样与请求覆盖规则</summary>
+  <p>默认值会填补请求未提供的任何字段。开箱即用的默认值与 Ollama 一致：temperature <code>0.8</code>、top-k <code>40</code>、top-p <code>0.9</code>、min-p <code>0</code>、在最近 <code>64</code> 个 token 上的重复惩罚 <code>1.1</code>、存在/频率惩罚 <code>0</code>、seed <code>-1</code>。你显式配置过的参数还会<em>覆盖</em>客户端为其发来的值 —— 很多聊天客户端（如 VS Code Copilot Chat）会把 <code>temperature</code>/<code>top_p</code> 硬编码进每一次请求。加上 <code>--sampling-precedence request</code> 可把控制权交还给客户端。</p>
+  <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_metal --host 127.0.0.1 \
+    --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
+    --presence-penalty 0.0 --frequency-penalty 0.0 --seed 42 \
+    --stop "&lt;/s&gt;" --stop "&lt;|endoftext|&gt;"</code></pre>
+  </details>
+
+  <h3 id="upload-policy">上传与保留策略</h3>
+  <div class="table-scroll"><table>
+    <thead><tr><th>边界</th><th>默认行为与配置</th></tr></thead>
+    <tbody>
+      <tr><td>单文件</td><td>默认 500 MB；<code>--upload-max-mb</code> 控制 multipart 上传与解码后的 base64 附件。</td></tr>
+      <tr><td>HTTP 请求体</td><td><code>POST /api/upload</code> 跟随单文件上限且不低于 500 MB。其他路由仍为 500 MB；base64 约膨胀三分之一，因此 JSON 内的文件在扣除其他字段前已限于约 375 MB。</td></tr>
+      <tr><td>总预算</td><td><code>--upload-quota-mb</code> 默认关闭；生成的图像与视频计入总量，超额请求在模型工作前拒绝。</td></tr>
+      <tr><td>保留时间</td><td><code>--upload-ttl-hours</code> 默认关闭，因为会话会引用附件路径。<code>TENSORSHARP_UPLOAD_DIR</code> 移动默认的二进制旁 <code>uploads/</code> 目录。</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="service-modes">按任务选择服务模式</h2>
+  <p>按任务选择对应的模型与协议。嵌入与 Jev 已有完整指南；下方保留宿主侧限制，视频与工具细节按需展开。</p>
+  <p><a href="embeddings_zh-cn.html#start">嵌入服务指南</a> · <a href="http-api_zh-cn.html#jev">Jev API</a> · <a href="agentic_zh-cn.html">智能体与工具</a> · <a href="models-video_zh-cn.html">视频模型与下载</a></p>
+
+  <h3 id="embeddings">嵌入服务</h3>
+  <details>
+    <summary>编码器、媒体投影器与后端范围</summary>
+  <p>使用 <code>--model encoder.gguf --embeddings</code> 托管 Snowflake、MiniLM 或 EmbeddingGemma 2。<code>POST /v1/embeddings</code> 与 <code>POST /api/embed</code> 返回归一化向量；EmbeddingGemma 2 配合 <code>--mmproj</code> 还支持图像/音频/视频与混合内容序列。后端与验证范围依模型而定。 <a href="embeddings_zh-cn.html">配方、API 与验证 →</a></p>
+  </details>
+
+  <h3 id="jev">Jev 类型化决策</h3>
+  <details>
+    <summary>Jev 请求、别名与工作量上限</summary>
+  <p>托管一个 DiffusionGemma GGUF（例如使用 <code>config/jev-diffusiongemma-q4.json</code>），<code>POST /v1/systemone</code> 就会应答与 Jev 兼容的类型化决策请求：请求体携带状态与类型化问题（<code>noul</code>、<code>choice</code>、<code>score</code>），响应返回在一次去噪步之后读出的概率、选项与期望分数。<code>model</code> 可以写已加载模型的名称，或别名 <code>jev-latest</code> / <code>jev-preview</code>（它们不是独立的权重）。请求只接受 JSON；用 <code>--mmproj</code> 加载视觉塔后，请求还可以在 <code>images</code> 数组中内联最多 8 张图像（base64 或 <code>data:</code> URL）。<code>TS_JEV_MAX_BODY_MB</code>（默认 8，1–64）、<code>TS_JEV_MAX_CANVAS</code>（默认 64，8–4096）与 <code>TS_JEV_MAX_PENDING</code>（默认可接纳 32 个请求，1–1024）限定工作量。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev_zh-cn.md" target="_blank" rel="noopener">字段、限制与状态码 →</a></p>
+  </details>
+
+  <h3 id="agentic">Agentic Work 与代码执行</h3>
+  <details>
+    <summary>工具、子智能体与隔离边界</summary>
+  <p>在能够完整往返工具调用的模型家族上，服务器让已加载的模型在进程内执行「生成 → 工具 → 再生成」循环。Agent Skills 可以在不执行脚本的情况下被发现与读取；运维者需另行传入 <code>--skills-allow-exec</code> 才允许运行技能自带脚本。<code>--code-exec</code> 则显式开启由宿主处理的 <code>read_file</code>、<code>write_file</code>、<code>apply_patch</code> 与沙箱化 <code>shell</code> 工具。Web UI 聊天会话会在各轮之间保留私有工作区；无状态 API 请求各自获得隔离的请求工作区，并在结束后删除。</p>
+  <p>同一个模型还可以委派任务：在 <code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/api/chat/ollama</code> 与 Web UI 的 <code>/api/chat</code> 上，对能渲染工具声明并解析工具调用的家族（Mistral 3、Hunyuan Dense 与 DiffusionGemma 除外），子智能体委派<strong>默认开启</strong>。是否调用 <code>spawn_agent</code>、<code>wait_agent</code>、<code>send_input</code>、<code>close_agent</code> 与 <code>list_agents</code> 由模型决定；它既不依赖技能，也不依赖 <code>--code-exec</code>。每个子智能体都是同一模型上的独立对话，拥有自己的 KV 状态副本；explorer 与 reviewer 子智能体只读。<code>--no-multi-agent</code> 可关闭委派，下方的 <code>--agents-*</code> 选项为它设定上限，请求也可以用 <code>"multi_agent": false</code> 退出。项目没有发布它的延迟或质量测量数据。→ <a href="agentic_zh-cn.html#sub-agents">子智能体</a></p>
+  <div class="callout warn"><div class="ic">🔒</div><p>执行类工具在运维者开启前保持关闭，但一旦开启，系统不会再逐条命令弹出审批。沙箱模式默认是 <code>required</code>，无法安全隔离时直接拒绝：macOS 使用 Seatbelt，Linux 要求 bubblewrap 0.12.0 或更新版本。Windows Job Object 只能约束后代进程，不能隔离文件系统或网络，因此技能脚本需要显式选择更弱的沙箱模式，而模型生成的命令需要 <code>--code-exec-unconfined</code>。同一请求的子智能体树中，宿主工具调用一次只执行一个；<code>worker</code> 子智能体只有在 <code>--agents-allow-worker-tools</code> 下才能使用父智能体的可写工具。完整参数、模型家族限制、工作区生命周期与安全边界见 <a href="agentic_zh-cn.html">Agentic Work、Skills 与沙箱</a>。</p></div>
+  </details>
+
+  <h3 id="video">视频生成：网页界面能设什么，什么只能靠 API</h3>
+  <details>
+    <summary>模型配方、启动参数与逐请求视频字段</summary>
+  <p><strong>LTX 2.5:</strong> 使用 <code>--config config/ltx-2.5-distilled.json</code>；NVIDIA 用 <code>cuda</code>/<code>ggml_cuda</code>，Apple 用 <code>mlx</code>/<code>ggml_metal</code>（实际为 MLX），CPU 别名选择直接 CPU。默认 1024×1024×17、24 fps，宽高为 64 倍数、帧数 <code>8k+1</code>；8 步半尺寸加 3 步精修，CFG 1。 <a href="models-video_zh-cn.html#ltx-25">五文件、音频、条件与限制 →</a></p>
+
+  <p>托管一个视频生成模型（LTX 2.5、MiniMax-H3 或 Wan），网页界面就变成了一个视频生成器。这些接口判断的是 <code>IVideoGenerationModel</code> 接缝而不是架构字符串，因此其他模型会返回 <code>400</code> 与 <code>The loaded model is not a video-generation model.</code>。有必要清楚地知道浏览器实际控制了请求中多小的一部分：一次视频任务可能跑几分钟，也可能跑几小时，而浏览器在任务开始后无法再改变这一点。</p>
+  <pre data-lang="bash"><code># MiniMax-H3：画面与它的 32 kHz 立体声音轨在同一个潜变量里一起去噪。
+# 不设尺寸参数：文生视频为 640×384，上传的关键帧按 MiniMax 的 768p 配方决定画布；
+# --video-width/--video-height 会把所有模式固定为同一尺寸
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --host 127.0.0.1 \
+    --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-steps 20 --video-frames 22
+
+# 换另一个权重：用身份 / 外观参考生成一个新场景，尺寸为 640×384
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --host 127.0.0.1 \
+    --model ./models/minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-steps 20 --video-frames 22</code></pre>
+  <p>FL2VA 与 Ref2VA 是关键帧和参考模式各自使用的独立检查点。唯一配置 <code>config/minimax-h3-fl2va.json</code> 会下载两者、共享的 Qwen3-VL-32B 编码器、两个 VAE 和固定版本的分词器。模型按请求切换去噪器，<code>/api/models</code> 会报告可用模式。配置把输出尺寸交给对应工作流；手动安装分词器时可设置 <code>TS_VIDEO_TOKENIZER</code>。</p>
+  <p>要让 FL2VA 按 LightX2V 的 8 步或 4 步 Turbo 配方提供服务，加上它的插件配置即可。此后每段片段都按插件的调度采样，所以请不设 <code>--video-steps</code>（或设为插件的步数），请求也不要带 <code>steps</code>，与 Web UI 一样：与之冲突的 <code>--video-steps</code> 会在下载任何文件之前终止启动，冲突的请求返回 <code>400</code>（流式路由则是 <code>{done, error}</code> 事件）。权重（1.38 GB）在首次使用时下载；4 步配方为推断所得。→ <a href="models-video_zh-cn.html#h3-turbo">Turbo 插件</a></p>
+  <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json --host 127.0.0.1 \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json</code></pre>
+  <div class="callout warn"><div class="ic">⏱️</div><p><strong>浏览器发送的是提示词，外加所加载模型声明支持的条件输入</strong> —— 首帧、尾帧，或最多 <code>maxReferenceImages</code> 张参考图，以及随附的参考片段与音轨 —— 这份请求体是按 <code>GET /api/models</code> 返回的 <code>video</code> 能力对象拼出来的，而不是靠架构名去猜。帧数、fps、分辨率、去噪步数、seed、flow shift、采样器、负向提示词与引导缓存<em>都没有</em>在界面上暴露：它们来自启动参数或模型自身的配方。引导则根本没有对应的启动参数 —— <strong>服务端完全没有 <code>--cfg</code></strong> —— 只能在请求里设置，而 MiniMax-H3 会拒绝任何大于 <code>1.0</code> 的取值，因为它出厂就是 CFG 蒸馏过的。若要按请求设置这些值，请直接调用 <a href="http-api_zh-cn.html#video-api"><code>POST /api/video-generate</code></a> 或 <code>/v1/videos/generations</code>。</p></div>
+  <p>进程在启动时就已决定的部分：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>由什么决定</th><th>设置项</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>--model</code>（进程内固定）</td><td>属于哪个家族，以及去噪前向次数</td><td><strong>最大的单项成本因素。</strong>MiniMax-H3 经过 CFG 蒸馏，每一步都只是一次无引导前向 —— 默认 20 步；它的步数蒸馏调度来自插件，而不是另一个权重（见下一行）。基础的 Wan2.2-TI2V-5B 走官方配方 50 步 × 2 次 CFG = 100 次 DiT 前向；步数蒸馏的 <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> 权重会从文件名被识别出来，只跑 4 次无引导前向。在 M5 Pro 上、1088×832 × 121 帧的同一个请求，这就是约 3 h 30 m 与 17 m 30 s 的差别。→ <a href="models-video_zh-cn.html#minimax-h3">H3 实测</a> · <a href="models-video_zh-cn.html#wan">Wan 实测</a> · <a href="models-video_zh-cn.html">下载</a></td></tr>
+      <tr><td><code>--lora &lt;插件&gt;</code>（进程内固定）</td><td>MiniMax-H3 的步数蒸馏调度</td><td>FL2VA 检查点的 <a href="models-video_zh-cn.html#h3-turbo">LightX2V Turbo 插件</a>——<code>config/lora/minimax-h3-fl2v-turbo-8step.json</code> 与 <code>-4step.json</code>——让每段片段按锁定的配方只跑 8 或 4 次无引导前向，而不是 20 次（4 步配方为推断所得）。Ref2VA 不接受它们。尚无 Turbo 片段的耗时记录。</td></tr>
+      <tr><td><code>--video-width N</code> / <code>--video-height N</code></td><td>默认输出尺寸</td><td><strong>服务端最主要的画质杠杆</strong>，因为网页界面自己不发送尺寸：不设它们，每段视频都按模型默认尺寸生成。MiniMax-H3 建议两个都不设：文生视频与参考为 640×384，图生视频与首尾帧按 MiniMax 的 768p 配方由第一个关键帧决定画布（3:2 照片为 1152×768，16:9 为 1344×768）。这两种模式保留关键帧的构图，在 640×384 下远景人物的脸会糊掉；配方尺寸要多花数倍时间。两个都设会对所有模式（包括关键帧）固定同一尺寸，并关闭 Studio 的“按首帧（模型推荐配置）”尺寸；只给出宽高之一时，H3 会按条件图像的宽高比推出另一个。别名：<code>--width</code> / <code>--height</code>。</td></tr>
+      <tr><td><code>--video-steps N</code></td><td>默认去噪步数</td><td>分辨率之后第二重要的质量/耗时取舍。MiniMax-H3 默认 20 步；16–24 步明显更干净，超过约 30 步收益很小，更少的步数则来自 Turbo 插件（见上一行）。请求中的 <code>steps</code> 会覆盖它；在 Turbo 插件下两者都必须不设或等于插件的步数，否则会被拒绝（启动时拒绝，或返回 <code>400</code>）。</td></tr>
+      <tr><td><code>--video-mode &lt;mode&gt;</code></td><td>默认条件模式</td><td>为未带 <code>videoMode</code> 的请求钉住 <code>t2v</code> / <code>i2v</code> / <code>fl2v</code> / <code>ref</code>。不传它，每个请求会按自身携带的内容推断模式，通常这才是你想要的；只提供单一模式的部署才需要钉住它。</td></tr>
+      <tr><td><code>--video-frames N</code></td><td>默认帧数</td><td>这是服务端范围的<em>默认值</em>，不是上限：请求里带 <code>frames</code> 就会覆盖它。数值会对齐到模型自身的时间网格 —— Wan 为 <code>4k+1</code>，MiniMax-H3 为 <code>17k+5</code>。不传该参数时按模型配方来 —— Wan2.2-TI2V 为 49 帧，其余 Wan 权重为 33 帧，MiniMax-H3 为 22 帧。</td></tr>
+      <tr><td><code>--fps N</code></td><td>默认播放帧率</td><td>同样是默认值，可被请求中的 <code>fps</code> 独立覆盖。不传时配方给出 Wan2.2-TI2V 24 fps、其余 16 fps；MiniMax-H3 以固定 24 fps 训练，会覆盖任何其他取值。fps 只改变播放速度，不改变计算量。</td></tr>
+      <tr><td><code>--audio-vae &lt;path&gt;</code></td><td>是否会返回音轨</td><td>只对与视频联合生成音频的模型有意义（<code>minimax_h3_audio_vae_fp32.safetensors</code>）。不传它，MiniMax-H3 照样能跑并产出视频，只是没有声音 —— 而 <code>/api/models</code> 上的 <code>supportsAudio</code> 会报 <code>false</code>。</td></tr>
+      <tr><td>请求本身（仅 API）</td><td>其余全部</td><td><code>width</code>、<code>height</code>、<code>frames</code>、<code>steps</code>、<code>cfg</code>、<code>cfg2</code>、<code>seed</code>、<code>fps</code>、<code>flowShift</code>、<code>sampler</code>、<code>negativePrompt</code>、<code>cfgCacheStride</code>、<code>videoMode</code>、<code>generateAudio</code>、<code>endImage</code>、<code>referenceImages</code>、<code>referenceVideos</code>、<code>referenceAudios</code>、<code>referenceVideoAudios</code>。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Web UI 形态的接口按上述 JSON 字段名接收参数；同一个请求体在 <code>/api/video-generate</code>（返回一个 MP4）与 <code>/api/video-generate/stream</code>（SSE 去噪进度）上都可用。视频生成在进程内串行执行，同一时刻只跑一个任务：</p>
+  <pre data-lang="bash"><code>curl -s http://127.0.0.1:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{
+        "prompt": "a red fox trotting through falling snow, cinematic",
+        "width": 640, "height": 384,
+        "frames": 22, "fps": 24,
+        "steps": 8, "cfg": 1.0, "seed": 42,
+        "videoMode": "t2v",
+        "generateAudio": true
+      }'</code></pre>
+  <p>返回体是 <code>{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }</code>；<code>audioUrl</code> 指向旁挂的 WAV，当模型没有产出音轨时为 <code>null</code>。Wan 使用同样的请求体，只是换成它自己的旋钮 —— <code>"flowShift": 5.0</code>、<code>"sampler": "unipc"</code>、<code>"negativePrompt"</code>、<code>"cfgCacheStride": 2</code> —— 这些 MiniMax-H3 一个都不需要，因为它在 <code>"cfg": 1.0</code> 下无引导运行（在 Turbo 插件下，与插件不同的 <code>flowShift</code> 或 <code>sampler</code> 会被拒绝）。</p>
+  <p><code>"image"</code> 字段可直接携带 base64 条件帧（允许带 <code>data:…;base64,</code> 前缀）；<code>"imagePath"</code>、<code>"endImage"</code> 以及每一个 <code>reference*</code> 条目都是 Web UI 使用的形式，必须引用 <code>/api/upload</code> 已经返回过的文件 —— 任何解析到上传目录之外的路径都会被拒绝。OpenAI 形态的 <code>POST /v1/videos/generations</code> 接收同样的参数，但尺寸写作 <code>"size": "832x480"</code>、负向提示词写作 <code>"negative_prompt"</code>。完整的请求/响应结构见 <a href="http-api_zh-cn.html#video-api">HTTP API</a> 页。</p>
+  <div class="callout tip"><div class="ic">💡</div><p><strong>开跑长任务之前，先估算规模。</strong>开销主要由 DiT token 数决定（<code>latent_frames × (h/2) × (w/2)</code>），而自注意力是 O(token²)，因此帧数与帧面积的影响远大于步数。在 MiniMax-H3 上的顺序是分辨率、帧数、步数 —— 它本来就不用引导，唯一的蒸馏杠杆是 <a href="models-video_zh-cn.html#h3-turbo">Turbo 插件</a>（仅 FL2VA），只跑 8 或 4 次前向而不是 20 次。在 Wan 上：换用步数蒸馏权重、减少帧数、减小帧面积（但不要低于约 0.3 MP）、在基础权重上减少步数，最后是 <code>"cfgCacheStride": 2</code> 或 <code>3</code>（1.30× / 1.43×）。480p（约 0.4 MP）是 Wan 训练过的分辨率，属于真正的输出档位，而非降级模式。</p></div>
+  </details>
+
+  <h2 id="reference">完整参考</h2>
+  <p>展开需要的表格；键盘可聚焦并切换每个摘要。</p>
+
+  <h3 id="options">服务器选项</h3>
+  <details>
+    <summary>全部服务器选项与行为</summary>
   <p>选项不区分大小写，也接受 <code>--option=value</code> 形式。与 CLI 不同，服务端遇到未知选项或多余的位置参数会拒绝启动；若有已知选项与之相差不超过两处编辑，还会提示最接近的那个。</p>
   <div class="table-scroll">
   <table>
@@ -175,7 +247,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
     <tbody>
       <tr><td><code>--model &lt;path&gt;</code></td><td>要托管的 GGUF 文件（推理必需）。</td></tr>
       <tr><td><code>--mmproj &lt;path|none&gt;</code></td><td>显式多模态投影器：mmproj GGUF；对 Gemma 4 家族（包括 DiffusionGemma）也可以是存放视觉塔的 HuggingFace <code>.safetensors</code> 分片（<code>diffusiongemma-26B-A4B-it</code> 没有发布 mmproj）。只写文件名时相对于模型目录解析；传 <code>none</code> 可禁用。需要 <code>--model</code>；不会自动扫描投影器。</td></tr>
-      <tr><td><code>--embeddings</code> · <code>--embedding-threads &lt;N&gt;</code> · <code>--embedding-context-size &lt;N&gt;</code></td><td>托管 GGUF 嵌入编码器而不是聊天模型（见<a href="#embeddings">嵌入服务</a>）；需要 <code>--model</code>，不能与 <code>--mmproj</code> 同用，支持 <code>cpu</code>、<code>ggml_cpu</code>、<code>ggml_metal</code> 与 <code>ggml_cuda</code>。生成类路由（聊天、Responses、Ollama、<code>/v1/systemone</code>，以及 <code>/api/image-generate</code>、<code>/api/image-edit</code>、<code>/api/video-generate</code> 与它们的 <code>/stream</code> 形式）返回 400 <code>This server hosts an embedding model. Use /v1/embeddings or /api/embed.</code>；显式指定本机没有的 <code>--backend</code> 时以退出码 2 结束，并打印 <code>error: model load refused: Backend 'X' is not supported on this machine.</code>。后两个参数设置编码器的 CPU 线程数与每条输入的最大 token 数，且需要 <code>--embeddings</code>。</td></tr>
+      <tr><td><code>--embeddings</code> · <code>--embedding-threads &lt;N&gt;</code> · <code>--embedding-context-size &lt;N&gt;</code></td><td>托管 GGUF 嵌入编码器而不是聊天模型（见<a href="#embeddings">嵌入服务</a>）；需要 <code>--model</code>。Snowflake/MiniLM 支持 <code>cpu</code>、<code>ggml_cpu</code>、<code>ggml_metal</code> 与 <code>ggml_cuda</code>；EmbeddingGemma 2 还实现了直连 <code>cuda</code>/<code>mlx</code>，并可通过匹配的 <code>--mmproj</code> 接收媒体。Vulkan 嵌入尚未实现；实现可用不代表所有后端的媒体质量或性能已验证一致。生成类路由（聊天、Responses、Ollama、<code>/v1/systemone</code>，以及 <code>/api/image-generate</code>、<code>/api/image-edit</code>、<code>/api/video-generate</code> 与它们的 <code>/stream</code> 形式）返回 400 <code>This server hosts an embedding model. Use /v1/embeddings or /api/embed.</code>；显式指定本机没有的 <code>--backend</code> 时以退出码 2 结束，并打印 <code>error: model load refused: Backend 'X' is not supported on this machine.</code>。后两个参数设置编码器的 CPU 线程数与每条输入的最大 token 数，且需要 <code>--embeddings</code>。</td></tr>
       <tr><td><code>--backend &lt;type&gt;</code></td><td>默认后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code>（默认：macOS 上为 <code>ggml_metal</code>，其他平台为 <code>ggml_cpu</code>；环境变量 <code>BACKEND</code>）。</td></tr>
       <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度，仅用于层内权重切分；默认 1，环境变量 <code>TENSORSHARP_TP_DEGREE</code>。模型与 GPU 后端必须支持此模式。与 <code>--layer-split</code> 互斥；不支持的请求在启动时失败。</td></tr>
       <tr><td><code>--layer-split &lt;N&gt;</code></td><td>支持按层切分的架构使用的本地 GPU 数；环境变量 <code>TENSORSHARP_LAYER_SPLIT_DEGREE</code>。整层放到不同设备，仅支持单节点；不能与 TP 或分布式 TP 参数组合。</td></tr>
@@ -183,7 +255,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
       <tr><td><code>--gpu-device &lt;N&gt;</code></td><td><code>ggml_vulkan</code> 后端在多 GPU 主机上使用的 Vulkan 设备索引（默认：0；环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）。</td></tr>
       <tr><td><code>--list-gpus</code></td><td>列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出。</td></tr>
       <tr><td><code>--port &lt;N&gt;</code> · <code>--host &lt;address&gt;</code> · <code>--urls &lt;urls&gt;</code></td><td>监听端口（默认 <code>5000</code>；环境变量 <code>PORT</code>）、绑定地址（默认 <code>0.0.0.0</code>；环境变量 <code>HOST</code>），或以分号分隔的完整监听 URL，用于前两者无法表达的情形（回退到 <code>ASPNETCORE_URLS</code>；同时给出时以 <code>--port</code> / <code>--host</code> 为准）。</td></tr>
-      <tr><td><code>--no-webui</code></td><td>不提供内置 Web UI；<code>GET /</code> 返回纯文本存活响应。所有 API 端点（包括 <code>/uploads</code>）照常可用。环境变量：<code>TS_NO_WEBUI</code>（非 <code>0</code> 即开启）。</td></tr>
+      <tr><td><code>--no-webui</code></td><td>不提供内置 Web UI；<code>GET /</code> 返回存活响应。所有 API 端点（包括 <code>/uploads</code>）照常可用。环境变量：<code>TS_NO_WEBUI</code>（非 <code>0</code> 即开启）。</td></tr>
       <tr><td><code>--help</code></td><td>打印完整参数说明后退出；不带任何参数时也会显示。推理始终需要启动参数 <code>--model</code>。</td></tr>
       <tr><td><code>--config &lt;path&gt;</code></td><td>从 JSON <a href="#config">配置文件</a>读取参数（命令行参数会覆盖它）。支持 <code>${变量}</code> 与通过 <code>{ "path": ..., "urls": [...] }</code> 自动下载模型。可重复。</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>所有端点（Web UI、Ollama、OpenAI）的生成上限：请求未指定时用它填充，请求要求更多时按它截断（默认：<code>20000</code>，该默认值只填充、不截断）。</td></tr>
@@ -233,8 +305,11 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
   </table>
   </div>
   <div class="callout tip"><div class="ic">✅</div><p>逐请求字段（<code>temperature</code>、<code>top_p</code>、<code>seed</code>、<code>stop</code> ……）会填补所有你未在此配置的参数；对于你配置过的参数，除非以 <code>--sampling-precedence request</code> 启动，否则以你的取值为准。<code>chat.start</code> 日志会打印每个请求实际使用的采样参数。</p></div>
+  </details>
 
-  <h2 id="env">环境变量</h2>
+  <h3 id="env">环境变量</h3>
+  <details>
+    <summary>环境变量、默认值与状态目录</summary>
   <div class="table-scroll">
   <table>
     <thead><tr><th>变量</th><th>说明</th></tr></thead>
@@ -260,8 +335,11 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
   </table>
   </div>
   <p class="page-foot-note">服务器默认监听 <code>http://0.0.0.0:5000</code>；<code>--port</code>、<code>--host</code> 与 <code>--urls</code>（或环境变量 <code>PORT</code> / <code>HOST</code> / <code>ASPNETCORE_URLS</code>）可以改变它，Docker Space 镜像设置的是 <code>PORT=7860</code>。</p>
+  </details>
 
-  <h2 id="tunables">连续批处理调参</h2>
+  <h3 id="tunables">连续批处理调参</h3>
+  <details>
+    <summary>连续批处理与调度器参数</summary>
   <p>调度器 / 引擎的旋钮在进程启动时读取。通过环境变量（或会被翻译成它们的 <code>--continuous-batching</code> 系列参数）设置。</p>
   <div class="table-scroll">
   <table>
@@ -271,7 +349,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
       <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>每步 token 预算（默认 <code>4096</code>）。</td></tr>
       <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>最大在飞序列数（默认 <code>16</code>）。</td></tr>
       <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>存在活跃 decode 时每请求的 prefill 上限（默认 <code>256</code>）；仅 prefill 时会用满完整 token 预算。</td></tr>
-      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>系统中最多一个序列时的 prefill 分块大小，会限制所有独占 prefill 分块（默认 <code>8192</code>）。</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>系统中最多一个序列时的 prefill 分块大小，会限制所有独占 prefill 分块（默认 <code>8192</code>，受 <code>TS_SCHED_MAX_BATCHED_TOKENS</code> 约束）。不设置时，能自行决定单独提示步长的模型会自己决定：开启流水线 prefill 的 Muse Spark 使用 8192 token 的步长，不超过 2048 token 的余数并入前一步，可能超过该预算。设置它则关闭模型自定的步长；引擎日志会说明实际采用哪一种。</td></tr>
       <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>切换序列前的 decode token 数（默认 <code>256</code> = 块大小）。</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS</code> / <code>TS_SCHED_BLOCK_SIZE</code></td><td>引擎池中的物理块数（默认 <code>256</code>） / 每块 token 数（只靠整页复用的家族默认 <code>16</code>，其余默认 <code>256</code>）。</td></tr>
       <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> 禁用所有跨请求的运行时前缀复用（= <code>--no-prefix-cache</code> 所设置的值）。</td></tr>
@@ -280,6 +358,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
   </table>
   </div>
   <p>完整的环境变量面（MLX 调参、MTP 旋钮、扩散）见 <a href="api-reference_zh-cn.html#env-vars">API 参考</a> 页与<a href="advanced_zh-cn.html">高级</a>页。</p>
+  </details>
 
   <div class="content-footer">
     <a href="cli_zh-cn.html">← 命令行</a>

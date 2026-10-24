@@ -1685,6 +1685,11 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MuseSparkProjectionFloat32(
+            GgmlTensorView2D result, GgmlTensorView2D input, GgmlTensorView2D weight);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_AddmmQuantF32(
             GgmlTensorView2D result,
             GgmlTensorView2D m1,
@@ -2158,6 +2163,18 @@ internal enum GgmlIndexReductionOp
             float oaiLimit,
             int runOnCpu);            // non-zero: run this layer on the host ggml CPU backend (MoE CPU offload)
 
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MuseSparkMoEFFNQuantF32(
+            IntPtr hiddenIn, IntPtr hiddenOut, int seqLen, int hiddenDim, int nFf,
+            int numExperts, int nUsed, IntPtr selectedExperts, IntPtr routingWeights,
+            IntPtr gateData, int gateType, long gateNe0, long gateNe1, long gateTotalBytes,
+            IntPtr upData, int upType, long upNe0, long upNe1, long upTotalBytes,
+            IntPtr downData, int downType, long downNe0, long downNe1, long downTotalBytes,
+            IntPtr gateBias, IntPtr upBias, IntPtr downBias,
+            int activationType, float oaiAlpha, float oaiLimit, int runOnCpu,
+            IntPtr postExpertNorm, float postExpertNormEps);
+
         // Gemma 4 MoE GEGLU + post_norm + residual add fused kernel.
         // Computes residual_in_out += rms_norm(moe_ffn(hidden_in), eps) * post_norm_w
         // in a single GGML graph dispatch. Mirrors the existing
@@ -2330,6 +2347,15 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_FusedPrefillAttentionF16KV(
+            IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
+            int numHeads, int numKvHeads, int headDim,
+            int seqLen, int kvLen, int kvCacheLen,
+            int maskStartPos, int slidingWindow,
+            float scale);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MuseSparkAttentionF16KV2D(
             IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
             int numHeads, int numKvHeads, int headDim,
             int seqLen, int kvLen, int kvCacheLen,
@@ -4374,6 +4400,10 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_HasResidentDeviceCopy(IntPtr key, long rawBytes);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_GetBackendMemory(out long freeBytes, out long totalBytes);
 
         [LibraryImport(DllName)]
@@ -4766,6 +4796,10 @@ internal enum GgmlIndexReductionOp
         internal static void AddmmPreciseMetal(GgmlTensorView2D result, GgmlTensorView2D input, GgmlTensorView2D weight)
             => CheckResult(TSGgml_AddmmF32PreciseMetal(result, default, input, weight, 0, 1), "gemma4_projection_float32_metal");
 
+        internal static void MuseSparkProjectionFloat32(
+            GgmlTensorView2D result, GgmlTensorView2D input, GgmlTensorView2D weight)
+            => CheckResult(TSGgml_MuseSparkProjectionFloat32(result, input, weight), "muse_spark_projection_float32");
+
         public static void AddmmQuant(GgmlTensorView2D result, GgmlTensorView2D m1, IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes)
         {
             CheckResult(TSGgml_AddmmQuantF32(result, m1, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes), "addmm_quant");
@@ -4829,6 +4863,53 @@ internal enum GgmlIndexReductionOp
                 gateUpData, gateUpGgmlType, gateUpNe0, gateUpNe1, gateUpRawBytes,
                 downData, downGgmlType, downNe0, downNe1, downRawBytes,
                 halfDim, actType), "fused_ffn_act_project_quant");
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_MuseSparkPrepareQKF32(
+            GgmlTensorView2D query, GgmlTensorView2D key, GgmlTensorView2D packed,
+            IntPtr queryNorm, IntPtr keyNorm, int* positions, int positionCount,
+            int queryHeads, int kvHeads, int headDim, float eps, int applyRope,
+            int ropeDim, float freqBase, float freqScale);
+
+        public static unsafe void MuseSparkPrepareQK(GgmlTensorView2D query,
+            GgmlTensorView2D key, GgmlTensorView2D packed, IntPtr queryNorm, IntPtr keyNorm,
+            int[] positions, int queryHeads, int kvHeads, int headDim, float eps,
+            bool applyRope, int ropeDim, float freqBase, float freqScale)
+        {
+            fixed (int* pos = positions)
+                CheckResult(TSGgml_MuseSparkPrepareQKF32(query, key, packed, queryNorm, keyNorm,
+                    pos, positions?.Length ?? 0, queryHeads, kvHeads, headDim, eps,
+                    applyRope ? 1 : 0, ropeDim, freqBase, freqScale), "muse_spark_qk_prep");
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MuseSparkPostNormResidualF32(
+            GgmlTensorView2D result, GgmlTensorView2D stream, GgmlTensorView2D branch,
+            IntPtr alpha, IntPtr beta, IntPtr preScale, int channels, float eps);
+
+        public static void MuseSparkPostNormResidual(GgmlTensorView2D result,
+            GgmlTensorView2D stream, GgmlTensorView2D branch, IntPtr alpha, IntPtr beta,
+            IntPtr preScale, int channels, float eps)
+            => CheckResult(TSGgml_MuseSparkPostNormResidualF32(result, stream, branch,
+                alpha, beta, preScale, channels, eps), "muse_spark_residual");
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MuseSparkNormGateF32(
+            GgmlTensorView2D result, GgmlTensorView2D input, IntPtr gamma,
+            GgmlTensorView2D gate, int headDim, float eps, int withGate, int reuseScratch);
+
+        public static bool MuseSparkNormGate(GgmlTensorView2D result, GgmlTensorView2D input,
+            IntPtr gamma, GgmlTensorView2D gate, int headDim, float eps, bool withGate, bool reuseScratch)
+        {
+            int status = TSGgml_MuseSparkNormGateF32(result, input, gamma, gate, headDim,
+                eps, withGate ? 1 : 0, reuseScratch ? 1 : 0);
+            CheckResult(status, "muse_spark_norm_gate");
+            if (status != 1 && status != 2) throw new InvalidOperationException("Unexpected Spark norm execution status.");
+            return status == 1;
         }
 
         public static void FusedRmsNormResidualAdd(
@@ -5270,8 +5351,22 @@ internal enum GgmlIndexReductionOp
             int activationType,
             float oaiAlpha,
             float oaiLimit,
-            bool runOnCpu = false)
+            bool runOnCpu = false,
+            IntPtr postExpertNorm = default,
+            float postExpertNormEps = 1e-8f)
         {
+            if (postExpertNorm != IntPtr.Zero)
+            {
+                CheckResult(TSGgml_MuseSparkMoEFFNQuantF32(
+                    hiddenIn, hiddenOut, seqLen, hiddenDim, nFf,
+                    numExperts, nUsed, selectedExperts, routingWeights,
+                    gateData, gateType, gateNe0, gateNe1, gateTotalBytes,
+                    upData, upType, upNe0, upNe1, upTotalBytes,
+                    downData, downType, downNe0, downNe1, downTotalBytes,
+                    gateBias, upBias, downBias, activationType, oaiAlpha, oaiLimit,
+                    runOnCpu ? 1 : 0, postExpertNorm, postExpertNormEps), "muse_spark_moe_ffn");
+                return;
+            }
             CheckResult(TSGgml_MoEFFNPrefillSwiGLUQuantF32(
                 hiddenIn, hiddenOut, seqLen, hiddenDim, nFf,
                 numExperts, nUsed, selectedExperts, routingWeights,
@@ -5530,8 +5625,15 @@ internal enum GgmlIndexReductionOp
             IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
             int numHeads, int numKvHeads, int headDim,
             int seqLen, int kvLen, int kvCacheLen,
-            int maskStartPos, int slidingWindow, float scale)
+            int maskStartPos, int slidingWindow, float scale, bool museSpark2DUploads = false)
         {
+            if (museSpark2DUploads)
+            {
+                CheckResult(TSGgml_MuseSparkAttentionF16KV2D(qData, kData, vData, outData,
+                    numHeads, numKvHeads, headDim, seqLen, kvLen, kvCacheLen,
+                    maskStartPos, slidingWindow, scale), "muse_spark_attention_f16kv_2d");
+                return;
+            }
             CheckResult(TSGgml_FusedPrefillAttentionF16KV(
                 qData, kData, vData, outData,
                 numHeads, numKvHeads, headDim,
@@ -6196,6 +6298,9 @@ internal enum GgmlIndexReductionOp
         /// host-buffer cache (excludes zero-copy weight wrappers). Used by tests to assert that
         /// per-block activation/KV device copies are reclaimed rather than leaked.</summary>
         public static long DeviceCopyCacheResidentBytes() => TSGgml_DeviceCopyCacheResidentBytes();
+
+        public static bool HasResidentDeviceCopy(IntPtr key, long rawBytes)
+            => key != IntPtr.Zero && rawBytes > 0 && TSGgml_HasResidentDeviceCopy(key, rawBytes) == 1;
 
         /// <summary>Diagnostic: active backend device memory. On Metal <paramref name="totalBytes"/>
         /// is recommendedMaxWorkingSetSize and <paramref name="freeBytes"/> = total - currentAllocatedSize,

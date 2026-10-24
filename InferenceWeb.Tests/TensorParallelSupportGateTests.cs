@@ -78,6 +78,7 @@ public class TensorParallelSupportGateTests
     [InlineData("qwen4exp")]
     [InlineData("gemma4")]
     [InlineData("muse-glimmer")]
+    [InlineData("muse-spark")]
     [InlineData("glm-dsa")]
     [InlineData("glm5next")]
     public void TpCapableArchitectures_AreUntouched(string arch)
@@ -85,6 +86,20 @@ public class TensorParallelSupportGateTests
         ITensorParallelGroup group = null;
         Assert.Equal(4, Resolve(arch, BackendType.GgmlCuda, 4, ref group, out int layerSplit));
         Assert.Equal(1, layerSplit);
+    }
+
+    [Fact]
+    public void MuseSparkRetainsExplicitLayerSplitAndRejectsDistributedTp()
+    {
+        ITensorParallelGroup group = null;
+        Assert.Equal(1, TensorSharp.Models.ModelBase.ResolveTensorParallelSupport(
+            Arch("muse-spark"), BackendType.GgmlCuda, 1, ref group, out int split, 5));
+        Assert.Equal(5, split);
+        Assert.Null(group);
+        group = new StubTpGroup();
+        var error = Assert.Throws<NotSupportedException>(() =>
+            Resolve("muse-spark", BackendType.GgmlCuda, 2, ref group, out _));
+        Assert.Contains("muse-spark", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

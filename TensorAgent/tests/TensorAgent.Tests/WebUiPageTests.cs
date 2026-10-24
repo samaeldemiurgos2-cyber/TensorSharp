@@ -3178,8 +3178,8 @@ public sealed partial class WebUiPageTests : IDisposable
     /// architecture is called.
     /// </summary>
     [WebJavaScriptTheory]
-    [InlineData(KeyframesVideo, "Describe a video… or attach a photo to start it from")]
-    [InlineData(ReferencesVideo, "Describe a video… attach photos, clips or sounds it should feature")]
+    [InlineData(KeyframesVideo, "Describe a video… attach a video to continue from its last frame, or a photo for frame guidance")]
+    [InlineData(ReferencesVideo, "Describe a video… attach a video to continue from its last frame, or a photo for frame guidance")]
     [InlineData("""
         { family: 'minimax-h3', supportsAudio: true, supportsImageConditioning: false,
           supportsEndImageConditioning: false, supportsReferenceConditioning: false, maxReferenceImages: 0 }

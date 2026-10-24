@@ -950,18 +950,20 @@ TpF32Gather * tp_cuda_f32_gather_create(ggml_backend_t * backends, int count)
     if (!exact_f32_enabled(backends, count)) return nullptr;
     // This executor owns backends outside the generic TP device group, so run
     // the same cached behavioural checks before its first communicator exists.
-    if (std::getenv("GGML_CUDA_ALLREDUCE") == nullptr)
     {
+        const bool choose = std::getenv("GGML_CUDA_ALLREDUCE") == nullptr;
         std::vector<int> devices;
         for (int r = 0; r < count; ++r)
             devices.push_back(static_cast<ggml_backend_cuda_context *>(backends[r]->context)->device);
-        if (std::getenv("NCCL_P2P_DISABLE") == nullptr
+        if (choose && std::getenv("NCCL_P2P_DISABLE") == nullptr
             && tp_probe_cuda_peer_access(devices.data(), count) == 0)
         {
             setenv("NCCL_P2P_DISABLE", "1", 0);
             std::fprintf(stderr, "[TP] F32 gather: using NCCL shared-memory transport after failed peer-copy probe.\n");
         }
-        if (tp_probe_cuda_collective(devices.data(), count) == 0) return nullptr;
+        // Also when the operator chose NCCL: correctness, not transport.
+        tp_cuda_respect_vmm_peer_limit(devices.data(), count);
+        if (choose && tp_probe_cuda_collective(devices.data(), count) == 0) return nullptr;
     }
     auto handle = std::make_unique<TpF32Gather>();
     if (!exact_f32_initialize(handle->state, backends, count)) return nullptr;

@@ -58,6 +58,7 @@ public static class DiffusionCompanions
         (CatalogFamily.Ltx25, CatalogFileRole.Vae, "TS_VIDEO_VAE"),
         (CatalogFamily.Ltx25, CatalogFileRole.AudioVae, "TS_VIDEO_AUDIO_VAE"),
         (CatalogFamily.Ltx25, CatalogFileRole.LatentUpscaler, "TS_VIDEO_UPSCALER"),
+        (CatalogFamily.Ltx25, CatalogFileRole.IngredientsLora, "TS_LTX25_INGREDIENTS_LORA"),
     ];
 
     /// <summary>

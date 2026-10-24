@@ -346,9 +346,9 @@ committed).
 
 ## Files
 
-Four networks cooperate, so a run needs four files. The two denoisers are
-**separate checkpoints, not settings** — which one you load decides what
-conditioning it accepts.
+Five model files cooperate: two denoisers and three shared networks. The two
+denoisers are **separate checkpoints, not settings**; TensorSharp chooses the
+partition that matches each request when both files are present.
 
 | File | Size | Source |
 |---|---|---|
@@ -357,39 +357,39 @@ conditioning it accepts.
 | `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` | 16.97 GiB | same repo — the text encoder, shared (`-Q2_K_M.gguf`, 12.20 GiB, pairs with a smaller denoiser) |
 | `minimax_h3_video_vae_fp16.safetensors` | 5.21 GB | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) (also mirrored under `vae/` in the unsloth repo) |
 | `minimax_h3_audio_vae_fp32.safetensors` | 0.61 GB | same repo — omit for silent video |
+| `vocab.json`, `merges.txt`, `tokenizer_config.json` | ~4.2 MB | [MiniMaxAI/MiniMax-H3/processor](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor) — the config downloads these pinned files beside the text encoder |
 
-One model set occupies about 35.5 GB on disk. The second denoiser shares the
-text encoder, VAEs and tokenizer. Device residency is handed off between stages
-when needed; activation buffers, temporary weights and other live contexts also
-contribute to memory use.
+One denoiser plus the shared components occupies about 35.5 GB; both denoisers
+and shared components occupy about 46.1 GB on disk. Device residency is handed
+off between stages when needed; activation buffers, temporary weights and other
+live contexts also contribute to memory use.
 
 Companions resolve automatically next to the denoiser, or with `--video-vae`,
 `--video-text-encoder`, `--audio-vae`.
 
-Two shipped configs download the lot on first run and only differ in their `model`
-entry, so the encoder and the VAEs are fetched once:
+The shipped config downloads the complete set on first run, including both mode-specific
+denoisers. The loaded model chooses the matching checkpoint for each mode without restarting:
 
 ```sh
-TensorSharp.Server.Host --config config/minimax-h3-fl2va.json # keyframes
-TensorSharp.Cli         --config config/minimax-h3-ref2va.json \
+TensorSharp.Server.Host --config config/minimax-h3-fl2va.json # frames or references
+TensorSharp.Cli         --config config/minimax-h3-fl2va.json --video-mode ref \
   --ref-image person.png --prompt "…" --output out.mp4        # references
 ```
 
-Both name `"backend": "ggml_cuda"` (a `--backend` on the command line wins) and set
-22 frames at 24 fps. Only the Ref2VA config pins 640×384; the FL2VA config leaves
-the size to the model, so text-to-video runs at 640×384 and a keyframe gets its
-[recipe canvas](#sizes-and-settings). Neither sets steps or guidance: a shipped
+The config names `"backend": "ggml_cuda"` (a `--backend` on the command line wins) and sets
+22 frames at 24 fps. It leaves size to the model, so text-to-video
+runs at 640×384 and a keyframe gets its
+[recipe canvas](#sizes-and-settings). It leaves steps and guidance unset: a shipped
 config has to parse on both hosts, and the two spell steps differently
 (`--video-steps N` on the server, `--diffusion-steps N` on the CLI), while the
 server takes no `--cfg` at all — so the model's own defaults apply.
 
-> **The text-encoder GGUF carries no tokenizer**, and that is the one thing a config
-> cannot fetch for you: auto-download fills in options that are **flags**, and the
-> tokenizer is not one. Put three files from the `processor/` folder of
+> **The text-encoder GGUF carries no tokenizer.** The config fetches the pinned three
+> files from the `processor/` folder of
 > [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor)
-> beside it — `vocab.json`, `merges.txt` and `tokenizer_config.json` — or point
-> `TS_VIDEO_TOKENIZER` at the folder holding them. (The TensorAgent Mac app's catalog
-> entries download all three; see [TensorAgent](../../TensorAgent/README.md).) Neither
+> beside the encoder — `vocab.json`, `merges.txt` and `tokenizer_config.json`. Manual
+> installs can place them beside it or point `TS_VIDEO_TOKENIZER` at their folder. (The TensorAgent Mac app's single catalog entry also downloads all three; see
+> [TensorAgent](../../TensorAgent/README.md).) Neither
 > published GGUF has any metadata at all, so TensorSharp identifies H3 by its tensors
 > rather than by an architecture string (arch keys `minimax-h3` / `minimax_h3` are
 > accepted when a file does declare one).
@@ -421,6 +421,7 @@ server takes no `--cfg` at all — so the model's own defaults apply.
 `--video-mode` makes the choice explicit; otherwise inputs select it. Keep
 `ref2va` in a reference checkpoint's filename. Requests mixing keyframes and
 named references, or using the wrong checkpoint partition, are rejected.
+The shared config includes both denoisers, so either conditioning mode works in one host.
 Synthetic first/last-frame and canonical image-plus-audio reference runs have
 completed. Natural-media reference quality, reference clips and broader prompt/
 seed coverage remain unestablished.
@@ -432,7 +433,7 @@ TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
   --output morph.mp4
 
-TensorSharp.Cli --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --config config/minimax-h3-fl2va.json --backend ggml_metal \
   --ref-image person.jpg --ref-audio song.wav --video-mode ref \
   --prompt "She performs on a small club stage" --diffusion-seed 42 \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -540,7 +541,7 @@ refused with a message that names the plug-in, never overridden.
 |---|---|---|
 | CLI | `--diffusion-steps`, `--flow-shift`, `--sampler`, `--cfg` | One `Configuration error:` line and exit code 1, before anything downloads |
 | Server startup | `--video-steps` | The same, before anything downloads |
-| `--config` on either host | The merged options, before the config's own files download | The same; a refused run downloads nothing, not even the ~35.5 GB model set |
+| `--config` on either host | The merged options, before the config's own files download | The same; a refused run downloads nothing, not even the ~46 GB model set |
 | A request | `"steps"`, `"flowShift"`, `"sampler"` (a `"cfg"` other than 1 is refused for every H3 model) | 400 on `/api/video-generate` and `/v1/videos/generations`; a `{done, error}` event on `/api/video-generate/stream` |
 | Video Studio | A shot planned for another recipe | 409 `sampling_recipe_conflict`, and no job ([Video Studio](../video-studio.md#sampling-recipes)) |
 
@@ -597,7 +598,7 @@ choose plug-ins; send requests without `steps`, as the Web UI does
 ([API examples](../../TensorSharp.Server.Host/API_EXAMPLES.md#minimax-h3--video-and-native-32-khz-stereo-audio)).
 [Video Studio](../video-studio.md#sampling-recipes) shows the recipe, fixes the step
 count and binds each job to it. The [TensorAgent app](../../TensorAgent/README.md)
-offers both plug-ins on its keyframes entry as speed plug-ins, applied per clip in
+offers both plug-ins on the MiniMax-H3 entry for FL2VA clips, applied per clip in
 chat and in Studio, and never sends steps, a flow shift or a sampler.
 
 ### Turbo validation status
@@ -704,20 +705,25 @@ Returns `{ ok, url, audioUrl, audioMuxed, width, height, frames, fps, seed, code
 `audioUrl` is null when the model produced no track; `audioMuxed` says whether the MP4
 carries the soundtrack as well ([below](#audio-output)). The full field set is `prompt`,
 `width`, `height`, `frames`, `steps`, `cfg`, `fps`, `seed`, `flowShift`,
-`imagePath` (or inline base64 `image`), `videoMode`, `generateAudio`, `endImage`,
+`imagePath` (or inline base64 `image`), `videoMode`, `generateAudio`, `endImage`, `continueFromVideos`,
 `referenceImages`, `referenceVideos`, `referenceAudios`, `referenceVideoAudios`;
 the Wan fields `negativePrompt`, `sampler`, `cfgCacheStride` and `cfg2` are
 accepted and ignored by H3. Most of them are **camelCase only** —
-`videoMode`, `generateAudio`, `endImage` and the four `reference*` lists are the
+`videoMode`, `generateAudio`, `endImage`, `continueFromVideos` and the four `reference*` lists are the
 only ones that also accept a snake_case spelling (`video_mode`, `generate_audio`,
-`end_image`, `reference_images`, …), and camelCase wins when both are present.
+`end_image`, `continue_from_videos`, `reference_images`, …), and camelCase wins when both are present.
 Sending `image_path` or `flow_shift` is silently ignored rather than rejected, so
 prefer camelCase everywhere. `referenceVideoAudios` pairs **by index** with
 `referenceVideos`, the same positional rule `--ref-video-audio` follows. `imagePath` / `endImage` /
 `referenceImages` name files previously uploaded through `/api/upload`; paths
 outside the upload directory are rejected. `/v1/videos/generations` shares the same
-parser, so the same seven fields accept snake_case there too (`video_mode`,
+parser, so the same fields accept snake_case there too (`video_mode`,
 `reference_images`, …); it returns `audio_url` rather than `audioUrl`, and no mux flag.
+
+`continueFromVideos` takes one or two previously uploaded video files and uses their
+exact final frames as the new take's first frame and, optionally, its last frame. The
+first clip starts the take; the second clip's ending pins the take's end. This uses
+FL2VA frame conditioning; `referenceVideos` continues to provide full-clip Ref2VA context.
 
 A model rejection — the wrong checkpoint for the mode, or keyframes together with
 references — comes back as a **400 carrying the model's own message**, not a generic

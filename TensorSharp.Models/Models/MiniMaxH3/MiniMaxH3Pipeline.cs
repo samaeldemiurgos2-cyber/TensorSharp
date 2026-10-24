@@ -32,6 +32,7 @@ namespace TensorSharp.Models.MiniMaxH3
     {
         private readonly MiniMaxH3Model _model;
         private MiniMaxH3DiT _dit;
+        private MiniMaxH3Partition? _ditPartition;
         private MiniMaxH3VideoVae _vae;
         private MiniMaxH3AudioVae _audioVae;
         private bool _disposed;
@@ -89,15 +90,18 @@ namespace TensorSharp.Models.MiniMaxH3
         public GeneratedVideo Generate(string prompt, VideoGenerationParams p)
         {
             p ??= new VideoGenerationParams();
+            p = p.ResolveVideoContinuations();
             // The LoRA plug-in is read once: the model swaps it only between clips.
-            MiniMaxH3LoraSet lora = _model.Loras;
+            MiniMaxH3Partition partition = _model.PartitionFor(p);
+            MiniMaxH3LoraSet configuredLora = _model.Loras;
+            MiniMaxH3LoraSet lora = configuredLora?.Partition == partition ? configuredLora : null;
             MiniMaxH3SamplingRecipe recipe = lora?.Recipe;
             ValidateSamplingParameters(p, recipe);
             var total = Stopwatch.StartNew();
 
             // The mode decides what an image MEANS, and so whether it may size the canvas:
             // a keyframe is a frame of the clip, a reference is not.
-            var mode = MiniMaxH3ModeResolver.Resolve(p, _model.Partition);
+            var mode = MiniMaxH3ModeResolver.Resolve(p, partition);
             RequirePluginMode(recipe, mode);
 
             // A KEYFRAME is conditioned twice, and both halves matter.
@@ -142,7 +146,7 @@ namespace TensorSharp.Models.MiniMaxH3
             System.Threading.Tasks.Task<double> prefault = null;
             if (PrefaultMode == 2)
             {
-                string ditPath = _model.DiTPath;
+                string ditPath = _model.DenoiserPathFor(partition);
                 long avail = AvailablePhysicalBytes();
                 prefault = System.Threading.Tasks.Task.Run(
                     () => MiniMaxH3Model.PrefaultWeightFile(ditPath, avail));
@@ -220,7 +224,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 // read places - which is exactly the join below.
                 if (PrefaultMode == 1 || PrefaultMode == 3)
                 {
-                    string ditPath = _model.DiTPath;
+                    string ditPath = _model.DenoiserPathFor(partition);
                     long avail = AvailablePhysicalBytes();
                     prefault = System.Threading.Tasks.Task.Run(
                         () => MiniMaxH3Model.PrefaultWeightFile(ditPath, avail));
@@ -262,7 +266,12 @@ namespace TensorSharp.Models.MiniMaxH3
 
 
             var ditClock = Stopwatch.StartNew();
-            _dit ??= _model.CreateDiT();
+            if (_dit == null || _ditPartition != partition)
+            {
+                _dit?.Dispose();
+                _dit = _model.CreateDiT(partition);
+                _ditPartition = partition;
+            }
             ditClock.Stop();
             Console.WriteLine($"  [h3] denoiser loaded in {ditClock.Elapsed.TotalSeconds:F1}s");
 
@@ -1471,6 +1480,7 @@ namespace TensorSharp.Models.MiniMaxH3
             if (_disposed) return;
             _disposed = true;
             _dit?.Dispose();
+            _ditPartition = null;
             _vae?.Dispose();
             _audioVae?.Dispose();
         }

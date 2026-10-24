@@ -98,6 +98,7 @@ BlockPool + PagedKvStorage   (托管主机内存)
 | `ManagedPagedAttention` | `TensorSharp.Runtime/Paged/ManagedPagedAttention.cs` | 纯 C# 分页注意力正确性回退。 |
 | `SequenceState` | `TensorSharp.Runtime/Scheduling/SequenceState.cs` | 每请求的状态、token、块、logits 与采样信息。 |
 | `ContinuousBatchScheduler` | `TensorSharp.Runtime/Scheduling/ContinuousBatchScheduler.cs` | 带前缀缓存与抢占的迭代级调度器。 |
+| `ISoloPrefillBudgetModel` | `TensorSharp.Runtime/Scheduling/ISoloPrefillBudgetModel.cs` | 可选的模型契约：由模型决定单个请求的 prefill 步长（启用流水化 prefill 的 Muse Spark），除非设置了 `TS_SCHED_SOLO_PREFILL_CHUNK`。 |
 | `BatchExecutor` | `TensorSharp.Runtime/Scheduling/BatchExecutor.cs` | 执行计划中的步骤、采样并捕获 KV 块。 |
 | `ExecutionPlanner` | `TensorSharp.Runtime/Scheduling/ExecutionPlanner.cs` | 纯函数路径选择：能力 + 覆盖 + 步特征 → `ExecutionPlan`。 |
 | `ExecutionCapabilities` | `TensorSharp.Runtime/Scheduling/ExecutionCapabilities.cs` | 已加载模型 × 后端组合的声明式能力快照。 |
@@ -295,7 +296,7 @@ logits。不加 gate 时，三轮中仍有一轮改变了 8 请求轮次的输�
 
 投机只在模型声明有收益（`SpeculationProfitable`）时启用，这由各模型自己决定：Qwen 3.5/3.6/3.8 与
 GLM 5.2 / GLM-5.3 在所有后端上；Gemma 4 在 ggml 后端（含 `ggml_cpu`）与纯 C# `cuda` 后端上；
-Qwen 3.8 Flash Next 在其 GGML token 计算图路径上；GLM-5.3-Flash 在其 KDA 回滚可用时；DeepSeek V4 / V4.1
+Qwen 3.8 Flash Next 在其 GGML token 计算图路径上；GLM-5.3-Flash 在其 KDA 回滚可用时；Muse Spark 在 GGML 后端上（仅 n-gram），其原生 `--tp` 除外；DeepSeek V4 / V4.1
 与 Muse-Glimmer 只在加载了各自草稿器时。Nemotron-H 直接拒绝投机（`SpeculationRefusal`）。GPT OSS、Mistral 3 与
 Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都走标准 decode。并发批次从不投机——当有多个
 序列在运行时，每个序列都走普通的批处理 / 回退步骤。无法挂载的 `--draft-model`（草稿器不匹配或不完整，
@@ -317,6 +318,7 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 | GLM 5.x | 没有 `ForwardBatch`：MLA 每个 token 只存一行压缩表示，DSA indexer 又要对同一段连续历史打分，没有分页 KV 布局可批。并发改由原生**序列 slot** 承担（`TSGgml_GlmSlotAlloc` / `SetActiveSlot` / `SlotFree`）——绑定请求只是切换活动 slot，不搬运 KV 字节，每个 slot 的计算图独立缓存与捕获。在此之上默认启用批量融合 decode（一张图、每序列一个 token，整批只读一遍权重）：4 个并发请求时合计 decode 提速 1.81×。批处理会改变 GEMM 形状，而 2 bit MoE 可能把这点差别放大成不同的专家选择。 | `TS_BATCHED_FUSED_DECODE=0` 关闭批量 decode。 |
 | Hunyuan Dense | 默认 `ForwardBatch` 路径，使用 F32 分页缓冲。块量化（`q8_0` / `q4_0`）KV cache 会保留 KV 快照换入路径，该路径能精确处理这些 dtype。 | — |
 | Muse-Glimmer | 没有 `ForwardBatch`（它不是 `IBatchedPagedModel`）：并发请求走按序列 KV 换入回退路径，把每个序列的 K/V 快照到主机内存，`--tp` 下同样如此。属于 Radix 页面家族（主机 slab 页面）。只在加载了 DFlash 草稿器（`--draft-model`）时投机。 | 没有批处理开关；`TS_MUSE_GLIMMER_*` 是内核 A/B 开关（见 [Muse-Glimmer 模型卡](models/muse-glimmer_zh-cn.md#7-环境变量)）。 |
+| Muse Spark | 在 `ggml_cuda` / `ggml_vulkan` 上，原生整模型执行器用自己的**序列 slot** 处理并发（每个 slot 在各层所在 GPU 上持有 F16 K/V，`ggml_cuda` 上 `--tp N` 时则按 KV 组切分到各 GPU；46 个滑动窗口层使用环形缓冲）：所有运行中请求的 decode 步共享一张带按序列掩码的计算图，同时到达的文本提示在一张图中 prefill，图像嵌入在图内替换占位行。完成的 slot 会被保留并移交给延续该会话的请求（可先回退），模板前导与共享系统提示会被写入一个检查点 slot，再克隆进新会话。按层切分在 CUDA GPU 间流水化 prefill 时，单个 prompt 按模型选择的步长 prefill（8,192 token；见下文 `TS_SCHED_SOLO_PREFILL_CHUNK`）。逐算子路径（`TS_MUSE_SPARK_NATIVE=0`，以及 `ggml_vulkan` 上的 `--tp`）属于 Radix 页面家族；它的打包分页 `ForwardBatch` 需要 F32 KV 且只接受纯文本请求。 | `TS_MUSE_SPARK_NATIVE=0` 选择逐算子路径；`TS_MUSE_SPARK_PLAN_SLOTS` 在放置规划中预留 slot；`TS_MUSE_SPARK_PIPELINE=0` 关闭流水化 prefill（见 [Muse Spark 卡片](models/muse-spark_zh-cn.md#选项)）。 |
 | DeepSeek V4 / V4.1 | 没有 `ForwardBatch`：压缩注意力缓存没有分页布局。并发由原生执行器的序列 slot 承担（纯 C# `cpu` 与直连 CUDA `cuda` 执行器保持串行）。默认启用的 token 批量融合 decode 每步只读一遍权重，最多 16 个序列，更多时分窗口执行；加载了 DSpark 草稿器时不启用。V4.1 会把已结束会话的 slot 保留给它的下一轮（加载了 DSpark 草稿器时不保留）。 | `TS_BATCHED_FUSED_DECODE=0`；V4.1 保留 slot 的预算由 `TS_DSV41_RETAINED_CACHE_MB`（默认 2048）决定。 |
 | Qwen 3.8 Flash Next（`qwen4exp`） | 没有 `ForwardBatch`：并发通过 GGML 融合 span 路径上的按序列状态 holder 实现，逐个序列 decode（没有 token 批量融合 decode）。已结束的会话会被保留，共享提示前缀会被做成检查点并克隆到新会话中，仅限精确前缀。`--layer-split N` 是按层切分（qwen4exp 没有张量并行模式），保留与检查点在按层切分下都可用。共享 MTP 头（`--draft-model`）只对从位置 0 开始 prefill 的单序列请求投机。 | `TS_Q4E_RETAINED_CACHE_MB` 是保留与检查点共用的预算（默认取实测内存余量的一半；`0` 不保留任何状态）。 |
 | DiffusionGemma | 独立文本扩散路径。`Forward(int[] tokens)` 刻意不支持；生成会迭代去噪固定长度 canvas block。Web UI 请求共享 `DiffusionBatchScheduler`，在 block 之间接纳并发请求，并可选择批处理活跃 canvas。 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH`、`DIFFUSION_BATCHED_FORWARD`；`DIFFUSION_NO_FUSED_DECODE=1` 关闭 GGML 融合整模型 diffusion decode。 |
@@ -456,7 +458,7 @@ Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 | `TS_SCHED_MAX_BATCHED_TOKENS` | `4096` | 每步 token 预算。 |
 | `TS_SCHED_MAX_RUNNING_SEQS` | `16` | 最大同时执行序列数。 |
 | `TS_SCHED_PREFILL_CHUNK` | `256` | 存在活跃 decode 时每请求的 prefill 上限；仅 prefill 的步骤会公平分配完整 token 预算。服务端参数：`--prefill-chunk-size N`。 |
-| `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | solo（无争用）请求的每步 prefill 上限——以大分块把 prompt 送入融合整图 prefill 路径。受 `TS_SCHED_MAX_BATCHED_TOKENS` 约束。 |
+| `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | solo（无争用）请求的每步 prefill 上限——以大分块把 prompt 送入融合整图 prefill 路径。受 `TS_SCHED_MAX_BATCHED_TOKENS` 约束。有自己单请求步长的模型（`ISoloPrefillBudgetModel`）——启用流水化 prefill 的 Muse Spark：8192 token，不超过 2048 的余量并入前一步——在未设置该变量时自行决定步长，且步长可超过 `TS_SCHED_MAX_BATCHED_TOKENS`；设置了该变量则按此处所述生效，并关闭模型自己的步长。只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会关闭它。引擎日志会说明当前生效的是哪条规则。 |
 | `TS_SCHED_NUM_BLOCKS` | `256` | 引擎块池物理块数。 |
 | `TS_SCHED_BLOCK_SIZE` | 只靠页面复用的家族（Hunyuan Dense、Mistral 3、Muse-Glimmer）为 `16`，其余为 `256` | 每块 token 数。只靠整页做跨请求复用的家族按这个粒度复用：块大小为 256 时，短于一块的一轮什么都复用不了。 |
 | `TS_SCHED_PREFIX_CACHE` | `1` | 设为 `0` 关闭准入时的全部提示复用：Radix 的页面、终态与检查点。`--no-prefix-cache`（CLI 与服务端）会设置它。 |

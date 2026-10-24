@@ -206,67 +206,14 @@ namespace tsg
             return false;
 
 #ifdef TSG_GGML_USE_CUDA
-        // Pick a collective that actually works on THIS host, for THIS rank
-        // count, before the backend creates its communicator.
-        //
-        // The CUDA comm chain is nccl -> internal -> none, and each link has a
-        // way of failing quietly:
-        //   * NCCL trusts the driver's P2P capability report. Where that report
-        //     is a lie (virtualized cloud boxes), init succeeds and the FIRST
-        //     collective wedges every GPU in peer-waiting spin kernels.
-        //   * the "internal" pinned-host pipeline only supports exactly 2
-        //     devices, so at 3+ ranks it declines and the chain lands on
-        //     "none", whose AllReduce always returns false. Every segment
-        //     boundary then drains its partials to host RAM and pushes the sum
-        //     back — a correct result at a fraction of the speed.
-        // So a host with false P2P used to lose the device collective entirely
-        // the moment it had more than two GPUs.
-        //
-        // Instead: check peer traffic behaviourally first (no NCCL needed), and
-        // when it is broken, take P2P away from NCCL rather than taking NCCL
-        // away from the model. NCCL then routes over its shared-memory
-        // transport, which keeps the reduction off the per-segment host path and
-        // works for any rank count the backend supports. The internal pipeline
-        // stays as the 2-device fallback for when NCCL is unusable outright.
-        // An explicit GGML_CUDA_ALLREDUCE from the operator wins unconditionally.
         {
             const char* reg_name = ggml_backend_reg_name(reg);
-            if (reg_name != nullptr && std::strcmp(reg_name, "CUDA") == 0
-                && std::getenv("GGML_CUDA_ALLREDUCE") == nullptr)
+            if (reg_name != nullptr && std::strcmp(reg_name, "CUDA") == 0)
             {
                 int probe_devices[TSG_MAX_DEVICES];
                 for (int r = 0; r < n; ++r)
                     probe_devices[r] = dev(r).device_index >= 0 ? dev(r).device_index : r;
-
-                // NCCL caches its tunables at the first communicator init in the
-                // process, so this has to happen before any probe touches NCCL.
-                if (std::getenv("NCCL_P2P_DISABLE") == nullptr
-                    && tp_probe_cuda_peer_access(probe_devices, n) == 0)
-                {
-                    tp_setenv("NCCL_P2P_DISABLE", "1");
-                    std::fprintf(stderr,
-                        "[TP] peer access is advertised but non-functional on this host; "
-                        "running NCCL with NCCL_P2P_DISABLE=1 (shared-memory transport).\n");
-                    std::fflush(stderr);
-                }
-
-                if (tp_probe_cuda_collective(probe_devices, n) == 0)
-                {
-                    // NCCL is unusable even without P2P. The internal pipeline
-                    // is 2-device only; past that the host reduction is all that
-                    // is left, and saying so beats a silent 2x.
-                    tp_setenv("GGML_CUDA_ALLREDUCE", n == 2 ? "internal" : "none");
-                    std::fprintf(stderr,
-                        n == 2
-                        ? "[TP] device collective (NCCL) is non-functional on this host; "
-                          "using the pinned-host-memory AllReduce instead. Set "
-                          "GGML_CUDA_ALLREDUCE to override, TS_GGML_TP_AR_PROBE=force to re-test.\n"
-                        : "[TP] device collective (NCCL) is non-functional on this host and the "
-                          "pinned-host-memory AllReduce only supports 2 devices; falling back to "
-                          "the host reduction, which will cost throughput. Set "
-                          "GGML_CUDA_ALLREDUCE to override, TS_GGML_TP_AR_PROBE=force to re-test.\n");
-                    std::fflush(stderr);
-                }
+                tp_cuda_prepare_collective(probe_devices, n);
             }
         }
 #endif
@@ -1535,6 +1482,7 @@ static int tsg_multi_device_init(int backendType, const int* deviceIndices, int 
                 if (g_backend != nullptr)
                 {
                     tsg::sync_backend(g_backend);
+                    tsg::free_spark_float32_backend();
                     ggml_backend_free(g_backend);
                 }
                 g_backend = replacement;
@@ -1549,6 +1497,7 @@ static int tsg_multi_device_init(int backendType, const int* deviceIndices, int 
             {
                 // Re-init after a previous group was torn down.
                 tsg::sync_backend(g_backend);
+                tsg::free_spark_float32_backend();
                 ggml_backend_free(g_backend);
                 g_backend = nullptr;
             }
@@ -1629,6 +1578,7 @@ TSG_EXPORT int TSGgml_TensorParallelInitLoopback(int backendType, int count)
             if (g_backend != nullptr)
             {
                 tsg::sync_backend(g_backend);
+                tsg::free_spark_float32_backend();
                 ggml_backend_free(g_backend);
                 g_backend = nullptr;
             }
@@ -1832,7 +1782,7 @@ TSG_EXPORT int TSGgml_TensorParallelAllReduceHost(float** buffers, int rankCount
 // the result once per rank. Only a win when the collective is materially faster
 // than the host sum — that is, on multi-GPU boxes with NVLink or working P2P and
 // large payloads. Returns 0 when unavailable so the caller can use the host path.
-TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCount, int64_t count)
+static int tsg_allreduce_host_buffers_on_device(float** buffers, int rankCount, int64_t count, bool exact_f32)
 {
     try
     {
@@ -1872,7 +1822,9 @@ TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCou
                 tensors[static_cast<std::size_t>(r)] = t;
             }
 
-            if (!tsg::tp_device_allreduce(tensors.data()))
+            if (!(exact_f32
+                ? tsg::tp_reduce_segment(tensors.data(), rankCount, true)
+                : tsg::tp_device_allreduce(tensors.data())))
                 return 0;
 
             for (int r = 0; r < rankCount; ++r)
@@ -1892,3 +1844,83 @@ TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCou
         return 0;
     }
 }
+
+TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCount, int64_t count)
+{
+    return tsg_allreduce_host_buffers_on_device(buffers, rankCount, count, false);
+}
+
+// Preserve F32 partials through the collective. The upstream CUDA/NCCL
+// collective may otherwise narrow large prefill payloads to BF16. Reuse the
+// TensorSharp-owned exact transport and its exact chunked/host fallback;
+// the fetched ggml tree remains unchanged.
+TSG_EXPORT int TSGgml_TensorParallelAllReduceDeviceF32(float** buffers, int rankCount, int64_t count)
+{
+    return tsg_allreduce_host_buffers_on_device(buffers, rankCount, count, true);
+}
+
+#ifdef TSG_GGML_USE_CUDA
+namespace tsg
+{
+    // Pick a collective that actually works on THIS host, for THIS rank count,
+    // before a backend creates its communicator.
+    //
+    // The CUDA comm chain is nccl -> internal -> none, and each link has a way
+    // of failing quietly:
+    //   * NCCL trusts the driver's P2P capability report. Where that report is
+    //     a lie (virtualized cloud boxes), init succeeds and the FIRST
+    //     collective wedges every GPU in peer-waiting spin kernels.
+    //   * the "internal" pinned-host pipeline only supports exactly 2 devices,
+    //     so at 3+ ranks it declines and the chain lands on "none", whose
+    //     AllReduce always returns false. Every segment boundary then drains
+    //     its partials to host RAM and pushes the sum back (ggml's meta backend
+    //     falls back to its peer-copy butterfly) — a correct result at a
+    //     fraction of the speed.
+    // So a host with false P2P used to lose the device collective entirely the
+    // moment it had more than two GPUs.
+    //
+    // Instead: check peer traffic behaviourally first (no NCCL needed), and
+    // when it is broken, take P2P away from NCCL rather than taking NCCL away
+    // from the model. NCCL then routes over its shared-memory transport, which
+    // keeps the reduction off the host path and works for any rank count the
+    // backend supports. The internal pipeline stays as the 2-device fallback
+    // for when NCCL is unusable outright. An explicit GGML_CUDA_ALLREDUCE from
+    // the operator wins unconditionally.
+    void tp_cuda_prepare_collective(const int* device_indices, int n)
+    {
+        if (n <= 1) return;
+        const bool choose = std::getenv("GGML_CUDA_ALLREDUCE") == nullptr;
+        // NCCL caches its tunables at the first communicator init in the
+        // process, so this has to happen before any probe touches NCCL.
+        if (choose && std::getenv("NCCL_P2P_DISABLE") == nullptr
+            && tp_probe_cuda_peer_access(device_indices, n) == 0)
+        {
+            tp_setenv("NCCL_P2P_DISABLE", "1");
+            std::fprintf(stderr,
+                "[TP] peer access is advertised but non-functional on this host; "
+                "running NCCL with NCCL_P2P_DISABLE=1 (shared-memory transport).\n");
+            std::fflush(stderr);
+        }
+        // Also when the operator chose NCCL: correctness, not transport.
+        tp_cuda_respect_vmm_peer_limit(device_indices, n);
+
+        if (choose && tp_probe_cuda_collective(device_indices, n) == 0)
+        {
+            // NCCL is unusable even without P2P. The internal pipeline is
+            // 2-device only; past that the host reduction is all that is left,
+            // and saying so beats a silent 2x.
+            tp_setenv("GGML_CUDA_ALLREDUCE", n == 2 ? "internal" : "none");
+            std::fprintf(stderr,
+                n == 2
+                ? "[TP] device collective (NCCL) is non-functional on this host; "
+                  "using the pinned-host-memory AllReduce instead. Set "
+                  "GGML_CUDA_ALLREDUCE to override, TS_GGML_TP_AR_PROBE=force to re-test.\n"
+                : "[TP] device collective (NCCL) is non-functional on this host and the "
+                  "pinned-host-memory AllReduce only supports 2 devices; falling back to "
+                  "the host reduction, which will cost throughput. Set "
+                  "GGML_CUDA_ALLREDUCE to override, TS_GGML_TP_AR_PROBE=force to re-test.\n");
+            std::fflush(stderr);
+        }
+    }
+}
+#endif

@@ -150,6 +150,37 @@ namespace
         // nothing real: the pool already owns every core it is allowed to use.
         std::mutex g_moe_cpu_compute_mutex;
 
+        // Spark's post-expert RMSNorm graph has large token x expert
+        // intermediates. Opt in to retaining one CPU arena across layers and
+        // chunks, independently of the accelerator's per-rank allocators. The
+        // native process environment is latched when this library is loaded;
+        // changing .NET's environment after load does not enable this path.
+        const bool g_spark_reuse_cpu_moe_scratch = []() {
+            const char* value = std::getenv("TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        ggml_gallocr_t g_spark_cpu_moe_gallocr = nullptr;
+        bool g_spark_cpu_moe_arena_logged = false;
+        std::uint64_t g_spark_cpu_moe_reused_calls = 0;
+
+        // Caller holds g_moe_cpu_compute_mutex. No ggml_context or caller-owned
+        // weight/activation buffers are retained; only scratch storage/plans.
+        bool alloc_spark_cpu_moe_scratch(ggml_backend_t cpu, ggml_cgraph* graph)
+        {
+            if (g_spark_cpu_moe_gallocr == nullptr)
+                g_spark_cpu_moe_gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+            if (g_spark_cpu_moe_gallocr != nullptr &&
+                ggml_gallocr_alloc_graph(g_spark_cpu_moe_gallocr, graph))
+                return true;
+            // Upstream alloc_graph fails during reserve, before binding graph
+            // tensors. Discard the failed arena and let this graph use the
+            // existing fresh-allocation path; host wrappers remain untouched.
+            if (g_spark_cpu_moe_gallocr != nullptr)
+                ggml_gallocr_free(g_spark_cpu_moe_gallocr);
+            g_spark_cpu_moe_gallocr = nullptr;
+            return false;
+        }
+
         // Set by TSGgml_SetHostMoeThreads (the --cpu-moe-threads flag). It
         // cannot travel through TS_CPU_MOE_THREADS alone: .NET's
         // Environment.SetEnvironmentVariable writes only the managed
@@ -419,6 +450,11 @@ namespace
         const float* gate_bias = nullptr;
         const float* up_bias = nullptr;
         const float* down_bias = nullptr;
+
+        // Muse Spark normalizes each scaled expert output before routing/sum.
+        // This is not the post-aggregation norm used by Gemma's residual path.
+        const float* post_expert_norm = nullptr;
+        float post_expert_norm_eps = 1e-8f;
 
         int activation_type = 0;
         float oai_alpha = 1.702f;
@@ -715,6 +751,7 @@ namespace
     // back in VRAM.
     struct MoECpuGraphBinding
     {
+        ggml_tensor* post_expert_norm_t = nullptr;
         ggml_tensor* hidden_t = nullptr;
         ggml_tensor* hidden_out_t = nullptr;
         ggml_tensor* post_norm_w_t = nullptr;
@@ -738,6 +775,10 @@ namespace
         const MoECpuGraphBinding& b)
     {
         const auto t_enter = std::chrono::steady_clock::now();
+        // Acquire before backend lookup as release/reconfiguration can otherwise
+        // retire the returned backend before this call acquires its compute lock.
+        // Every owner uses compute -> backend lock order.
+        std::lock_guard<std::mutex> compute_lock(g_moe_cpu_compute_mutex);
         ggml_backend_t cpu = moe_cpu_backend();
         if (cpu == nullptr)
         {
@@ -746,7 +787,6 @@ namespace
         }
         // Held for the whole body: the scratch allocation, the host-pointer
         // wraps and the compute all run against the one shared backend.
-        std::lock_guard<std::mutex> compute_lock(g_moe_cpu_compute_mutex);
 
         // The accelerator may still have writes in flight targeting hidden_in
         // (the previous layer's output) and the routing arrays. The host is
@@ -798,11 +838,23 @@ namespace
             return 0;
         }
 
-        // Everything still unbound (ids, routing weights, biases, post-norm
-        // weight, and all graph intermediates) is small; allocate it in one
-        // CPU-backend buffer freed when this call returns.
-        BufferHandle scratch(ggml_backend_alloc_ctx_tensors(ctx, cpu));
-        if (scratch.value == nullptr)
+        bool reused_scratch = false;
+        if (g_spark_reuse_cpu_moe_scratch && p.post_expert_norm != nullptr)
+        {
+            // All uploads precede graph execution, including late-consumed
+            // learned scales. Protect them from arena lifetime/in-place reuse.
+            // Large inputs and weights remain externally bound, not copied.
+            for (auto* leaf : { b.hidden_t, b.gate_w, b.up_w, b.down_w, b.ids_t,
+                    b.weights_t, b.gate_bias_t, b.up_bias_t, b.down_bias_t,
+                    b.post_norm_w_t, b.post_expert_norm_t })
+                if (leaf != nullptr) ggml_set_input(leaf);
+            ggml_set_output(b.hidden_out_t);
+            reused_scratch = alloc_spark_cpu_moe_scratch(cpu, graph);
+        }
+        // Legacy/non-Spark calls keep their exact fresh-allocation path. The
+        // Spark arena is optional; allocation failure also uses this fallback.
+        BufferHandle scratch(reused_scratch ? nullptr : ggml_backend_alloc_ctx_tensors(ctx, cpu));
+        if (!reused_scratch && scratch.value == nullptr)
         {
             set_last_error("MoE CPU offload: failed to allocate the host scratch buffer.");
             return 0;
@@ -814,6 +866,10 @@ namespace
         ggml_backend_tensor_set(b.weights_t, p.routing_weights, 0,
             static_cast<std::size_t>(p.seq_len) *
             static_cast<std::size_t>(p.n_used) * sizeof(float));
+
+        if (b.post_expert_norm_t != nullptr)
+            ggml_backend_tensor_set(b.post_expert_norm_t, p.post_expert_norm, 0,
+                static_cast<std::size_t>(p.hidden_dim) * sizeof(float));
 
         if (b.post_norm_w_t != nullptr)
         {
@@ -867,6 +923,16 @@ namespace
         {
             set_last_error("MoE CPU offload: host graph compute failed.");
             return 0;
+        }
+
+        if (reused_scratch) ++g_spark_cpu_moe_reused_calls;
+        if (reused_scratch && !g_spark_cpu_moe_arena_logged)
+        {
+            std::fprintf(stderr, "[muse-spark-cpu-moe-scratch] reuse=1 backend=CPU rows=%d hidden=%d ffn=%d used=%d allocated_bytes=%zu\n",
+                p.seq_len, p.hidden_dim, p.n_ff, p.n_used,
+                ggml_gallocr_get_buffer_size(g_spark_cpu_moe_gallocr, 0));
+            std::fflush(stderr);
+            g_spark_cpu_moe_arena_logged = true;
         }
 
         // hidden_out_t was wrapped around the caller's buffer, so the result is
@@ -1051,6 +1117,14 @@ namespace
 
         // Optional per-expert biases. ggml_add_id consumes a 2D [bias_dim, num_experts]
         // f32 tensor and adds bias[:, ids[u, t]] to result[:, u, t].
+        if (p.post_expert_norm != nullptr &&
+            (!std::isfinite(p.post_expert_norm_eps) || p.post_expert_norm_eps <= 0.0f))
+        {
+            set_last_error("MoE prefill: post-expert RMSNorm epsilon must be finite and positive.");
+            return 0;
+        }
+        ggml_tensor* post_expert_norm_t = p.post_expert_norm != nullptr
+            ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_dim) : nullptr;
         ggml_tensor* gate_bias_t = nullptr;
         ggml_tensor* up_bias_t = nullptr;
         ggml_tensor* down_bias_t = nullptr;
@@ -1093,7 +1167,7 @@ namespace
         // hundred KB at most. The hidden input is not pinned: it can be tokens x
         // hidden large, and every kernel that reads it (the expert matmuls)
         // quantizes or gathers it before writing anything.
-        for (ggml_tensor* uploaded : { ids_t, weights_t, gate_bias_t, up_bias_t, down_bias_t, post_norm_w_t })
+        for (ggml_tensor* uploaded : { ids_t, weights_t, gate_bias_t, up_bias_t, down_bias_t, post_norm_w_t, post_expert_norm_t })
         {
             if (uploaded != nullptr)
             {
@@ -1247,6 +1321,14 @@ namespace
         }
 
         // Apply per-(token,expert) routing weights via broadcast multiply.
+        // The norm reduces hidden_dim independently for each (token, expert).
+        // Moving it after the weighted sum, or scaling after RMSNorm, changes
+        // the model. Match llama.cpp build_moe_ffn's post_exp_norm ordering.
+        if (post_expert_norm_t != nullptr)
+        {
+            down_proj = ggml_mul(ctx, down_proj, post_expert_norm_t);
+            down_proj = ggml_rms_norm(ctx, down_proj, p.post_expert_norm_eps);
+        }
         ggml_tensor* weighted = ggml_mul(ctx, down_proj, weights_t);
         if (weighted == nullptr)
         {
@@ -1333,16 +1415,38 @@ namespace
         // times faster end to end. `stream_experts` picks the second; the branch
         // below (taken before any accelerator binding) is the first.
         const int stream_threshold = moe_offload_stream_batch_threshold();
-        const bool stream_experts =
+        bool stream_experts =
             p.run_on_cpu &&
             p.allow_device_stream &&
             stream_threshold > 0 &&
             seq_len >= stream_threshold &&
             g_backend != nullptr;
 
+        if (stream_experts && p.post_expert_norm != nullptr)
+        {
+            // Spark evaluates an offloaded layer once on the pinned device
+            // (rank 0 under TP). Resident TP expert slices never enter this
+            // path. A complete expert stack plus scratch must fit even though
+            // uploads are filtered to the experts routed in this batch.
+            MoeStreamMemoryPlan plan;
+            stream_experts = plan_moe_stream_memory(graph, plan);
+            struct LastDecision { const char* reason = nullptr; std::size_t required = 0, reusable = 0; };
+            static thread_local LastDecision last[TSG_MAX_DEVICES];
+            auto& previous = last[tsg::g_active_rank];
+            if (previous.reason != plan.reason || previous.required != plan.required || previous.reusable != plan.reusable)
+            {
+                std::fprintf(stderr, "[muse-spark-stream] rank=%d rows=%d decision=%s reason=%s required=%zu free=%zu reusable=%zu\n",
+                    tsg::g_active_rank, seq_len, stream_experts ? "stream" : "cpu", plan.reason,
+                    plan.required, plan.free, plan.reusable);
+                std::fflush(stderr);
+                previous = { plan.reason, plan.required, plan.reusable };
+            }
+        }
+
         if (p.run_on_cpu && !stream_experts)
         {
             MoECpuGraphBinding b;
+            b.post_expert_norm_t = post_expert_norm_t;
             b.hidden_t = hidden_t;
             b.hidden_out_t = hidden_out_t;
             b.post_norm_w_t = post_norm_w_t;
@@ -1517,6 +1621,9 @@ namespace
         }
 
         // ids and routing weights are always small; copy from C# host arrays.
+        if (post_expert_norm_t != nullptr)
+            ggml_backend_tensor_set(post_expert_norm_t, p.post_expert_norm, 0,
+                static_cast<std::size_t>(hidden_dim) * sizeof(float));
         ggml_backend_tensor_set(ids_t, selected_experts, 0,
             static_cast<std::size_t>(seq_len) *
             static_cast<std::size_t>(n_used) * sizeof(std::int32_t));
@@ -1616,9 +1723,13 @@ namespace
         int activation_type,
         float oai_alpha,
         float oai_limit,
-        int run_on_cpu)
+        int run_on_cpu,
+        const float* post_expert_norm = nullptr,
+        float post_expert_norm_eps = 1e-8f)
     {
         MoEFFNGraphParams p;
+        p.post_expert_norm = post_expert_norm;
+        p.post_expert_norm_eps = post_expert_norm_eps;
         p.hidden_in = hidden_in;
         p.hidden_out = hidden_out;
         p.seq_len = seq_len;
@@ -1660,6 +1771,15 @@ namespace
         // 4-10x against llama.cpp on every offloaded prefill.
         p.allow_device_stream =
             tsg::g_device_count.load(std::memory_order_acquire) <= 1;
+        if (post_expert_norm != nullptr)
+        {
+            // Only the dedicated Muse Spark ABI supplies this weight. Its
+            // offloaded layers execute once, including under TP; resident
+            // per-rank expert slices use run_on_cpu=false. Keep the other
+            // models' TP prohibition and require explicit Spark opt-in.
+            const char* enabled = std::getenv("TS_MUSE_SPARK_STREAM_EXPERTS");
+            p.allow_device_stream = enabled != nullptr && std::strcmp(enabled, "1") == 0;
+        }
         return moe_ffn_prefill_graph_impl(p);
     }
 
@@ -1834,6 +1954,7 @@ namespace tsg
         // already exists (the flag is parsed before the model loads, but a
         // reload must not keep the previous run's count either).
         {
+            std::lock_guard<std::mutex> compute_lock(g_moe_cpu_compute_mutex);
             std::lock_guard<std::mutex> lock(g_moe_cpu_backend_mutex);
             rebuild_moe_cpu_threadpool_locked();
         }
@@ -1851,7 +1972,15 @@ namespace tsg
         // the pin budget forever.
         host_pin_release_all();
         host_moe_decode_release();
+        std::lock_guard<std::mutex> compute_lock(g_moe_cpu_compute_mutex);
         std::lock_guard<std::mutex> lock(g_moe_cpu_backend_mutex);
+        if (g_spark_cpu_moe_gallocr != nullptr)
+        {
+            ggml_gallocr_free(g_spark_cpu_moe_gallocr);
+            g_spark_cpu_moe_gallocr = nullptr;
+        }
+        g_spark_cpu_moe_arena_logged = false;
+        g_spark_cpu_moe_reused_calls = 0;
         if (g_moe_cpu_backend != nullptr)
         {
             ggml_backend_free(g_moe_cpu_backend);
@@ -2227,6 +2356,23 @@ namespace tsg
 
 extern "C"
 {
+    // Read-only observability; does not create a backend/arena or alter its
+    // lifetime. Counts successful Spark CPU-offload dispatches using this arena.
+    TSG_EXPORT int TSGgml_GetMuseSparkCpuMoeScratchState(
+        std::uint64_t* allocated_bytes, std::uint64_t* successful_calls)
+    {
+        if (allocated_bytes == nullptr || successful_calls == nullptr) return 0;
+        try
+        {
+            std::lock_guard<std::mutex> lock(g_moe_cpu_compute_mutex);
+            *allocated_bytes = g_spark_cpu_moe_gallocr == nullptr ? 0 :
+                ggml_gallocr_get_buffer_size(g_spark_cpu_moe_gallocr, 0);
+            *successful_calls = g_spark_cpu_moe_reused_calls;
+            return 1;
+        }
+        catch (...) { return 0; }
+    }
+
     // Worker threads for the host-side MoE matmul (--cpu-moe-threads). 0 =
     // default (available_cpu_parallelism() - 1). Safe to call before any
     // backend exists; it re-applies to a live one.
@@ -2311,6 +2457,37 @@ extern "C"
             set_last_error("Unknown error in MoE FFN prefill.");
             return 0;
         }
+    }
+
+    // Separate ABI keeps every existing model's entry point unchanged.
+    TSG_EXPORT int TSGgml_MuseSparkMoEFFNQuantF32(
+        float* hidden_in, float* hidden_out, int seq_len, int hidden_dim, int n_ff,
+        int num_experts, int n_used, const std::int32_t* selected_experts, const float* routing_weights,
+        void* gate_data, int gate_type, std::int64_t gate_ne0, std::int64_t gate_ne1, std::int64_t gate_total_bytes,
+        void* up_data, int up_type, std::int64_t up_ne0, std::int64_t up_ne1, std::int64_t up_total_bytes,
+        void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_total_bytes,
+        const float* gate_bias, const float* up_bias, const float* down_bias,
+        int activation_type, float oai_alpha, float oai_limit, int run_on_cpu,
+        const float* post_expert_norm, float post_expert_norm_eps)
+    {
+        try
+        {
+            if (post_expert_norm == nullptr)
+            {
+                set_last_error("Muse Spark MoE: post-expert norm weight is required.");
+                return 0;
+            }
+            return moe_ffn_prefill_swiglu_quant_f32_impl(
+                hidden_in, hidden_out, seq_len, hidden_dim, n_ff,
+                num_experts, n_used, selected_experts, routing_weights,
+                gate_data, gate_type, gate_ne0, gate_ne1, gate_total_bytes,
+                up_data, up_type, up_ne0, up_ne1, up_total_bytes,
+                down_data, down_type, down_ne0, down_ne1, down_total_bytes,
+                gate_bias, up_bias, down_bias, activation_type, oai_alpha, oai_limit,
+                run_on_cpu, post_expert_norm, post_expert_norm_eps);
+        }
+        catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+        catch (...) { set_last_error("Unknown error in Muse Spark MoE."); return 0; }
     }
 
     // Gemma 4 MoE residual-fused GEGLU kernel.

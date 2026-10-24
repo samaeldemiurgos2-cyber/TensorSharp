@@ -17,6 +17,12 @@ struct metadata {
     int text_dim = 0, text_layers = 0, image_token_id = 0, n_experts = 0;
     uint64_t tokenizer_hash = 0;
     bool bf16_activations = false;
+    // A llama.cpp mmproj (clip, projector deepseek41v) has no router biases,
+    // text layer count or tokenizer fingerprint: the biases come from the text
+    // GGUF's blk.N.exp_probs_b_vl.bias, and its general.basename/version
+    // identify the checkpoint instead (empty when the file does not say).
+    bool router_bias_in_text = false;
+    std::string source_basename, source_version;
 };
 
 class encoder {
@@ -29,6 +35,7 @@ public:
     const metadata & params() const;
     // Decoded F32 host vectors. The text graph uploads each bias to its layer
     // device; this encoder does not own or mutate language-model state.
+    // Empty (any layer is out of range) when params().router_bias_in_text.
     const std::vector<float> & router_bias(int layer) const;
     // Input: row-major patches [n_h*n_w,3,patch_size,patch_size], normalized
     // and BF16-rounded for the original checkpoint. Output: complete span

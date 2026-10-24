@@ -58,11 +58,12 @@ namespace TensorSharp.Runtime
     /// config file otherwise, instead of hard-coding a drive letter that means
     /// nothing on Linux or macOS.</item>
     /// <item><b>Auto-download.</b> A file option may be an object
-    /// <c>{ "path": "...", "urls": ["...", "..."] }</c>. If <c>path</c> is missing
+    /// <c>{ "path": "...", "urls": ["...", "..."], "optional": true }</c>. If <c>path</c> is missing
     /// on disk it is downloaded from the first working URL and saved there, so the
     /// next run reuses the local copy. An optional <c>"files"</c> array contains
     /// additional download objects, such as the remaining split GGUF shards;
-    /// all are resolved while only the main path becomes an argument.
+    /// all are resolved while only the main path becomes an argument. A file marked
+    /// <c>"optional": true</c> is skipped when it has no source or cannot be downloaded.
     /// See <see cref="ModelDownloader"/>.</item>
     /// </list>
     ///
@@ -667,10 +668,11 @@ namespace TensorSharp.Runtime
         }
 
         /// <summary>
-        /// Resolve a <c>{ "path": ..., "url"|"urls": ..., "sha256": ... }</c> object
+        /// Resolve a <c>{ "path": ..., "url"|"urls": ..., "sha256": ..., "optional": ... }</c> object
         /// into a concrete local path, downloading the file from the first working
         /// URL when it is not already present. Relative paths resolve against the
         /// config file's directory so a config and its models can travel together.
+        /// An optional file is skipped if it has no source or every source fails.
         /// </summary>
         private static string ResolveDownloadSpec(
             string configPath,
@@ -694,10 +696,16 @@ namespace TensorSharp.Runtime
                     continue;
                 }
 
-                if (file.Urls.Count == 0)
+                if (file.Urls.Count == 0 && !file.Optional)
                     throw new FileNotFoundException(
                         $"Configuration file '{configPath}' option '{file.Key}' path not found and no download URL was provided: {file.Path}",
                         file.Path);
+
+                if (file.Urls.Count == 0)
+                {
+                    context.Log.WriteLine($"[model-download] {file.Key}: optional file is missing and has no download URL; continuing without it");
+                    continue;
+                }
 
                 if (context.Preview)
                 {
@@ -708,12 +716,19 @@ namespace TensorSharp.Runtime
                 }
 
                 context.Log.WriteLine($"[model-download] {file.Key}: '{file.Path}' not found locally; attempting download from {file.Urls.Count} source(s)");
-                ModelDownloader.Download(file.Path, file.Urls, file.Sha256, file.Key, context.Log, context.InteractiveProgress);
+                try
+                {
+                    ModelDownloader.Download(file.Path, file.Urls, file.Sha256, file.Key, context.Log, context.InteractiveProgress);
+                }
+                catch (IOException ex) when (file.Optional)
+                {
+                    context.Log.WriteLine($"[model-download] {file.Key}: optional download unavailable; continuing without it ({ex.Message})");
+                }
             }
             return files[0].Path;
         }
 
-        private sealed record DownloadFile(string Key, string Path, List<string> Urls, string? Sha256);
+        private sealed record DownloadFile(string Key, string Path, List<string> Urls, string? Sha256, bool Optional);
 
         private static void CollectDownloadFiles(
             string configPath,
@@ -737,8 +752,15 @@ namespace TensorSharp.Runtime
             string? sha256 = spec.TryGetProperty("sha256", out JsonElement shaElement) && shaElement.ValueKind == JsonValueKind.String
                 ? shaElement.GetString()
                 : null;
+            bool optional = false;
+            if (spec.TryGetProperty("optional", out JsonElement optionalElement))
+            {
+                if (optionalElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                    throw new ArgumentException($"Configuration file '{configPath}' option '{key}' has an \"optional\" field that is not a boolean.");
+                optional = optionalElement.GetBoolean();
+            }
 
-            files.Add(new DownloadFile(key, localPath, urls, sha256));
+            files.Add(new DownloadFile(key, localPath, urls, sha256, optional));
 
             if (!spec.TryGetProperty("files", out JsonElement additionalFiles))
                 return;

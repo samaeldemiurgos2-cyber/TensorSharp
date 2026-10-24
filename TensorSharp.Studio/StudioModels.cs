@@ -230,6 +230,8 @@ public sealed class StudioGenerationRequest
     public string? ShotId { get; set; }
     public List<StudioTemporalCondition> TemporalConditions { get; set; } = [];
     public List<string> ReferenceAssetIds { get; set; } = [];
+    /// <summary>Full video clips used as identity/appearance references in ref mode.</summary>
+    public List<string> ReferenceVideoAssetIds { get; set; } = [];
 }
 
 public sealed record StudioTemporalCondition(string AssetId, int FrameIndex, float Strength = 1);
@@ -256,6 +258,9 @@ public sealed class StudioModelCapability
     public bool TemporalGuidance { get; set; }
     public bool IdentityReferences { get; set; }
     public int MaxReferences { get; set; }
+    /// <summary>Whether ref mode can use full video clips in addition to still references.</summary>
+    public bool ReferenceVideos { get; set; }
+    public int MaxReferenceVideos { get; set; }
     /// <summary>Whether ref mode can also pin the first frame: keep a character from reference photos while starting on a
     /// frame, for example the last frame of the previous segment of a chain.</summary>
     public bool ReferencesWithFirstFrame { get; set; }
@@ -442,6 +447,7 @@ public sealed class StudioJobSummary
     /// <summary>How many timed keyframes and identity references the shot uses.</summary>
     public int GuideCount { get; set; }
     public int ReferenceCount { get; set; }
+    public int ReferenceVideoCount { get; set; }
 }
 
 public sealed class StudioOptions

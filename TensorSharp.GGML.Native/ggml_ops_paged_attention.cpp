@@ -133,6 +133,7 @@ namespace
     struct PagedAttnSession
     {
         bool valid = false;
+        ggml_backend_t backend = nullptr;
         int num_q = 0;
         int padded_kv_len_bucket = 0;
         int num_heads = 0;
@@ -182,6 +183,7 @@ namespace
             ctx_mem_size = 0;
             q_in = k_in = v_in = attn_mask = sinks_tensor = attn_result = nullptr;
             graph = nullptr;
+            backend = nullptr;
             valid = false;
             kv_zero_covered_from = 0;
         }
@@ -215,7 +217,9 @@ namespace
     {
         for (auto& sess : g_paged_attn_cache)
         {
-            if (!sess.valid) continue;
+            // Equal packed shapes on different layer-placement ranks must
+            // never reuse device buffers allocated by another backend.
+            if (!sess.valid || sess.backend != g_backend) continue;
             if (sess.num_q == num_q &&
                 sess.padded_kv_len_bucket == padded_kv_len_bucket &&
                 sess.num_heads == num_heads &&
@@ -328,6 +332,7 @@ namespace
         sess.head_dim = head_dim;
         sess.scale_bits = float_bits(scale);
         sess.has_sinks = has_sinks;
+        sess.backend = g_backend;
         // The buffer was explicitly cleared above, so the entire padded
         // range is already clean.
         sess.kv_zero_covered_from = 0;
@@ -828,11 +833,19 @@ TSG_EXPORT int TSGgml_PagedAttentionForward(
         const int per_token_kv_stride = num_kv_heads * head_dim;
         const int per_token_q_stride = num_heads * head_dim;
 
-        // Reusable scratch buffer for the gather. Sized for the longest
-        // sequence in this batch.
+        // Only the union of the queries' visible windows is needed. Retain
+        // earlier KV rows in the page pool for prefix reuse, but do not gather
+        // or upload them on sliding-attention layers.
         int max_seq_len = 0;
         for (int s = 0; s < num_seqs; ++s)
-            max_seq_len = std::max(max_seq_len, seq_lens[s]);
+        {
+            const int q_start = query_start_loc[s];
+            const int num_q = query_start_loc[s + 1] - q_start;
+            if (num_q <= 0) continue;
+            const int first_q_pos = positions != nullptr ? positions[q_start] : seq_lens[s] - num_q;
+            const int first_key = sliding_window > 0 ? std::max(0, first_q_pos - sliding_window + 1) : 0;
+            max_seq_len = std::max(max_seq_len, seq_lens[s] - first_key);
+        }
         if (max_seq_len <= 0)
         {
             set_last_error("All seq_lens are zero in paged attention forward.");
@@ -875,24 +888,34 @@ TSG_EXPORT int TSGgml_PagedAttentionForward(
             // critical input to the causal mask.
             const int first_q_pos = positions != nullptr ? positions[q_start]
                                                           : (seq_len - num_q);
+            const int first_key = sliding_window > 0 ? std::max(0, first_q_pos - sliding_window + 1) : 0;
+            const int live_len = seq_len - first_key;
+            if (live_len <= 0)
+            {
+                set_last_error("No visible keys for paged attention queries.");
+                return 0;
+            }
 
-            // Gather K, V for this sequence from the paged buffer.
+            // The first visible key may lie inside a page, and physical page
+            // IDs need not be consecutive. Copy each intersecting span into a
+            // zero-based live buffer, then shift the mask positions to match.
             const int* table = block_table_flat + block_table_offsets[s];
-            const int n_blocks = (seq_len + block_size - 1) / block_size;
             const std::size_t per_token_kv_bytes =
                 static_cast<std::size_t>(per_token_kv_stride) * sizeof(float);
-            for (int blk = 0; blk < n_blocks; ++blk)
+            for (int key = first_key; key < seq_len;)
             {
-                const int block_id = table[blk];
-                const int tokens_in_block = std::min(block_size, seq_len - blk * block_size);
+                const int block_id = table[key / block_size];
+                const int offset_in_block = key % block_size;
+                const int tokens_in_block = std::min(block_size - offset_in_block, seq_len - key);
                 const std::size_t src_offset =
-                    static_cast<std::size_t>(block_id) * block_size * per_token_kv_stride;
+                    (static_cast<std::size_t>(block_id) * block_size + offset_in_block) * per_token_kv_stride;
                 const std::size_t dst_offset =
-                    static_cast<std::size_t>(blk) * block_size * per_token_kv_stride;
+                    static_cast<std::size_t>(key - first_key) * per_token_kv_stride;
                 const std::size_t bytes =
                     static_cast<std::size_t>(tokens_in_block) * per_token_kv_bytes;
                 std::memcpy(k_scratch + dst_offset, paged_k_data + src_offset, bytes);
                 std::memcpy(v_scratch + dst_offset, paged_v_data + src_offset, bytes);
+                key += tokens_in_block;
             }
 
             int ok = paged_attention_single_seq_impl(
@@ -900,7 +923,7 @@ TSG_EXPORT int TSGgml_PagedAttentionForward(
                 k_scratch,
                 v_scratch,
                 out_data + static_cast<std::size_t>(q_start) * per_token_q_stride,
-                num_q, seq_len, first_q_pos,
+                num_q, live_len, first_q_pos - first_key,
                 num_heads, num_kv_heads, head_dim, sliding_window, scale,
                 /* sinks_data */ nullptr);
             if (!ok)
@@ -1256,4 +1279,27 @@ TSG_EXPORT int TSGgml_PagedAttentionForwardDevice(
         num_seqs, num_tokens, num_heads, num_kv_heads, head_dim,
         block_size, sliding_window, scale,
         /* sinks_data */ nullptr);
+}
+
+#if defined(TSG_GGML_TEST_DIAGNOSTICS)
+// Calling-thread diagnostic only: no allocation, backend lookup or mutation.
+// Used to prove that backend teardown retired this thread's retained sessions.
+TSG_EXPORT int TSGgml_PagedAttentionSessionCount()
+{
+    int count = 0;
+    for (const auto& session : g_paged_attn_cache)
+        if (session.valid && session.buffer != nullptr) ++count;
+    return count;
+}
+#endif
+
+namespace tsg
+{
+    // Match the existing prefill-session lifecycle. The caller has stopped
+    // compute before backend teardown; free buffers while their backend lives.
+    // This releases the calling thread's TLS cache, not other worker threads.
+    void free_paged_attn_sessions()
+    {
+        for (auto& session : g_paged_attn_cache) session.destroy();
+    }
 }

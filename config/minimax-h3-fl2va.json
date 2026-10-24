@@ -1,31 +1,28 @@
 {
-  // MiniMax-H3 — joint video + 32 kHz stereo audio generation. This is the FL2VA
-  // checkpoint: text-to-video, image-to-video, and first-and-last-frame.
+  // MiniMax-H3 — joint video + 32 kHz stereo audio generation. This one config
+  // downloads both FL2VA and Ref2VA: text-to-video, first/last-frame, and reference mode.
   //
   //   TensorSharp.Server.Host --config config/minimax-h3-fl2va.json
   //
   //   TensorSharp.Cli --config config/minimax-h3-fl2va.json \
   //     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
   //
-  // Four networks cooperate, and naming them here is what lets them auto-download
-  // into ${modelRoot} on the first run (~35.5 GB in total) and be reused after:
-  //   1. the denoiser     (model)               the packed audio-video DiT   10.64 GiB
+  // The denoiser group includes both mode-specific checkpoints. The shared networks
+  // cooperate, and naming them here is what lets the complete set
+  // auto-download into ${modelRoot} on the first run (~46 GB including both
+  // denoisers and the small tokenizer files) and be reused after:
+  //   1. the denoisers    (model + files)       the packed audio-video DiTs  21.24 GiB
   //   2. Qwen3-VL-32B     (video-text-encoder)  the text encoder, 50 layers  16.97 GiB
   //   3. the video VAE    (video-vae)           16x spatial / 4x temporal     5.21 GB
   //   4. the audio VAE    (audio-vae)           32 kHz stereo soundtrack      0.61 GB
   // Each is loaded and released in turn, so peak VRAM is max(...) and not the sum.
   // Delete the "audio-vae" entry and you still get video, just silent.
   //
-  // THE TOKENIZER IS NOT AUTOMATED. The text-encoder GGUF carries none, and
-  // auto-download can only fill in options that are flags — the tokenizer is not
-  // one. Put all three files next to the encoder in ${modelRoot} (or point
-  // TS_VIDEO_TOKENIZER at whatever folder holds them). tokenizer_config.json is the
-  // only one that defines the vision markers: text-to-video runs without it, but an
-  // --image / --end-image keyframe is refused before the vision tower runs.
-  //   curl -L -o models/vocab.json https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/vocab.json
-  //   curl -L -o models/merges.txt https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/merges.txt
-  //   curl -L -o models/tokenizer_config.json https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/tokenizer_config.json
+  // The text-encoder GGUF carries no tokenizer. These config-managed companion
+  // files are downloaded beside it on first use, including tokenizer_config.json's
+  // vision markers for first/last-frame and reference conditioning.
   //
+  // The FL2VA denoiser is primary; the matching Ref2VA sibling enables reference mode.
   // Steps and guidance are deliberately NOT set here: a shipped config must parse on
   // both hosts, and the two spell steps differently — --video-steps N on the server,
   // --diffusion-steps N on the CLI, and the server takes no --cfg at all. So the
@@ -78,7 +75,16 @@
   "model": {
     "path": "${modelRoot}/minimax_h3_fl2va_pruned-Q4_K.gguf",
     "urls": [ "${gguf}/minimax_h3_fl2va_pruned-Q4_K.gguf" ],
-    "sha256": "dd948e08ad0ba3c71bd42f368e283dd82e790f5122a63b276e22a3e0283d0c10"
+    "sha256": "dd948e08ad0ba3c71bd42f368e283dd82e790f5122a63b276e22a3e0283d0c10",
+    "files": [
+      {
+        // MiniMax-H3 uses separate denoisers for keyframes and references. Keeping
+        // the Ref2VA sibling here lets the loaded model switch modes without a restart.
+        "path": "${modelRoot}/minimax_h3_ref2va_pruned-Q4_K.gguf",
+        "urls": [ "${gguf}/minimax_h3_ref2va_pruned-Q4_K.gguf" ],
+        "sha256": "2fa5840021cf6967843eaeefde9aaa277e540de02986d5ee3d5b0e6a7a8c9dec"
+      }
+    ]
   },
 
   // Truncated to 50 layers with the final norm removed, and freed before the
@@ -88,7 +94,24 @@
   "video-text-encoder": {
     "path": "${modelRoot}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
     "urls": [ "${gguf}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf" ],
-    "sha256": "11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc"
+    "sha256": "11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc",
+    "files": [
+      {
+        "path": "${modelRoot}/vocab.json",
+        "urls": [ "${hf}/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/vocab.json" ],
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      },
+      {
+        "path": "${modelRoot}/merges.txt",
+        "urls": [ "${hf}/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/merges.txt" ],
+        "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+      },
+      {
+        "path": "${modelRoot}/tokenizer_config.json",
+        "urls": [ "${hf}/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/tokenizer_config.json" ],
+        "sha256": "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68"
+      }
+    ]
   },
 
   "video-vae": {

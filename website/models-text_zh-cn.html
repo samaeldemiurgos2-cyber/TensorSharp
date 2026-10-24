@@ -23,8 +23,8 @@
   <h2 id="download-run">下载并运行</h2>
   <p>运行构建命令前，请先<a href="getting-started_zh-cn.html#install-dotnet">按平台安装并验证 .NET 10 SDK</a>。第一个代码块是已验证的 Gemma 4 E4B 快速上手。所有代码块都使用 Hugging Face CLI（<code>pip install -U huggingface_hub</code>）；其后的各家族代码块假定已完成完整源码构建。从仓库根目录运行。CLI 的一次性文本提示从 <code>--input</code> 指定的文件读取（先把问题写入 <code>prompt.txt</code>——<code>--prompt</code> 只用于图像与视频生成模型）。按硬件把 <code>--backend</code> 换成 <code>ggml_metal</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>（CLI 默认后端为 <code>ggml_cpu</code>）。</p>
 
-  <h3 id="gemma4-fast-lane">约 30 秒快速上手：Gemma 4 E4B Q8_0（原生 GGML）</h3>
-  <p>复制并运行这些命令约需 30 秒；7.48 GiB 的模型下载与首次 restore/构建耗时更长，取决于网络与机器。仓库基准已经验证 TensorSharp 的 E4B Q8_0 家族与执行路径；链接的公开 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org 仓库</a>是推荐下载源。下面的代码块面向 Linux + NVIDIA：</p>
+  <h3 id="gemma4-fast-lane">快速上手：Gemma 4 E4B Q8_0（原生 GGML）</h3>
+  <p>请为 7.48 GiB 模型下载与首次 restore/构建预留时间，耗时取决于网络与机器。本示例使用 E4B Q8_0 家族；链接的公开 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org 仓库</a>是推荐下载源。下面的代码块面向 Linux + NVIDIA：</p>
   <pre data-lang="bash"><code>hf download ggml-org/gemma-4-E4B-it-GGUF gemma-4-E4B-it-Q8_0.gguf --local-dir models
 TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
 echo "请说明本地推理的价值。" &gt; prompt.txt
@@ -36,33 +36,10 @@ dotnet run --project TensorSharp.Server.Host -c Release --no-build -- --model mo
     --backend ggml_cuda</code></pre>
   <p>Apple Silicon 请省略 CUDA 环境变量并使用 <code>ggml_metal</code>；受支持的 Windows/Linux Vulkan GPU 请改为请求 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> 并使用 <code>ggml_vulkan</code>。图像、视频或音频输入还需运行 <code>hf download ggml-org/gemma-4-E4B-it-GGUF mmproj-gemma-4-E4B-it-Q8_0.gguf --local-dir models</code>，并传入 <code>--mmproj models/mmproj-gemma-4-E4B-it-Q8_0.gguf</code>。服务端浏览器界面位于 <code>http://localhost:5000/</code>，存活检查为 <code>/health</code>。Windows PowerShell 与完整平台语法见<a href="getting-started_zh-cn.html#e4b-fast-lane">快速开始</a>。</p>
 
-  <h3 id="deepseek41">DeepSeek V4.1 Flash（384 个路由专家，文本 + 图像/视频、思考、工具）</h3>
-  <p>V4.1 并不是换了权重的 V4——它在每一次前向上都不同，把 GGUF 的架构名改成 <code>deepseek4</code> 是无效的。TensorSharp 为它准备了独立的原生计算图：四条残差流与延迟 hyper-connection 混合，每个注意力块带 128 token 的原始滑动窗口（前两层没有压缩注意力，接下来的 18 层压缩比为 2，最后 20 层为 1），带候选块过滤的 lightning indexer，以及在第 1 层与第 14 层注入的 Engram n-gram 特征。<strong>服务后端是 <code>ggml_cuda</code>。</strong><code>ggml_cpu</code> 用标量回退实现跑同一套图，使得没有 GPU 也能验证该架构；<code>ggml_vulkan</code> 与 <code>ggml_metal</code> 需要 <code>TS_DSV41_ALLOW_NON_CUDA_GPU=1</code>，且每遇到一个架构专属算子就要一次主机往返；<code>cpu</code> 运行纯 C# 执行器——不用 ggml、不依赖原生库、也不需要 GPU——在一个小型合成夹具上按 2e-5 对齐 PyTorch 参考实现（这是架构层面的一致，而不是在真实 Q2_K 权重上的对齐），而且在这条路径上只能跑纯文本，因为视觉伴生模型是原生 ggml 组件；<code>cuda</code> 则用 Direct CUDA 引擎自己的内核运行 V4.1；两者都是正确性与可移植性路径，而非服务路径；<code>mlx</code> 会直接拒绝该检查点，而不是把 V4.1 的权重塞进并未实现它的图。</p>
-  <p><strong>新下载：</strong>使用下方修复后的 <code>smalinin/DeepSeek-V4.1-Flash-GGUF</code> 的 <code>Q2_K-Q5/</code>，共十个分片、312.349 GiB，含 F32 mHC 矩阵、BF16 Engram 门和 Q5_K Engram 表。原七分片 Q2_K 把敏感矩阵量化，不再推荐用于质量验证。历史七分片吞吐与修复后检查点的验证分开记录。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/deepseek41_zh-cn.md">模型卡与文件校验和 →</a></p>
-  <p>当前发布的 GGUF <strong>已包含 Engram 权重与哈希常量</strong>。TensorSharp 直接读取，文本推理无需生成或提供单独的 Engram 文件。图像与视频仍需要可选的视觉伴随文件，因为转换过程未包含视觉塔、aligner 与视觉路由偏置。</p>
-  <pre data-lang="bash"><code># 七个 Q2_K 分片，246.35 GiB，张量类型混合 Q2_K/Q3_K —— 需放在同一目录
-python3 -m venv /tmp/dsv41-tools
-/tmp/dsv41-tools/bin/python -m pip install huggingface_hub
-/tmp/dsv41-tools/bin/hf download smalinin/DeepSeek-V4.1-Flash-GGUF \
-    --revision d1de55c19f95172c882906cc83c0e55932d26a63 \
-    --include "Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-*.gguf" --local-dir models/deepseek41-q2-q5
-
-# 可选：--mmproj 需要的约 970 MB 视觉伴随文件
-/tmp/dsv41-tools/bin/python -m pip install numpy==2.0.2 gguf
-/tmp/dsv41-tools/bin/python eng/dsv41-prepare-vision.py models/deepseek41-q2-q5/Q2_K-Q5 \
-    --parent-model models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
-    --repository deepseek-ai/DeepSeek-V4.1-Flash \
-    --revision dba1be0a40aa45a94ad051997016db3960a90277
-
-# 八卡服务 —— 这里的 --layer-split 是按层切分，不是张量并行
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-    --model models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
-    --mmproj models/deepseek41-q2-q5/Q2_K-Q5/deepseek41.vision.gguf \
-    --backend ggml_cuda --layer-split 8 --port 5000</code></pre>
-  <p>仅提供文本服务时，省略视觉准备命令与 <code>--mmproj</code>。下方吞吐数据对应早期二进制与检查点；每次测量的 revision 与覆盖范围见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/deepseek41_validation.md">验证报告</a>。</p>
-  <p>历史 vcruz305 的十一个 Q4_K_M 分片（415 GiB）同样内嵌 Engram 常量。在那里两张 Engram 表各自涨到 51.5 GiB；在八张 46 GB 卡上，这些表留在主机内存映射中，路由专家也需要卸载到 CPU——加载器会打印它需要的 <code>--n-cpu-moe N</code> 并直接拒绝启动，而不是在推理途中耗尽显存。</p>
-  <p>历史七分片 Q2_K 的两张 Engram 表在显存足够时<strong>默认驻留 GPU</strong>，在图内用 <code>get_rows</code> 直接对量化行做 gather——因为 TensorSharp 保持检查点自身的量化格式：一行 256 个值的 Q2_K 只有 84 字节，两张 3.84 亿行的表合计 60.1 GiB。历史上的八卡 A40 实测（每次使用冷提示词）：驻留 GPU 为 prefill 532–541 / decode 35.6–35.9 tok/s；主机映射并用 <code>TS_DSV41_ENGRAM_WARM=1</code> 预热为 506–528 / 34.5–35.2；不预热则只有 207–221 / 28.0–29.2。驻留 GPU 还省掉了启动时 130 秒的整表预热，以及预热路径依赖的 60 GiB 主机页缓存。放置策略是保守的：如果把表放上 GPU 会逼出路由专家的 CPU 卸载，它们就留在主机映射上，并在启动时说明。</p>
-  <p><code>--layer-split N</code> 选择本地整层放置。<code>--tp N</code> 可在同一批 GPU 上打开实验性的 routed-MoE 张量并行——gate/up 沿 FFN 中间维切分，down 沿输入维切分，partial 经主机中转的 F32 缓冲归约——而历史七分片 Q2_K 实测比按层切分<em>更慢</em>；该结果不代表修复版十分片检查点的性能。并发请求各有独立序列槽位；原生 <code>ggml_cuda</code> 可在一张图中解码其 token，其他原生后端采用逐槽前向。批处理 GEMM 形状可能改变接近打平时的贪心结果；<code>TS_BATCHED_FUSED_DECODE=0</code> 选择串行解码。DSpark 会关闭批处理解码与保留缓存复用。V4.1 的 DSpark 属于实验性支持：加载器在 <code>ggml_cuda</code> 或 <code>ggml_cpu</code> 上可通过 <code>--draft-model</code> 接受 <code>deepseek41-dspark</code> 草稿模型，训练模型已在 <code>ggml_cuda</code> 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证；V4 的草稿模型仍会被拒绝，而不是半加载。带音频的请求以 HTTP 400 拒绝，而不是被悄悄丢掉。哪些已实测、哪些明确未验证，见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/deepseek41_validation.md">验证报告</a>。</p>
+  <h3 id="deepseek41">DeepSeek V4.1 Flash 1017（文本、图像/视频、思考、工具）</h3>
+  <p>DeepSeek V4.1 有独立的计算图，包含压缩注意力、索引器、超连接与内嵌 Engram 特征，并不是把 V4 权重改名。最新选取的转换为 <code>unsloth/DeepSeek-V4.1-Flash-1017-GGUF</code>，<strong>UD-IQ2_XXS、六个分片</strong>，Hugging Face 修订 <code>60ad3651</code>。准确文件名、转换资格、启动设置与后端局限见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/deepseek41_zh-cn.md">当前模型卡</a>，不要套用旧检查点的数字。</p>
+  <p><code>ggml_cuda</code> 是服务后端；<code>--tp N</code> 与 <code>--layer-split N</code> 是不同的本地放置模式，吞吐取决于检查点与互连。托管 <code>cpu</code> 执行器属于正确性与可移植性路径，其 PyTorch 参照门槛覆盖小型合成模型，不构成完整检查点的 CPU 质量资格。图像与视频需要匹配的视觉伴随模型；音频会被拒绝。</p>
+  <p><strong>2026-10-22–23 在五张 A40 上的记录：</strong>约 1.8K token 提示下，TP5 精确 prefill 为 563.9 tok/s，对照 llama.cpp 按层切分 174.6（3.23×）；默认近似 YOCO 路径为 960.5（5.50×）。上下文 32,768、并发 1、输出 256 token、贪心采样并关闭思考，预热后三次取中位数。这是内部 prefill 计时，不是客户端 TTFT。近似执行存在实测质量代价：困惑度为近似 2.4978、精确 2.4811、llama.cpp 2.4697。<a href="benchmarks_zh-cn.html#deepseek41">两种提示长度、精确/近似结果与局限 →</a></p>
 
   <h3 id="deepseek4">DeepSeek V4 Flash（284B MoE，文本、思考、工具、DSpark）</h3>
   <p>一个 284B 的专家混合模型，配备 128 token 的原始滑动窗口加块压缩注意力（官方宣称 1M 上下文）。它<em>不</em>走通用的逐算子前向：TensorSharp 通过三套专属的整模型执行器之一运行它 —— <code>--backend cuda</code>（Direct CUDA，不依赖 ggml）、<code>--backend ggml_cuda</code> / <code>ggml_vulkan</code>（原生 ggml），以及 <code>--backend cpu</code>（100% 纯 C#，零原生依赖）。GPU 执行器通过 <code>--layer-split N</code> 将整层放到 N 张本地 GPU，让大于单卡显存的模型也能运行。未配置放置方式时默认单设备；CPU 执行器从映射分片流式读取权重。</p>
@@ -259,6 +236,28 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-U
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
     --draft-model models/dflash-kquant.gguf --spec-draft 15 --input prompt.txt --backend ggml_cuda</code></pre>
 
+  <h3 id="muse-spark">Muse Spark（816B 稀疏 MoE，文本 + 图像、思考、工具）</h3>
+  <p>Unsloth 发布的 <a href="https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF" target="_blank" rel="noopener">Muse-Spark-Open-816B-A42B</a> 声明 <code>general.architecture = muse-spark</code>（别名 <code>muse_spark</code>）：总参数 816B，每 token 激活约 42B；62 个块，隐藏宽度 8192，128 个 query 头 / 16 个 KV 头，head dim 64；256 个路由专家，按 sigmoid 路由取 top-8，专家潜空间宽 4096。其中 46 层是带 RoPE 的 2048 token 滑动窗口层，其余 16 层是全局 NoPE 层。元数据自报 1,048,576 token 的上下文，但这一点<em>未经</em>验证：不设 <code>MAX_CONTEXT</code> 时，原生执行器会把上下文限制为装得下的最大长度并写入日志；设了 <code>MAX_CONTEXT</code> 而装不下时则拒绝加载。这是一个<strong>需要多 GPU 服务器</strong>的模型：实测环境是十张 A40（各 46 GB），UD-IQ3_XXS 量化的全部专家都放在显存里；GPU 更少时，显存放不下的专家堆栈会留在主机内存里，主机内存就得足够大。TensorAgent 的模型目录不包含它。</p>
+  <pre data-lang="bash"><code># UD-IQ3_XXS 为 8 个分片、317 GiB（UD-Q3_K_XL 为 10 个，UD-Q4_K_XL 为 12 个）——同一量化的所有分片放在同一个目录里
+hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF --include "UD-IQ3_XXS/*" --local-dir models/muse-spark
+# 图像投影器（2.2 GB），位于仓库根目录
+hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF mmproj-Q8_0.gguf --local-dir models/muse-spark
+
+# 实测配置：十张 A40、全部专家在显存中、32K 上下文、规划 5 个槽位 —— --model 指向该组中的任一分片均可
+MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 TS_CODE_EXEC=0 \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+    --model models/muse-spark/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00001-of-00008.gguf \
+    --backend ggml_cuda --layer-split 10 \
+    --host 127.0.0.1 --port 8083 --no-webui --no-skills --no-multi-agent
+# 用 --tp 10 代替 --layer-split 10 会把每一层切分到十张 GPU 上：decode 更快，长提示 prefill 更慢</code></pre>
+  <p>后续分片不是独立模型：TensorSharp 从第 1 个分片读取架构、分词器与模型设置，再从完整的分片集合加载张量。<code>--no-webui --no-skills --no-multi-agent</code> 与基准运行保持一致——需要 Web UI、Agent Skills 与子智能体时去掉即可。规划的 5 个槽位容纳 4 个并发请求外加共享前缀检查点。需要图像输入时加上 <code>--mmproj models/muse-spark/mmproj-Q8_0.gguf</code>，并用 <code>TS_MUSE_SPARK_DEV0_RESERVE_MB</code> 在 GPU 0 上为视觉编码器留出空间（十张 A40 的运行没有加载投影器）。GPU 更少时，<code>TS_MUSE_SPARK_CPU_MOE=auto</code> 会把放不下的专家堆栈留在主机内存里。</p>
+  <p>在 <code>ggml_cuda</code> 与 <code>ggml_vulkan</code> 上，它默认走 TensorSharp 自有的<strong>原生整模型执行器</strong>：执行器自己加载分片 GGUF，每个微批（prefill 微批为 2048 token）向所有 GPU 与 CPU 提交一张 GGML 图，用的是未经修改的上游 ggml。<code>--layer-split N</code> 把 62 层分布到 N 张 GPU 上并让各 GPU 的占用尽量均衡，最多 16 张（无法满足的数量会被拒绝，而不是在更少的 GPU 上运行）；<code>TS_MUSE_SPARK_CPU_MOE=auto</code> 则对每层的 gate、up、down 专家堆栈分别放置：能放进 GPU 的尽量放进去，留在主机上的字节尽量少。它会覆盖 <code>--n-cpu-moe N</code>——后者是把前 N 层的专家强制放到主机上；两者都不设时，装不下的模型会被拒绝，报错信息会点名该选项。在多路 CPU 的主机上，主机侧专家堆栈会被复制到 NUMA 本地内存，由绑核的工作线程执行；2–16 token 的批次交给 TensorSharp 自有的静态行内核，结果与 ggml 逐位一致。<code>TS_MUSE_SPARK_NATIVE=0</code> 选择较早的逐算子路径，<code>TS_MUSE_SPARK_NATIVE=1</code> 则让 GGML CPU 后端也使用该执行器。整模型实测只在 <code>ggml_cuda</code> 上进行：Vulkan 默认同样选择该执行器，但没有任何整模型运行记录。</p>
+  <p>在两张或更多 CUDA GPU 上、且全部专家都在显存中时，按层切分会<strong>流水线式 prefill</strong>：每次提示调用被切成等大的微批，GPU k 处理一个微批时 GPU k+1 处理前一个，与 llama.cpp 的流水线并行相同。微批大小按调用决定——约为调用的四分之一，介于 512 与 2,048 行之间，长上下文的掩码放不进暂存缓冲时会更小——除非用 <code>TS_MUSE_SPARK_PIPELINE_UBATCH</code> 固定；<code>TS_MUSE_SPARK_PIPELINE=0</code> 关闭流水线，<code>1</code> 则要求启用，加载日志会说明实际情况。只有一个提示时，调度器让模型决定 prefill 步长——8,192 token，较短的余数并入前一步——除非设置了 <code>TS_SCHED_SOLO_PREFILL_CHUNK</code>。在实测的十张 A40 运行中，按层切分每张 GPU 约占 36 GiB，加载约 6 分钟。</p>
+  <p>在 <code>ggml_cuda</code> 上，<code>--tp N</code> 以<strong>张量并行</strong>方式运行同一个原生执行器：通过上游 ggml 的 meta 后端（即 llama.cpp <code>-sm tensor</code> 背后的机制）把每一层切分到前 N 张 CUDA GPU 上（用 <code>CUDA_VISIBLE_DEVICES</code> 选择）。注意力按 KV 组切分，路由专家沿隐藏维度切分，输出头按词表行切分，每层以两次 all-reduce 结束；TensorSharp 会先探测 peer 拷贝，P2P 不可用时让 NCCL 走共享内存。全部专家必须放进显存，因此 <code>--n-cpu-moe N</code> 会被拒绝；<code>TS_MUSE_SPARK_LAYER_SPLIT</code>、<code>TS_MUSE_SPARK_PIPELINE=1</code> 以及超过 16 个 KV 头的 N 同样会被拒绝；流水线 prefill 与推测解码在此模式下关闭。<code>TS_MUSE_SPARK_NATIVE=0</code> 保留较早的逐算子 TP 路径，<code>ggml_vulkan</code> 上的 <code>--tp N</code> 也走这条路径：按 GQA 头组切分注意力、以整个专家为单位划分专家，允许不均匀划分（例如九张 GPU），且仅限单节点。</p>
+  <p>每个请求拥有一个 F16 的按序列 KV 槽位——滑动层用环形缓冲区，全局层的行按需增长——decode 在各槽位之间批处理（文本与图像请求都适用），同时到达的新文本提示也会一起批量 prefill。前缀缓存可以从已完成的槽位续接对话、回退已完成的对话以重新生成回答，并把共享的系统提示词 / 模板前导检查点克隆进新对话；互不相关的对话只共享这段公开前缀。</p>
+  <p>图像以 OpenAI <code>image_url</code> 内容部分或 CLI 的 <code>--image</code> 传入，经由共享的 Muse-Glimmer 视觉编码器与该发布自带的 <code>mmproj-Q8_0.gguf</code> 处理；Muse-Glimmer-30B 的投影器会被拒绝，也没有音频输入。思考与工具沿用 Muse-Glimmer 的通道协议：模型在 <code>assistant to=self</code> 消息里推理、在 <code>assistant to=user</code> 中作答，模板还会渲染推理等级（low / medium / high / xhigh）；ATEM XML 工具调用按 <code>to=</code> 接收方头部路由，另有一个 commentary 通道——因此 Agent Skills 享有完整的渐进式披露，子智能体委派也会提供给它。<code>response_format</code> 可以与 <code>"think": true</code> 组合：JSON 语法在 <code>to=user&lt;|message|&gt;</code> 之后才开始约束。该模型需要 GGUF 内嵌的聊天模板，没有通用回退。推测解码只有无权重的 n-gram 草稿器（<code>--spec --spec-type ngram</code>），没有训练过的草稿模型。</p>
+  <p><strong>报告更新于 2026-10-22，未记录实际测量日期：</strong>十张 A40、UD-IQ3_XXS、全部专家驻留显存、32,768 上下文、F16 KV、关闭思考。按层切分的 4,075 token 提示 prefill 为 999.7 对 483.2 tok/s（2.07×，单请求、输出上限 32）；张量并行的单请求 decode 为 22.63 对 16.19 tok/s（1.40×，167 token 提示、输出上限 256），四并发总输出为 45.73 对 24.49 tok/s（1.87×）。两者对照 llama.cpp 的对应模式，参照 TP 各行只有两次重复；主机没有可用 P2P，参照构建未启用 NCCL。<a href="benchmarks_zh-cn.html#muse-spark">计时方法、质量与完整局限 →</a> Muse Spark 晚于 <code>v2026.10.11</code> 发布标签，需要源码构建。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/muse-spark_zh-cn.md">模型卡与验证范围 →</a></p>
+
   <h3 id="diffusiongemma">DiffusionGemma（分块文本扩散，文本 + 图像）</h3>
   <pre data-lang="bash"><code>hf download unsloth/diffusiongemma-26B-A4B-it-GGUF diffusiongemma-26B-A4B-it-Q4_K_M.gguf --local-dir models
 # 可选，用于图像输入：视觉塔不在任何 GGUF 里，只在这个上游分片中（2.84 GB）
@@ -288,6 +287,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
       <tr><td>GLM 5.x（5.3-Flash）</td><td>图像</td><td>GLM-OCR ViT——24 个块作为一张常驻设备的图跑完，投影后的行在原生执行器内部覆盖 <code>&lt;|image|&gt;</code> 占位。支持多图与多轮图像会话。投影器：<code>mmproj-BF16.gguf</code>（同仓库）。GLM-5.2 与 GLM-5.3（<code>glm-dsa</code>）均仅文本：GLM-5.3 仓库在任何量化下都未发布 mmproj，且给 <code>glm-dsa</code> 传入 <code>--mmproj</code> 只会告警并忽略、不会报错，因此仍是一次纯文本运行。只有 <code>glm5next</code> 接受投影器。</td></tr>
       <tr><td>Mistral 3</td><td>图像</td><td>Pixtral 视觉编码器。投影器：<code>mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf</code>。</td></tr>
       <tr><td>Muse-Glimmer</td><td>图像</td><td>50 层稀疏窗口 ViT，采用 2D RoPE 与 2×2 像素混洗；图像按 llama.cpp 相同的方式选定网格后直接拉伸（不填充、不切块）。投影器：<code>mmproj-Muse-Glimmer-30B-Q8_0.gguf</code>。</td></tr>
+      <tr><td>Muse Spark</td><td>图像</td><td>共享的 Muse-Glimmer 视觉编码器，配合该发布自带的 <code>mmproj-Q8_0.gguf</code>（仓库根目录）。它的投影器类型是 <code>muse-glimmer</code>，但 8192 宽的输出必须与 Spark 解码器匹配，因此 Muse-Glimmer-30B 的投影器会被拒绝。图像以 OpenAI <code>image_url</code> 内容部分或 CLI 的 <code>--image</code> 传入；投影器里带有音频塔也不会启用音频。</td></tr>
       <tr><td>Nemotron-H (Omni)</td><td>图像（配伴随文件时支持音频）</td><td>RADIO / v2_vl ViT 编码器。传入匹配的 <code>--mmproj</code>；图像 token 在 <code>&lt;image&gt;</code> 占位处展开。音频只有在加载了另行准备、带 Parakeet 音频塔的伴随 GGUF（<code>--mmproj</code> 或 <code>TS_NEMOTRON_AUDIO_MMPROJ</code>）时才运行；没有公开仓库提供该文件，缺少时音频会被拒绝。</td></tr>
       <tr><td>DiffusionGemma</td><td>图像</td><td>Gemma 4 的 <code>gemma4v</code> 视觉塔，通过 <code>--mmproj</code> 从上游 <code>model-00011-of-00011.safetensors</code> 分片（或 mmproj GGUF）加载。图像可用于聊天，也可用于 <code>/v1/systemone</code> 决策（每个请求最多 8 张）。音频与视频会被拒绝。</td></tr>
     </tbody>
@@ -296,7 +296,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
   <p>通过 <a href="cli_zh-cn.html#examples">CLI</a>（<code>--image</code>、<code>--video</code>、<code>--audio</code>、<code>--pdf</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 上传，或 <a href="http-api_zh-cn.html">HTTP API</a>（Ollama 用 base64 <code>images</code> 数组，OpenAI 用 <code>image_url</code> data URI）发送文件。数字版 PDF 会提取完整文本层并内联到提示中；扫描版 PDF 会转换为页面图像，需要支持视觉的模型。CLI 的 <code>--pdf</code> 仅用于一次性模式；CLI 与 Web UI 上传都由 <code>TS_PDF_MAX_PAGES</code> 限制页数（默认读取全部页）。</p>
 
   <h2 id="thinking">思考 / 推理模式</h2>
-  <p>具备思考能力的模型（Qwen 3.5/3.6、Qwen 3.8 Flash Next、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、DeepSeek V4.1、GLM 5.x、Muse-Glimmer）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
+  <p>具备思考能力的模型（Qwen 3.5/3.6、Qwen 3.8 Flash Next、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、DeepSeek V4.1、GLM 5.x、Muse-Glimmer、Muse Spark）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
   <ul>
     <li><strong>Qwen 3.5/3.6 / Nemotron-H</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签。关闭思考时，Nemotron-H Reasoning-128K 有时会在已闭合的 <code>&lt;think&gt;&lt;/think&gt;</code> 之后继续推理并自己写出 <code>&lt;/think&gt;</code>。若它从回复的前 2,048 个字符之内开始，这段文本会作为推理上报，而不是作为答案；更晚出现的闭合被当作答案文本，推理和字面的 <code>&lt;/think&gt;</code> 因此留在答案中，这是已知限制（<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/nemotron_zh-cn.md#12-输出解析器与聊天模板">详情</a>）。</li>
     <li><strong>Qwen 3.8 Flash Next</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，开关方式也相同：关闭思考时，发布的模板会渲染一个已闭合的空 <code>&lt;think&gt;&lt;/think&gt;</code> 块。</li>
@@ -306,6 +306,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
     <li><strong>DeepSeek V4.1</strong> —— 同样的标签，但带有训练过的收尾转换：达到 <code>TS_THINKING_BUDGET</code> 时模型输出 <code>&lt;/think&gt;</code>，并在原有 <code>max_tokens</code> 之内写完答案。当输出额度不少于 512 token 时，预算默认取 75%。</li>
     <li><strong>GLM 5.x</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，也是按需开启：加 <code>--think</code> 会补上 <code>Reasoning Effort: Max</code> 系统行并留下一个未闭合的块由模型自己收尾，不加时提示里写的是空的 <code>&lt;think&gt;&lt;/think&gt;</code>。历史轮次的思考内容始终不会带进提示。<strong>GLM-5.3-Flash 则始终思考</strong>：系统行将 <code>reasoning_effort: "low"</code> / <code>"high"</code> 映射为 <code>Low</code> / <code>High</code>，省略或指定 <code>"medium"</code> 时使用 <code>Max</code>，生成提示总是打开 <code>&lt;think&gt;</code>，历史轮次的思考内容也会保留。</li>
     <li><strong>Muse-Glimmer</strong> —— 聊天模板输出的 <code>assistant to=self</code> 推理通道。</li>
+    <li><strong>Muse Spark</strong> —— 同一套通道协议：在 <code>assistant to=self</code> 消息里推理，在 <code>assistant to=user</code> 中作答。模板还会渲染推理等级（low / medium / high / xhigh）。</li>
     <li><strong>DiffusionGemma</strong> —— 不通过提示开启：提示词始终以关闭思考的方式渲染。模型自发写出的思考块会被解析出来，只有在 <code>"think": true</code> 时才作为推理内容返回。</li>
   </ul>
   <p>通过 <code>--think</code>（CLI）、<code>"think": true</code>（Ollama API / Web UI）或浏览器中的思考开关启用。响应会单独暴露推理 —— 例如 Ollama 聊天响应中的 <code>message.thinking</code>。</p>
@@ -321,6 +322,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
     <li><strong>DeepSeek V4</strong> —— DSML 标记：系统提示词负责讲解语法并携带每个函数的 JSON schema，模型以 <code>&lt;｜DSML｜tool_calls&gt;&lt;｜DSML｜invoke name="NAME"&gt;&lt;｜DSML｜parameter name="key" string="true|false"&gt;value&lt;/｜DSML｜parameter&gt;…</code> 作答。</li>
     <li><strong>GLM 5.x</strong> —— 逐参数标签的 XML：<code>&lt;tool_call&gt;NAME&lt;arg_key&gt;k&lt;/arg_key&gt;&lt;arg_value&gt;v&lt;/arg_value&gt;…&lt;/tool_call&gt;</code>。函数名以裸文本紧跟在开标签之后，每个参数自成一组键值对；模板里用 <code>tojson</code> 渲染过的值会被解析回数字、数组与对象。</li>
     <li><strong>Muse-Glimmer</strong> —— 聊天模板声明的 ATEM XML 标记；解析器会把调用提取成同样的结构化 <code>tool_calls</code>。</li>
+    <li><strong>Muse Spark</strong> —— 同样的 ATEM XML 调用，按 <code>to=</code> 接收方头部路由，另有一个 commentary 通道。</li>
   </ul>
   <p><strong>Mistral 3、Hunyuan Dense 与 DiffusionGemma 不在此列表中：</strong>前两者既不渲染工具声明也不渲染工具结果，DiffusionGemma 会拒绝带工具的请求，因此客户端工具、内置技能 / 代码工具与子智能体委派都不会提供给它们；选中的 Agent Skill 指令会作为无工具回退直接内联。</p>
   <p>完整的请求/响应示例与续接循环见 <a href="http-api_zh-cn.html#tools">通过 HTTP 进行工具调用</a>。</p>

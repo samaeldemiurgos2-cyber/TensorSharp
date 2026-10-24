@@ -15,9 +15,9 @@
 //   * ref  — "use this person/product, new scene". The image is an identity and
 //            appearance reference; the first frame need NOT resemble it.
 //
-// i2v/fl2v need the FL2VA checkpoint and ref needs Ref2VA — they are separate
-// files, not settings, so choosing the wrong one has to be reported rather than
-// silently producing something the user did not ask for.
+// i2v/fl2v need the FL2VA checkpoint and ref needs Ref2VA. They are separate files;
+// the Video Studio adapter selects the needed denoiser per take while keeping the host
+// model and its shared components loaded.
 using System;
 using TensorSharp.Models.Video;
 
@@ -86,6 +86,26 @@ namespace TensorSharp.Models.MiniMaxH3
             Validate(mode, partition, hasFirst, hasLast,
                      hasRefs || imageIsReference, namedReferences: hasRefs);
             return mode;
+        }
+
+        /// <summary>Choose the checkpoint partition for a model that may have both denoisers
+        /// installed. Continuation clips select FL2VA; otherwise an explicit mode wins and
+        /// named reference inputs select Ref2VA when no mode was given. The primary partition
+        /// preserves legacy behavior when no conditioning was requested.</summary>
+        public static MiniMaxH3Partition PartitionFor(VideoGenerationParams p, MiniMaxH3Partition primary)
+        {
+            ArgumentNullException.ThrowIfNull(p);
+            if (p.ContinuationVideoPaths is { Count: > 0 })
+                return MiniMaxH3Partition.FirstLastFrame;
+            MiniMaxH3Mode? explicitMode = Parse(p.Mode);
+            bool hasRefs = (p.ReferenceImagePaths?.Count ?? 0) > 0
+                           || (p.ReferenceVideoPaths?.Count ?? 0) > 0
+                           || (p.ReferenceAudioPaths?.Count ?? 0) > 0;
+            if (explicitMode == MiniMaxH3Mode.Reference || explicitMode == null && hasRefs)
+                return MiniMaxH3Partition.Reference;
+            if (explicitMode != null)
+                return MiniMaxH3Partition.FirstLastFrame;
+            return primary;
         }
 
         /// <param name="hasRefs">Anything is being treated as a reference, including a

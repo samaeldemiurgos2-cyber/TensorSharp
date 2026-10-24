@@ -21,7 +21,7 @@ namespace TensorSharp.Server.RequestParsers
     /// Parses the parameters shared by all video-generation endpoints, for any video
     /// model. Startup <c>--video-frames</c>/<c>--fps</c> values seed the request;
     /// explicitly supplied JSON fields then override those defaults.
-    /// <para>Fields added for joint audio-video and reference-conditioned models are
+    /// <para>Fields added for joint audio-video, clip continuation, and reference-conditioned models are
     /// accepted in both camelCase and snake_case, since the OpenAI-shaped route uses
     /// snake_case while the web UI uses camelCase.</para>
     /// </summary>
@@ -125,6 +125,9 @@ namespace TensorSharp.Server.RequestParsers
             if (error != null) return p;
             p.ReferenceVideoPaths = ParseReferenceList(
                 root, "referenceVideos", "reference_videos", options, "referenceVideos", ref error);
+            if (error != null) return p;
+            p.ContinuationVideoPaths = ParseReferenceList(
+                root, "continueFromVideos", "continue_from_videos", options, "continueFromVideos", ref error);
             if (error != null) return p;
             p.ReferenceAudioPaths = ParseReferenceList(
                 root, "referenceAudios", "reference_audios", options, "referenceAudios", ref error);

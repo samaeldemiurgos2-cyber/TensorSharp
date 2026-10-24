@@ -2315,6 +2315,7 @@ namespace
     struct PrefillAttnSession
     {
         bool valid = false;
+        ggml_backend_t backend = nullptr;
         int num_q = 0;
         int kv_bucket = 0;
         int num_heads = 0;
@@ -2344,6 +2345,7 @@ namespace
             ctx_mem.reset();
             q_in = k_in = v_in = mask = result = nullptr;
             graph = nullptr;
+            backend = nullptr;
             valid = false;
             kv_zero_covered_from = 0;
         }
@@ -2366,7 +2368,9 @@ namespace
     {
         for (auto& s : g_prefill_attn_cache)
         {
-            if (s.valid && s.num_q == num_q && s.kv_bucket == kv_bucket &&
+            // A shape match alone is insufficient during whole-layer GPU
+            // placement: this graph's tensors live on its original backend.
+            if (s.valid && s.backend == g_backend && s.num_q == num_q && s.kv_bucket == kv_bucket &&
                 s.num_heads == num_heads && s.num_kv_heads == num_kv_heads &&
                 s.head_dim == head_dim && s.scale_bits == scale_bits && s.kv_f16 == kv_f16)
             {
@@ -2452,9 +2456,25 @@ namespace
         s.num_q = num_q; s.kv_bucket = kv_bucket; s.num_heads = num_heads;
         s.num_kv_heads = num_kv_heads; s.head_dim = head_dim;
         s.scale_bits = prefill_float_bits(scale); s.kv_f16 = kv_f16;
+        s.backend = g_backend;
         s.kv_zero_covered_from = 0; // buffer explicitly cleared above
         s.valid = true;
         return true;
+    }
+
+    // Spark opt-in: identical live K/V bytes and destination layout, with one
+    // strided synchronous transfer per tensor instead of one per KV head.
+    // No new resident cache, asynchronous host lifetime or graph ownership.
+    std::atomic<std::uint64_t> g_muse_spark_kv_2d_upload_pairs{0};
+    void upload_prefill_kv_2d(ggml_tensor* k, ggml_tensor* v,
+        const void* k_data, const void* v_data, int kv_len, int kv_stride,
+        int kv_heads, int head_dim, std::size_t elem_bytes)
+    {
+        const std::size_t width = static_cast<std::size_t>(kv_len) * head_dim * elem_bytes;
+        const std::size_t src_pitch = static_cast<std::size_t>(kv_stride) * head_dim * elem_bytes;
+        ggml_backend_tensor_set_2d(k, k_data, 0, width, kv_heads, k->nb[2], src_pitch);
+        ggml_backend_tensor_set_2d(v, v_data, 0, width, kv_heads, v->nb[2], src_pitch);
+        g_muse_spark_kv_2d_upload_pairs.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Cached head-first fused prefill attention. q_data is F32 [numHeads, seqLen,
@@ -2465,7 +2485,7 @@ namespace
         const void* q_data, const void* k_data, const void* v_data, float* out_data,
         int num_heads, int num_kv_heads, int head_dim,
         int seq_len, int kv_len, int kv_stride,
-        int mask_start_pos, int sliding_window, float scale, bool kv_f16)
+        int mask_start_pos, int sliding_window, float scale, bool kv_f16, bool kv_upload_2d = false)
     {
         if (!ensure_backend()) return 0;
 
@@ -2498,12 +2518,18 @@ namespace
         const std::size_t rowBytes = static_cast<std::size_t>(kv_len) * head_dim * kv_elem;
         const auto* kb = static_cast<const unsigned char*>(k_data);
         const auto* vb = static_cast<const unsigned char*>(v_data);
-        for (int h = 0; h < num_kv_heads; ++h)
+        if (kv_upload_2d)
+            upload_prefill_kv_2d(sess->k_in, sess->v_in, k_data, v_data,
+                kv_len, kv_stride, num_kv_heads, head_dim, kv_elem);
+        else
         {
-            const std::size_t srcOff = static_cast<std::size_t>(h) * srcHeadElems * kv_elem;
-            const std::size_t dstOff = static_cast<std::size_t>(h) * dstHeadElems * kv_elem;
-            ggml_backend_tensor_set(sess->k_in, kb + srcOff, dstOff, rowBytes);
-            ggml_backend_tensor_set(sess->v_in, vb + srcOff, dstOff, rowBytes);
+            for (int h = 0; h < num_kv_heads; ++h)
+            {
+                const std::size_t srcOff = static_cast<std::size_t>(h) * srcHeadElems * kv_elem;
+                const std::size_t dstOff = static_cast<std::size_t>(h) * dstHeadElems * kv_elem;
+                ggml_backend_tensor_set(sess->k_in, kb + srcOff, dstOff, rowBytes);
+                ggml_backend_tensor_set(sess->v_in, vb + srcOff, dstOff, rowBytes);
+            }
         }
 
         // Zero the K/V padding [kv_len, covered) per head only when this call is
@@ -2574,7 +2600,7 @@ namespace
         const void* q_data, const void* k_data, const void* v_data, float* out_data,
         int num_heads, int num_kv_heads, int head_dim,
         int seq_len, int kv_len, int kv_stride,
-        int mask_start_pos, int sliding_window, float scale, bool kv_f16)
+        int mask_start_pos, int sliding_window, float scale, bool kv_f16, bool kv_upload_2d = false)
     {
         if (!ensure_backend()) return 0;
 
@@ -2633,7 +2659,10 @@ namespace
         // headDim] cache. Contiguous single upload when the cache is exactly sized.
         const std::size_t kv_elem = kv_f16 ? sizeof(ggml_fp16_t) : sizeof(float);
         const std::size_t dstHeadElems = static_cast<std::size_t>(kv_len) * head_dim;
-        if (kv_stride == kv_len)
+        if (kv_upload_2d)
+            upload_prefill_kv_2d(k_in, v_in, k_data, v_data,
+                kv_len, kv_stride, num_kv_heads, head_dim, kv_elem);
+        else if (kv_stride == kv_len)
         {
             const std::size_t bytes = static_cast<std::size_t>(num_kv_heads) * dstHeadElems * kv_elem;
             ggml_backend_tensor_set(k_in, k_data, 0, bytes);
@@ -2957,7 +2986,7 @@ TSG_EXPORT int TSGgml_DiffusionPrefillAttentionF32(
 // Same fused mul_mat -> soft_max_ext -> mul_mat graph as the F32 path; GQA is
 // handled by ggml's mul_mat broadcast (numHeads % numKVHeads == 0).
 // ============================================================================
-TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
+static int fused_prefill_attention_f16_impl(
     const float* q_data,        // head-first F32 [numHeads, seqLen, headDim]
     const void* k_data,         // head-first F16 cache [numKVHeads, kvCacheLen, headDim]
     const void* v_data,         // same layout
@@ -2970,7 +2999,7 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
     int kvCacheLen,             // allocated seq stride of the cache (>= kvLen)
     int maskStartPos,
     int slidingWindow,
-    float scale)
+    float scale, bool kv_upload_2d)
 {
     try
     {
@@ -2989,7 +3018,7 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
             return fused_prefill_attn_cached(
                 q_data, k_data, v_data, out_data,
                 numHeads, numKVHeads, headDim, seqLen, kvLen, /*kv_stride*/ kvCacheLen,
-                maskStartPos, slidingWindow, scale, /*kv_f16*/ true);
+                maskStartPos, slidingWindow, scale, /*kv_f16*/ true, kv_upload_2d);
         }
 
         // Large-kvLen path: flash attention streams K/V instead of materializing
@@ -2999,7 +3028,7 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
             int fr = fused_prefill_attn_flash(
                 q_data, k_data, v_data, out_data,
                 numHeads, numKVHeads, headDim, seqLen, kvLen, /*kv_stride*/ kvCacheLen,
-                maskStartPos, slidingWindow, scale, /*kv_f16*/ true);
+                maskStartPos, slidingWindow, scale, /*kv_f16*/ true, kv_upload_2d);
             if (fr >= 0) return fr;
         }
 
@@ -3080,7 +3109,10 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
         // slice is contiguous and a single upload suffices; otherwise upload
         // per-head to skip the unused [kvLen, kvCacheLen) tail.
         const std::size_t dstHeadElems = static_cast<std::size_t>(kvLen) * headDim;
-        if (kvCacheLen == kvLen)
+        if (kv_upload_2d)
+            upload_prefill_kv_2d(k_in, v_in, k_data, v_data,
+                kvLen, kvCacheLen, numKVHeads, headDim, sizeof(ggml_fp16_t));
+        else if (kvCacheLen == kvLen)
         {
             const std::size_t bytes = static_cast<std::size_t>(numKVHeads) * dstHeadElems * sizeof(ggml_fp16_t);
             ggml_backend_tensor_set(k_in, k_data, 0, bytes);
@@ -3124,6 +3156,32 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
         set_last_error("Unknown fused prefill attention (F16 KV) failure.");
         return 0;
     }
+}
+
+// Existing ABI and all non-Spark callers retain the original per-head uploads.
+TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
+    const float* q, const void* k, const void* v, float* output,
+    int heads, int kv_heads, int head_dim, int rows, int kv_len, int kv_stride,
+    int mask_start, int window, float scale)
+{
+    return fused_prefill_attention_f16_impl(q, k, v, output, heads, kv_heads, head_dim,
+        rows, kv_len, kv_stride, mask_start, window, scale, false);
+}
+
+TSG_EXPORT int TSGgml_MuseSparkAttentionF16KV2D(
+    const float* q, const void* k, const void* v, float* output,
+    int heads, int kv_heads, int head_dim, int rows, int kv_len, int kv_stride,
+    int mask_start, int window, float scale)
+{
+    return fused_prefill_attention_f16_impl(q, k, v, output, heads, kv_heads, head_dim,
+        rows, kv_len, kv_stride, mask_start, window, scale, true);
+}
+
+// Process-lifetime, read-only diagnostic of actual successful K/V upload pairs.
+// It records transfers, not graph completion or quality/performance acceptance.
+TSG_EXPORT std::uint64_t TSGgml_GetMuseSparkKv2DUploadPairs()
+{
+    return g_muse_spark_kv_2d_upload_pairs.load(std::memory_order_relaxed);
 }
 
 TSG_EXPORT int TSGgml_ScaledDotProductAttentionF32(

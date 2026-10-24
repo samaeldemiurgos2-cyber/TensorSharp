@@ -197,10 +197,14 @@ struct evaluation
     ggml_tensor * gate_out = nullptr, * up_out = nullptr, * hidden_out = nullptr;
     ggml_tensor * raw_gate = nullptr, * raw_up = nullptr;
     tsg_dsv4_fused_desc strip_desc, swiglu_desc, reduce_desc;
+    // With tp, the TP node runs on the CPU backend (host-driven ranks) unless
+    // tp_layer_device names a CUDA device: the node then runs on that device's
+    // fused backend and enqueues every rank there (device-resident path).
     evaluation(const fixture & data, int tokens, tsg_dsv41_tp::executor * tp, int layer,
                ggml_backend_dev_t reference_device = nullptr, bool preserve_taps = false, bool shared_once = false,
-               int full_rows = 0, int first_row = 0, bool fused = false)
-        : device(tp ? nullptr : reference_device), backend(device.backend)
+               int full_rows = 0, int first_row = 0, bool fused = false, ggml_backend_dev_t tp_layer_device = nullptr,
+               bool split_launch = false)
+        : device(tp ? tp_layer_device : reference_device), backend(device.backend)
     {
 #if defined(TSG_GGML_USE_CUDA)
         // The owned strip kernel runs inside TensorSharp's fused CUDA backend,
@@ -225,7 +229,17 @@ struct evaluation
         weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, data.used, tokens);
         ggml_tensor * gate = nullptr, * up = nullptr, * down = nullptr;
         ggml_tensor * zero_shared = nullptr;
-        if (tp) out = tp->build(ctx, layer, x, weights, ids);
+        // The production caller adds the unsharded shared-expert output after
+        // the routed TP reduction. Exercise that boundary with a known tensor;
+        // the independent scalar check below rejects rank-count multiplication.
+        ggml_tensor * shared = shared_once ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, data.embedding, tokens) : nullptr;
+        if (tp && split_launch)
+        {
+            // The production split: launch, the shared expert, then gather.
+            require(shared != nullptr && tp_layer_device != nullptr, "Split TP evaluation needs a shared tensor and a layer device");
+            out = tp->build(ctx, layer, x, weights, ids, shared);
+        }
+        else if (tp) out = tp->build(ctx, layer, x, weights, ids);
         else
         {
             gate = ggml_new_tensor_3d(ctx, data.gate.type, data.embedding, data.hidden, data.experts);
@@ -283,15 +297,7 @@ struct evaluation
                 }
             }
         }
-        // The production caller adds the unsharded shared-expert output after
-        // the routed TP reduction. Exercise that boundary with a known tensor;
-        // the independent scalar check below rejects rank-count multiplication.
-        ggml_tensor * shared = nullptr;
-        if (shared_once)
-        {
-            shared = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, data.embedding, tokens);
-            out = ggml_add(ctx, out, shared);
-        }
+        if (shared) out = ggml_add(ctx, out, shared);
         graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, out);
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i)
@@ -391,6 +397,26 @@ std::vector<float> scalar_f32_reference(const fixture & data, int tokens, bool s
 
 void check_partitions()
 {
+    // Down output rows: complete tilings, and multiples of 32 (ggml-cuda's MMF
+    // row block) whenever the width allows, preferring 128 (the owned quantized
+    // strip kernel) and then 64. A 2-row fallback at 3/5 ranks on width 256 sent
+    // F16 down projections through an F16-accumulating fallback.
+    for (int64_t width : {int64_t(256), int64_t(512), int64_t(4096), int64_t(5120), int64_t(130)})
+    for (int ranks : {2, 3, 4, 5, 6, 7, 8})
+    for (int layer = 0; layer < ranks; ++layer)
+    {
+        const auto parts = tsg_dsv41_tp::split_outputs(width, ranks, layer);
+        int64_t end = 0, alignment = 2;
+        for (const int64_t candidate : {int64_t(128), int64_t(64), int64_t(32)})
+            if (width % candidate == 0 && width / candidate >= ranks) { alignment = candidate; break; }
+        for (const auto & part : parts)
+        {
+            require(part.first == end && part.count > 0 && part.count % alignment == 0,
+                    "TP output strips are incomplete, overlapping, or not aligned to the widest possible block");
+            end += part.count;
+        }
+        require((int) parts.size() == ranks && end == width, "TP output strips lost rows");
+    }
     for (int ranks : {2, 3, 4, 5, 6, 7, 8})
     {
         std::vector<int64_t> aggregate(ranks);
@@ -494,33 +520,32 @@ void report_difference(const char * label, const std::vector<float> & reference,
     std::cout << "DIAGNOSTIC " << label << " max_abs=" << d.max_abs << " rel_l2=" << d.rel_l2 << std::endl;
 }
 
-// The executor's row partition evaluated without the executor: the test
-// slices the fixture bytes itself (no upload_strip), runs every strip as an
-// ordinary ggml graph on one device and sums the strips on the host in rank
-// order, exactly like the executor's reduction.
+// The executor's partition evaluated without the executor: the test slices
+// the fixture bytes itself (no upload_strip) and runs ordinary ggml graphs on
+// one device. Gate/up/SwiGLU run per hidden-row strip and their rows are
+// concatenated; the down projection then runs per output-row strip over the
+// complete hidden activations, and those rows are concatenated too. Nothing
+// is summed across strips, exactly like the executor.
 struct partitioned_output
 {
     std::vector<float> output, gate, up, hidden;
 };
 
+std::vector<float> down_output_rows(const fixture & data, int tokens, const std::vector<tsg_dsv41_tp::strip> & strips,
+                                    ggml_backend_dev_t device, const std::vector<float> & hidden);
+
 partitioned_output partitioned_reference(const fixture & data, int tokens, int ranks, int layer,
                                          ggml_backend_dev_t device, bool taps)
 {
     partitioned_output result;
-    result.output.assign((size_t) data.embedding * tokens, 0.0f);
-    if (taps)
-    {
-        result.gate.resize((size_t) data.hidden * data.used * tokens);
-        result.up.resize(result.gate.size());
-        result.hidden.resize(result.gate.size());
-    }
+    result.gate.resize((size_t) data.hidden * data.used * tokens);
+    result.up.resize(result.gate.size());
+    result.hidden.resize(result.gate.size());
     for (auto part : tsg_dsv41_tp::split_weights(data.hidden, data.down.type, ranks, layer))
     {
         fixture subset(data, part);
-        evaluation sliced(subset, tokens, nullptr, layer, device, taps);
-        const auto output = sliced.run();
-        for (size_t i = 0; i < result.output.size(); ++i) result.output[i] += output[i];
-        if (!taps) continue;
+        evaluation sliced(subset, tokens, nullptr, layer, device, true);
+        sliced.run();
         const auto g = values(sliced.gate_out), u = values(sliced.up_out), h = values(sliced.hidden_out);
         for (int row = 0; row < tokens * data.used; ++row)
         {
@@ -528,6 +553,14 @@ partitioned_output partitioned_reference(const fixture & data, int tokens, int r
             std::copy_n(u.data() + row * part.count, part.count, result.up.data() + row * data.hidden + part.first);
             std::copy_n(h.data() + row * part.count, part.count, result.hidden.data() + row * data.hidden + part.first);
         }
+    }
+    result.output = down_output_rows(data, tokens, tsg_dsv41_tp::split_outputs(data.embedding, ranks, layer),
+                                     device, result.hidden);
+    if (!taps)
+    {
+        result.gate.clear();
+        result.up.clear();
+        result.hidden.clear();
     }
     return result;
 }
@@ -578,6 +611,57 @@ std::vector<float> down_projection(const fixture & data, int tokens, const std::
         ggml_free(ctx);
     }
     return sum;
+}
+
+// The down projection over output-row strips (the executor's split), each
+// strip fed the complete hidden activations; strips are concatenated by row.
+std::vector<float> down_output_rows(const fixture & data, int tokens, const std::vector<tsg_dsv41_tp::strip> & strips,
+                                    ggml_backend_dev_t device, const std::vector<float> & hidden)
+{
+    std::vector<float> rows_out((size_t) data.embedding * tokens, 0.0f);
+    std::vector<int> selected;
+    std::vector<float> routing;
+    fill_routing(data, tokens, selected, routing);
+    const size_t row_bytes = ggml_row_size(data.down.type, data.hidden);
+    for (auto part : strips)
+    {
+        std::vector<char> slice(row_bytes * part.count * data.experts);
+        for (int expert = 0; expert < data.experts; ++expert)
+            std::memcpy(slice.data() + row_bytes * part.count * expert,
+                        data.down_data.data() + row_bytes * ((size_t) expert * data.embedding + part.first),
+                        row_bytes * part.count);
+        reference_backend reference(device);
+        ggml_backend_t backend = reference.backend;
+        ggml_context * ctx = ggml_init({1024 * 1024, nullptr, true});
+        auto * h = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, data.hidden, data.used, tokens);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, data.used, tokens);
+        auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, data.used, tokens);
+        auto * down = ggml_new_tensor_3d(ctx, data.down.type, data.hidden, part.count, data.experts);
+        auto * e = ggml_mul(ctx, reference.mul_mat_id(ctx, down, h, ids), weights);
+        ggml_tensor * out = nullptr;
+        for (int expert = 0; expert < data.used; ++expert)
+        {
+            auto * view = ggml_view_2d(ctx, e, part.count, tokens, e->nb[2], expert * e->nb[1]);
+            out = out ? ggml_add(ctx, out, view) : view;
+        }
+        if (data.used == 1) out = ggml_cont(ctx, out);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        require(buffer != nullptr, "Cannot allocate down output-row graph");
+        ggml_backend_tensor_set(down, slice.data(), 0, slice.size());
+        ggml_backend_tensor_set(h, hidden.data(), 0, hidden.size() * sizeof(float));
+        ggml_backend_tensor_set(ids, selected.data(), 0, selected.size() * sizeof(int));
+        ggml_backend_tensor_set(weights, routing.data(), 0, routing.size() * sizeof(float));
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "Down output-row forward failed");
+        const auto output = values(out);
+        for (int token = 0; token < tokens; ++token)
+            std::copy_n(output.data() + (size_t) token * part.count, part.count,
+                        rows_out.data() + (size_t) token * data.embedding + part.first);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    return rows_out;
 }
 
 std::vector<float> dequantize(const tsg_dsv41_tp::source & src, const std::vector<char> & bytes)
@@ -732,6 +816,85 @@ void quantized_scratch_lifecycle(ggml_backend_dev_t device)
             std::cout<<"SCRATCH_LIFECYCLE tokens="<<tokens<<" injected="<<fail<<" passed"<<std::endl;
         }
     } catch(...) {fault(false);throw;}
+}
+
+// The device-resident exchange issues rank 0 on the calling thread and every
+// other rank on a worker. A rank graph that throws (a failed scratch
+// reservation) must reach the TP error latch and NaN output on either kind of
+// rank, without terminating the process or leaving a rank in the layer
+// barrier, and the next forward must recover bit-identically to the
+// host-driven node.
+void resident_scratch_failure(const std::vector<ggml_backend_dev_t> & devices)
+{
+    fixture data(GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 5120);
+    tsg_dsv41_tp::executor tp(std::vector<ggml_backend_dev_t>{devices[0], devices[1]}, data.used);
+    tp.add_layer(0, data.gate, data.up, data.down, .1f);
+    require(tp.device_resident(), "Two CUDA ranks did not select the device-resident exchange");
+    struct step { int tokens; const char * fault; bool split; };
+    // The fault fires on every scratch reservation of the named device, which
+    // only the owned quantized strip kernels make: "0" fails rank 0 (the
+    // calling thread), "1" the worker rank, "all" both.
+    const step steps[] = {
+        {16, nullptr, false}, {129, "0", false}, {129, nullptr, false},
+        {257, "1", true}, {257, nullptr, true}, {513, "all", true}, {16, nullptr, true},
+        {513, nullptr, false}, {16, "1", false}, {1025, nullptr, true},
+    };
+#if defined(TSG_GGML_USE_CUDA)
+    {
+        // Without the strip kernel nothing reserves scratch and no fault fires.
+        reference_backend probe(devices[0]);
+        ggml_context * shapes = ggml_init({ggml_tensor_overhead(), nullptr, true});
+        require(shapes != nullptr, "Cannot create the strip precondition context");
+        auto * gate = ggml_new_tensor_3d(shapes, data.gate.type, data.embedding, data.hidden, data.experts);
+        bool supported = probe.inner != nullptr;
+        for (const step & s : steps)
+            if (s.fault && supported)
+                supported = tsg_matmul_id_quant_strip_supported(probe.inner, gate, s.tokens, data.hidden, 0);
+        ggml_free(shapes);
+        if (!supported)
+        {
+            std::cout << "The quantized strip kernel does not run these shapes on this GPU; "
+                         "the injected fault cannot fire (not run)" << std::endl;
+            std::exit(77);
+        }
+    }
+#endif
+    const char * fault_name = "TS_TP_TEST_FAIL_SCRATCH_DEVICE";
+    auto fault = [&](const char * value) {
+#if defined(_WIN32)
+        _putenv_s(fault_name, value ? value : "");
+#else
+        if (value) setenv(fault_name, value, 1);
+        else unsetenv(fault_name);
+#endif
+    };
+    try {
+        for (const step & s : steps) {
+            fault(s.fault);
+            tp.begin_forward();
+            const auto actual = evaluation(data, s.tokens, &tp, 0, nullptr, false, s.split,
+                                           0, 0, false, devices[0], s.split).run();
+            fault(nullptr);
+            if (s.fault) {
+                // launch() reports the lowest failing rank, so "all" names rank 0's device.
+                const std::string expected = std::string("Injected TensorSharp CUDA matmul scratch failure on device ") +
+                    (std::strcmp(s.fault, "1") == 0 ? "1" : "0");
+                require(tp.error().find(expected) != std::string::npos,
+                        ("The targeted rank's failure did not reach the TP error latch: " + tp.error()).c_str());
+                require(std::all_of(actual.begin(), actual.end(), [](float v) { return std::isnan(v); }),
+                        "A rank's scratch failure did not invalidate the device-resident TP output");
+            } else {
+                require(tp.error().empty(), tp.error().c_str());
+                const auto host = evaluation(data, s.tokens, &tp, 0, nullptr, false, s.split).run();
+                require(tp.error().empty(), tp.error().c_str());
+                require(actual.size() == host.size() &&
+                        std::memcmp(actual.data(), host.data(), actual.size() * sizeof(float)) == 0,
+                        "Device-resident TP after a rank failure differs from host-driven TP");
+            }
+            std::cout << "RESIDENT_SCRATCH_FAILURE tokens=" << s.tokens << " fault=" << (s.fault ? s.fault : "none")
+                      << " split=" << s.split << " passed" << std::endl;
+        }
+    } catch (...) { fault(nullptr); throw; }
 }
 
 void quantized_strip_projections(ggml_backend_dev_t device)
@@ -1005,6 +1168,19 @@ void checkpoint_diagnostic(const std::vector<ggml_backend_dev_t> & devices,
     require(tp.error().empty(), tp.error().c_str());
     require(std::all_of(actual.begin(), actual.end(), [](float value) { return std::isfinite(value); }),
             "Real checkpoint TP output contains nonfinite values");
+    // The production path: the node on the layer device's fused backend.
+    // Only the transport differs from the host-driven run above.
+    std::vector<float> resident;
+    if (tp.device_resident())
+    {
+        resident = evaluation(data, tokens, &tp, layer, nullptr, false, false, 0, 0, false, devices[0]).run();
+        require(tp.error().empty(), tp.error().c_str());
+        const bool same = resident.size() == actual.size() &&
+            std::memcmp(resident.data(), actual.data(), actual.size() * sizeof(float)) == 0;
+        std::cout << "REAL device-resident TP " << (same ? "bit-identical to" : "DIFFERS from")
+                  << " host-driven TP" << std::endl;
+        require(same, "Real checkpoint device-resident TP differs from host-driven TP");
+    }
     evaluation fused(data, tokens, nullptr, layer, devices[0], true, false, 0, 0, true);
     const auto expected = fused.run();
     evaluation plain(data, tokens, nullptr, layer, devices[0], true);
@@ -1086,6 +1262,7 @@ int main(int argc, char ** argv)
     try
     {
         bool cuda = false, checkpoint_shape = false, diagnostic = false, down_f32 = false, failure_only = false, strip_only = false;
+        bool resident_failure_only = false;
         int cuda_ranks = 0, fanout_pairs = 0, staging_pairs = 0, upload_pairs = 0, gather_pairs = 0, gate_fence_pairs = 0;
         bool without_gate_fence = false;
         std::string model_directory;
@@ -1100,6 +1277,7 @@ int main(int argc, char ** argv)
             else if (option == "--diagnostic-down-f32") down_f32 = true;
             else if (option == "--failure-only") failure_only = true;
             else if (option == "--quant-strip-only") strip_only = true;
+            else if (option == "--resident-failure-only") resident_failure_only = true;
             else if (option == "--fanout-pairs" && arg + 1 < argc) fanout_pairs = std::stoi(argv[++arg]);
             else if (option == "--staging-pairs" && arg + 1 < argc) staging_pairs = std::stoi(argv[++arg]);
             else if (option == "--upload-pairs" && arg + 1 < argc) upload_pairs = std::stoi(argv[++arg]);
@@ -1110,7 +1288,7 @@ int main(int argc, char ** argv)
             else if (option == "--model-layer" && arg + 1 < argc) model_layer = std::stoi(argv[++arg]);
             else if (option == "--model-tokens" && arg + 1 < argc) model_tokens = std::stoi(argv[++arg]);
             else if (option == "--model-exact") model_exact = true;
-            else throw std::runtime_error("Usage: GgmlOpsDsv41TpTest [--cuda 2..8] [--checkpoint-shape] [--diagnose] [--diagnostic-down-f32] [--failure-only [--without-gate-fence]|--fanout-pairs N|--staging-pairs N|--upload-pairs N|--gather-pairs N|--gate-fence-pairs N] | --cuda 1 --quant-strip-only | --cuda N --model-dir DIR [--model-layer L --model-tokens T|--gather-pairs N|--gate-fence-pairs N]");
+            else throw std::runtime_error("Usage: GgmlOpsDsv41TpTest [--cuda 2..8] [--checkpoint-shape] [--diagnose] [--diagnostic-down-f32] [--failure-only [--without-gate-fence]|--resident-failure-only|--fanout-pairs N|--staging-pairs N|--upload-pairs N|--gather-pairs N|--gate-fence-pairs N] | --cuda 1 --quant-strip-only | --cuda N --model-dir DIR [--model-layer L --model-tokens T|--gather-pairs N|--gate-fence-pairs N]");
         }
         if (cuda && !(cuda_ranks >= 2 && cuda_ranks <= 8) && !(strip_only && cuda_ranks == 1)) return 1;
         require(!strip_only || (cuda && !failure_only && !fanout_pairs && !staging_pairs && !upload_pairs), "Quantized strip test requires CUDA and an exclusive test mode");
@@ -1139,6 +1317,14 @@ int main(int argc, char ** argv)
         if (cuda) return 77;
 #endif
         const auto cpu = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+        if (resident_failure_only)
+        {
+            require(cuda && devices.size() >= 2 && !failure_only && !strip_only && !checkpoint_shape && !diagnostic &&
+                    !fanout_pairs && !staging_pairs && !upload_pairs && !gather_pairs && !gate_fence_pairs &&
+                    model_directory.empty(), "The device-resident failure test requires --cuda 2..8 and no other mode");
+            resident_scratch_failure(devices);
+            return 0;
+        }
         if (gather_pairs || gate_fence_pairs)
         {
             require(model_layer >= 0, "Gather comparison requires a nonnegative layer");
@@ -1181,6 +1367,7 @@ int main(int argc, char ** argv)
         try { tsg_dsv41_tp::split(256, 256, 2, 0); } catch (const std::exception &) { rejected = true; }
         require(rejected, "TP accepted empty rank strips");
         int checks = 0;
+        std::vector<std::string> failures;
         // The published Q2_K checkpoint stores routed gate/up in Q2_K and
         // down in Q3_K. Its nine down blocks must remain independently typed
         // and aligned when every rank receives a different hidden-width strip.
@@ -1236,6 +1423,38 @@ int main(int argc, char ** argv)
                     auto actual = evaluation(data, tokens, &tp, layer).run();
                     require(tp.error().empty(), tp.error().c_str());
                     for (float value : actual) require(std::isfinite(value), "TP produced nonfinite output");
+                    if (cuda && tp.device_resident())
+                    {
+                        // The production path: the node on a layer device's fused
+                        // backend, every rank enqueued behind its stream. Only the
+                        // transport differs from the host-driven run, so the result
+                        // must be bit-identical. Take the layer device from both
+                        // ends of the rank list to cross device orderings.
+                        for (auto * layer_device : {devices.front(), devices.back()})
+                        {
+                            const auto resident = evaluation(data, tokens, &tp, layer, nullptr, false, false,
+                                                             0, 0, false, layer_device).run();
+                            require(tp.error().empty(), tp.error().c_str());
+                            if (resident.size() != actual.size() ||
+                                std::memcmp(resident.data(), actual.data(), actual.size() * sizeof(float)) != 0)
+                                failures.push_back(std::string(ggml_type_name(type)) + "/" + ggml_type_name(down_type) +
+                                    " ranks=" + std::to_string(ranks) + " layer=" + std::to_string(layer) +
+                                    " tokens=" + std::to_string(tokens) + ": device-resident TP differs from host-driven TP");
+                            ++checks;
+                        }
+                        // The launch/shared-expert/gather split, against the
+                        // host-driven node plus the same shared tensor.
+                        const auto host_shared = evaluation(data, tokens, &tp, layer, nullptr, false, true).run();
+                        const auto split = evaluation(data, tokens, &tp, layer, nullptr, false, true,
+                                                      0, 0, false, devices.back(), true).run();
+                        require(tp.error().empty(), tp.error().c_str());
+                        if (split.size() != host_shared.size() ||
+                            std::memcmp(split.data(), host_shared.data(), split.size() * sizeof(float)) != 0)
+                            failures.push_back(std::string(ggml_type_name(type)) + "/" + ggml_type_name(down_type) +
+                                " ranks=" + std::to_string(ranks) + " layer=" + std::to_string(layer) +
+                                " tokens=" + std::to_string(tokens) + ": split launch/gather TP differs from host-driven TP");
+                        ++checks;
+                    }
                     const auto against_full = measure(expected[tokens], actual);
                     std::cout << ggml_type_name(type) << "/" << ggml_type_name(down_type) << " ranks=" << ranks << " layer=" << layer
                               << " tokens=" << tokens << " max_abs=" << against_full.max_abs << " rel_l2=" << against_full.rel_l2 << std::endl;
@@ -1263,15 +1482,19 @@ int main(int argc, char ** argv)
                               << "; partitioned versus full-weight: max_abs=" << oracle_shift.max_abs
                               << " rel_l2=" << oracle_shift.rel_l2 << ")" << std::endl;
                     // The strict full-weight comparison and its original
-                    // tolerances remain the pass criterion.
-                    require(against_full.max_abs < (type == GGML_TYPE_F32 ? 1e-7 : 2e-6),
-                            "TP output differs from the full-weight reference");
-                    require(against_full.rel_l2 < 1e-5,
-                            "TP relative error exceeds the full-weight reference tolerance");
+                    // tolerances remain the pass criterion. Record and carry on,
+                    // so one run reports every failing fixture and rank count.
+                    if (!within(against_full))
+                        failures.push_back(std::string(ggml_type_name(type)) + "/" + ggml_type_name(down_type) +
+                            " ranks=" + std::to_string(ranks) + " layer=" + std::to_string(layer) +
+                            " tokens=" + std::to_string(tokens) + ": TP differs from the full-weight reference (max_abs=" +
+                            std::to_string(against_full.max_abs) + " rel_l2=" + std::to_string(against_full.rel_l2) + ")");
                     ++checks;
                 }
             }
         }
+        for (const auto & failure : failures) std::cerr << "FAIL " << failure << '\n';
+        require(failures.empty(), "TP comparisons failed (listed above)");
         require(checks > 0, "No TP numerical comparisons executed");
         std::cout << "Passed " << checks << " true MoE tensor-parallel comparisons\n";
         return 0;

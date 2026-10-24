@@ -30,6 +30,71 @@ ggml_tensor * v41_rope(ggml_tensor * x, ggml_tensor * pos, int il, bool inverse 
     return ggml_concat(ctx, content, tail, 0);
 }
 
+// Shared-cache mirrors (TS_DSV41_KV_MIRRORS). A kv source writes its new
+// compressed and indexer rows into each mirror as well; those writes are
+// emitted just before the first layer the mirror's GPU builds, so they join
+// that GPU's split instead of cutting the source GPU's. Only the new rows cross
+// GPUs, and a reader's mirror holds the source's bytes.
+struct v41_mirror_write { ggml_tensor * dst; ggml_tensor * rows; ggml_tensor * idxs; int dev; };
+std::vector<v41_mirror_write> v41_mirror_pending;
+
+void v41_queue_mirror_writes(const dsv4_layer & L, const dsv4_slot_layer & C, ggml_tensor * index_rows,
+                             ggml_tensor * kv_rows, const plan_inputs * per_device)
+{
+    for (int d = 0; d < m.n_gpu; ++d)
+    {
+        if (!(L.mirror_devices >> d & 1) || !C.csa_k_mirror[d] || !per_device[d].write_idxs) continue;
+        v41_mirror_pending.push_back({ C.lid_k_mirror[d], index_rows, per_device[d].write_idxs, d });
+        v41_mirror_pending.push_back({ C.csa_k_mirror[d], kv_rows, per_device[d].write_idxs, d });
+    }
+}
+
+// dev < 0 emits every pending write.
+void v41_flush_mirror_writes(int dev)
+{
+    for (auto it = v41_mirror_pending.begin(); it != v41_mirror_pending.end();)
+    {
+        if (dev >= 0 && it->dev != dev) { ++it; continue; }
+        ggml_tensor * write = ggml_set_rows(ctx, it->dst, it->rows, it->idxs);
+        pin(write, it->dev);
+        ggml_build_forward_expand(gf, write);
+        it = v41_mirror_pending.erase(it);
+    }
+}
+
+// The compressed / indexer cache of `source` that a layer on `dev` reads.
+static ggml_tensor * v41_shared_csa(const dsv4_slot_layer & source, int dev)
+{
+    return dev >= 0 && dev <= MAX_GPUS && source.csa_k_mirror[dev] ? source.csa_k_mirror[dev] : source.csa_k;
+}
+static ggml_tensor * v41_shared_lid(const dsv4_slot_layer & source, int dev)
+{
+    return dev >= 0 && dev <= MAX_GPUS && source.lid_k_mirror[dev] ? source.lid_k_mirror[dev] : source.lid_k;
+}
+
+// Gathered-decode K: [raw_rows window rows | the top-k selected compressed
+// rows]. The compressed rows are gathered where the shared cache lives. When
+// that is another GPU, only those top-k rows cross over and are appended on the
+// consumer: assembling K on the source GPU instead moved the consumer's whole
+// raw ring there and the assembled K back, ~3 MiB per layer and token staged
+// through the host on a layer-split box without P2P. K's bytes are identical.
+ggml_tensor * v41_gathered_k(ggml_tensor * raw, int64_t raw_rows, ggml_tensor * shared_kv, ggml_tensor * top,
+                             int source_dev, int dev)
+{
+    const int64_t head = hp.n_embd_head;
+    if (source_dev == dev)
+        return fused_node(TSG_DSV4_FUSED_KGATHER, GGML_TYPE_F16, head, 1, raw_rows + hp.indexer_top_k, 1,
+            { raw, shared_kv, top }, dev, (int) raw_rows);
+    ggml_tensor * selected = fused_node(TSG_DSV4_FUSED_KGATHER, GGML_TYPE_F16, head, 1, hp.indexer_top_k, 1,
+        { shared_kv, shared_kv, top }, source_dev, 0);
+    // C.raw_k is [head, ring]; a compacted window is already [head, 1, rows].
+    if (raw->ne[1] != 1) raw = ggml_reshape_3d(ctx, raw, head, 1, raw->ne[1]);
+    GGML_ASSERT(raw->ne[2] == raw_rows);
+    ggml_tensor * k = ggml_concat(ctx, raw, selected, 2);
+    pin(k, dev);
+    return k;
+}
+
 ggml_tensor * build_engram(int il, ggml_tensor * x)
 {
     const auto & L = m.layers[il];
@@ -69,9 +134,10 @@ ggml_tensor * build_engram(int il, ggml_tensor * x)
     // Q2_K releases quantize the learned elementwise weights too. get_rows
     // converts the four small rows to F32 on the owning GPU.
     ggml_tensor * qw = ggml_get_rows(ctx, L.engram_q, res.inp.engram_rows);
-    ggml_tensor * kw = ggml_get_rows(ctx, L.engram_k, res.inp.engram_rows);
     ggml_tensor * q = ggml_mul(ctx, ggml_rms_norm(ctx, x, hp.rms_eps), qw);
-    key = ggml_mul(ctx, ggml_rms_norm(ctx, key, hp.rms_eps), kw);
+    key = ggml_rms_norm(ctx, key, hp.rms_eps);
+    // Without engram_k, engram_q already holds q_weight * k_weight.
+    if (L.engram_k) key = ggml_mul(ctx, key, ggml_get_rows(ctx, L.engram_k, res.inp.engram_rows));
     ggml_tensor * dot = ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, q, key)), 1.0f / sqrtf((float) dim));
     trace_v41(dot, il, "engram_dot");
     ggml_tensor * magnitude = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, dot), 1e-6f, INFINITY));
@@ -122,6 +188,80 @@ ggml_tensor * v41_compress(int il, ggml_tensor * cur, const plan_inputs & pi, co
     return latent;
 }
 
+// A kv source's own writes: the compressed and indexer cache rows its
+// attention input produces, plus their mirrors. YOCO runs this for every
+// position of the ubatch before the replay layers narrow to the kept tail.
+bool v41_skip_source_writes = false;
+
+void v41_source_writes(int il, ggml_tensor * cur)
+{
+    const auto & L = m.layers[il];
+    const auto & C = m.active_slot->layers[il];
+    const int dev = L.device, ratio = hp.compress_ratios[il];
+    const int64_t head = hp.n_embd_head;
+    const auto & pi = ratio == 2 ? res.inp.csa[dev] : res.inp.hca[dev];
+    const auto & plan = ratio == 2 ? res.plan_csa : res.plan_hca;
+    ggml_tensor * latent = v41_compress(il, cur, pi, plan);
+    if (!latent) return;
+    trace_v41(latent, il, "latent");
+    const int64_t n = latent->ne[1];
+    ggml_tensor * ik = rms(ggml_mul_mat(ctx, L.indexer_k, latent), L.indexer_k_norm);
+    ik = v41_quant(v41_rope(ggml_reshape_3d(ctx, ik, hp.indexer_head_size, 1, n), pi.write_pos, il), 1, dev);
+    ggml_tensor * index_rows = ggml_reshape_2d(ctx, ik, hp.indexer_head_size, n);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.lid_k, index_rows, pi.write_idxs));
+    latent = v41_quant(v41_rope(ggml_reshape_3d(ctx, latent, head, 1, n), pi.write_pos, il), 2, dev);
+    ggml_tensor * kv_rows = ggml_reshape_2d(ctx, latent, head, n);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.csa_k, kv_rows, pi.write_idxs));
+    v41_queue_mirror_writes(L, C, index_rows, kv_rows, ratio == 2 ? res.inp.csa : res.inp.hca);
+}
+
+// YOCO: the last `kept` positions of a tensor whose outermost token axis has nt.
+ggml_tensor * yoco_tail(ggml_tensor * t, int64_t kept)
+{
+    int axis = 3;
+    while (axis > 0 && t->ne[axis] != nt) --axis;
+    if (t->ne[axis] != nt) throw std::runtime_error("V4.1 YOCO: tensor has no token axis");
+    int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+    ne[axis] = kept;
+    return ggml_view_4d(ctx, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3],
+        (size_t) (nt - kept) * t->nb[axis]);
+}
+
+// YOCO: from here on the graph covers only the ubatch's last `kept` tokens.
+// Every per-token input becomes its tail; the window mask becomes the replay's.
+// The host still fills the full-width input tensors, which the tails view, so
+// yoco_restore() puts them back in res.inp once the graph is built.
+graph_inputs yoco_saved_inputs;
+bool yoco_narrowed = false;
+
+void yoco_narrow(int64_t kept)
+{
+    graph_inputs & inp = res.inp;
+    yoco_saved_inputs = inp;
+    yoco_narrowed = true;
+    const int64_t skip = nt - kept;
+    auto tail_1d = [&](ggml_tensor * t) { return t ? ggml_view_1d(ctx, t, kept, (size_t) skip * t->nb[0]) : t; };
+    for (int d = 0; d <= m.n_gpu; d++)
+    {
+        inp.pos[d] = tail_1d(inp.pos[d]);
+        inp.tokens[d] = tail_1d(inp.tokens[d]);
+        inp.raw_idxs[d] = tail_1d(inp.raw_idxs[d]);
+        if (inp.raw_mask_yoco[d]) inp.raw_mask[d] = inp.raw_mask_yoco[d];
+        for (plan_inputs * pi : { &inp.csa[d], &inp.hca[d], &inp.lid[d] })
+            if (pi->kq_mask)
+                pi->kq_mask = ggml_view_2d(ctx, pi->kq_mask, pi->kq_mask->ne[0], kept, pi->kq_mask->nb[1],
+                    (size_t) skip * pi->kq_mask->nb[1]);
+    }
+    p0 += skip;
+    nt = kept;
+}
+
+void yoco_restore()
+{
+    if (yoco_narrowed) res.inp = yoco_saved_inputs;
+    yoco_narrowed = false;
+}
+
 ggml_tensor * build_attention_v41(int il, ggml_tensor * cur, ggml_tensor * pos)
 {
     const auto & L = m.layers[il];
@@ -145,20 +285,7 @@ ggml_tensor * build_attention_v41(int il, ggml_tensor * cur, ggml_tensor * pos)
         const auto & source = m.active_slot->layers[L.kv_source];
         const auto & pi = ratio == 2 ? res.inp.csa[dev] : res.inp.hca[dev];
         const auto & plan = ratio == 2 ? res.plan_csa : res.plan_hca;
-        if (L.kv_source == il)
-        {
-            ggml_tensor * latent = v41_compress(il, cur, pi, plan);
-            if (latent)
-            {
-                trace_v41(latent, il, "latent");
-                const int64_t n = latent->ne[1];
-                ggml_tensor * ik = rms(ggml_mul_mat(ctx, L.indexer_k, latent), L.indexer_k_norm);
-                ik = v41_quant(v41_rope(ggml_reshape_3d(ctx, ik, hp.indexer_head_size, 1, n), pi.write_pos, il), 1, dev);
-                ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.lid_k, ggml_reshape_2d(ctx, ik, hp.indexer_head_size, n), pi.write_idxs));
-                latent = v41_quant(v41_rope(ggml_reshape_3d(ctx, latent, head, 1, n), pi.write_pos, il), 2, dev);
-                ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.csa_k, ggml_reshape_2d(ctx, latent, head, n), pi.write_idxs));
-            }
-        }
+        if (L.kv_source == il && !v41_skip_source_writes) v41_source_writes(il, cur);
         if (L.index_source == il && plan.n_kv <= hp.indexer_top_k)
         {
             // Every reachable compressed row is selected. Keep producing K
@@ -172,7 +299,8 @@ ggml_tensor * build_attention_v41(int il, ggml_tensor * cur, ggml_tensor * pos)
             iq = v41_quant(v41_rope(iq, pos, il), 1, dev);
             ggml_tensor * iw = ggml_scale(ctx, ggml_mul_mat(ctx, L.indexer_proj, cur),
                 1.0f / sqrtf((float) (hp.indexer_head_size * hp.indexer_n_head)));
-            ggml_tensor * ik = ggml_view_2d(ctx, source.lid_k, hp.indexer_head_size, plan.n_kv, source.lid_k->nb[1], 0);
+            ggml_tensor * shared_lid = v41_shared_lid(source, dev);
+            ggml_tensor * ik = ggml_view_2d(ctx, shared_lid, hp.indexer_head_size, plan.n_kv, shared_lid->nb[1], 0);
             ik = ggml_reshape_3d(ctx, ik, hp.indexer_head_size, 1, plan.n_kv);
             ggml_tensor * imask = pi.kq_mask;
             if (v41_candidates && il > hp.candidate_source)
@@ -220,15 +348,15 @@ ggml_tensor * build_attention_v41(int il, ggml_tensor * cur, ggml_tensor * pos)
                     head, 1, raw_rows, 1,
                     { C.raw_k, C.raw_k, res.inp.raw_read_idxs[dev] }, dev, 0);
             }
-            k = fused_node(TSG_DSV4_FUSED_KGATHER, GGML_TYPE_F16,
-                head, 1, raw_rows + hp.indexer_top_k, 1,
-                { raw, source.csa_k, v41_shared_top }, source_dev, (int) raw_rows);
+            const bool local = v41_shared_csa(source, dev) != source.csa_k;
+            k = v41_gathered_k(raw, raw_rows, v41_shared_csa(source, dev), v41_shared_top, local ? dev : source_dev, dev);
             mask = res.inp.gather_mask[dev];
         }
         else
         {
             if (!v41_shared_mask) throw std::runtime_error("V4.1 index source has not published its selection");
-            ggml_tensor * compressed = ggml_view_2d(ctx, source.csa_k, head, plan.n_kv, source.csa_k->nb[1], 0);
+            ggml_tensor * shared_csa = v41_shared_csa(source, dev);
+            ggml_tensor * compressed = ggml_view_2d(ctx, shared_csa, head, plan.n_kv, shared_csa->nb[1], 0);
             compressed = ggml_reshape_3d(ctx, compressed, head, 1, plan.n_kv);
             k = ggml_concat(ctx, k, compressed, 2);
             mask = ggml_concat(ctx, mask, v41_shared_mask, 0);
@@ -368,11 +496,12 @@ ggml_tensor * build_attention_v41_batched(int il, ggml_tensor * cur, ggml_tensor
                     const int64_t n = latent->ne[1];
                     ggml_tensor * ik = rms(ggml_mul_mat(ctx, L.indexer_k, latent), L.indexer_k_norm);
                     ik = v41_quant(v41_rope(ggml_reshape_3d(ctx, ik, hp.indexer_head_size, 1, n), pi.write_pos, il), 1, dev);
-                    ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.lid_k,
-                        ggml_reshape_2d(ctx, ik, hp.indexer_head_size, n), pi.write_idxs));
+                    ggml_tensor * index_rows = ggml_reshape_2d(ctx, ik, hp.indexer_head_size, n);
+                    ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.lid_k, index_rows, pi.write_idxs));
                     ggml_tensor * ck = v41_quant(v41_rope(ggml_reshape_3d(ctx, latent, head, 1, n), pi.write_pos, il), 2, dev);
-                    ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.csa_k,
-                        ggml_reshape_2d(ctx, ck, head, n), pi.write_idxs));
+                    ggml_tensor * kv_rows = ggml_reshape_2d(ctx, ck, head, n);
+                    ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.csa_k, kv_rows, pi.write_idxs));
+                    v41_queue_mirror_writes(L, C, index_rows, kv_rows, ratio == 1 ? B.v41_hca : B.v41_csa);
                 }
             }
 
@@ -386,7 +515,8 @@ ggml_tensor * build_attention_v41_batched(int il, ggml_tensor * cur, ggml_tensor
                 ggml_tensor * iq = ggml_view_3d(ctx, iq_all, hp.indexer_head_size, hp.indexer_n_head, 1,
                     iq_all->nb[1], iq_all->nb[2], i * iq_all->nb[2]);
                 ggml_tensor * iw = ggml_view_2d(ctx, iw_all, iw_all->ne[0], 1, iw_all->nb[1], i * iw_all->nb[1]);
-                ggml_tensor * ik = ggml_view_2d(ctx, source.lid_k, hp.indexer_head_size, plan.n_kv, source.lid_k->nb[1], 0);
+                ggml_tensor * shared_lid = v41_shared_lid(source, dev);
+                ggml_tensor * ik = ggml_view_2d(ctx, shared_lid, hp.indexer_head_size, plan.n_kv, shared_lid->nb[1], 0);
                 ik = ggml_reshape_3d(ctx, ik, hp.indexer_head_size, 1, plan.n_kv);
                 ggml_tensor * imask = pi.kq_mask;
                 if (v41_bd_candidates[i] && il > hp.candidate_source)
@@ -420,15 +550,16 @@ ggml_tensor * build_attention_v41_batched(int il, ggml_tensor * cur, ggml_tensor
                         head, 1, raw_rows, 1,
                         { C.raw_k, C.raw_k, B.raw_read_idxs[dev] }, dev, 0);
                 }
-                k = fused_node(TSG_DSV4_FUSED_KGATHER, GGML_TYPE_F16,
-                    head, 1, raw_rows + hp.indexer_top_k, 1,
-                    { raw, source.csa_k, v41_bd_shared_top[i] }, source_dev, (int) raw_rows);
+                const bool local = v41_shared_csa(source, dev) != source.csa_k;
+                k = v41_gathered_k(raw, raw_rows, v41_shared_csa(source, dev), v41_bd_shared_top[i],
+                    local ? dev : source_dev, dev);
                 mask = B.gather_mask[dev];
             }
             else
             {
                 if (!v41_bd_shared_mask[i]) throw std::runtime_error("V4.1 index source has not published its selection");
-                ggml_tensor * compressed = ggml_view_2d(ctx, source.csa_k, head, plan.n_kv, source.csa_k->nb[1], 0);
+                ggml_tensor * shared_csa = v41_shared_csa(source, dev);
+                ggml_tensor * compressed = ggml_view_2d(ctx, shared_csa, head, plan.n_kv, shared_csa->nb[1], 0);
                 compressed = ggml_reshape_3d(ctx, compressed, head, 1, plan.n_kv);
                 k = ggml_concat(ctx, k, compressed, 2);
                 mask = ggml_concat(ctx, mask, v41_bd_shared_mask[i], 0);

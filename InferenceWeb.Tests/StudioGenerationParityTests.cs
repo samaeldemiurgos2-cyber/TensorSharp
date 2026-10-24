@@ -136,8 +136,15 @@ public sealed class StudioGenerationParityTests : IDisposable
         typeof(T).GetField($"<{property}>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(model, value);
         return model;
     }
-    static MiniMaxH3Model H3(MiniMaxH3Partition partition) =>
-        WithProperty((MiniMaxH3Model)RuntimeHelpers.GetUninitializedObject(typeof(MiniMaxH3Model)), nameof(MiniMaxH3Model.Partition), partition);
+    static MiniMaxH3Model H3(MiniMaxH3Partition partition)
+    {
+        var model = WithProperty((MiniMaxH3Model)RuntimeHelpers.GetUninitializedObject(typeof(MiniMaxH3Model)), nameof(MiniMaxH3Model.Partition), partition);
+        typeof(MiniMaxH3Model).GetField("_firstLastDitPath", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(model, partition == MiniMaxH3Partition.FirstLastFrame ? "metadata-only-fl2va.gguf" : null);
+        typeof(MiniMaxH3Model).GetField("_referenceDitPath", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(model, partition == MiniMaxH3Partition.Reference ? "metadata-only-ref2va.gguf" : null);
+        return model;
+    }
     static WanVideoModel Wan(WanVariant variant, int inputChannels) => WithProperty(
         WithProperty((WanVideoModel)RuntimeHelpers.GetUninitializedObject(typeof(WanVideoModel)), nameof(WanVideoModel.Variant), variant),
         nameof(WanVideoModel.InputChannels), inputChannels);

@@ -3,9 +3,11 @@
   // Native text and image conditioning, eight-step AV sampling and video/audio decoding.
   // Accepts first/last images and multiple timed image guides (imageConditions).
   // Ordered referenceImages are temporal guides, evenly spaced first to last.
-  // videoMode=ref instead uses identity/appearance references when the optional
-  // Ingredients adapter is installed beside the model in loras/, or selected
-  // through TS_LTX25_INGREDIENTS_LORA. Its trained preview is 768x448x121.
+  // videoMode=ref instead uses identity/appearance references through the optional
+  // Ingredients IC-LoRA below. The adapter is gated by Lightricks; accept its terms
+  // and configure HF_TOKEN (or the Hugging Face token file) to download it. If access
+  // is unavailable, the preset continues without reference mode. Its trained preview
+  // is 768x448x121.
 
   // Five verified assets, 43,077,008,276 bytes in total, pinned by commit and SHA-256, all
   // from unsloth/LTX-2.5-GGUF, which is not gated: no Hugging Face token is needed. The
@@ -41,7 +43,18 @@
   "model": {
     "path": "${ltxRoot}/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf",
     "urls": [ "${hf}/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf" ],
-    "sha256": "55442750eb0013d94fffaa4dadb577c5f4dc07107ec04389d41444f6e517d980"
+    "sha256": "55442750eb0013d94fffaa4dadb577c5f4dc07107ec04389d41444f6e517d980",
+    "files": [
+      {
+        // The official Ingredients IC-LoRA is a gated companion. Config expansion
+        // downloads it before model loading when Hugging Face access is approved;
+        // a denied/unavailable optional download leaves ordinary LTX generation usable.
+        "path": "${ltxRoot}/loras/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors",
+        "urls": [ "${hf}/Lightricks/LTX-2.5-22b-IC-LoRA-Ingredients/resolve/12040e4091ac2008d3906a594e31a7fb1ab9d546/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors" ],
+        "sha256": "ff873a5beada3c579a8137c7c53343916f78bcc9a529ba910143073fe8715e95",
+        "optional": true
+      }
+    ]
   },
 
   "video-text-encoder": {

@@ -301,7 +301,14 @@ namespace TensorSharp.Models.WanVideo
         // Wan is video-only and takes at most a first-frame image; the reference-conditioning
         // and joint-audio paths belong to other families (MiniMax-H3).
         string IVideoGenerationModel.VideoModelFamily => "wan";
+        bool IVideoGenerationModel.SupportsTextToVideo => !RequiresImage;
         int IVideoGenerationModel.DefaultPreviewFrames => 21;
+        int IVideoGenerationModel.FrameCountMultiple => 4;
+        int IVideoGenerationModel.FrameCountOffset => 1;
+        int IVideoGenerationModel.DefaultPreviewFps => Variant == WanVariant.TI2V ? 24 : 16;
+        int IVideoGenerationModel.DefaultOutputWidth => Variant == WanVariant.TI2V ? 1280 : 832;
+        int IVideoGenerationModel.DefaultOutputHeight => Variant == WanVariant.TI2V ? 704 : 480;
+        int IVideoGenerationModel.ResolutionMultiple => Variant == WanVariant.TI2V ? 32 : 16;
         bool IVideoGenerationModel.SupportsAudio => false;
         // A T2V-only checkpoint refuses an image, so it must not invite one (chat would offer a photo that fails).
         bool IVideoGenerationModel.SupportsImageConditioning => SupportsImage;

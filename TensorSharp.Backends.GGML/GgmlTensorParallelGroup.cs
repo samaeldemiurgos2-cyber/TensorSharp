@@ -161,17 +161,38 @@ namespace TensorSharp.GGML
         /// is — on the CPU for small payloads, staged through the device
         /// collective for large ones.
         /// </summary>
-        public void AllReduce(Tensor[] tensors)
+        public void AllReduce(Tensor[] tensors) => AllReduceCore(tensors, requireFloat32: false);
+
+        /// <summary>
+        /// Sum F32 partials without lossy wire compression, including large
+        /// prefill payloads. Uses the host sum when an exact device transport
+        /// is unavailable.
+        /// </summary>
+        public void AllReduceFloat32(Tensor[] tensors) => AllReduceCore(tensors, requireFloat32: true);
+
+        private void AllReduceCore(Tensor[] tensors, bool requireFloat32)
         {
             if (!IsActive) return;
             if (tensors == null || tensors.Length != Degree)
                 throw new ArgumentException($"Expected {Degree} tensors, got {tensors?.Length ?? 0}.");
 
-            long count = tensors[0].Storage.ElementCount;
-            for (int r = 1; r < Degree; r++)
+            if (tensors[0] == null)
+                throw new ArgumentException("AllReduce requires a tensor on every rank.", nameof(tensors));
+            long count = tensors[0].ElementCount();
+            for (int r = 0; r < Degree; r++)
             {
-                if (tensors[r].Storage.ElementCount != count)
+                Tensor tensor = tensors[r];
+                if (tensor == null)
+                    throw new ArgumentException("AllReduce requires a tensor on every rank.", nameof(tensors));
+                if (tensor.ElementType != DType.Float32)
+                    throw new NotSupportedException("GGML tensor-parallel AllReduce requires Float32 tensors.");
+                if (!tensor.IsContiguous())
+                    throw new ArgumentException("AllReduce requires contiguous tensor views.", nameof(tensors));
+                if (tensor.ElementCount() != count)
                     throw new ArgumentException("AllReduce requires identically sized tensors on every rank.");
+                if (tensor.StorageOffset < 0 || tensor.StorageOffset > tensor.Storage.ElementCount ||
+                    count < 0 || count > tensor.Storage.ElementCount - tensor.StorageOffset)
+                    throw new ArgumentException("AllReduce tensor view extends outside its storage.", nameof(tensors));
             }
             if (count <= 0) return;
 
@@ -183,13 +204,13 @@ namespace TensorSharp.GGML
                 float** ptrs = stackalloc float*[Degree];
                 for (int r = 0; r < Degree; r++)
                 {
-                    if (tensors[r].ElementType != DType.Float32)
-                        throw new NotSupportedException("GGML tensor-parallel AllReduce requires Float32 tensors.");
                     ptrs[r] = (float*)tensors[r].Storage.PtrAtElement(tensors[r].StorageOffset);
                 }
 
                 if (count >= DeviceAllReduceThreshold && _context.HasDeviceAllReduce &&
-                    GgmlNative.TensorParallelAllReduceDevice(ptrs, Degree, count))
+                    (requireFloat32
+                        ? GgmlNative.TensorParallelAllReduceDeviceF32(ptrs, Degree, count)
+                        : GgmlNative.TensorParallelAllReduceDevice(ptrs, Degree, count)))
                 {
                     return;
                 }

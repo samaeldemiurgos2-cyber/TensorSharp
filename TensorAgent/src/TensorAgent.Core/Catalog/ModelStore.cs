@@ -50,16 +50,12 @@ public readonly record struct ModelDownloadProgress(
 /// beside its model, a VAE beside its DiT) works unchanged.
 ///
 /// <para>
-/// A file that two entries list is stored once. The MiniMax-H3 keyframes and references
-/// entries share 24.0 GB of companions -- the text encoder, the video and audio VAEs and
-/// the tokenizer files -- and differ only in an 11.4 GB denoiser, so fetching every file
-/// of every entry into its own folder cost 70.9 GB for the pair. A download that finds a
-/// file already complete under another entry links it from there instead (see
-/// <see cref="TryLinkSharedCopy"/>): 46.8 GB for both, and the second install fetches only
-/// its denoiser. Each entry still has every file in its own folder under its own name,
-/// which is what keeps companion discovery, <see cref="Delete"/> and the orphan sweep as
-/// they were: removing a folder removes that entry's names, and the bytes stay on disk for
-/// as long as another entry names them.
+/// A file that two entries list is stored once. The unified MiniMax-H3 entry contains both
+/// 11.4 GB denoisers plus their 24.0 GB of shared companions -- the text encoder, video and
+/// audio VAEs and tokenizer files -- for about 46.8 GB total. The denoisers are alternate
+/// generation weights, so the model keeps only the active one resident. Each entry has every
+/// file in its own folder under its own name, which is what keeps companion discovery,
+/// <see cref="Delete"/> and the orphan sweep consistent.
 /// </para>
 /// </summary>
 public sealed class ModelStore

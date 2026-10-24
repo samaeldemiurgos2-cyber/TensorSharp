@@ -4,15 +4,13 @@
 
   // ---- Navigation model (single source of truth, bilingual) ----
   var NAV = [
-    { group: { en: "Introduction", zh: "简介" }, items: [
+    { group: { en: "Start", zh: "开始" }, items: [
       { page: "index",    label: { en: "Home", zh: "首页" } },
-      { page: "overview", label: { en: "Overview & Architecture", zh: "概览与架构" } },
-      { page: "features", label: { en: "Features", zh: "功能特性" } },
-      { page: "book",     label: { en: "TensorSharp Books", zh: "TensorSharp 配套图书" } },
-    ]},
-    { group: { en: "Get started", zh: "快速上手" }, items: [
       { page: "getting-started", label: { en: "Getting Started", zh: "快速开始" } },
-      { page: "backends", label: { en: "Compute Backends", zh: "计算后端" } },
+      { page: "features", label: { en: "Features", zh: "功能特性" } },
+    ]},
+    { group: { en: "Choose", zh: "选择" }, items: [
+      { page: "backends", label: { en: "Choose a Backend", zh: "选择计算后端" } },
       { page: "models",   label: { en: "Supported Models", zh: "支持的模型" }, children: [
         { page: "models-downloads", label: { en: "Model Downloads", zh: "模型下载" } },
         { page: "embeddings", label: { en: "Embedding Models", zh: "嵌入模型" } },
@@ -21,25 +19,25 @@
         { page: "models-video",     label: { en: "Video Generation", zh: "视频生成" } },
       ]},
     ]},
-    { group: { en: "Run it", zh: "运行" }, items: [
+    { group: { en: "Use", zh: "使用" }, items: [
       { page: "tensoragent", label: { en: "TensorAgent Desktop", zh: "TensorAgent 桌面版" } },
-      { page: "knowledge", label: { en: "Personal Knowledge Bases", zh: "个人知识库" } },
       { page: "cli",    label: { en: "Command Line (CLI)", zh: "命令行 (CLI)" } },
       { page: "server", label: { en: "Server & Web UI", zh: "服务器与 Web UI" } },
-      { page: "agentic", label: { en: "Agentic Work", zh: "智能体工作流" } },
-    ]},
-    { group: { en: "Integrate", zh: "集成" }, items: [
       { page: "http-api", label: { en: "HTTP API (Ollama / OpenAI)", zh: "HTTP API (Ollama / OpenAI)" } },
       { page: "code-api", label: { en: "C# Library / Code", zh: "C# 库 / 代码" } },
+      { page: "knowledge", label: { en: "Personal Knowledge Bases", zh: "个人知识库" } },
+      { page: "agentic", label: { en: "Agentic Work", zh: "智能体工作流" } },
     ]},
-    { group: { en: "Deep dive", zh: "深入了解" }, items: [
+    { group: { en: "Understand & operate", zh: "理解与运维" }, items: [
+      { page: "overview", label: { en: "Overview & Architecture", zh: "概览与架构" }, children: [
+        { page: "architecture-reference", label: { en: "Architecture Reference", zh: "架构参考" } },
+      ]},
       { page: "advanced",    label: { en: "Advanced Features", zh: "高级功能" } },
       { page: "distributed", label: { en: "Multi-GPU & Multi-Node", zh: "多 GPU 与多节点" } },
       { page: "benchmarks",  label: { en: "Benchmarks & Testing", zh: "基准测试" } },
-    ]},
-    { group: { en: "Reference", zh: "参考" }, items: [
       { page: "api-reference", label: { en: "API Reference", zh: "API 参考" } },
       { page: "glossary",      label: { en: "Glossary & FAQ", zh: "术语表与 FAQ" } },
+      { page: "book",     label: { en: "TensorSharp Books", zh: "TensorSharp 配套图书" } },
     ]},
   ];
 
@@ -207,11 +205,24 @@
     var links = toc.querySelectorAll("a[data-target]");
     var spy = function () {
       var current = null;
-      heads.forEach(function (h) { if (h.getBoundingClientRect().top <= 120) current = h.id; });
+      heads.forEach(function (h) { if (h.getClientRects().length && h.getBoundingClientRect().top <= 120) current = h.id; });
       links.forEach(function (l) { l.classList.toggle("active", l.dataset.target === current); });
     };
     window.addEventListener("scroll", spy, { passive: true });
     spy();
+  }
+
+  // Keep links into collapsed reference sections usable, including old bookmarks.
+  function revealFragment() {
+    var id;
+    try { id = decodeURIComponent(location.hash.slice(1)); } catch (e) { return; }
+    var target = id && document.getElementById(id);
+    if (!target) return;
+    var opened = false;
+    for (var node = target; node; node = node.parentElement) {
+      if (node.tagName === "DETAILS" && !node.open) { node.open = true; opened = true; }
+    }
+    if (opened) window.requestAnimationFrame(function () { target.scrollIntoView({ block: "start" }); });
   }
 
   // ---- Copy buttons + language labels on code blocks ----
@@ -341,5 +352,11 @@
     enhanceCode();
     buildSearch();
     globalKeys();
+    revealFragment();
+    window.addEventListener("hashchange", revealFragment);
+    document.addEventListener("click", function (e) {
+      var link = e.target.closest("a[href^='#']");
+      if (link) window.requestAnimationFrame(revealFragment);
+    });
   });
 })();

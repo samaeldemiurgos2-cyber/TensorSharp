@@ -157,7 +157,7 @@ public sealed partial class PrefixCacheContractConformanceTests
             // The managed fixture's environment (DeepSeekNativeRetentionFixtureTests); retention is always on.
             ["TS_DSV41_RETAINED_CACHE_MB"] = "2048", ["MAX_CONTEXT"] = "512",
             ["TS_DSV4_UBATCH"] = "3", ["TS_DSV4_THREADS"] = "2", ["TS_DSV41_ENGRAM_THREADS"] = "2",
-            ["TS_DSV4_FA"] = "0",
+            ["TS_DSV4_FA"] = "0", ["TS_DSV41_YOCO_KEEP"] = "0",
         });
         string path = TestGates.FindGguf(Environment.GetEnvironmentVariable(EnvDsv41FixtureDir), Dsv41Fixture);
         Assert.True(path != null, "the gate admitted the fixture but the loader found none");

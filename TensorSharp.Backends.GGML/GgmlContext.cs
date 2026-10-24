@@ -15,6 +15,20 @@ namespace TensorSharp.GGML
     public sealed class GgmlContext
     {
         internal GgmlMemoryPool MemoryPool { get; }
+        private readonly bool _collectivesEnabled;
+
+        /// <summary>
+        /// Opt this CUDA TP context into a bounded host scratch pool: eight
+        /// reusable blocks per rank, at most 128 blocks of 8 MiB. Allocation is
+        /// lazy. Single-device and sequential layer-placement contexts retain
+        /// their original policy.
+        /// </summary>
+        public bool ConfigureTensorParallelHostPool() =>
+            _collectivesEnabled && BackendType == GgmlBackendType.Cuda &&
+            MemoryPool.ConfigureCudaTensorParallel(Degree);
+
+        /// <summary>Snapshot host-pool counters without device synchronization.</summary>
+        public GgmlMemoryPoolStatistics GetHostPoolStatistics() => MemoryPool.GetStatistics();
 
         /// <summary>
         /// Return every pooled-but-unused host block to the operating system and report
@@ -53,6 +67,7 @@ namespace TensorSharp.GGML
             DeviceIds = (int[])deviceIds.Clone();
             DeviceId = deviceIds[0];
             BackendType = backendType;
+            _collectivesEnabled = enableCollectives && deviceIds.Length > 1;
             MemoryPool = new GgmlMemoryPool(backendType);
             MemoryPool.EnsureInitialBlocks();
             GgmlNative.EnsureAvailable(backendType);

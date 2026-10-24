@@ -22,8 +22,7 @@
   "catalog.license.qwenImage": "Licencia de investigación Qwen (no comercial); codificador de texto Apache-2.0",
   "catalog.model.minimaxH3.parameters": "DiT de audio y vídeo de 33 mil millones (20 mil millones tras podar sus ramas AdaLN) + codificador de texto Qwen3-VL-32B",
   "catalog.model.minimaxH3.quantization": "Q4_K (DiT) / Q4_K_M (codificador de texto)",
-  "catalog.model.minimaxH3Fl2va.notes": "Crea un vídeo corto con su propia banda sonora a partir de una descripción, anima una foto adjunta o conecta dos fotos como primer y último fotograma. Necesita 32 GB de memoria RAM. La licencia de MiniMax no cubre el uso en la UE, el Reino Unido, Corea del Sur ni Estados Unidos.",
-  "catalog.model.minimaxH3Ref2va.notes": "Crea un vídeo corto con su propia banda sonora que incluye las personas, objetos, lugares o sonidos de hasta nueve fotos, vídeos y grabaciones adjuntos. Indica quién o qué aparece: la referencia aporta su aspecto y la descripción lo sitúa en la escena. Necesita 32 GB de memoria RAM. La licencia de MiniMax no cubre el uso en la UE, el Reino Unido, Corea del Sur ni Estados Unidos.",
+  "catalog.model.minimaxH3.notes": "Crea un vídeo corto con su propia banda sonora a partir de una descripción, anima una foto adjunta, conecta una foto inicial y otra final o incluye personas, objetos, lugares o sonidos de hasta nueve fotos, vídeos y grabaciones adjuntos. Elige en Video Studio el modo de primer y último fotograma o el modo de referencias. Necesita 32 GB de memoria RAM. La licencia de MiniMax no cubre el uso en la UE, el Reino Unido, Corea del Sur ni Estados Unidos.",
   "catalog.license.minimaxH3": "Licencia comunitaria MiniMax H3",
   "catalog.lora.viggleTurbo.purpose": "Imágenes y ediciones en 6 pasos en vez de 40, con una calidad cercana a la del modelo completo.",
   "catalog.license.qwenResearch": "Licencia de investigación Qwen (no comercial)",
@@ -67,6 +66,6 @@
   "catalog.extended.744b40b.parameters": "744B (40B activos)",
   "catalog.extended.384experts.parameters": "MoE, 384 expertos enrutados",
   "catalog.extended.14bExpert.parameters": "14B por experto",
-  "catalog.model.ltx25.notes": "Generación experimental de texto/imagen a vídeo con audio estéreo de 48 kHz. LTX 2.5 Distilled usa 8 pasos Euler ancestral a la mitad del tamaño, un escalado latente x2 y 3 pasos de refinado con CFG 1 y admite primer/último fotograma y varias imágenes clave con posición e intensidad. Las imágenes guían la secuencia; las referencias de identidad y los adaptadores de vídeo/audio necesitan otros checkpoints. Descargas fijadas: 43,08 GB de un repositorio de acceso libre; no hace falta cuenta de Hugging Face. Nivel conservador de 48 GB; validado con clips cortos de 1024×1024.",
-  "catalog.license.ltx25": "Condiciones de LTX-2.5 y Gemma"
+  "catalog.model.ltx25.notes": "Generación experimental de texto/imagen a vídeo con audio estéreo de 48 kHz. LTX 2.5 Distilled usa 8 pasos Euler ancestral a la mitad del tamaño, un escalado latente x2 y 3 pasos de refinado con CFG 1; admite primer/último fotograma y varias imágenes clave con posición e intensidad. Las imágenes guían la secuencia. El IC-LoRA Ingredients opcional (1,31 GB) añade referencias de identidad; requiere aprobación de Hugging Face y un token. Los cinco archivos base sin restricciones suman 43,08 GB. Nivel conservador de 48 GB; validado con clips cortos de 1024×1024.",
+  "catalog.license.ltx25": "Condiciones de LTX-2.5, Ingredients IC-LoRA y Gemma"
 }

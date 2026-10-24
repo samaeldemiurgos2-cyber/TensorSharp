@@ -8,7 +8,9 @@ import { fileURLToPath } from 'node:url';
 
 const source = readFileSync(fileURLToPath(new URL('../../../TensorSharp.Chat/WebUi/studio.js', import.meta.url)), 'utf8');
 function simulatedDocument() {
-  const document = { readyState: 'loading', addEventListener: () => {}, activeElement: null };
+  const document = { readyState: 'loading', activeElement: null, listeners: {},
+    addEventListener(event, handler) { (this.listeners[event] ||= []).push(handler); },
+    dispatch(event, properties = {}) { for (const handler of this.listeners[event] || []) handler({ target: this, ...properties }); } };
   class Element {
     constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.listeners = {}; this.attributes = {}; this.dataset = {}; this.style = {}; this.className = ''; this.textContent = ''; this.inert = false; }
     append(...nodes) { for (const node of nodes) { node.parentNode = this; this.children.push(node); } }
@@ -43,7 +45,7 @@ function harness() {
     }
   });
   // Expose private helpers only in this VM, leaving the production public API small.
-  const instrumented = source.replace('  function renderProject() {', '  function renderProject() { if (window.__skipRender) return;').replace('  window.TensorSharpStudio = Object.freeze', '  window.__test = { S, ui, api, change, receiveProject, localMediaUrl, frames, seconds, snapped, renderAllowed, history, response, boundedMessages, restoreAssistantHistory, deleteAsset, confirmAssetDeletion, renderLibrary, generationForm, keydown, removeTrack, renderTimeline, jobsPanel, jobsTabText, renderInspector, renderGuide, continueFrom, placeAfter, chainPlacement, properties, useReference, extractFrame, shotRequest, shotProblem, shotText, newShotForm };\n  window.TensorSharpStudio = Object.freeze');
+  const instrumented = source.replace('  function renderProject() {', '  function renderProject() { if (window.__skipRender) return;').replace('  window.TensorSharpStudio = Object.freeze', '  window.__test = { S, ui, api, change, receiveProject, localMediaUrl, frames, seconds, snapped, renderAllowed, history, response, boundedMessages, restoreAssistantHistory, deleteAsset, confirmAssetDeletion, renderLibrary, generationForm, keydown, removeTrack, renderTimeline, jobsPanel, jobsTabText, renderInspector, renderGuide, continueFrom, placeAfter, chainPlacement, properties, useReference, extractFrame, shotRequest, shotProblem, shotText, newShotForm, build, background, refreshCapabilities };\n  window.TensorSharpStudio = Object.freeze');
   vm.runInContext(instrumented, context, { filename: 'studio.js' });
   const api = context.window.__test;
   api.ui.save = { textContent: '' }; api.ui.status = { textContent: '', dataset: {} };
@@ -111,6 +113,11 @@ function generationHarness(previous = null, overrides = {}, effectiveParameters 
     const tile = view().querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === assetId);
     assert.ok(tile, 'picker tile for ' + assetId); await tile.click();
   };
+  const pickReference = async assetId => {
+    const add = named('+ Add reference photo'); assert.ok(add, 'Reference photo capacity is available.'); await add.click();
+    const tile = view().querySelector('.ts-picker').querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === assetId);
+    assert.ok(tile, 'reference picker tile for ' + assetId); await tile.click();
+  };
   const clear = async name => { await slot(name).querySelectorAll('button').find(b => b.textContent === 'Remove').click(); };
   const use = value => { const radio = view().querySelectorAll('input').find(i => i.type === 'radio' && i.value === value); assert.ok(radio, 'use ' + value); radio.checked = true; radio.dispatch('change'); };
   const radios = () => view().querySelectorAll('input').filter(i => i.type === 'radio').map(i => ({ value: i.value, disabled: !!i.disabled }));
@@ -118,7 +125,7 @@ function generationHarness(previous = null, overrides = {}, effectiveParameters 
   const text = node => [node.textContent, ...node.children.flatMap(text)].filter(Boolean);
   const submit = async () => { handlers.push(response({ id: 'job' }), response([])); await generate().click(); return h.calls.find(c => c.body && c.body.action === 'jobs/generate')?.body.payload; };
   const describe = value => { field('Describe this shot').value = value; field('Describe this shot').dispatch('input'); };
-  return { ...h, get body() { return view(); }, view, field, audio, named, generate, reset, slot, slotButton, pick, clear, use, radios, hints, text, submit, describe };
+  return { ...h, get body() { return view(); }, view, field, audio, named, generate, reset, slot, slotButton, pick, pickReference, clear, use, radios, hints, text, submit, describe };
 }
 
 test('a new Studio take submits the host quality defaults without reducing them to timeline or preview size', async () => {
@@ -388,13 +395,16 @@ const REF2VA = { modes: ['t2v', 'ref'], imageConditioning: false, lastFrameCondi
   referenceMinFrames: 121, defaultFrameCount: 17, unavailableModes: { i2v: 'Needs the FL2VA checkpoint.', fl2v: 'Needs the FL2VA checkpoint.' } };
 
 test('a reference checkpoint opens on reference photos and sends them in the order they were chosen, never as frames', async () => {
-  const { api, view, use, describe, field, hints, submit } = generationHarness(null, REF2VA);
+  const { api, view, use, describe, field, hints, submit, pickReference, named } = generationHarness(null, REF2VA);
   const body = { querySelectorAll: selector => view().querySelectorAll(selector) };
   assert.equal(Number(field('Length').value), 121, 'Reference use raises the length to the model minimum.');
   assert.ok(hints().includes('Length raised to 5.0 s: this model needs at least that for reference photos.'), hints().join(' | '));
-  const tile = id => body.querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === id);
-  await tile('cat').click(); await tile('banner').click();
-  assert.equal(tile('cat').attributes['aria-pressed'], 'true');
+  assert.equal(body.querySelectorAll('.ts-picker-tile').length, 0, 'Library choices appear only while the reference picker is open.');
+  await pickReference('cat'); await pickReference('banner');
+  await named('+ Add reference photo').click();
+  assert.equal(body.querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === 'cat').attributes['aria-current'], 'true');
+  await named('Cancel').click();
+  assert.equal(body.querySelectorAll('.ts-picker-tile').length, 0, 'Closing the picker leaves only selected references.');
   assert.ok(hints().includes('Order sent to the model: 1. cat.png · 2. banner_1.png'));
   describe('The person from Picture 1 holds the cat from Picture 2 in a garden.');
   const request = await submit();
@@ -403,10 +413,10 @@ test('a reference checkpoint opens on reference photos and sends them in the ord
   api.S.tab = 'generate'; api.renderInspector(); use('frames'); assert.ok(body.querySelectorAll('.ts-slot').every(s => s.dataset.state === 'disabled'), 'Ref2VA pins no frames and says why.');
 });
 
-test('reference use requires at least one reference photo', async () => {
+test('reference use requires at least one reference image or video', async () => {
   const { api, describe, generate, calls } = generationHarness(null, REF2VA);
   describe('A new scene.'); await generate().click();
-  assert.equal(calls.length, 0); assert.equal(api.ui.status.textContent, 'Select at least one reference image.');
+  assert.equal(calls.length, 0); assert.equal(api.ui.status.textContent, 'Select at least one reference image or video.');
 });
 
 test('a reference take reopens on reference photos with its references in their saved order', async () => {
@@ -943,6 +953,243 @@ function chainHarness(overrides = {}, previous = null) {
   return { ...g, extracted, form, extractCalls, generateCalls, card, labelled, jobCards, refs };
 }
 
+// Install the page's real inspector event handlers; the ordinary form harness intentionally renders only its contents.
+function inspectorInteractionHarness() {
+  const g = chainHarness({ ...INGREDIENTS, referencesWithFirstFrame: false, referenceVideos: true, maxReferenceVideos: 1 });
+  const storage = new Map();
+  g.context.window.localStorage = { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) };
+  g.context.window.__skipRender = true; g.api.build(); g.api.S.root.hidden = false; g.api.renderInspector();
+  const stored = () => JSON.parse(storage.get('tensorsharp.studio.shot.' + g.project.id));
+  const capabilitiesChanged = async () => {
+    const model = g.api.S.capabilities.models[0];
+    g.handlers.push(response({ models: [{ ...model, displayName: model.displayName + ' refreshed' }] }));
+    await g.api.background(() => g.api.refreshCapabilities());
+  };
+  return { ...g, stored, capabilitiesChanged };
+}
+
+for (const media of ['photo', 'video']) test('a background capability redraw preserves the pressed reference ' + media + ' Remove button until its click captures and saves the removal', async () => {
+  const g = inspectorInteractionHarness(); g.use('ref');
+  if (media === 'photo') await g.pickReference('cat');
+  else await g.labelled(g.card('shot.mp4'), 'Use full video as reference: shot.mp4').click();
+  const label = media === 'photo' ? 'Remove reference photo (cat.png)' : 'Remove video reference (shot.mp4)';
+  const selected = media === 'photo' ? 'refs' : 'videoRefs';
+  const remove = g.named(label), prompt = g.field('Describe this shot');
+  prompt.focus(); prompt.value = 'Keep the draft while removing this reference.'; g.field('Seed (−1 = random)').value = '37';
+  // A real pointer focuses the button before capability/job replies can arrive; capture has not run yet.
+  g.api.ui.inspector.dispatch('pointerdown', { target: remove }); remove.focus();
+  g.api.ui.inspector.dispatch('focusout', { target: prompt, relatedTarget: remove });
+  assert.equal(g.api.S.inspectorPressed, true);
+  await g.capabilitiesChanged();
+  await new Promise(resolve => setTimeout(resolve, 0)); // the focusout flush must also wait while the pointer is held
+  assert.equal(remove.isConnected, true, 'Replacing the pressed node would make the browser discard its click.');
+  assert.equal(g.named(label), remove); assert.equal(g.api.S.inspectorDirty, true);
+  assert.equal(g.field('Describe this shot'), prompt); assert.equal(prompt.value, 'Keep the draft while removing this reference.');
+  g.document.dispatch('pointerup', { target: remove });
+  assert.equal(g.api.S.inspectorPressed, false);
+  await remove.click(); await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(g.named(label), undefined); assert.deepEqual([...g.form()[selected]], []); assert.deepEqual(g.stored()[selected], []);
+  assert.equal(g.field('Describe this shot').value, 'Keep the draft while removing this reference.');
+  assert.equal(g.stored().prompt, 'Keep the draft while removing this reference.'); assert.equal(g.stored().seed, 37);
+  assert.equal(g.api.S.inspectorDirty, false, 'The released pointer flushes the deferred redraw after Remove captures the draft.');
+  if (media === 'photo') { assert.ok(g.named('+ Add reference photo')); assert.equal(g.view().querySelectorAll('.ts-picker-tile').length, 0, 'The removed image must not remain below the selected references.'); }
+  else assert.ok(g.named('+ Add full video reference'), 'Removing the video frees its replacement slot.');
+});
+
+test('a deferred inspector redraw keeps an active text field until focus leaves editing, then flushes once', async () => {
+  const g = inspectorInteractionHarness(), prompt = g.field('Describe this shot');
+  prompt.focus(); prompt.value = 'Typing survives the background update.'; prompt.dispatch('input');
+  await g.capabilitiesChanged();
+  assert.equal(g.api.S.inspectorDirty, true); assert.equal(g.field('Describe this shot'), prompt); assert.equal(g.document.activeElement, prompt);
+  g.api.ui.inspector.dispatch('focusout', { target: prompt });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(g.field('Describe this shot'), prompt); assert.equal(g.api.S.inspectorDirty, true, 'A queued flush must re-check whether a field is still being edited.');
+  const seed = g.field('Seed (−1 = random)'); seed.focus();
+  g.api.ui.inspector.dispatch('focusout', { target: prompt, relatedTarget: seed });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(g.field('Describe this shot'), prompt, 'Moving between editable fields must keep the current form.');
+  const generate = g.generate(); generate.focus();
+  g.api.ui.inspector.dispatch('focusout', { target: seed, relatedTarget: generate });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.notEqual(g.field('Describe this shot'), prompt); assert.equal(g.api.S.inspectorDirty, false);
+  assert.equal(g.field('Describe this shot').value, 'Typing survives the background update.'); assert.equal(g.stored().prompt, 'Typing survives the background update.');
+});
+
+test('selected reference photos have Remove controls, close their order gaps, and make room for replacements without losing the form', async () => {
+  const g = chainHarness({ ...REF2VA, maxReferences: 2 });
+  g.project.assets.push({ id: 'dog', kind: 'image', name: 'dog.png', width: 1024, height: 1024 }); g.api.renderInspector();
+  const selectedNames = () => g.view().querySelector('.ts-ref-list').querySelectorAll('.ts-picker-name').map(n => n.textContent);
+  await g.pickReference('cat'); await g.pickReference('banner');
+  assert.deepEqual(selectedNames(), ['cat.png, picture 1', 'banner_1.png, picture 2']);
+  const removedThumbnail = g.view().querySelector('.ts-ref-list').querySelectorAll('img')[0].src;
+  assert.equal(g.named('+ Add reference photo'), undefined, 'The two selected photos fill the model allowance.');
+  // Capture fields as part of Remove, including a value whose input event has not fired yet.
+  g.field('Describe this shot').value = 'A dog joins the person from Picture 1.';
+  g.field('Seed (−1 = random)').value = '29'; g.field('Width').value = '768'; g.field('Height').value = '512';
+  await g.named('Remove reference photo (cat.png)').click();
+  assert.deepEqual([...g.form().refs], ['banner']); assert.deepEqual(selectedNames(), ['banner_1.png, picture 1']);
+  assert.equal(g.named('Remove reference photo (cat.png)'), undefined); assert.equal(g.view().querySelectorAll('.ts-picker-tile').length, 0);
+  assert.ok(!g.view().querySelectorAll('img').some(img => img.src === removedThumbnail), 'The removed photo thumbnail disappears from Generate until the picker is opened.');
+  assert.ok(g.project.assets.some(a => a.id === 'cat'), 'The photo remains available in the asset library.');
+  assert.equal(g.document.activeElement.dataset.focusKey, 'ref-banner-remove');
+  await g.pickReference('dog');
+  assert.deepEqual(selectedNames(), ['banner_1.png, picture 1', 'dog.png, picture 2']);
+  assert.equal(g.field('Describe this shot').value, 'A dog joins the person from Picture 1.');
+  assert.equal(Number(g.field('Seed (−1 = random)').value), 29); assert.equal(Number(g.field('Width').value), 768); assert.equal(Number(g.field('Height').value), 512);
+  const request = await g.submit();
+  assert.deepEqual(request.referenceAssetIds, ['banner', 'dog']); assert.equal(request.prompt, 'A dog joins the person from Picture 1.');
+  assert.equal(request.seed, 29); assert.equal(request.width, 768); assert.equal(request.height, 512);
+});
+
+test('a library full-video reference can be removed and replaced in Generate while its independent first frame and saved form survive', async () => {
+  const g = chainHarness({ ...INGREDIENTS, referencesWithFirstFrame: false, referenceVideos: true, maxReferenceVideos: 1 });
+  g.api.S.capabilities.externalProcesses = true;
+  g.project.assets.push({ id: 'other-shot', kind: 'video', name: 'other.mp4', durationSeconds: 3, width: 1024, height: 576 });
+  await g.pick('first', 'banner'); g.describe('The person walks into a new scene.');
+  g.field('Seed (−1 = random)').value = '31'; g.field('Seed (−1 = random)').dispatch('input');
+  await g.labelled(g.card('shot.mp4'), 'Use full video as reference: shot.mp4').click();
+  assert.equal(g.form().use, 'ref'); assert.deepEqual([...g.form().videoRefs], ['shot']);
+  assert.ok(g.named('Remove video reference (shot.mp4)'), 'The full video selected from the library is shown in the reference view.');
+  const removedThumbnail = g.view().querySelector('.ts-ref-list').querySelectorAll('img')[0].src;
+  assert.equal(g.named('+ Add full video reference'), undefined, 'The selected video fills this model’s video reference capacity.');
+  await g.pickReference('cat');
+  await g.named('Remove video reference (shot.mp4)').click();
+  assert.deepEqual([...g.form().videoRefs], []); assert.deepEqual([...g.form().refs], ['cat']); assert.equal(g.form().first, 'banner');
+  assert.equal(g.named('Remove video reference (shot.mp4)'), undefined); assert.equal(g.document.activeElement.dataset.focusKey, 'refs-video-add');
+  assert.ok(!g.view().querySelectorAll('img').some(img => img.src === removedThumbnail), 'The removed video thumbnail disappears from Generate until the picker is opened.');
+  assert.ok(g.project.assets.some(a => a.id === 'shot'), 'The video remains available in the asset library.');
+  await g.named('+ Add full video reference').click();
+  const picker = g.view().querySelector('.ts-picker');
+  assert.ok(picker.querySelectorAll('.ts-picker-tile').some(t => t.dataset.assetId === 'cat'), 'The shared picker still offers photos.');
+  await picker.querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === 'other-shot').click();
+  assert.deepEqual([...g.form().videoRefs], ['other-shot']); assert.equal(g.api.S.picker, null); assert.equal(g.extractCalls().length, 0);
+  // The same selection survives redraws, switching the Generate use, and leaving and returning to the tab.
+  g.api.renderInspector(); g.use('frames');
+  assert.equal(g.slot('first').dataset.state, 'filled'); assert.ok(g.named('Remove video reference (other.mp4)'));
+  g.use('ref'); g.api.S.tab = 'clip'; g.api.renderInspector(); g.api.S.tab = 'generate'; g.api.renderInspector();
+  assert.ok(g.named('Remove video reference (other.mp4)')); assert.equal(g.named('Remove video reference (shot.mp4)'), undefined);
+  assert.equal(g.field('Describe this shot').value, 'The person walks into a new scene.'); assert.equal(Number(g.field('Seed (−1 = random)').value), 31);
+  const request = await g.submit();
+  assert.deepEqual(request.referenceVideoAssetIds, ['other-shot']); assert.deepEqual(request.referenceAssetIds, ['cat']);
+  assert.equal(request.conditioningAssetId, null, 'This model’s reference view does not send the independent frame.');
+  assert.equal(g.form().first, 'banner'); assert.equal(g.extractCalls().length, 0); assert.equal(request.seed, 31);
+});
+
+test('removing a selected reference closes the open picker and clears the prior generation refusal', async () => {
+  const g = chainHarness({ ...INGREDIENTS, referencesWithFirstFrame: false, referenceVideos: true, maxReferenceVideos: 2 });
+  await g.labelled(g.card('shot.mp4'), 'Use full video as reference: shot.mp4').click();
+  g.describe('A new scene with this character.');
+  const refusal = 'The selected video reference is unavailable.';
+  g.handlers.push(response({ code: 'reference_media_rejected', message: refusal }, 400));
+  await g.generate().click();
+  assert.equal(g.form().refusal.message, refusal);
+  await g.named('Remove video reference (shot.mp4)').click();
+  assert.equal(g.form().refusal, null); assert.ok(!g.text(g.view()).includes(refusal));
+  await g.named('+ Add full video reference').click();
+  await g.view().querySelector('.ts-picker').querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === 'shot').click();
+  await g.named('+ Add full video reference').click();
+  assert.ok(g.api.S.picker); assert.ok(g.view().querySelector('.ts-picker'));
+  g.field('Describe this shot').value = 'A new scene with this character.';
+  await g.named('Remove video reference (shot.mp4)').click();
+  assert.equal(g.api.S.picker, null); assert.equal(g.view().querySelector('.ts-picker'), null);
+  assert.equal(g.field('Describe this shot').value, 'A new scene with this character.');
+});
+
+test('a kept video reference stays removable after the model loses video support or its reference capacity becomes zero', async () => {
+  for (const referenceVideos of [false, true]) {
+    const g = chainHarness({ ...INGREDIENTS, referencesWithFirstFrame: false, referenceVideos: true, maxReferenceVideos: 1 });
+    await g.labelled(g.card('shot.mp4'), 'Use full video as reference: shot.mp4').click();
+    Object.assign(g.api.S.capabilities.models[0], { referenceVideos, maxReferenceVideos: 0 }); g.api.renderInspector();
+    assert.ok(g.named('Remove video reference (shot.mp4)'), 'A capability change must leave the selected video visible and removable.');
+    assert.equal(g.named('+ Add full video reference'), undefined);
+    await g.named('Remove video reference (shot.mp4)').click();
+    assert.deepEqual([...g.form().videoRefs], []); assert.equal(g.document.activeElement.dataset.focusKey, 'refs-section');
+    g.api.renderInspector(); assert.equal(g.named('Remove video reference (shot.mp4)'), undefined);
+  }
+});
+
+test('a selected photo remains removable at zero photo capacity and returns focus to the reference section', async () => {
+  const g = chainHarness({ ...INGREDIENTS, referencesWithFirstFrame: false, referenceVideos: true, maxReferences: 1, maxReferenceVideos: 1 });
+  g.use('ref');
+  await g.pickReference('cat');
+  g.api.S.capabilities.models[0].maxReferences = 0; g.api.renderInspector();
+  assert.ok(g.named('Remove reference photo (cat.png)')); assert.ok(g.named('+ Add full video reference'));
+  await g.named('Remove reference photo (cat.png)').click();
+  assert.deepEqual([...g.form().refs], []); assert.equal(g.named('Remove reference photo (cat.png)'), undefined);
+  assert.equal(g.named('+ Add reference photo'), undefined); assert.equal(g.view().querySelectorAll('.ts-picker-tile').length, 0);
+  assert.equal(g.document.activeElement.dataset.focusKey, 'refs-section', 'With no photo allowance, focus returns to the section heading.');
+});
+
+test('photo and full-video reference limits leave the other media kind selectable and removal releases only its own capacity', async () => {
+  const g = chainHarness({ ...INGREDIENTS, referencesWithFirstFrame: false, referenceVideos: true, maxReferences: 1, maxReferenceVideos: 1 });
+  g.project.assets.push({ id: 'other-shot', kind: 'video', name: 'other.mp4', durationSeconds: 3 }); g.use('ref');
+  const tile = (parent, id) => parent.querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === id);
+  const picker = () => g.view().querySelector('.ts-picker');
+  await g.pickReference('cat');
+  assert.equal(g.named('+ Add reference photo'), undefined, 'A full photo allowance does not offer another photo slot.');
+  assert.ok(g.named('Remove reference photo (cat.png)'), 'The selected photo remains removable at capacity.');
+  await g.named('+ Add full video reference').click();
+  assert.equal(tile(picker(), 'banner').disabled, true); assert.equal(picker().querySelector('.ts-picker-import').disabled, true);
+  assert.equal(tile(picker(), 'cat').attributes['aria-current'], 'true');
+  assert.equal(tile(picker(), 'shot').disabled, false, 'A full photo allowance leaves the video allowance available.');
+  await g.named('Cancel').click(); assert.equal(g.document.activeElement.dataset.focusKey, 'refs-video-add');
+  await g.named('+ Add full video reference').click();
+  // This harness invokes even disabled controls, exercising a stale picker callback's model-limit guard too.
+  await tile(picker(), 'banner').click();
+  assert.deepEqual([...g.form().refs], ['cat']); assert.equal(g.api.ui.status.textContent, 'This model accepts at most 1 reference images.');
+  await tile(picker(), 'shot').click();
+  await g.named('Remove reference photo (cat.png)').click();
+  assert.ok(g.named('+ Add reference photo')); assert.equal(g.view().querySelectorAll('.ts-picker-tile').length, 0);
+  assert.deepEqual([...g.form().videoRefs], ['shot']);
+  g.use('frames'); await g.named('+ Add reference photo').click();
+  assert.equal(tile(picker(), 'other-shot').disabled, true, 'A full video allowance cannot be bypassed through the photo picker.');
+  assert.equal(tile(picker(), 'banner').disabled, false, 'A full video allowance leaves the photo allowance available.');
+  await tile(picker(), 'banner').click();
+  assert.deepEqual([...g.form().refs], ['banner']); assert.deepEqual([...g.form().videoRefs], ['shot']);
+  await g.named('Remove video reference (shot.mp4)').click();
+  await g.named('+ Add full video reference').click();
+  assert.equal(tile(picker(), 'cat').disabled, true); assert.equal(tile(picker(), 'other-shot').disabled, false);
+  await tile(picker(), 'other-shot').click();
+  assert.deepEqual([...g.form().refs], ['banner']); assert.deepEqual([...g.form().videoRefs], ['other-shot']);
+});
+
+test('removing and replacing a full-video reference preserves the separately shown pending first frame from the original video', async () => {
+  const g = chainHarness({ ...INGREDIENTS, referenceVideos: true, maxReferenceVideos: 1 });
+  g.project.assets.push({ id: 'other-shot', kind: 'video', name: 'other.mp4', durationSeconds: 3 });
+  await g.labelled(g.card('shot.mp4'), 'Use full video as reference: shot.mp4').click();
+  assert.deepEqual(plain(g.form().firstFrom), { assetId: 'shot', frame: -1 }); assert.equal(g.slot('first').dataset.state, 'pending');
+  await g.named('Remove video reference (shot.mp4)').click();
+  assert.deepEqual([...g.form().videoRefs], []); assert.deepEqual(plain(g.form().firstFrom), { assetId: 'shot', frame: -1 });
+  assert.equal(g.slot('first').dataset.state, 'pending');
+  await g.named('+ Add full video reference').click();
+  await g.view().querySelector('.ts-picker').querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === 'other-shot').click();
+  assert.deepEqual([...g.form().videoRefs], ['other-shot']); assert.deepEqual(plain(g.form().firstFrom), { assetId: 'shot', frame: -1 });
+  assert.equal(g.slot('first').dataset.state, 'pending'); assert.equal(g.extractCalls().length, 0);
+});
+
+test('the full-video picker uses the selected video model and its reference limit when another available model comes first', async () => {
+  const g = chainHarness();
+  const first = g.api.S.capabilities.models[0];
+  Object.assign(first, { referenceVideos: false, maxReferenceVideos: 8 });
+  g.api.S.capabilities.models.push({ ...first, ...INGREDIENTS, modelId: 'selected-video-model', referencesWithFirstFrame: false,
+    referenceVideos: true, maxReferenceVideos: 1 });
+  g.project.assets.push({ id: 'other-shot', kind: 'video', name: 'other.mp4', durationSeconds: 3 }); g.api.renderInspector();
+  g.field('Video model').value = 'selected-video-model'; g.field('Video model').dispatch('change');
+  g.use('ref'); g.describe('A new scene with the selected model.');
+  await g.named('+ Add full video reference').click();
+  const tiles = g.view().querySelector('.ts-picker').querySelectorAll('.ts-picker-tile');
+  const staleOtherTile = tiles.find(t => t.dataset.assetId === 'other-shot');
+  await tiles.find(t => t.dataset.assetId === 'shot').click();
+  assert.deepEqual([...g.form().videoRefs], ['shot']); assert.ok(g.named('Remove video reference (shot.mp4)'));
+  assert.equal(g.form().modelId, 'selected-video-model'); assert.equal(g.named('+ Add full video reference'), undefined);
+  // A callback from the previous picker must still honor the currently selected model’s smaller allowance.
+  await staleOtherTile.click();
+  assert.deepEqual([...g.form().videoRefs], ['shot']); assert.equal(g.api.ui.status.textContent, 'This model accepts at most 1 full video reference(s).');
+  const request = await g.submit();
+  assert.equal(request.modelId, 'selected-video-model'); assert.deepEqual(request.referenceVideoAssetIds, ['shot']);
+  assert.equal(g.extractCalls().length, 0);
+});
+
 test('a library video continues in one tap: its last frame starts the next take, which keeps the description, the character and the video’s size', async () => {
   const g = chainHarness(INGREDIENTS);
   g.project.assets.push({ id: 'lost', kind: 'video', name: 'lost.mp4', durationSeconds: 2, missing: true });
@@ -1128,9 +1375,8 @@ test('on a model that cannot keep a character while starting on a frame, the ref
 
 test('the reference view shows a first frame only for a model that keeps both, and never sends a frame it does not show', async () => {
   const g = chainHarness(INGREDIENTS); g.use('ref');
-  const refTile = (h, id) => h.view().querySelector('.ts-refs').querySelectorAll('.ts-picker-tile').find(t => t.dataset.assetId === id);
   assert.ok(g.slot('first'), 'Ingredients can start on a frame while keeping a character.'); assert.equal(g.slot('last'), undefined);
-  await g.pick('first', 'banner'); await refTile(g, 'cat').click(); g.describe('She walks on.');
+  await g.pick('first', 'banner'); await g.pickReference('cat'); g.describe('She walks on.');
   assert.ok(g.text(g.view()).some(l => l.startsWith('Starts on banner_1.png · Uses 1 reference photo(s) · ')), g.text(g.view()).join(' | '));
   const request = await g.submit();
   assert.equal(request.mode, 'ref'); assert.equal(request.conditioningAssetId, 'banner'); assert.deepEqual(request.referenceAssetIds, ['cat']);
@@ -1138,7 +1384,7 @@ test('the reference view shows a first frame only for a model that keeps both, a
   const other = chainHarness({ ...INGREDIENTS, referencesWithFirstFrame: false, referencesWithFirstFrameUnavailableReason: 'LTX cannot pin a first frame on this host.' });
   await other.pick('first', 'banner'); other.use('ref');
   assert.equal(other.view().querySelectorAll('.ts-slot').length, 0, 'No first-frame slot where the model cannot keep both.');
-  await refTile(other, 'cat').click(); other.describe('She walks on.');
+  await other.pickReference('cat'); other.describe('She walks on.');
   assert.ok(other.text(other.view()).some(l => l.startsWith('Uses 1 reference photo(s) · ')), 'The summary says what is sent.');
   const sent = await other.submit();
   assert.equal(sent.mode, 'ref'); assert.equal(sent.conditioningAssetId, null); assert.deepEqual(sent.referenceAssetIds, ['cat']);

@@ -15,110 +15,202 @@
 <a class="skip" href="#content">Skip to content</a>
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index.html">Home</a> › Getting Started</div>
-  <h1>Getting Started</h1>
-  <p class="lede">From a source checkout to a verified CLI reply or local API. The quick start runs Gemma 4 E4B on a native GGML backend; a managed CPU path (no CMake or GPU toolchain) remains available when you cannot build native code.</p>
-  <div class="callout tip"><div class="ic">💻</div><p><strong>Want the desktop app?</strong> Follow the <a href="tensoragent.html">TensorAgent Desktop download and user guide</a> for macOS and Windows installers, model setup, chat, files and optional code/browser tools. Distribution packages include the app runtime, so you can install without building this repository.</p></div>
-  <div class="callout note"><div class="ic">📘</div><p><strong>Following the Gemma 4 E4B path?</strong> <em>From Tensors to Tokens</em> turns this quick start into a guided, from-scratch explanation of the engine behind every step. <a href="book.html">Explore the TensorSharp book →</a></p></div>
+<h1 id="getting-started">Getting started</h1>
 
-  <p class="page-foot-note"><strong>Release versions:</strong> downloaded packages reflect their release tag. Releases before the updated desktop packaging workflow may contain only CLI/server archives and lack newer features. Choose a release with the required assets, or build this checkout.</p>
+<p class="lede">Get one text reply first: choose an interface and platform → install → download one model → send a prompt → check the result. Add images, video, multiple GPUs or skills after that path works.</p>
 
-  <h2 id="prerequisites">1 · Prerequisites</h2>
-  <h3 id="install-dotnet">Install the .NET 10 SDK</h3>
-  <p>TensorSharp targets <code>net10.0</code>, so a source build requires the full <strong>.NET 10 SDK</strong>—installing only the .NET Runtime or ASP.NET Core Runtime is not enough. The SDK includes the runtimes needed to run the CLI and server. Start with Microsoft's <a href="https://learn.microsoft.com/en-us/dotnet/core/install/" target="_blank" rel="noopener">cross-platform .NET installation guide</a>, then use the instructions for your operating system:</p>
-  <div class="table-scroll">
-  <table>
-    <thead><tr><th>Platform</th><th>Install the SDK</th><th>Official instructions</th></tr></thead>
-    <tbody>
-      <tr><td><strong>Windows</strong></td><td>Open PowerShell or Command Prompt and run <code>winget install Microsoft.DotNet.SDK.10</code>.</td><td><a href="https://learn.microsoft.com/en-us/dotnet/core/install/windows" target="_blank" rel="noopener">Install .NET on Windows</a></td></tr>
-      <tr><td><strong>macOS</strong></td><td>Download the .NET 10 SDK installer for your processor: <strong>Arm64</strong> for Apple Silicon or <strong>x64</strong> for an Intel Mac.</td><td><a href="https://learn.microsoft.com/en-us/dotnet/core/install/macos" target="_blank" rel="noopener">Install .NET on macOS</a></td></tr>
-      <tr><td><strong>Linux</strong></td><td>Follow the page for your distribution, configure its package feed if directed, and install <code>dotnet-sdk-10.0</code>. On Ubuntu, after completing the repository setup for your release: <code>sudo apt-get update</code>, then <code>sudo apt-get install -y dotnet-sdk-10.0</code>.</td><td><a href="https://learn.microsoft.com/en-us/dotnet/core/install/linux" target="_blank" rel="noopener">Choose a Linux distribution</a> (for example, <a href="https://learn.microsoft.com/en-us/dotnet/core/install/linux-ubuntu-install" target="_blank" rel="noopener">Ubuntu</a>)</td></tr>
-    </tbody>
-  </table>
-  </div>
-  <p>Open a new terminal after installation and confirm that a <code>10.0.x</code> SDK is listed:</p>
-  <pre data-lang="bash"><code>dotnet --list-sdks</code></pre>
-  <h3>Other prerequisites</h3>
-  <ul>
-    <li><strong><code>git</code>, <code>curl</code>, and network access</strong> — used to clone TensorSharp and download a model. A full native build also clones <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a> into <code>ExternalProjects/ggml/</code>; set <code>TENSORSHARP_GGML_NO_UPDATE=1</code> to skip later network updates.</li>
-    <li><strong>A GGUF model file</strong> — e.g. from <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>. See <a href="models-downloads.html#downloads">Model downloads</a>.</li>
-  </ul>
-  <h4>Per-platform toolchains (only for GPU acceleration)</h4>
-  <div class="table-scroll">
-  <table>
-    <thead><tr><th>Platform</th><th>Needed for</th><th>Install</th></tr></thead>
-    <tbody>
-      <tr><td><strong>macOS</strong> (Metal)</td><td><code>ggml_metal</code> / <code>mlx</code></td><td>CMake 3.20+ and Xcode command-line tools. MLX additionally builds <code>libmlxc</code>.</td></tr>
-      <tr><td><strong>Windows</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+, Visual Studio 2022 C++ build tools, NVIDIA driver + CUDA Toolkit 12.x (with cuBLAS).</td></tr>
-      <tr><td><strong>Linux</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+, NVIDIA driver + CUDA Toolkit 12.x (with cuBLAS).</td></tr>
-      <tr><td><strong>Linux ARM64 + NVIDIA GB10</strong> (DGX Spark, experimental)</td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CUDA 13. Build inside the <code>eng/Dockerfile.gb10</code> container on a native Linux ARM64 Docker builder (no GPU needed to compile), or use the <code>linux-arm64-cuda13-GB10</code> release archives, which need only a compatible NVIDIA driver. See <a href="backends.html#binaries">platform binaries</a>.</td></tr>
-      <tr><td><strong>Windows / Linux</strong> (any Vulkan GPU)</td><td><code>ggml_vulkan</code></td><td>Enabled automatically when the machine has a Vulkan runtime (loader installed); opt out with <code>--no-vulkan</code> (or <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF</code>). Windows auto-provisions a portable Vulkan toolchain when no SDK is installed; on Linux install e.g. <code>libvulkan-dev glslc spirv-headers</code>. Needs a Vulkan 1.3 driver at run time.</td></tr>
-      <tr><td>Any (CPU only)</td><td><code>cpu</code></td><td>Nothing beyond the .NET SDK. <code>ggml_cpu</code> is faster but is a native build.</td></tr>
-    </tbody>
-  </table>
-  </div>
+<span id="when-to-try-tensorsharp"></span><h2 id="choose">1 · Choose your interface</h2>
 
-  <h2 id="build">2 · Clone and choose a build path</h2>
-  <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
+<div class="table-scroll"><table>
+<thead><tr><th scope="col">Your goal</th><th scope="col">Start here</th></tr></thead>
+<tbody>
+<tr><td>Install and chat</td><td><a href="tensoragent.html">Desktop install and first chat</a>. Mac/Windows packages include their runtime; skip the source-build steps below.</td></tr>
+<tr><td>Use a terminal, browser or compatible HTTP client</td><td>Continue with the CLI/server source path below; both use the same GGUF text model.</td></tr>
+<tr><td>Embed the engine in C#</td><td>Get one text run working, then read <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/DEVELOPMENT.md#project--nuget-package-boundaries">package boundaries and integration</a>.</td></tr>
+</tbody></table></div>
+
+<p>Desktop path: choose the Mac Apple Silicon DMG or Windows x64 MSI on the release page, install and open it, then <strong>☰ → Models → Download → Use</strong> and send a message. PKG/ZIP alternatives exist; Windows may need WebView2. The built-in catalog starts at 12 GB system RAM and downloads weights separately. Older releases may lack desktop assets; <a href="tensoragent.html">Desktop install and first chat</a> covers package verification and limits.</p>
+
+<p>The CLI/server also have <a href="https://github.com/zhongkaifu/TensorSharp/releases">self-contained release archives</a> for Windows/Linux x64 CPU/CUDA and macOS arm64. Packages reflect their own tag, not every current-source feature. The commands below build source; they do not validate downloaded release archives.</p>
+
+<span id="install-and-first-run"></span><h2 id="prerequisites">2 · Install and match your platform</h2>
+
+<h3 id="install-dotnet">Source builds need the .NET 10 SDK</h3>
+
+<div class="table-scroll"><table>
+<thead><tr><th scope="col">Platform</th><th scope="col">Install and check</th></tr></thead>
+<tbody>
+<tr><td>Windows</td><td>PowerShell: <code>winget install Microsoft.DotNet.SDK.10</code>.</td></tr>
+<tr><td>macOS</td><td>Install the .NET 10 SDK from <a href="https://learn.microsoft.com/en-us/dotnet/core/install/macos">Microsoft</a>: Arm64 for Apple Silicon, x64 for Intel.</td></tr>
+<tr><td>Linux</td><td>Follow the <a href="https://learn.microsoft.com/en-us/dotnet/core/install/linux">distribution instructions</a>, configure its package feed and install the .NET 10 SDK (commonly <code>dotnet-sdk-10.0</code>).</td></tr>
+</tbody></table></div>
+
+<p>Install the full SDK; the .NET Runtime alone cannot build this source. Open a new terminal and confirm a <code>10.0.x</code> SDK is listed:</p>
+
+<pre data-lang="bash"><code>dotnet --list-sdks</code></pre>
+
+<span id="pick-a-backend"></span><h3 id="e4b-fast-lane">Choose the backend for this machine</h3>
+
+<div class="table-scroll"><table>
+<thead><tr><th scope="col">Machine</th><th scope="col">Value to use below</th><th scope="col">Native source-build prerequisites</th></tr></thead>
+<tbody>
+<tr><td>Apple Silicon Mac</td><td><code>ggml_metal</code></td><td>Git, curl, CMake 3.20+ and Xcode command-line tools.</td></tr>
+<tr><td>Windows / Linux + NVIDIA</td><td><code>ggml_cuda</code></td><td>CMake, a C++ toolchain, NVIDIA driver and matching CUDA Toolkit; Windows needs Visual Studio C++ build tools.</td></tr>
+<tr><td>Windows / Linux + Vulkan GPU</td><td><code>ggml_vulkan</code></td><td>CMake, C++/Vulkan build tools and a Vulkan 1.3 driver.</td></tr>
+<tr><td>CPU, no GPU</td><td><code>ggml_cpu</code></td><td>CMake 3.20+ and a C++ compiler; this is still a native build.</td></tr>
+</tbody></table></div>
+
+<p>Examples use <code>ggml_cpu</code>; replace the backend with one value from the table. Before a CUDA build set <code>TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON</code>; for Vulkan use <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code>. In Windows PowerShell the CUDA form is <code>$env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=&quot;ON&quot;</code>; on macOS/Linux it is <code>export TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON</code>. Metal needs no CUDA switch. See the <a href="backends.html#native-build">backend and native-build guide</a> for complete installation, automatic Vulkan tooling and MLX prerequisites.</p>
+
+<h3 id="build">Get the source</h3>
+
+<pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
 cd TensorSharp</code></pre>
-  <h3>Managed-CPU path (no native toolchain)</h3>
-  <p>To skip every native build, pass both skip properties and use the managed <code>cpu</code> backend. The first run restores and builds the managed projects automatically.</p>
-  <pre data-lang="bash"><code>-p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true -- --backend cpu</code></pre>
-  <h3>Full native / GPU path</h3>
-  <p>Build the whole solution when you want GGML CPU, Metal, CUDA, Vulkan, or MLX. The first build compiles the native bridge and can take several minutes; subsequent builds are incremental.</p>
-  <pre data-lang="bash"><code>dotnet build TensorSharp.slnx -c Release</code></pre>
-  <p>On macOS and Windows this also builds the TensorAgent app when the .NET SDK running the build has the .NET MAUI workloads, and warns when it does not; add <code>-p:TensorSharpSkipTensorAgentApp=true</code> to leave the app out (<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/DEVELOPMENT.md#build-the-entire-solution" target="_blank" rel="noopener">details</a>).</p>
-  <p>Or build just one application:</p>
-  <pre data-lang="bash"><code># Console application
-dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
 
-# Web application
-dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release</code></pre>
-  <p>The CLI binary lands in <code>TensorSharp.Cli/bin/...</code> and the server in <code>TensorSharp.Server.Host/bin/...</code>. For a CUDA- or Vulkan-enabled native build, manual native builds, or MLX, see <a href="backends.html#native-build">Building the native libraries</a>.</p>
+<p>Run the application project below; its first invocation restores and builds it. You do not need to build the whole solution and desktop apps first. Git, curl and network access fetch source, dependencies and the model; the first native build fetches upstream ggml.</p>
 
-  <h2 id="download">3 · Download a model</h2>
-  <p>For the quick start, download the recommended benchmark-verified <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q8_0.gguf file (7.48 GiB)</a> from the public <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a> repository. The lower-memory <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_K_M.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q4_K_M.gguf</a> lives in the same repository, and the <a href="models-downloads.html#downloads">Models</a> page lists other options.</p>
-  <pre data-lang="bash"><code>curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf</code></pre>
-  <div class="callout note"><div class="ic">🧩</div><p>For multimodal models, download the matching <strong>projector</strong> (mmproj) and pass its exact path with <code>--mmproj</code>. The server does not auto-detect a projector; the CLI looks beside the model only when an image, audio or video input is given, and only for each architecture's known projector file names. Explicit paths are reliable.</p></div>
-  <div class="callout tip"><div class="ic">⚡</div><p><strong>Generating images or video? Pick the fast path on the way in.</strong> Each of these families has one, and the difference is not subtle:</p>
-  <ul>
-    <li><strong>MiniMax-H3 video + audio</strong> — joint video and audio: the picture and native 32 kHz stereo audio are denoised together in a single packed latent, and a run writes an <code>.mp4</code> plus a sidecar <code>.wav</code>. It is four files across two repositories — the FL2VA denoiser (10.64 GiB), the shared Qwen3-VL-32B text encoder (16.97 GiB), the video VAE (5.21 GB) and the audio VAE (0.61 GB), ≈35.5 GB in all — or one <code>--config config/minimax-h3-fl2va.json</code>, which downloads all four on first run. The checkpoint ships CFG-distilled, so <code>--cfg 1.0</code> is required (TensorSharp refuses anything higher), and the default is 20 steps. The step lever is LightX2V's Turbo plug-in for FL2VA: <code>--lora</code> with <code>minimax-h3-fl2v-turbo-8step.json</code> from <code>config/lora/</code> downloads 1.38 GB of weights on first use and samples the 8 steps it was distilled for (the 4-step file, whose recipe is inferred, samples 4); leave <code>--diffusion-steps</code>, <code>--flow-shift</code> and <code>--sampler</code> unset with it. No Turbo clip timings are recorded yet. The one gap auto-download cannot fill: the text-encoder GGUF carries no tokenizer, so fetch <code>vocab.json</code> and <code>merges.txt</code> from <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor" target="_blank" rel="noopener">MiniMaxAI/MiniMax-H3</a> yourself and drop them beside the encoder (or point <code>TS_VIDEO_TOKENIZER</code> at their folder).</li>
-    <li><strong>Wan video, video only</strong> — a base <code>Wan2.2-TI2V-5B</code> follows the official 50-step × 2-CFG recipe = 100 DiT passes; a <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> checkpoint is trained guidance-free and costs 4. TensorSharp detects it from the DiT file name and needs no extra flag. On an M5 Pro a 1088×832 × 121-frame image-to-video takes ≈3 h 30 m on the base checkpoint and <strong>17 m 30 s</strong> on Turbo — the same command, a different <code>--model</code> path.</li>
-    <li><strong>Qwen-Image-2.1</strong> — its CFG 1 default already means one transformer pass per step, so the levers are step count and size. The biggest is a step-distillation LoRA plug-in from <code>config/lora/</code>: <code>--lora config/lora/qwen-image-2.1-viggle-turbo.json</code> downloads its weights on first use and brings its own recipe, 6 transformer passes instead of 40 (4–8 supported); Pruna 8-step and 5-step and a Fun-Acc 4-step preset ship beside it. All four adapters are under the Qwen Research License (non-commercial). Then size: for drafts use <code>--width 1024 --height 1024</code> (a quarter of the 2048×2048 default's latent image tokens). Without a distillation LoRA, <code>--diffusion-steps 25</code> is the plain step cut.</li>
-  </ul>
-  <p>→ <a href="models-downloads.html#downloads">Model downloads</a> for the exact repos and files · <a href="benchmarks.html#wan">the measurements behind these numbers</a> · <a href="benchmarks.html#qwen-image21">Qwen-Image-2.1 LoRA timings</a></p></div>
+<h2 id="download">3 · Download one text model</h2>
 
-  <p>LTX 2.5 Distilled uses <code>config/ltx-2.5-distilled.json</code> to fetch five verified files; official companions require approved access and HF credentials. Start with the experimental 48 GB tier and 1024×1024×17 preview; the model supplies the complete 8+3 two-stage recipe. <a href="models-video.html#ltx-25">Backends, conditioning and measured scope →</a></p>
+<p>This example uses the public <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf">Gemma 4 E4B Q8_0</a>, a <strong>7.48 GiB</strong> file. Disk size is not the runtime memory requirement: leave room for KV cache and execution. A smaller Q4_K_M is in the same repository; check the <a href="models-text.html#gemma4-fast-lane">Gemma 4 model card</a> and <a href="models-downloads.html#downloads">other model downloads</a> before changing model or quantization. <strong>Text input needs no mmproj.</strong></p>
 
-  <h3 id="e4b-fast-lane">Gemma 4 E4B backend and platform notes</h3>
-  <p>The first-run commands below are for Linux + NVIDIA. On Windows + NVIDIA, set <code>$env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'</code> in PowerShell, then run the same commands without the Bash assignment prefix. On Apple Silicon, omit the CUDA environment assignment and use <code>ggml_metal</code>. For Vulkan on Windows/Linux, set <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> (PowerShell: <code>$env:TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN='ON'</code>) and use <code>ggml_vulkan</code>. Without a GPU, use <code>ggml_cpu</code> (native CPU kernels). Text needs no projector. For image, video, or audio, download <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code> from the same repository and add <code>--mmproj models/mmproj-gemma-4-E4B-it-Q8_0.gguf</code>.</p>
+<details>
+<summary>Windows PowerShell download command</summary>
 
-  <h2 id="first-run">4 · First run</h2>
-  <p>The one-shot prompt comes from a <em>file</em> via <code>--input</code>; <code>--prompt</code> belongs to the generative families — the image prompt for Qwen-Image-2.1, and the video prompt for LTX 2.5, MiniMax-H3 and Wan. The CLI defaults to <code>ggml_cpu</code>, greedy decoding, and 100 generated tokens. The environment assignment enables the CUDA native build; the first run compiles it and can take several minutes, later runs are incremental.</p>
+<pre data-lang="powershell"><code>curl.exe --create-dirs --fail -L &quot;https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true&quot; -o models/gemma-4-E4B-it-Q8_0.gguf</code></pre>
 
-  <h3>Option A — one-shot generation (CLI)</h3>
-  <pre data-lang="bash"><code>echo "What is TensorSharp? Answer briefly." &gt; prompt.txt
-TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --max-tokens 128 --backend ggml_cuda</code></pre>
 
-  <h3>Option B — interactive chat (REPL)</h3>
-  <pre data-lang="bash"><code>dotnet run --project TensorSharp.Cli -c Release --no-build -- --model models/gemma-4-E4B-it-Q8_0.gguf -i --max-tokens 128 --backend ggml_cuda</code></pre>
-  <p>Type messages turn-by-turn; drive the session with <a href="cli.html#repl">slash commands</a> like <code>/reset</code>, <code>/think on</code>, or <code>/image photo.png</code>.</p>
+</details>
 
-  <h3>Option C — browser UI + HTTP APIs (server)</h3>
-  <pre data-lang="bash"><code>TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --max-tokens 128
-# open http://localhost:5000/index.html</code></pre>
-  <p>The health response is at <code>http://localhost:5000/</code>; the browser chat is at <code>/index.html</code>. The <a href="http-api.html">Ollama- and OpenAI-compatible</a> endpoints use the same fixed port.</p>
+<details>
+<summary>macOS / Linux download command</summary>
 
-  <div class="callout tip"><div class="ic">✅</div><p><strong>Skip the long command lines.</strong> Put your options in a JSON file and pass <code>--config config/server-basic.json</code> (or <code>config/cli-basic.json</code>). A config entry can even auto-download the model on first run, so a fresh machine needs no manual download step. The repository's <code>config/</code> folder ships ready-to-run examples. → <a href="server.html#config">Configuration file</a></p></div>
+<pre data-lang="bash"><code>curl --create-dirs --fail -L &quot;https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true&quot; -o models/gemma-4-E4B-it-Q8_0.gguf</code></pre>
 
-  <h2 id="next">Where to go next</h2>
-  <div class="card-grid">
-    <a class="card" href="backends.html"><div class="ic">🖥️</div><h3>Pick a backend</h3><p>Match <code>--backend</code> to your hardware.</p></a>
-    <a class="card" href="cli.html"><div class="ic">⌨️</div><h3>CLI reference</h3><p>All flags, the REPL, and batch workflows.</p></a>
-    <a class="card" href="http-api.html"><div class="ic">🔌</div><h3>HTTP API</h3><p>Call the server from curl, Python, or SDKs.</p></a>
-    <a class="card" href="models.html"><div class="ic">🧠</div><h3>Models</h3><p>What's supported and where to download.</p></a>
-    <a class="card" href="models-video.html#minimax-h3"><div class="ic">🎬</div><h3>Video and audio</h3><p>LTX 2.5 and MiniMax-H3 generate joint stereo audio/video; Wan generates video.</p></a>
-    <a class="card" href="benchmarks.html"><div class="ic">📊</div><h3>Benchmarks</h3><p>Measured speed per model, and the levers that move it.</p></a>
-  </div>
+
+</details>
+
+<h2 id="first-run">4 · Get your first text reply</h2>
+
+<p>Run from the repository root and replace <code>ggml_cpu</code> using the platform table. A one-shot CLI text prompt comes from a file via <code>--input</code>; <code>--prompt</code> belongs to image/video generation. This example uses greedy sampling and at most 32 output tokens. The first native build can take several minutes.</p>
+
+<details>
+<summary>Terminal: Windows PowerShell</summary>
+
+<pre data-lang="powershell"><code>&#x27;What is 2+2? Reply with only the number.&#x27; | Set-Content -Encoding utf8 prompt.txt
+dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cpu --temperature 0 --max-tokens 32</code></pre>
+
+
+</details>
+
+<details>
+<summary>Terminal: macOS / Linux</summary>
+
+<pre data-lang="bash"><code>printf &#x27;%s\n&#x27; &#x27;What is 2+2? Reply with only the number.&#x27; &gt; prompt.txt
+dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cpu --temperature 0 --max-tokens 32</code></pre>
+
+
+</details>
+
+<p>Prefer a browser or HTTP? Start the server with the same model and selected backend instead, and leave this terminal running:</p>
+
+<pre data-lang="bash"><code>dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cpu --host 127.0.0.1 --port 8080 --max-tokens 32</code></pre>
+
+<p>Open <a href="http://127.0.0.1:8080/">http://127.0.0.1:8080/</a> and send the same arithmetic prompt. These examples explicitly use loopback and port 8080; the actual default is <code>0.0.0.0:5000</code>, and macOS commonly reserves 5000 for AirPlay. The server has no built-in authentication or TLS; remote deployments need their own authenticated HTTPS boundary.</p>
+
+<h2 id="verify">5 · Verify this path</h2>
+
+<div class="table-scroll"><table>
+<thead><tr><th scope="col">Check</th><th scope="col">Expected result</th></tr></thead>
+<tbody>
+<tr><td>CLI or browser reply</td><td>Nonempty assistant text; the arithmetic example should answer <code>4</code>. Log messages alone are not a model reply.</td></tr>
+<tr><td>Process and errors</td><td>The CLI exits normally; the server stays running. Resolve download, build or model-load errors at that stage.</td></tr>
+<tr><td>Server liveness</td><td><code>GET /health</code> returns <code>TensorSharp.Server is running</code>. This checks liveness, not model readiness or quality.</td></tr>
+<tr><td>Model and API</td><td><code>GET /v1/models</code> lists the configured model ID. For a direct request, use the JSON below.</td></tr>
+</tbody></table></div>
+
+<p>Check from another terminal; in Windows PowerShell use <code>curl.exe</code> instead of <code>curl</code>:</p>
+
+<pre data-lang="bash"><code>curl --fail http://127.0.0.1:8080/health
+curl --fail http://127.0.0.1:8080/v1/models</code></pre>
+
+<p>Save this as <code>request.json</code>; if the model ID differs, use the ID returned by <code>/v1/models</code>:</p>
+
+<pre data-lang="json"><code>{
+  &quot;model&quot;: &quot;gemma-4-E4B-it-Q8_0&quot;,
+  &quot;messages&quot;: [
+    {
+      &quot;role&quot;: &quot;user&quot;,
+      &quot;content&quot;: &quot;What is 2+2? Reply with only the number.&quot;
+    }
+  ],
+  &quot;temperature&quot;: 0,
+  &quot;max_tokens&quot;: 32,
+  &quot;stream&quot;: false
+}</code></pre>
+
+<pre data-lang="bash"><code>curl --fail http://127.0.0.1:8080/v1/chat/completions -H &quot;Content-Type: application/json&quot; --data-binary &quot;@request.json&quot;</code></pre>
+
+<p>Check that <code>choices[0].message.content</code> contains text. With the Web UI available, <code>/</code> opens chat; with <code>--no-webui</code> or no Web UI files, <code>/</code> returns liveness text. <strong>The stable liveness route is <code>/health</code> in either case.</strong> For terminal conversations use CLI <code>--interactive</code>; see the <a href="cli.html">CLI reference</a> and <a href="http-api.html">HTTP API examples</a> for full formats.</p>
+
+<h2 id="troubleshooting">If a step fails</h2>
+
+<div class="table-scroll"><table>
+<thead><tr><th scope="col">Symptom</th><th scope="col">Next check</th></tr></thead>
+<tbody>
+<tr><td>No <code>10.0.x</code> SDK</td><td>Install the SDK and open a new terminal; the runtime alone is insufficient.</td></tr>
+<tr><td>CMake, compiler or GPU library error</td><td>Check the <a href="backends.html#native-build">backend and native-build guide</a>; when native builds are unavailable, try the managed CLI path below.</td></tr>
+<tr><td>Model path or memory error</td><td>Confirm a complete download, matching filename and room beyond weight size; choose a supported quantization.</td></tr>
+<tr><td>Server cannot listen</td><td>Keep <code>--host 127.0.0.1</code>, choose a free <code>--port</code>, and update request URLs together.</td></tr>
+<tr><td>Liveness works but no model reply</td><td>Read load logs and <code>/v1/models</code>, then check the request against <a href="http-api.html">HTTP API examples</a>. Liveness is not an inference check.</td></tr>
+</tbody></table></div>
+
+<details>
+<summary>No native toolchain: managed CPU CLI path</summary>
+
+<p><code>cpu</code> is pure C#, distinct from native <code>ggml_cpu</code>. It emphasizes portability and debugging; check model/feature coverage. Explicitly skip both native builds:</p>
+
+<pre data-lang="bash"><code>dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend cpu --temperature 0 --max-tokens 32</code></pre>
+
+
+</details>
+
+<h2 id="next">After the reply, choose your next task</h2>
+
+<div class="table-scroll"><table>
+<thead><tr><th scope="col">Task</th><th scope="col">Existing guide and key conditions</th></tr></thead>
+<tbody>
+<tr><td>Image generation/editing</td><td><a href="models-image.html#lora">Qwen-Image-2.1</a> covers matching 4–8-step LoRA recipes, dimensions, CFG and licensing; some plug-ins are non-commercial, so check each configuration's source and license.</td></tr>
+<tr><td>Video and audio</td><td><a href="models-video.html#minimax-h3">MiniMax-H3</a> covers FL2VA/Ref2VA, 32 kHz audio, CFG 1 and Turbo parameters; <a href="models-video.html#wan">Wan</a> covers checkpoint-dependent base/distilled recipes.</td></tr>
+<tr><td>LTX 2.5</td><td><a href="models-video.html#ltx-25">Two-stage recipe and conditioning</a> covers five base files (43.08 GB), the experimental 48 GB tier, a 1024×1024×17 preview and 8+3 steps. Base files are ungated; the optional Ingredients IC-LoRA (~1.31 GB) needs approved access.</td></tr>
+<tr><td>Embeddings, knowledge and skills</td><td><a href="embeddings.html">Embeddings</a> · <a href="knowledge.html">knowledge library</a> · <a href="agentic.html">Agent Skills</a>. Check their models, extraction coverage and execution permissions first.</td></tr>
+<tr><td>More GPUs and serving throughput</td><td><a href="distributed.html#vs-layer-split">Multi-GPU</a> · <a href="advanced.html">cache and speculation</a>. <code>--tp</code> and <code>--layer-split</code> are mutually exclusive and model-specific.</td></tr>
+</tbody></table></div>
+
+<p>Reuse options through <a href="server.html#config">JSON configuration files</a>; configurations can download resources, so inspect the file first. Source may lead published packages; check <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/PROJECT_STATUS.md">project status</a> before choosing a feature.</p>
+
+<span id="build-tensoragent-from-the-same-solution"></span><span id="text-and-code-embeddings"></span><span id="new-video-embedding-and-skill-workflows"></span><span id="reuse-your-files-as-a-knowledge-library"></span><span id="make-it-fast"></span><h3 id="reference-links">Advanced setups and references</h3>
+
+<ul>
+<li>Desktop source builds: <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/TensorAgent/README.md">TensorAgent build and validation</a> retains MAUI workloads, platform app heads, <code>TensorSharpSkipTensorAgentApp</code> and missing-prerequisite skip behavior. Building a test project does not run its tests.</li>
+<li>Embeddings: the <a href="embeddings.html">separate service guide</a> retains MiniLM/Snowflake downloads, <code>--embeddings</code>, managed/native backends and <code>/v1/embeddings</code> / <code>/api/embed</code> requests. Run chat and embeddings on different ports.</li>
+<li>Knowledge: the <a href="knowledge.html">knowledge guide</a> retains <code>TS_KNOWLEDGE_DIRECTORY</code>, <code>knowledgeCollections</code>, BM25/optional embeddings, Reindex and media-extraction limits. Uploading still requires selecting “Use in this chat”.</li>
+<li>Multimodal input: the <a href="models-text.html#gemma4-fast-lane">Gemma 4 model card</a> retains matching projector filenames and explicit <code>--mmproj</code>; the server does not auto-detect a projector. The <a href="models-video.html#minimax-h3">MiniMax-H3 guide</a> retains the ~46 GB config, 1.38 GB Turbo factors, sampling constraints and <code>TS_VIDEO_TOKENIZER</code>.</li>
+<li>DGX Spark / GB10: the <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/DEVELOPMENT.md#gb10--dgx-spark-build-container-experimental">experimental CUDA 13 / Linux ARM64 build</a> targets a single GB10, not x64 CUDA archives or generic ARM64 GPUs. Its historical hardware check predates upstream reintegration; hosted CI checks CPU/archive paths.</li>
+</ul>
+
+<details>
+<summary>Compatibility notes for existing advanced deployments</summary>
+
+<p>For native ggml source builds, <code>TENSORSHARP_GGML_NO_UPDATE=1</code> skips subsequent network updates. The <a href="advanced.html#continuous-batching">cache guide</a> retains default Radix behavior, <code>TS_SCHED_PREFIX_CACHE=0</code>, <code>--no-prefix-cache</code> and server disk checkpoints. The earlier guide's environment-specific Ubuntu settings remain below for matching CUDA/package-source environments; they are not part of the normal first run:</p>
+
+<pre data-lang="bash"><code># RunPod Ubuntu 24.04 images using this CUDA compatibility directory:
+export LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
+# Older Ubuntu releases needing the .NET backports package source:
+add-apt-repository ppa:dotnet/backports
+apt update &amp;&amp; apt install dotnet-sdk-10.0</code></pre>
+
+
+</details>
 
   <div class="content-footer">
     <a href="book.html">← TensorSharp Book</a>

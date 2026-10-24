@@ -22,8 +22,8 @@
     <figcaption>Gemma 4 E4B（Q8_0）运行于 <code>ggml_metal</code> 的交互式聊天（<code>--chat</code>），机器为 Apple M5 Pro。<code>/text</code> 附加了项目 README（40,224 个字符）。两次回答的解码速度都约为每秒 40 个 token；第二轮复用已缓存的 README，首个 token 在 140 毫秒内返回。参见<a href="#repl">交互式 REPL 命令</a>。</figcaption>
   </figure>
 
-  <h2 id="quickstart">约 30 秒快速开始</h2>
-  <p>请在 TensorSharp 仓库根目录执行，并先<a href="getting-started_zh-cn.html#install-dotnet"><strong>按平台安装 .NET 10 SDK</strong></a>。已验证的快速开始会构建原生 GGML 后端，并运行仓库基准已验证的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>gemma-4-E4B-it-Q8_0.gguf</code></a>（7.48 GiB）。复制并运行这些命令约需 30 秒；模型下载与首次 restore/构建耗时更长，取决于网络速度与机器性能。原生源码构建还需要 Git、网络访问、CMake 与可用的 C++ 工具链。</p>
+  <h2 id="quickstart">快速开始</h2>
+  <p>请在 TensorSharp 仓库根目录执行，并先<a href="getting-started_zh-cn.html#install-dotnet"><strong>按平台安装 .NET 10 SDK</strong></a>。快速开始会构建原生 GGML 后端，并运行示例使用的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>gemma-4-E4B-it-Q8_0.gguf</code></a>（7.48 GiB）。请为模型下载与首次 restore/构建预留时间，耗时取决于网络与机器性能。原生源码构建还需要 Git、网络访问、CMake 与可用的 C++ 工具链。</p>
   <h3>Linux + NVIDIA</h3>
   <pre data-lang="bash"><code>TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
 curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf
@@ -213,7 +213,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;Wan2_2-TI2V-5B-Turbo-Q8_0.gguf&gt; --image first_frame.png \
     --prompt "the camera pushes in as the waves rise" \
     --video-frames 121 --fps 24 --output out.mp4 --backend ggml_metal</code></pre>
-  <div class="callout tip"><div class="ic">⚡</div><p><strong>步数蒸馏是最大的一个提速杠杆，而且它不是一个开关。</strong>基础的 Wan2.2-TI2V-5B 走官方配方 50 步 × 2 次 CFG = <strong>100 次 DiT 前向</strong>；蒸馏后的 <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> 权重在训练时就不使用引导，只需 <strong>4</strong> 次。TensorSharp 会从 DiT 文件名识别它（<code>turbo</code>、<code>distill</code>、<code>lightning</code>、<code>lightx2v</code>、<code>fastwan</code>、<code>-dmd</code>，或显式的 <code>…-4steps-…</code> / <code>…8step…</code>，取值 1–16），并在加载时打印 <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off</code>。在 M5 Pro 上、1088×832 × 121 帧的同一个请求，<strong>基础权重约需 3 h 30 m，Turbo 只需 17 m 30 s</strong>。<code>--diffusion-steps</code> / <code>--cfg</code> 可覆盖识别到的取值。→ <a href="models-video_zh-cn.html#wan">去哪里下载</a> · <a href="benchmarks_zh-cn.html#wan">实测数据</a></p></div>
+  <div class="callout tip"><div class="ic">⚡</div><p><strong>步数蒸馏是最大的一个提速杠杆，而且它不是一个开关。</strong>基础的 Wan2.2-TI2V-5B 走官方配方 50 步 × 2 次 CFG = <strong>100 次 DiT 前向</strong>；蒸馏后的 <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> 权重在训练时就不使用引导，只需 <strong>4</strong> 次。TensorSharp 会从 DiT 文件名识别它（<code>turbo</code>、<code>distill</code>、<code>lightning</code>、<code>lightx2v</code>、<code>fastwan</code>、<code>-dmd</code>，或显式的 <code>…-4steps-…</code> / <code>…8step…</code>，取值 1–16），并在加载时打印 <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off</code>。在 M5 Pro 上、1088×832 × 121 帧的同一个请求，<strong>基础权重约需 3 h 30 m，Turbo 只需 17 m 30 s</strong>。<code>--diffusion-steps</code> / <code>--cfg</code> 可覆盖识别到的取值。→ <a href="models-video_zh-cn.html#wan">去哪里下载</a> · <a href="models-video_zh-cn.html#wan">实测数据</a></p></div>
 
   <h3 id="diffusion">DiffusionGemma 与检查</h3>
   <pre data-lang="bash"><code># DiffusionGemma 文本扩散生成
@@ -301,7 +301,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--list-gpus</code></td><td>列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出。</td></tr>
       <tr><td><code>--help</code></td><td>打印完整参数参考（逐项列出说明、默认值、取值范围与示例）后退出；不带任何参数启动 CLI 时也会显示。</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>、<code>f16</code>、<code>q8_0</code> 或 <code>q4_0</code>（默认：自动，由后端/模型选择；覆盖 <code>KV_CACHE_DTYPE</code> 环境变量）。块量化档位需要原生 GGML flash-attention 路径；<code>q4_0</code>（约为 f32 占用的 1/7）面向 128K–256K 的超长上下文。</td></tr>
-      <tr><td><code>--n-cpu-moe &lt;N&gt;</code> / <code>-ncmoe &lt;N&gt;</code></td><td>把前 N 层的路由 MoE 专家权重留在系统内存中并在 CPU 上做乘法；注意力、归一化、路由器与共享专家仍留在加速器上。传 <code>all</code> 表示所有层。所有架构默认都是 <code>0</code>。DeepSeek V4 不再自行卸载：装不下的权重会在加载时被拒绝，并给出能装下所需的最少卸载层数。GLM 5.x 上，驻留主机的专家直接从 GGUF 映射中取用、不做私有拷贝（设 <code>TS_GLM_MOE_MMAP=0</code> 改为拷贝），并且这个开关能与 <code>--tp</code> 组合——驻留主机的层保留完整专家，由 rank 0 求值。它是让原本装不下的权重能加载起来的手段，而不是提速开关：GLM-5.2 上 <code>--n-cpu-moe 30</code> 把 pp2048 从 915.9 拉到 94.7 t/s，但把加载器能定下的上下文从 342,272 抬到 646,400 token。环境变量：<code>TS_N_CPU_MOE</code>。</td></tr>
+      <tr><td><code>--n-cpu-moe &lt;N&gt;</code> / <code>-ncmoe &lt;N&gt;</code></td><td>把前 N 层的路由 MoE 专家权重留在系统内存中并在 CPU 上做乘法；注意力、归一化、路由器与共享专家仍留在加速器上。传 <code>all</code> 表示所有层。所有架构默认都是 <code>0</code>。DeepSeek V4 不再自行卸载：装不下的权重会在加载时被拒绝，并给出能装下所需的最少卸载层数。GLM 5.x 上，驻留主机的专家直接从 GGUF 映射中取用、不做私有拷贝（设 <code>TS_GLM_MOE_MMAP=0</code> 改为拷贝），并且这个开关能与 <code>--tp</code> 组合——驻留主机的层保留完整专家，由 rank 0 求值。在 Muse Spark 的原生执行器上，<code>TS_MUSE_SPARK_CPU_MOE=auto</code> 会覆盖它，改用逐层分别放置 gate、up、down 专家堆栈的方案，尽可能多地留在 GPU 上；两者都不设时，装不下的检查点会被拒绝，报错信息会点名该选项。它的原生 <code>--tp N</code> 把全部专家留在 GPU 上，并拒绝这个开关。它是让原本装不下的权重能加载起来的手段，而不是提速开关：GLM-5.2 上 <code>--n-cpu-moe 30</code> 把 pp2048 从 915.9 拉到 94.7 t/s，但把加载器能定下的上下文从 342,272 抬到 646,400 token。环境变量：<code>TS_N_CPU_MOE</code>。</td></tr>
       <tr><td><code>--cpu-moe</code> / <code>-cmoe</code></td><td><code>--n-cpu-moe all</code> 的简写（环境变量 <code>TS_CPU_MOE</code>）。</td></tr>
       <tr><td><code>--cpu-moe-threads &lt;N&gt;</code></td><td>主机侧专家矩阵乘的工作线程数。默认值取决于本进程实际可用的 CPU 并行度（已计入亲和性掩码与 cgroup 配额）：不超过 2 个 CPU 时为 <code>1</code>，不超过 8 个时为减一，更多时取一半且上限 <code>64</code>；DeepSeek V4 / V4.1 与 GLM-5.x 的原生执行器在卸载专家后使用全部可用 CPU（GLM-5.x 在无 GPU 的运行中也是如此）。不要超过 cgroup 的 CPU 配额 —— ggml 的线程池在栅栏处自旋，超订会让吞吐直接崩塌。环境变量：<code>TS_CPU_MOE_THREADS</code>。</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code> / <code>--chat</code></td><td>启动交互式 REPL（见下文）。它默认采样而不是贪心解码 —— 见<a href="#sampling">采样</a>。</td></tr>
@@ -418,7 +418,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     </tbody>
   </table>
   </div>
-  <p>在视频家族中，Wan 可运行于 <code>ggml_cuda</code>、<code>ggml_vulkan</code>、<code>ggml_metal</code>、<code>ggml_cpu</code>、<code>cuda</code> 与 <code>cpu</code> —— 它是唯一会直接拒绝 <code>--backend mlx</code> 的模型族。Wan 与 MiniMax-H3 都没有多卡路径：不支持的 <code>--tp N</code> / <code>--layer-split N</code> 请求与分布式组均在加载时被拒绝。→ <a href="benchmarks_zh-cn.html#minimax-h3">MiniMax-H3 实测数据</a> · <a href="benchmarks_zh-cn.html#wan">Wan 后端耗时与成本模型</a></p>
+  <p>在视频家族中，Wan 可运行于 <code>ggml_cuda</code>、<code>ggml_vulkan</code>、<code>ggml_metal</code>、<code>ggml_cpu</code>、<code>cuda</code> 与 <code>cpu</code> —— 它是唯一会直接拒绝 <code>--backend mlx</code> 的模型族。Wan 与 MiniMax-H3 都没有多卡路径：不支持的 <code>--tp N</code> / <code>--layer-split N</code> 请求与分布式组均在加载时被拒绝。→ <a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3 实测数据</a> · <a href="models-video_zh-cn.html#wan">Wan 后端耗时与成本模型</a></p>
   <p class="page-foot-note">完整参考（含 <code>--test</code>、<code>--test-templates</code> 与分块 prefill 正确性检查）见 <a href="api-reference_zh-cn.html#cli-flags">API 参考</a> 页。</p>
 
   <p>社区技能发现通过 <code>find-skills</code> 的 <code>skills_search</code>、<code>skills_inspect</code> 与 <code>skills_install</code> 工具完成，需要技能网络权限；不是独立的 HTTP 安装端点。服务端/应用可安装，默认 CLI 只读并提供搜索/检查。 <a href="agentic_zh-cn.html#find-skills">条件与当前技能包 →</a></p>

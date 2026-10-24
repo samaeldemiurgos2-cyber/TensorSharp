@@ -65,6 +65,10 @@ namespace TensorSharp.GGML
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_TensorParallelAllReduceDeviceF32(float** buffers, int rankCount, long count);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_TensorParallelFusedAvailable(int rankCount);
 
         [LibraryImport(DllName)]
@@ -293,6 +297,12 @@ namespace TensorSharp.GGML
         public static unsafe bool TensorParallelAllReduceDevice(float** buffers, int rankCount, long count)
         {
             return TSGgml_TensorParallelAllReduceDevice(buffers, rankCount, count) != 0;
+        }
+
+        /// <summary>Device collective without narrowing F32 partials to a lower precision.</summary>
+        public static unsafe bool TensorParallelAllReduceDeviceF32(float** buffers, int rankCount, long count)
+        {
+            return TSGgml_TensorParallelAllReduceDeviceF32(buffers, rankCount, count) != 0;
         }
 
         /// <summary>

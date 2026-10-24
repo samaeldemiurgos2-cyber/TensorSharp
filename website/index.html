@@ -152,6 +152,7 @@
         <li><a href="models-text.html#mistral3">Mistral 3</a></li>
         <li><a href="models-text.html#hunyuan-dense">Hunyuan Dense</a></li>
         <li><a href="models-text.html#muse-glimmer">Muse-Glimmer</a></li>
+        <li><a href="models-text.html#muse-spark">Muse Spark</a></li>
       </ul>
     </div>
     <div class="model-group">
@@ -195,7 +196,7 @@
     </div>
     <aside class="home-benchmarks" aria-labelledby="benchmarks">
       <h3 id="benchmarks">Performance you can check</h3>
-      <p>Comparisons with llama.cpp use identical GGUF files and the same hardware. Results include both wins and gaps, with separate measurements for prefill, decode and time to first token.</p>
+      <p>Recent records: DeepSeek V4.1 Flash 1017 on five A40s reaches 3.23× the reference prefill rate with exact TP5 at a ~1.8K prompt; Muse Spark on ten A40s reaches 1.40× solo TP decode against the matching reference mode. Models, quantization and timing methods differ; see the full conditions and the quality cost of default approximate YOCO.</p>
       <a class="home-card-link" href="benchmarks.html#head-to-head">See measurements and methodology →</a>
     </aside>
   </section>

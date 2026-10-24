@@ -346,17 +346,37 @@ namespace TensorSharp.Chat
             // frame and nothing else. Null for every non-video model, so the UI can test
             // one field instead of pattern-matching an architecture string.
             object video = null;
+            if (_svc.Model is TensorSharp.Models.Ltx25.Ltx25Model ltx)
+            {
+                try { _ = ltx.TryLoadIngredientsAdapterIfPresent(); }
+                catch (Exception e) when (e is not OperationCanceledException)
+                {
+                    _loggerFactory.CreateLogger("TensorSharp.Server.Video").LogError(e,
+                        "Could not attach the LTX Ingredients adapter discovered beside the loaded checkpoint.");
+                }
+            }
             if (_svc.Model is TensorSharp.Models.Video.IVideoGenerationModel videoModel)
             {
                 video = new
                 {
                     family = videoModel.VideoModelFamily,
+                    supportsTextToVideo = videoModel.SupportsTextToVideo,
                     supportsAudio = videoModel.SupportsAudio,
                     supportsImageConditioning = videoModel.SupportsImageConditioning,
                     supportsEndImageConditioning = videoModel.SupportsEndImageConditioning,
                     supportsKeyframeConditioning = videoModel.SupportsKeyframeConditioning,
                     defaultPreviewFrames = videoModel.DefaultPreviewFrames,
+                    frameCountMultiple = videoModel.FrameCountMultiple,
+                    frameCountOffset = videoModel.FrameCountOffset,
+                    defaultOutputWidth = _options.DefaultVideoWidth > 0 ? _options.DefaultVideoWidth : videoModel.DefaultOutputWidth,
+                    defaultOutputHeight = _options.DefaultVideoHeight > 0 ? _options.DefaultVideoHeight : videoModel.DefaultOutputHeight,
+                    resolutionMultiple = videoModel.ResolutionMultiple,
+                    defaultPreviewFps = videoModel is TensorSharp.Models.MiniMaxH3.MiniMaxH3Model
+                        ? videoModel.DefaultPreviewFps
+                        : _options.DefaultVideoFps > 0 ? _options.DefaultVideoFps : videoModel.DefaultPreviewFps,
+                    configuredFrames = _options.DefaultVideoFrames,
                     supportsReferenceConditioning = videoModel.SupportsReferenceConditioning,
+                    minimumReferenceFrames = videoModel.MinimumReferenceFrames,
                     maxReferenceImages = videoModel.MaxReferenceImages,
                 };
             }
@@ -674,8 +694,10 @@ namespace TensorSharp.Chat
                 // Frames written anywhere else resolve to nothing at chat time and 404 as
                 // thumbnails, and the GUID keeps two clips from both claiming frame_0001.png.
                 List<string> frames;
+                TensorSharp.Models.Media.VideoInfo videoInfo;
                 try
                 {
+                    videoInfo = TensorSharp.Models.Media.MediaCodecs.Video.Probe(savePath);
                     frames = await Task.Run(() => MediaHelper.ExtractVideoFrames(
                         savePath, _options.UploadDirectory,
                         Path.GetFileNameWithoutExtension(safeFileName)));
@@ -697,6 +719,8 @@ namespace TensorSharp.Chat
                     url = uploadUrl,
                     mediaType,
                     fileName = originalFileName,
+                    width = videoInfo.Width,
+                    height = videoInfo.Height,
                     frames = frames.Select(f => Path.GetFileName(f)).ToList(),
                     frameUrls = frames.Select(f => BuildUploadUrl(Path.GetFileName(f))).ToList(),
                 }, storedFiles);
@@ -971,11 +995,14 @@ namespace TensorSharp.Chat
                 string editName = Path.GetFileNameWithoutExtension(safeFileName) + "-edit.png";
                 string editPath = Path.Combine(_options.UploadDirectory, editName);
                 string editSourceName = null;
+                int width = 0, height = 0;
                 try
                 {
                     await Task.Run(() =>
                     {
                         var img = TensorSharp.Models.QwenImage.ImageIO.Load(savePath, preserveAlpha: true);
+                        width = img.Width;
+                        height = img.Height;
                         const long previewArea = 768L * 768;   // plenty for the ~300 px bubble preview
                         bool resizePreview = (long)img.Width * img.Height > previewArea;
                         var preview = resizePreview
@@ -1024,6 +1051,8 @@ namespace TensorSharp.Chat
                     editUnavailableReason = (string)null,
                     mediaType,
                     fileName = originalFileName,
+                    width,
+                    height,
                 }, storedFiles);
             }
 

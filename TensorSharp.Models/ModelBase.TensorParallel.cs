@@ -1084,7 +1084,7 @@ namespace TensorSharp.Models
         /// <summary>
         /// GGML counterpart of <see cref="PrepareCudaQuantizedWeightsForInferenceTP"/>:
         /// upload rank r's shard of every sharded weight to rank r's GPU, and the
-        /// replicated (unsharded) weights to all of them.
+        /// unsharded weights to rank 0.
         ///
         /// This is what actually splits the model across the GPUs. The shards are
         /// keyed in the native cache by host pointer *per rank*, so rank r's
@@ -1242,28 +1242,25 @@ namespace TensorSharp.Models
             }
             if (replicatedCount > 0)
             {
-                Console.WriteLine($"  TP replicated on rank 0: {replicatedCount} unsharded quantized weight(s), " +
+                Console.WriteLine($"  TP unsharded on rank 0: {replicatedCount} quantized weight(s), " +
                     $"{replicatedBytes / 1024 / 1024} MB.");
             }
 
-            // Sharding a handful of weights and replicating the rest is not a
-            // speedup - every rank recomputes the same replicated matmuls and
-            // then pays a collective on top, so TP can land well BELOW one GPU.
-            // gpt-oss is the live example: 24 sharded vs 1538 replicated
-            // (10.8 GB) measures 28 tok/s on two GPUs against 349 on one.
-            // Say so, because the alternative is a silent 12x regression.
+            // A large unsharded trunk can limit scaling. This is a weight-size
+            // diagnostic, not a measured speed comparison. Sum the actual
+            // shards because uneven partitions give ranks different sizes.
             long shardedBytes = AdditionalTpShardedBytes;
             foreach (var kv in _tpQuantWeights)
-                if (kv.Value is { Length: > 0 } sh && sh[0] != null)
-                    shardedBytes += sh[0].RawBytes * sh.Length;
+                if (kv.Value != null)
+                    foreach (var shard in kv.Value)
+                        if (shard != null) shardedBytes += shard.RawBytes;
             if (replicatedBytes > 0 && shardedBytes < replicatedBytes)
             {
                 Console.Error.WriteLine(
                     $"WARNING: tensor parallelism sharded only {shardedBytes / 1024 / 1024} MB across " +
-                    $"{TpDegree} ranks while {replicatedBytes / 1024 / 1024} MB stays replicated on every " +
-                    "rank. The replicated weights are recomputed identically by each rank and the " +
-                    "collectives are pure overhead, so this run is likely SLOWER than a single GPU. " +
-                    "Prefer one GPU for this model, or use it only to fit weights that do not fit on one.");
+                    $"{TpDegree} ranks while {replicatedBytes / 1024 / 1024} MB remains unsharded on rank 0. " +
+                    "Unsharded work and collective overhead may limit scaling; benchmark the selected " +
+                    "configuration before assuming a speedup.");
             }
             if (supersededCount > 0)
             {

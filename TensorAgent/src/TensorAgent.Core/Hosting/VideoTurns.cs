@@ -12,22 +12,22 @@ using System.Runtime.CompilerServices;
 using System.Text.Json;
 using TensorAgent.Core.Localization;
 using TensorSharp.Chat;
+using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Models.Video;
 
 namespace TensorAgent.Core.Hosting;
 
 /// <summary>
-/// A chat turn when the loaded model makes video clips (MiniMax-H3 or Wan).
+/// A chat turn when the loaded model makes video clips (MiniMax-H3, LTX 2.5 or Wan).
 ///
 /// <para>
 /// The same arrangement as <see cref="ImageTurns"/>: the page's one route for a turn,
 /// <c>/api/chat</c>, runs under the turn manager and the conversation recorder, so a clip
 /// that takes minutes survives the page being hidden and is in the saved chat when it is
-/// done. The newest user message is the request. Its words are the description; its photos,
-/// clips and sound files become whatever the loaded checkpoint can be given - keyframes for
-/// the first-and-last-frame checkpoint, references for the reference one - and a
-/// combination it cannot use is refused here, in the app's own words, before the model
-/// starts.
+/// done. The newest user message is the request. Its words are the description; photos become
+/// keyframes or appearance references, and clips for MiniMax-H3 or LTX 2.5 continue from
+/// their exact final frame. A combination the loaded checkpoint cannot use is refused here,
+/// in the app's own words, before the model starts.
 /// </para>
 /// <para>
 /// The video service's frames are translated into the chat stream's vocabulary:
@@ -256,17 +256,41 @@ public static class VideoTurns
         {
             ["prompt"] = prompt,
         };
+        // Chat WebUX sends an explicit output canvas only when the user selects one.
+        // Keeping the model default otherwise preserves the established image-to-video
+        // aspect behavior and each model's own text-to-video default.
+        if (user.TryGetProperty("videoWidth", out JsonElement outputWidth)
+            && outputWidth.ValueKind == JsonValueKind.Number && outputWidth.TryGetInt32(out int width) && width > 0
+            && user.TryGetProperty("videoHeight", out JsonElement outputHeight)
+            && outputHeight.ValueKind == JsonValueKind.Number && outputHeight.TryGetInt32(out int height) && height > 0)
+        {
+            payload["width"] = width;
+            payload["height"] = height;
+        }
+        string? requestedMode = Text(user, "videoMode") ?? Text(user, "video_mode")
+            ?? Text(body, "videoMode") ?? Text(body, "video_mode");
+        bool requestsReferences = string.Equals(requestedMode, "ref", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(requestedMode, "reference", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(requestedMode, "ref2va", StringComparison.OrdinalIgnoreCase);
         // Frame grids belong to the model: new families must not inherit H3's
         // 17k+5 length merely because they are not Wan. An unspecified preference
         // leaves the request unset so the model can apply its own valid default.
         if (model.DefaultPreviewFrames > 0)
             payload["frames"] = model.DefaultPreviewFrames;
 
+        if (model.VideoModelFamily == "minimax-h3"
+            && user.TryGetProperty("videoFrames", out JsonElement h3Frames))
+        {
+            if (h3Frames.ValueKind != JsonValueKind.Number || !h3Frames.TryGetInt32(out int requestedFrames)
+                || requestedFrames < 22 || requestedFrames > 243
+                || MiniMaxH3Geometry.AlignFrames(requestedFrames) != requestedFrames)
+                return VideoRequest.Refused(Loc.T("host.video.invalidH3Frames"));
+            payload["frames"] = requestedFrames;
+        }
+
         if (model.VideoModelFamily == "ltx-2.5")
         {
-            string? requestedMode = Text(user, "videoMode") ?? Text(user, "video_mode")
-                ?? Text(body, "videoMode") ?? Text(body, "video_mode");
-            if (string.Equals(requestedMode, "ref", StringComparison.OrdinalIgnoreCase) && !model.SupportsReferenceConditioning)
+            if (requestsReferences && clips.Length == 0 && !model.SupportsReferenceConditioning)
                 return VideoRequest.Refused(Loc.T("host.video.ingredientsUnavailable"));
             // The published distilled recipe must override generic video defaults.
             payload["steps"] = 8;
@@ -285,16 +309,62 @@ public static class VideoTurns
                     return VideoRequest.Refused(Loc.T("host.video.invalidFrames"));
                 payload["frames"] = requestedFrames;
             }
-            if (string.Equals(requestedMode, "ref", StringComparison.OrdinalIgnoreCase))
+            if (requestsReferences && clips.Length == 0)
             {
-                if (clips.Length > 0 || sounds.Length > 0)
+                if (sounds.Length > 0)
                     return VideoRequest.Refused(Loc.T("host.video.photosOnly"));
                 if (photos.Length > model.MaxReferenceImages)
                     return VideoRequest.Refused(Loc.T("host.video.tooManyReferences", ("max", model.MaxReferenceImages), ("count", photos.Length)));
-                payload["width"] = 768; payload["height"] = 448; payload["frames"] = 121;
+                if (!payload.ContainsKey("width") || !payload.ContainsKey("height"))
+                {
+                    payload["width"] = 768;
+                    payload["height"] = 448;
+                }
+                payload["frames"] = 121;
                 payload["videoMode"] = "ref"; payload["referenceImages"] = photos;
                 return VideoRequest.For(payload);
             }
+        }
+
+        // An attached clip is a continuation source for H3 and LTX: use its exact
+        // final frame as frame zero. A second clip pins the generated take's ending.
+        if (clips.Length > 0 && model.VideoModelFamily is ("minimax-h3" or "ltx-2.5"))
+        {
+            bool hasImageConditions = (user.TryGetProperty("imageConditions", out JsonElement clipConditions)
+                || user.TryGetProperty("image_conditions", out clipConditions))
+                && clipConditions.ValueKind == JsonValueKind.Array && clipConditions.GetArrayLength() > 0;
+            if (photos.Length > 0 || sounds.Length > 0 || hasImageConditions)
+                return VideoRequest.Refused(Loc.T("host.video.continuationConflict"));
+            if (clips.Length > 2)
+                return VideoRequest.Refused(Loc.T("host.video.continuationMax"));
+            if (!model.SupportsImageConditioning || clips.Length == 2 && !model.SupportsEndImageConditioning)
+                return VideoRequest.Refused(Loc.T("host.video.continuationUnavailable"));
+            payload["continueFromVideos"] = clips;
+            payload["videoMode"] = clips.Length == 1 ? "i2v" : "fl2v";
+            return VideoRequest.For(payload);
+        }
+
+        if (requestsReferences && !model.SupportsReferenceConditioning)
+            return VideoRequest.Refused(model.VideoModelFamily == "minimax-h3"
+                ? Loc.T("host.video.photosOnlyUseReferences")
+                : Loc.T("host.video.photosOnly"));
+
+        // A hybrid MiniMax-H3 load has both denoisers. Explicit reference mode sends
+        // stills as identity inputs; recordings remain references when no clip continues.
+        // With photos alone, the composer leaves mode unset or chooses keyframes, which
+        // preserves the first-frame behavior users already expect.
+        if (model.SupportsReferenceConditioning
+            && (requestsReferences || !model.SupportsImageConditioning || clips.Length > 0 || sounds.Length > 0))
+        {
+            int count = photos.Length + clips.Length + sounds.Length;
+            int max = model.MaxReferenceImages;
+            if (max > 0 && count > max)
+                return VideoRequest.Refused(Loc.T("host.video.tooManyReferences", ("max", max), ("count", count)));
+            if (photos.Length > 0) payload["referenceImages"] = photos;
+            if (clips.Length > 0) payload["referenceVideos"] = clips;
+            if (sounds.Length > 0) payload["referenceAudios"] = sounds;
+            if (count > 0 || requestsReferences) payload["videoMode"] = "ref";
+            return VideoRequest.For(payload);
         }
 
         if (model.SupportsKeyframeConditioning)
@@ -335,25 +405,6 @@ public static class VideoTurns
                 if (photos.Length > 1) payload["endImage"] = photos[1];
                 if (photos.Length > 0) payload["videoMode"] = photos.Length == 1 ? "i2v" : "fl2v";
             }
-            return VideoRequest.For(payload);
-        }
-
-        if (model.SupportsReferenceConditioning)
-        {
-            int count = photos.Length + clips.Length + sounds.Length;
-            int max = model.MaxReferenceImages;
-            if (max > 0 && count > max)
-                return VideoRequest.Refused(Loc.T("host.video.tooManyReferences", ("max", max), ("count", count)));
-            if (photos.Length > 0)
-                payload["referenceImages"] = photos;
-            if (clips.Length > 0)
-                payload["referenceVideos"] = clips;
-            if (sounds.Length > 0)
-                payload["referenceAudios"] = sounds;
-            // This turn decides how its attachments are used. An inherited startup
-            // mode (for example i2v) must not reinterpret a reference as a first frame.
-            if (count > 0)
-                payload["videoMode"] = "ref";
             return VideoRequest.For(payload);
         }
 

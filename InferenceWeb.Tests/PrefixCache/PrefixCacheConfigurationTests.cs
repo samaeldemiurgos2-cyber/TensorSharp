@@ -19,6 +19,22 @@ public class PrefixCacheConfigurationTests
             .WithSpeculation(SpeculationOptions.Disabled).EnablePrefixCaching);
     }
 
+    /// <summary>Only a value the user gave counts as a chosen lone-prompt step: unset, a model with its own
+    /// steps (Muse Spark's pipelined prefill) sizes them.</summary>
+    [Fact]
+    public void TheSoloPrefillChunkIsChosenOnlyWhenTheEnvironmentSetsIt()
+    {
+        using var env = new EnvScope();
+        env.Set("TS_SCHED_SOLO_PREFILL_CHUNK", null);
+        var unset = SchedulerConfig.FromEnvironment();
+        Assert.False(unset.SoloPrefillChunkSizeChosen);
+        Assert.Equal(8192, unset.SoloPrefillChunkSize);
+        env.Set("TS_SCHED_SOLO_PREFILL_CHUNK", "32768");
+        var set = SchedulerConfig.FromEnvironment();
+        Assert.True(set.SoloPrefillChunkSizeChosen);
+        Assert.Equal(32768, set.SoloPrefillChunkSize);
+    }
+
     [Fact]
     public void TheOffSwitchTurnsPrefixCachingOff()
     {

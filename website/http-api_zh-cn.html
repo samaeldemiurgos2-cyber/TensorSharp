@@ -362,7 +362,7 @@ curl -X DELETE http://localhost:5000/api/skills/pdf   # {"removed":true}</code><
     },
     "max_tokens": 120
   }'</code></pre>
-  <div class="callout warn"><div class="ic">⚠️</div><p><code>json_schema</code> 不能与调用方的 <code>tools</code> 同时使用。<code>think</code> 同样会被拒绝，但语法能等推理结束后再生效的家族除外——Gemma 4、Qwen 3.8 Flash Next、GPT-OSS、Muse-Glimmer、DeepSeek V4.1、<code>glm5next</code> 与 Nemotron-H——在这些家族上语法从推理结束处开始约束。它可以与 <code>skills</code> 组合，但选中技能正文会被内联，而且该请求不会提供任何内置技能 / 代码工具，因为 schema 约束下无法生成调用标记。无效 schema 返回 HTTP <code>400</code>；校验失败的输出返回 HTTP <code>422</code>。</p></div>
+  <div class="callout warn"><div class="ic">⚠️</div><p><code>json_schema</code> 不能与调用方的 <code>tools</code> 同时使用。<code>think</code> 同样会被拒绝，但语法能等推理结束后再生效的家族除外——Gemma 4、Qwen 3.8 Flash Next、GPT-OSS、Muse-Glimmer、Muse Spark、DeepSeek V4.1、<code>glm5next</code> 与 Nemotron-H——在这些家族上语法从推理结束处开始约束。它可以与 <code>skills</code> 组合，但选中技能正文会被内联，而且该请求不会提供任何内置技能 / 代码工具，因为 schema 约束下无法生成调用标记。无效 schema 返回 HTTP <code>400</code>；校验失败的输出返回 HTTP <code>422</code>。</p></div>
 
   <h2 id="knowledge">个人知识库 API</h2>
   <p>独立服务器设置 <code>TS_KNOWLEDGE_DIRECTORY</code> 后启用 <code>/api/knowledge</code>：<code>GET/POST /collections</code>、<code>DELETE /collections/{id}</code>、文档列表/上传/删除/重新索引与版本化原文件下载，以及 <code>POST /search</code> 和 <code>POST /read</code>。上传每请求一个 multipart 文件；搜索/读取显式传入 <code>collectionIds</code>。TensorAgent 的重命名、聊天导入和预览扩展不代表独立宿主提供同样端点。</p>

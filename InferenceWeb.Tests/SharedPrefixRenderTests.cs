@@ -39,6 +39,29 @@ public sealed class SharedPrefixRenderTests : IDisposable
         Assert.Equal(warmLength, AssertWholePrefix(model, "Another question after newChat."));
     }
 
+    [Fact]
+    public void TemplatePreambleIsSharedWithoutSystemMessagesOnlyForFamiliesThatOptIn()
+    {
+        ModelBase model = Model(new CharTokenizer());
+        model.Config.ChatTemplate = "preamble: cutoff 2026-01-04, current date, reasoning level, channels";
+        Assert.True(model.Config.ChatTemplate.Length + 1 >= ChatGenerationPipeline.MinSharedPrefixTokens);
+        int Shared(string arch, string user)
+        {
+            var history = new List<ChatMessage> { new() { Role = "user", Content = user } };
+            List<int> prompt = _renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate, history,
+                arch, addGenerationPrompt: true);
+            return _pipeline.ComputeSharedPrefixTokens(model, history, prompt, arch, [], false);
+        }
+
+        // Muse Spark: the preamble its template renders for an empty conversation, never user text.
+        int expected = _renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate, [],
+            "muse-spark", addGenerationPrompt: false).Count;
+        Assert.Equal(expected, Shared("muse-spark", "Write about hash tables."));
+        Assert.Equal(expected, Shared("muse-spark", "A different first question."));
+        // Families without the opt-in keep requiring system messages or tools.
+        Assert.Equal(0, Shared("qwen35", "Write about hash tables."));
+    }
+
     [Theory]
     [InlineData("type")]
     [InlineData("description")]

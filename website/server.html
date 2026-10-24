@@ -17,58 +17,70 @@
   <div class="breadcrumb"><a href="index.html">Home</a> › Server &amp; Web UI</div>
   <h1>Server &amp; Web UI</h1>
   <p class="lede"><code>TensorSharp.Server.Host</code> (built on the <code>TensorSharp.Server</code> library) is an ASP.NET Core app that hosts a single GGUF model and exposes a browser chat UI plus Ollama- and OpenAI-compatible REST APIs on the same port. The continuous-batching engine handles concurrency.</p>
+  <nav aria-label="Reading path"><ol>
+    <li><a href="#start">Start a local server</a></li>
+    <li><a href="#use">Use the browser or an API</a></li>
+    <li><a href="#operate">Configure and operate it</a></li>
+  </ol></nav>
+  <p>Start with the chat recipe below, or go straight to <a href="#service-modes">embeddings, Jev, agents or video</a> for another model or protocol. The <a href="#reference">reference tables</a> retain every option and expand when needed.</p>
+
+  <h2 id="start">1. Start a local server</h2>
+  <h3 id="e4b-fast-lane">Quick start (Gemma 4 E4B)</h3>
+  <p>Install the <a href="getting-started.html#install-dotnet">.NET 10 SDK for your platform</a>, Git, CMake, and <code>curl</code>, then paste this from a terminal. Allow time for the 7.48 GiB model download and first restore/build; duration depends on your connection and machine. It hosts the example Gemma 4 E4B Q8_0 from the recommended public <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>ggml-org</code> artifact</a> on the native GGML bridge. This block is for Linux + NVIDIA (the CUDA build also needs the CUDA Toolkit):</p>
+  <div class="callout warn"><div class="ic">🔐</div><p>The standalone server has no built-in API-key authentication. The commands below use HTTP (no TLS) and explicitly bind <code>127.0.0.1</code> for local access. Omitting <code>--host</code> uses the default all-interface binding, <code>0.0.0.0</code>. For remote access, use a host firewall and an authenticated HTTPS reverse proxy; do not expose the server port directly to an untrusted network.</p></div>
+  <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
+curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf
+dotnet run --project TensorSharp.Server.Host -c Release --no-build -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --host 127.0.0.1</code></pre>
+  <p>On Apple Silicon, omit the CUDA environment assignment and use <code>ggml_metal</code>; on a supported Windows/Linux Vulkan GPU, request <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> instead and use <code>ggml_vulkan</code>; with no supported GPU, drop the assignment and use <code>ggml_cpu</code>. The lower-memory <code>gemma-4-E4B-it-Q4_K_M.gguf</code> is in the same repository. Text needs no projector; image, video, or audio also requires the matching <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code> passed with <code>--mmproj</code>. See <a href="getting-started.html#e4b-fast-lane">Getting Started</a> for Windows PowerShell and full platform syntax.</p>
+  <p>After the startup log shows the listen address, check liveness and the loaded model from a second terminal, then send one chat request:</p>
+  <pre data-lang="bash"><code>curl -sS http://127.0.0.1:5000/health
+curl -sS http://127.0.0.1:5000/v1/models</code></pre>
+  <pre data-lang="bash"><code>curl -s http://127.0.0.1:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'</code></pre>
+  <p>The API base is <strong><code>http://127.0.0.1:5000</code></strong>. When the bundled <code>wwwroot/</code> is present and enabled, <strong><a href="http://127.0.0.1:5000/"><code>GET /</code></a></strong> serves its <code>index.html</code> chat UI. <code>GET /health</code> always returns the liveness response <code>"TensorSharp.Server is running"</code>; it does not check model readiness. The bare <code>/</code> falls back to that response when the Web UI is disabled or <code>index.html</code> is missing.</p>
+  <div class="callout note"><div class="ic">📌</div><p><code>--model</code> is required for inference. The server hosts exactly the startup GGUF and optional, explicitly supplied <code>--mmproj</code>; it does not scan a model directory or auto-detect a projector. <code>/api/models/load</code> can only re-load that same startup pair, optionally on another supported backend. A model-less process cannot choose a GGUF at runtime. The default listen address is <code>http://0.0.0.0:5000</code>; <code>--port</code>, <code>--host</code> and <code>--urls</code> (env <code>PORT</code> / <code>HOST</code> / <code>ASPNETCORE_URLS</code>) move it.</p></div>
+
+  <h3 id="built-source">Already-built source tree</h3>
+  <details>
+    <summary>Already built the source, or need another backend? Show launch examples</summary>
+
+  <p>Run these commands from the repository root after building. They invoke <code>TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll</code>; that output directory also contains the copied native libraries and <code>wwwroot/</code>. The <a href="https://github.com/zhongkaifu/TensorSharp/releases" target="_blank" rel="noopener">Releases page</a> also provides attached, self-contained CLI and server archives for supported platforms.</p>
+  <pre data-lang="bash"><code># Apple Silicon / Metal
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_metal --host 127.0.0.1
+
+# NVIDIA / GGML CUDA
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_cuda --host 127.0.0.1
+
+# AMD, Intel, or NVIDIA / Vulkan; inspect device indices first
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --list-gpus
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_vulkan --gpu-device 1 --host 127.0.0.1
+
+# Multimodal: the projector is always explicit
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda --host 127.0.0.1</code></pre>
+  </details>
+
+  <h2 id="use">2. Use the browser or an API</h2>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Your goal</th><th>Next step</th><th>Check</th></tr></thead>
+    <tbody>
+      <tr><td>Chat in a browser</td><td>Open <code>http://127.0.0.1:5000/</code>, then see <a href="#webui">UI features</a>.</td><td>The enabled Web UI needs its deployed <code>wwwroot/index.html</code>.</td></tr>
+      <tr><td>Use an OpenAI-compatible client</td><td>Use API base <code>http://127.0.0.1:5000/v1</code>; see <a href="http-api.html#openai">Chat Completions and Responses</a>.</td><td>Tools, reasoning and media depend on the model and endpoint.</td></tr>
+      <tr><td>Use an Ollama-compatible client</td><td>Follow the <a href="http-api.html#ollama">Ollama request examples</a>.</td><td><code>/api/chat/ollama</code> is the compatibility route; <code>/api/chat</code> uses the Web UI SSE protocol.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="webui">Web UI features</h3>
+  <p>Open <code>http://127.0.0.1:5000/</code>. The browser interface supports:</p>
+  <details>
+    <summary>Browser features, uploads and generation workflows</summary>
   <figure class="page-shot">
     <img src="assets/screenshots/tensorsharp-webui.png" alt="The TensorSharp Web UI: Qwen3.8 27B compared two mortgages by writing and running a Python script, answered with a table and a recommendation, and offered the script and the CSV as downloads" width="1760" height="1129" loading="lazy">
     <figcaption>Qwen3.8 27B (UD-Q4_K_XL) on <code>ggml_metal</code>, started with <code>--code-exec</code>, on an Apple M5 Pro. The model wrote a Python script, ran it in the macOS sandbox, checked that both schedules end at a $0 balance, answered with a table, and offered the script and the 540-row CSV as downloads.</figcaption>
   </figure>
 
-  <h2 id="embeddings">Embedding service</h2>
-  <p>Host Snowflake, MiniLM or EmbeddingGemma 2 with <code>--model encoder.gguf --embeddings</code>. <code>POST /v1/embeddings</code> and <code>POST /api/embed</code> return normalized vectors; EmbeddingGemma 2 with <code>--mmproj</code> also accepts image/audio/video and mixed content sequences. Backend support and measured scope depend on the model. <a href="embeddings.html">Recipes, APIs and validation →</a></p>
-
-  <h2 id="jev">Jev typed decisions</h2>
-  <p>Host a DiffusionGemma GGUF (for example with <code>config/jev-diffusiongemma-q4.json</code>) and <code>POST /v1/systemone</code> answers Jev-compatible typed-decision requests: the body carries state and typed questions (<code>noul</code>, <code>choice</code>, <code>score</code>), and the reply carries probabilities, choices and expected scores read after one denoising step. <code>model</code> may name the loaded model or the aliases <code>jev-latest</code> / <code>jev-preview</code>, which are not separate checkpoints. Requests are JSON only; with the vision tower loaded through <code>--mmproj</code>, a request may also carry up to 8 inline images (base64 or <code>data:</code> URLs) in its <code>images</code> array. <code>TS_JEV_MAX_BODY_MB</code> (default 8, 1–64), <code>TS_JEV_MAX_CANVAS</code> (default 64, 8–4096) and <code>TS_JEV_MAX_PENDING</code> (default 32 admitted requests, 1–1024) bound the work. <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev.md" target="_blank" rel="noopener">Fields, limits and status codes →</a></p>
-
-  <h2 id="start">Start the server</h2>
-  <h3 id="e4b-fast-lane">Quick start in ~30 seconds (Gemma 4 E4B)</h3>
-  <p>Install the <a href="getting-started.html#install-dotnet">.NET 10 SDK for your platform</a>, Git, CMake, and <code>curl</code>, then paste this from a terminal. Copying and running the commands takes about 30 seconds; the 7.48 GiB model download and the first restore/build take longer and depend on your connection and machine. It hosts the repository's benchmark-verified Gemma 4 E4B Q8_0 from the recommended public <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>ggml-org</code> artifact</a> on the native GGML bridge. This block is for Linux + NVIDIA (the CUDA build also needs the CUDA Toolkit):</p>
-  <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
-cd TensorSharp
-TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
-curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf
-dotnet run --project TensorSharp.Server.Host -c Release --no-build -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda</code></pre>
-  <p>On Apple Silicon, omit the CUDA environment assignment and use <code>ggml_metal</code>; on a supported Windows/Linux Vulkan GPU, request <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> instead and use <code>ggml_vulkan</code>; with no supported GPU, drop the assignment and use <code>ggml_cpu</code>. The lower-memory <code>gemma-4-E4B-it-Q4_K_M.gguf</code> is in the same repository. Text needs no projector; image, video, or audio also requires the matching <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code> passed with <code>--mmproj</code>. See <a href="getting-started.html#e4b-fast-lane">Getting Started</a> for Windows PowerShell and full platform syntax.</p>
-  <p>In a second terminal, verify the OpenAI-compatible endpoint:</p>
-  <pre data-lang="bash"><code>curl -s http://localhost:5000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'</code></pre>
-  <p>The API base is <strong><code>http://localhost:5000</code></strong>. When the bundled <code>wwwroot/</code> is present and enabled, <strong><a href="http://localhost:5000/"><code>GET /</code></a></strong> serves its <code>index.html</code> chat UI. Use <code>GET /health</code> for the stable plain-text liveness check; only a headless deployment with no enabled Web UI falls back to that health response at the bare <code>/</code> route.</p>
-  <div class="callout note"><div class="ic">📌</div><p><code>--model</code> is required for inference. The server hosts exactly the startup GGUF and optional, explicitly supplied <code>--mmproj</code>; it does not scan a model directory or auto-detect a projector. <code>/api/models/load</code> can only re-load that same startup pair, optionally on another supported backend. A model-less process cannot choose a GGUF at runtime. The default listen address is <code>http://0.0.0.0:5000</code>; <code>--port</code>, <code>--host</code> and <code>--urls</code> (env <code>PORT</code> / <code>HOST</code> / <code>ASPNETCORE_URLS</code>) move it.</p></div>
-  <div class="callout warn"><div class="ic">🔐</div><p>The server has no built-in API-key authentication or TLS and binds every interface. Keep it behind a host firewall for local use, or put an authenticated HTTPS reverse proxy in front of it; do not expose port 5000 directly to an untrusted network.</p></div>
-
-  <h3>Already-built source tree</h3>
-  <p>Run these commands from the repository root after building. They invoke <code>TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll</code>; that output directory also contains the copied native libraries and <code>wwwroot/</code>. The <a href="https://github.com/zhongkaifu/TensorSharp/releases" target="_blank" rel="noopener">Releases page</a> also provides attached, self-contained CLI and server archives for supported platforms.</p>
-  <pre data-lang="bash"><code># Apple Silicon / Metal
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_metal
-
-# NVIDIA / GGML CUDA
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_cuda
-
-# AMD, Intel, or NVIDIA / Vulkan; inspect device indices first
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --list-gpus
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_vulkan --gpu-device 1
-
-# Multimodal: the projector is always explicit
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda</code></pre>
-
-  <h3>Server-wide default sampling</h3>
-  <p>Defaults fill in any field a request omits. Out of the box they match Ollama: temperature <code>0.8</code>, top-k <code>40</code>, top-p <code>0.9</code>, min-p <code>0</code>, repeat penalty <code>1.1</code> over the last <code>64</code> tokens, presence/frequency <code>0</code>, seed <code>-1</code>. A parameter you set explicitly also <em>overrides</em> the value a client sends for it — many chat clients (VS Code Copilot Chat among them) hardcode <code>temperature</code>/<code>top_p</code> into every request. Add <code>--sampling-precedence request</code> to hand that control back to clients.</p>
-  <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_metal \
-    --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
-    --presence-penalty 0.0 --frequency-penalty 0.0 --seed 42 \
-    --stop "&lt;/s&gt;" --stop "&lt;|endoftext|&gt;"</code></pre>
-
-  <h2 id="webui">Web UI features</h2>
-  <p>Open <code>http://localhost:5000/</code>. The browser interface supports:</p>
   <ul>
     <li>Multi-turn chat conversations with streaming token generation (SSE).</li>
     <li>Answers rendered from Markdown: tables, code blocks, lists, headings and links. The page builds them as elements rather than parsing the model's text as HTML, so a reply cannot inject markup or script; a link keeps its target only for <code>http(s)</code>, <code>mailto</code> and the server's own file downloads.</li>
@@ -86,73 +98,27 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
   </ul>
 
   <p><strong>Selected-area image edits:</strong> attach photos, choose <strong>Select area</strong> on the editing target, save the selection and describe the change. Qwen-Image 2.1 keeps the original dimensions and protects pixels outside the selection. The result offers <strong>Compare original</strong> and <strong>Edit again</strong>; other attached photos remain references. <a href="models-image.html#mask-editing">Selection editor and mask API →</a></p>
+  </details>
 
-  <h3 id="steering">Steer a reply during generation</h3>
+  <h4 id="steering">Steer a reply during generation</h4>
   <p>Type and send a new message while a reply is generating. The host cancels and drains the old generation, retains its produced reply and starts the new turn; the separate <strong>Stop</strong> button still cancels. This requires a build after <code>v2026.10.10</code>.</p>
-  <h3 id="knowledge">Personal knowledge bases</h3>
+  <h4 id="knowledge">Personal knowledge bases</h4>
   <p>Set <code>TS_KNOWLEDGE_DIRECTORY</code> before startup to enable the store and <code>/api/knowledge</code> management API. Supported chat requests explicitly pass <code>knowledgeCollections</code>; missing or empty selection retrieves nothing. The standalone server Chat page has no TensorAgent collection-management panel, so use the API/SDK. TensorAgent separately supplies collection, folder and chat-import UI. <a href="knowledge.html#server">Configuration, supported routes and limits →</a></p>
-  <h2 id="agentic">Agentic work and code execution</h2>
-  <p>On tool-capable model families, the server runs the loaded model through an in-process generate → tool → generate loop. Agent Skills may be discovered and read without executing scripts; <code>--skills-allow-exec</code> separately opts the operator into bundled skill scripts. <code>--code-exec</code> opts into the host-handled <code>read_file</code>, <code>write_file</code>, <code>apply_patch</code>, and sandboxed <code>shell</code> tools. Web UI chat sessions retain a private workspace across rounds, while stateless API requests receive an isolated request workspace that is removed afterward.</p>
-  <p>The same model can also delegate: on <code>/v1/chat/completions</code>, <code>/v1/responses</code>, <code>/api/chat/ollama</code> and the Web UI's <code>/api/chat</code>, sub-agent delegation is <strong>on by default</strong> for families that render tool declarations and parse tool calls (not Mistral 3, Hunyuan Dense or DiffusionGemma). The model decides whether to call <code>spawn_agent</code>, <code>wait_agent</code>, <code>send_input</code>, <code>close_agent</code> and <code>list_agents</code>; it needs neither skills nor <code>--code-exec</code>. Each child is a separate conversation on the same model with its own copy of the KV state, and explorer and reviewer children are read-only. <code>--no-multi-agent</code> turns it off, the <code>--agents-*</code> options below bound it, and a request can opt out with <code>"multi_agent": false</code>. No latency or quality measurements are published for it. → <a href="agentic.html#sub-agents">Sub-agents</a></p>
-  <div class="callout warn"><div class="ic">🔒</div><p>Executable tools are off until the operator enables them, but there is no per-command approval prompt after that decision. The default sandbox mode is <code>required</code> and fails closed: macOS uses Seatbelt and Linux requires bubblewrap 0.12.0 or newer. Windows Job Objects bound descendants but do not confine filesystem or network access, so skill scripts require an explicit less-safe sandbox mode and model-authored commands require <code>--code-exec-unconfined</code>. Host tool calls anywhere in one request's sub-agent tree run one at a time, and a <code>worker</code> child gets the parent's mutable tools only with <code>--agents-allow-worker-tools</code>. See <a href="agentic.html">Agentic Work, Skills &amp; Sandboxing</a> for the complete flags, model-family limits, workspace lifecycle, and security boundaries.</p></div>
+  <h2 id="operate">3. Configure and operate it</h2>
+  <p>Keep a working local launch, then make configuration, access and storage explicit in your deployment. The <a href="#options">options</a>, <a href="#env">environment variables</a> and <a href="#tunables">scheduler reference</a> retain the full details.</p>
+  <ul>
+    <li><strong>Access:</strong> the examples bind loopback. Before cross-machine access, configure authentication, an HTTPS reverse proxy and a firewall.</li>
+    <li><strong>Process and model:</strong> <code>/health</code> checks liveness; use <code>/v1/models</code> and a bounded inference request to check model service. <code>--no-webui</code> disables the UI while APIs and <code>/uploads</code> remain available.</li>
+    <li><strong>Logs and state:</strong> choose persistent directories with <code>TENSORSHARP_LOG_DIR</code>, <code>TENSORSHARP_UPLOAD_DIR</code> and <code>TENSORSHARP_PREFIX_CACHE_DIR</code>. <code>--no-prefix-cache</code> disables runtime prefix reuse, startup prompt preparation and persistence across launches.</li>
+  </ul>
 
-  <p><strong>LTX 2.5:</strong> use <code>--config config/ltx-2.5-distilled.json</code>; NVIDIA uses <code>cuda</code>/<code>ggml_cuda</code>, Apple uses <code>mlx</code>/<code>ggml_metal</code> (the MLX executor), and CPU aliases select direct CPU. Defaults are 1024×1024×17 at 24 fps, dimensions divisible by 64 and frames <code>8k+1</code>; eight half-size steps plus three refinement steps, CFG 1. <a href="models-video.html#ltx-25">Five files, audio, conditioning and limits →</a></p>
-
-  <h2 id="video">Video generation: what the UI sets, and what only the API sets</h2>
-  <p>Host a video-generation model — LTX 2.5, MiniMax-H3 or Wan — and the Web UI turns into a video generator. The endpoints gate on the <code>IVideoGenerationModel</code> seam rather than on an architecture string, so anything else answers <code>400</code> with <code>The loaded model is not a video-generation model.</code> It is worth knowing exactly how little of the request the browser controls, because a video job can run for minutes or for hours and the browser gives you no way to change that mid-flight.</p>
-  <pre data-lang="bash"><code># MiniMax-H3: the clip and its 32 kHz stereo soundtrack, denoised together in one latent.
-# No size flags: text-to-video runs at 640×384 and an uploaded keyframe sizes the canvas
-# by MiniMax's 768p recipe; --video-width/--video-height would pin one size for every mode
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-    --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
-    --video-steps 20 --video-frames 22
-
-# The other checkpoint: identity/appearance references into a new scene, at 640×384
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-    --model ./models/minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_cuda \
-    --video-steps 20 --video-frames 22</code></pre>
-  <p>FL2VA and Ref2VA are two checkpoints, not two settings: which one is loaded decides whether attached images are keyframes or references, and it is what <code>/api/models</code> reports to the browser. <code>config/minimax-h3-fl2va.json</code> leaves the size to the model and <code>config/minimax-h3-ref2va.json</code> pins 640×384; both download the denoiser, the shared Qwen3-VL-32B text encoder and both VAEs on first run — but not the tokenizer, which is not a flag: put <code>vocab.json</code> and <code>merges.txt</code> from the upstream <code>MiniMaxAI/MiniMax-H3</code> <code>processor/</code> folder beside the encoder, or point <code>TS_VIDEO_TOKENIZER</code> at the folder holding them.</p>
-  <p>To serve FL2VA on LightX2V's 8- or 4-step Turbo recipe, add its plug-in config. Every clip then samples the plug-in's schedule, so leave <code>--video-steps</code> unset (or set it to the plug-in's count) and send requests without <code>steps</code>, as the Web UI does: a contradicting <code>--video-steps</code> stops startup before anything downloads, and a contradicting request gets a <code>400</code> (a <code>{done, error}</code> event on the stream route). The weights (1.38 GB) download on first use; the 4-step recipe is inferred. → <a href="models-video.html#h3-turbo">Turbo plug-ins</a></p>
-  <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
-    --lora config/lora/minimax-h3-fl2v-turbo-8step.json</code></pre>
-  <div class="callout warn"><div class="ic">⏱️</div><p><strong>The browser sends the prompt plus whatever conditioning the loaded model advertises</strong> — a first frame, a last frame, or up to <code>maxReferenceImages</code> reference stills alongside any attached clips and soundtracks — shaped from the <code>video</code> capability object that <code>GET /api/models</code> returns rather than guessed from an architecture name. Frame count, fps, resolution, denoise steps, seed, flow shift, sampler, negative prompt and the guidance cache are <em>not</em> exposed in the UI: they come from the startup flags or the model's own recipe. Guidance has no startup flag at all — <strong>the server takes no <code>--cfg</code></strong> — so a request is the only place to set it, and MiniMax-H3 refuses anything above <code>1.0</code> because it ships CFG-distilled. To set any of these per request, call <a href="http-api.html#video-api"><code>POST /api/video-generate</code></a> or <code>/v1/videos/generations</code> directly.</p></div>
-  <p>What the process decides at startup, and how:</p>
-  <div class="table-scroll">
-  <table>
-    <thead><tr><th>What decides it</th><th>Setting</th><th>Notes</th></tr></thead>
-    <tbody>
-      <tr><td><code>--model</code> (fixed for the process)</td><td>Which family, and how many denoise passes</td><td><strong>The single biggest cost factor.</strong> MiniMax-H3 is CFG-distilled, so every step is one guidance-free pass — 20 steps by default; its step-distilled schedule comes from a plug-in rather than another checkpoint (next row). A base Wan2.2-TI2V-5B runs the official 50 steps × 2 CFG passes = 100 DiT passes; a step-distilled <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> checkpoint is detected from the file name and runs 4 guidance-free passes. On an M5 Pro at 1088×832 × 121 frames that is ≈3 h 30 m versus 17 m 30 s for the identical request. → <a href="benchmarks.html#minimax-h3">H3 measurements</a> · <a href="benchmarks.html#wan">Wan measurements</a> · <a href="models-video.html">downloads</a></td></tr>
-      <tr><td><code>--lora &lt;plug-in&gt;</code> (fixed for the process)</td><td>MiniMax-H3's step-distilled schedule</td><td>The <a href="models-video.html#h3-turbo">LightX2V Turbo plug-ins</a> for the FL2VA checkpoint, <code>config/lora/minimax-h3-fl2v-turbo-8step.json</code> and <code>-4step.json</code>, run every clip in 8 or 4 guidance-free passes instead of 20, on a locked recipe (the 4-step recipe is inferred). Ref2VA refuses them. No Turbo clip timings are recorded yet.</td></tr>
-      <tr><td><code>--video-width N</code> / <code>--video-height N</code></td><td>Default output size</td><td><strong>The main quality lever on the server</strong>, because the Web UI sends no size of its own: without these every clip is generated at the model's default. For MiniMax-H3, leave both unset: text-to-video and references then run at 640×384, and image-to-video and first/last-frame take the canvas from the first keyframe by MiniMax's 768p recipe (1152×768 for a 3:2 photo, 1344×768 for 16:9). Those modes keep the keyframe's framing, and at 640×384 a wide shot's faces blur; the recipe size takes several times longer. Setting both pins one size for every mode, keyframes included, and turns off Studio's “From the first frame” size; when only one of the two is given H3 takes the other from the conditioning image's aspect ratio. Aliases: <code>--width</code> / <code>--height</code>.</td></tr>
-      <tr><td><code>--video-steps N</code></td><td>Default denoise steps</td><td>The quality/time trade-off after resolution. MiniMax-H3 defaults to 20; 16–24 is visibly cleaner, past ~30 gains little, and fewer steps come from a Turbo plug-in (row above). A request's <code>steps</code> overrides it; under a Turbo plug-in both must be unset or equal the plug-in's count, and anything else is refused (at startup, or with a <code>400</code>).</td></tr>
-      <tr><td><code>--video-mode &lt;mode&gt;</code></td><td>Default conditioning mode</td><td>Pins <code>t2v</code> / <code>i2v</code> / <code>fl2v</code> / <code>ref</code> for requests that omit <code>videoMode</code>. Omit it and each request infers its own mode from what it supplies, which is usually what you want; pin it for a deployment that only offers one.</td></tr>
-      <tr><td><code>--video-frames N</code></td><td>Default frame count</td><td>A server-wide <em>default</em>, not a cap: a request that carries <code>frames</code> overrides it. Snapped to the model's temporal grid — <code>4k+1</code> for Wan, <code>17k+5</code> for MiniMax-H3. With the flag omitted the model recipe applies — 49 frames for Wan2.2-TI2V, 33 for the other Wan checkpoints, 22 for MiniMax-H3.</td></tr>
-      <tr><td><code>--fps N</code></td><td>Default playback rate</td><td>Also a default, overridden independently by a request's <code>fps</code>. Omitted, the recipe gives 24 fps for Wan2.2-TI2V and 16 otherwise; MiniMax-H3 is trained at a fixed 24 fps and overrides any other value. FPS changes playback, not the amount of work.</td></tr>
-      <tr><td><code>--audio-vae &lt;path&gt;</code></td><td>Whether a soundtrack comes back</td><td>Only for models that generate audio jointly with the video (<code>minimax_h3_audio_vae_fp32.safetensors</code>). Without it MiniMax-H3 still runs and produces video, just silent — and <code>supportsAudio</code> on <code>/api/models</code> reports <code>false</code>.</td></tr>
-      <tr><td>The request (API only)</td><td>Everything else</td><td><code>width</code>, <code>height</code>, <code>frames</code>, <code>steps</code>, <code>cfg</code>, <code>cfg2</code>, <code>seed</code>, <code>fps</code>, <code>flowShift</code>, <code>sampler</code>, <code>negativePrompt</code>, <code>cfgCacheStride</code>, <code>videoMode</code>, <code>generateAudio</code>, <code>endImage</code>, <code>referenceImages</code>, <code>referenceVideos</code>, <code>referenceAudios</code>, <code>referenceVideoAudios</code>.</td></tr>
-    </tbody>
-  </table>
-  </div>
-  <p>The Web-UI-shaped endpoint takes the fields under their JSON names; the same body works on <code>/api/video-generate</code> (one MP4 back) and <code>/api/video-generate/stream</code> (SSE denoise progress). Generations are serialized process-wide, so one job runs at a time:</p>
-  <pre data-lang="bash"><code>curl -s http://localhost:5000/api/video-generate \
-  -H "Content-Type: application/json" \
-  -d '{
-        "prompt": "a red fox trotting through falling snow, cinematic",
-        "width": 640, "height": 384,
-        "frames": 22, "fps": 24,
-        "steps": 8, "cfg": 1.0, "seed": 42,
-        "videoMode": "t2v",
-        "generateAudio": true
-      }'</code></pre>
-  <p>The reply is <code>{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }</code>; <code>audioUrl</code> points at the sidecar WAV and is <code>null</code> when the model produced no track. Wan takes the same body with its own knobs instead — <code>"flowShift": 5.0</code>, <code>"sampler": "unipc"</code>, <code>"negativePrompt"</code>, <code>"cfgCacheStride": 2</code> — none of which MiniMax-H3 needs, because it runs guidance-free at <code>"cfg": 1.0</code> (under a Turbo plug-in, a <code>flowShift</code> or <code>sampler</code> other than the plug-in's own is refused).</p>
-  <p>An <code>"image"</code> field carries a base64 conditioning frame (a <code>data:…;base64,</code> prefix is accepted); <code>"imagePath"</code>, <code>"endImage"</code> and every <code>reference*</code> entry are the Web UI's form and must name files already returned by <code>/api/upload</code> — anything resolving outside the upload directory is rejected. The OpenAI-shaped <code>POST /v1/videos/generations</code> takes the same parameters but spells the size as <code>"size": "832x480"</code> and the negative prompt as <code>"negative_prompt"</code>. Full request/response shapes are on the <a href="http-api.html#video-api">HTTP API</a> page.</p>
-  <div class="callout tip"><div class="ic">💡</div><p><strong>Before starting a long job, size it.</strong> Cost is dominated by DiT tokens (<code>latent_frames × (h/2) × (w/2)</code>) and self-attention is O(tokens²), so frames and frame area matter far more than steps. On MiniMax-H3 the order is resolution, then frames, then steps — it is already guidance-free, and its one distillation lever is a <a href="models-video.html#h3-turbo">Turbo plug-in</a> (FL2VA only), which samples 8 or 4 passes instead of 20. On Wan: use a step-distilled checkpoint, cut frames, cut frame area (but not below ~0.3 MP), cut steps on base checkpoints, then <code>"cfgCacheStride": 2</code> or <code>3</code> for 1.30× / 1.43×. 480p (≈0.4 MP) is a resolution Wan is trained at, so it is a real output mode rather than a degraded one.</p></div>
-
-  <h2 id="config">Configuration file (<code>--config</code>)</h2>
-  <p>Instead of a long command line, pass a JSON file with <code>--config</code>. The <a href="cli.html">CLI</a> reads the same format. <strong>Command-line options always win</strong>—when the command line sets a single-valued option itself, that option's entry in the file is dropped before it is resolved (not emitted, its variables not substituted, its download never attempted), so one file can be reused across hosts while you override just what differs. Each override prints one <code>[config] --X is set on the command line, so the value from '&lt;file&gt;' is ignored …</code> line to stderr. This holds for <code>--gpu-device</code> and <code>--kv-cache-dtype</code> too. Repeat <code>--config</code> to layer files (a later file's entry replaces an earlier one's the same way). The repeatable options — <code>--stop</code>, <code>--skills-dir</code>, <code>--skill</code>, <code>--lora</code>, <code>--lora-scale</code>, <code>--lora-config</code>, <code>--image</code> and the <code>--ref-*</code> inputs — keep the file's values and add the command line's after them. Comments and trailing commas are allowed.</p>
-  <pre data-lang="bash"><code># Read all options from a file; override just the backend for this host
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json --backend ggml_cpu</code></pre>
+  <h3 id="config">Configuration file (<code>--config</code>)</h3>
+  <details>
+    <summary>Config precedence, variables and automatic downloads</summary>
+  <p>Instead of a long command line, pass a JSON file with <code>--config</code>. The <a href="cli.html">CLI</a> reads the same format. <strong>Command-line options always win</strong>—when the command line sets a single-valued option itself, that option's entry in the file is dropped before it is resolved (not emitted, its variables not substituted, its download never attempted), so one file can be reused across hosts while you override just what differs. Each override prints one <code>[config] --X is set on the command line, so the value from '&lt;file&gt;' is ignored …</code> line to stderr. This holds for <code>--gpu-device</code> and <code>--kv-cache-dtype</code> too. Repeat <code>--config</code> to layer files (a later file's entry replaces an earlier one's the same way). For <code>--skills-dir</code>, the winning source replaces the complete root list; repeated values within that source survive. Accumulating options — <code>--stop</code>, <code>--skill</code>, <code>--lora</code>, <code>--lora-scale</code>, <code>--lora-config</code>, <code>--image</code> and the <code>--ref-*</code> inputs — keep the file's values and add the command line's after them. Comments and trailing commas are allowed.</p>
+  <pre data-lang="bash"><code># Read options from a file; bind loopback and override the backend for this host
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json --host 127.0.0.1
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json --backend ggml_cpu --host 127.0.0.1</code></pre>
   <p>Keys are the same long option names below (with or without the leading <code>--</code>). A string/number becomes <code>--key value</code>, <code>true</code> becomes the bare switch <code>--key</code>, and an array becomes a repeated flag (e.g. <code>"stop": ["&lt;/s&gt;", "&lt;|eot|&gt;"]</code>). <code>false</code> and <code>null</code> emit nothing, so to turn a default-on option off name its negation (<code>"no-continuous-batching": true</code>). <code>lora-scale</code> and <code>lora-config</code> cannot be arrays, and a removed option is refused as a key. Because the server rejects unknown options, a CLI-only key (such as <code>interactive</code> or <code>input</code>) stops it at startup; the penalty window is <code>repeat-last-n</code> on both hosts.</p>
   <p><strong>Variables.</strong> Define shared values once under <code>"variables"</code> (alias <code>"vars"</code>) and reference them with <code>${name}</code>, or <code>${name:-fallback}</code> for a default, in any string value (an undefined name falls back to an environment variable of the same name). Declare as many roots as you need — models in different folders each get their own.</p>
   <p><strong>Auto-download.</strong> Any file option can be an object with a local <code>path</code> and one or more <code>urls</code> (or a single <code>url</code>). A relative <code>path</code> resolves against the config file's folder. If <code>path</code> is missing it downloads from the first working URL (mirrors tried in order), saves it there, and reuses it next time; progress prints to stderr, and an optional <code>sha256</code> verifies a fresh download (an existing file is used as-is). A download entry whose option the command line (or a later file) also sets is dropped before it is resolved, so <code>--mmproj none</code> on the command line both disables a configured projector and skips its download.</p>
@@ -166,8 +132,114 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
   "mmproj": { "path": "${modelRoot}/gemma-4-E4B-mmproj-F16.gguf", "urls": [ "${repo}/mmproj-F16.gguf" ] }
 }</code></pre>
   <p>Ready-to-use examples live in the repository's <code>config/</code> folder (<code>cli-basic.json</code>, <code>server-basic.json</code>, <code>variables.json</code>, <code>auto-download.json</code>, <code>qwen-image-2.1.json</code>) — each uses real, public, ungated URLs, so it works on a fresh machine. See <code>config/README.md</code> for the full reference.</p>
+  </details>
 
-  <h2 id="options">Server options</h2>
+  <h3 id="sampling">Server-wide default sampling</h3>
+  <details>
+    <summary>Sampling defaults and request precedence</summary>
+  <p>Defaults fill in any field a request omits. Out of the box they match Ollama: temperature <code>0.8</code>, top-k <code>40</code>, top-p <code>0.9</code>, min-p <code>0</code>, repeat penalty <code>1.1</code> over the last <code>64</code> tokens, presence/frequency <code>0</code>, seed <code>-1</code>. A parameter you set explicitly also <em>overrides</em> the value a client sends for it — many chat clients (VS Code Copilot Chat among them) hardcode <code>temperature</code>/<code>top_p</code> into every request. Add <code>--sampling-precedence request</code> to hand that control back to clients.</p>
+  <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_metal --host 127.0.0.1 \
+    --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
+    --presence-penalty 0.0 --frequency-penalty 0.0 --seed 42 \
+    --stop "&lt;/s&gt;" --stop "&lt;|endoftext|&gt;"</code></pre>
+  </details>
+
+  <h3 id="upload-policy">Uploads and retention</h3>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Boundary</th><th>Default and control</th></tr></thead>
+    <tbody>
+      <tr><td>One file</td><td>500 MB by default; <code>--upload-max-mb</code> controls multipart uploads and decoded base64 attachments.</td></tr>
+      <tr><td>HTTP request body</td><td><code>POST /api/upload</code> follows the per-file cap and never drops below 500 MB. Other routes stay at 500 MB; base64 expands by about a third, limiting an inline file to roughly 375 MB before other JSON fields.</td></tr>
+      <tr><td>Total budget</td><td><code>--upload-quota-mb</code> is off by default; generated images and videos count, and excess requests are rejected before model work.</td></tr>
+      <tr><td>Retention</td><td><code>--upload-ttl-hours</code> is off by default because sessions reference attachment paths. <code>TENSORSHARP_UPLOAD_DIR</code> moves the default <code>uploads/</code> directory beside the binary.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="service-modes">Choose a service mode for your task</h2>
+  <p>Select the model and protocol for the task. Embeddings and Jev already have detailed guides; the host-specific limits remain below, with video and tool details available on demand.</p>
+  <p><a href="embeddings.html#start">Embedding service guide</a> · <a href="http-api.html#jev">Jev API</a> · <a href="agentic.html">Agents and tools</a> · <a href="models-video.html">Video models and downloads</a></p>
+
+  <h3 id="embeddings">Embedding service</h3>
+  <details>
+    <summary>Encoders, media projectors and backend scope</summary>
+  <p>Host Snowflake, MiniLM or EmbeddingGemma 2 with <code>--model encoder.gguf --embeddings</code>. <code>POST /v1/embeddings</code> and <code>POST /api/embed</code> return normalized vectors; EmbeddingGemma 2 with <code>--mmproj</code> also accepts image/audio/video and mixed content sequences. Backend support and measured scope depend on the model. <a href="embeddings.html">Recipes, APIs and validation →</a></p>
+  </details>
+
+  <h3 id="jev">Jev typed decisions</h3>
+  <details>
+    <summary>Jev requests, aliases and workload limits</summary>
+  <p>Host a DiffusionGemma GGUF (for example with <code>config/jev-diffusiongemma-q4.json</code>) and <code>POST /v1/systemone</code> answers Jev-compatible typed-decision requests: the body carries state and typed questions (<code>noul</code>, <code>choice</code>, <code>score</code>), and the reply carries probabilities, choices and expected scores read after one denoising step. <code>model</code> may name the loaded model or the aliases <code>jev-latest</code> / <code>jev-preview</code>, which are not separate checkpoints. Requests are JSON only; with the vision tower loaded through <code>--mmproj</code>, a request may also carry up to 8 inline images (base64 or <code>data:</code> URLs) in its <code>images</code> array. <code>TS_JEV_MAX_BODY_MB</code> (default 8, 1–64), <code>TS_JEV_MAX_CANVAS</code> (default 64, 8–4096) and <code>TS_JEV_MAX_PENDING</code> (default 32 admitted requests, 1–1024) bound the work. <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev.md" target="_blank" rel="noopener">Fields, limits and status codes →</a></p>
+  </details>
+
+  <h3 id="agentic">Agentic work and code execution</h3>
+  <details>
+    <summary>Tools, sub-agents and sandbox boundaries</summary>
+  <p>On tool-capable model families, the server runs the loaded model through an in-process generate → tool → generate loop. Agent Skills may be discovered and read without executing scripts; <code>--skills-allow-exec</code> separately opts the operator into bundled skill scripts. <code>--code-exec</code> opts into the host-handled <code>read_file</code>, <code>write_file</code>, <code>apply_patch</code>, and sandboxed <code>shell</code> tools. Web UI chat sessions retain a private workspace across rounds, while stateless API requests receive an isolated request workspace that is removed afterward.</p>
+  <p>The same model can also delegate: on <code>/v1/chat/completions</code>, <code>/v1/responses</code>, <code>/api/chat/ollama</code> and the Web UI's <code>/api/chat</code>, sub-agent delegation is <strong>on by default</strong> for families that render tool declarations and parse tool calls (not Mistral 3, Hunyuan Dense or DiffusionGemma). The model decides whether to call <code>spawn_agent</code>, <code>wait_agent</code>, <code>send_input</code>, <code>close_agent</code> and <code>list_agents</code>; it needs neither skills nor <code>--code-exec</code>. Each child is a separate conversation on the same model with its own copy of the KV state, and explorer and reviewer children are read-only. <code>--no-multi-agent</code> turns it off, the <code>--agents-*</code> options below bound it, and a request can opt out with <code>"multi_agent": false</code>. No latency or quality measurements are published for it. → <a href="agentic.html#sub-agents">Sub-agents</a></p>
+  <div class="callout warn"><div class="ic">🔒</div><p>Executable tools are off until the operator enables them, but there is no per-command approval prompt after that decision. The default sandbox mode is <code>required</code> and fails closed: macOS uses Seatbelt and Linux requires bubblewrap 0.12.0 or newer. Windows Job Objects bound descendants but do not confine filesystem or network access, so skill scripts require an explicit less-safe sandbox mode and model-authored commands require <code>--code-exec-unconfined</code>. Host tool calls anywhere in one request's sub-agent tree run one at a time, and a <code>worker</code> child gets the parent's mutable tools only with <code>--agents-allow-worker-tools</code>. See <a href="agentic.html">Agentic Work, Skills &amp; Sandboxing</a> for the complete flags, model-family limits, workspace lifecycle, and security boundaries.</p></div>
+  </details>
+
+  <h3 id="video">Video generation: what the UI sets, and what only the API sets</h3>
+  <details>
+    <summary>Model recipes, startup flags and per-request video fields</summary>
+  <p><strong>LTX 2.5:</strong> use <code>--config config/ltx-2.5-distilled.json</code>; NVIDIA uses <code>cuda</code>/<code>ggml_cuda</code>, Apple uses <code>mlx</code>/<code>ggml_metal</code> (the MLX executor), and CPU aliases select direct CPU. Defaults are 1024×1024×17 at 24 fps, dimensions divisible by 64 and frames <code>8k+1</code>; eight half-size steps plus three refinement steps, CFG 1. <a href="models-video.html#ltx-25">Five files, audio, conditioning and limits →</a></p>
+
+  <p>Host a video-generation model — LTX 2.5, MiniMax-H3 or Wan — and the Web UI turns into a video generator. The endpoints gate on the <code>IVideoGenerationModel</code> seam rather than on an architecture string, so anything else answers <code>400</code> with <code>The loaded model is not a video-generation model.</code> It is worth knowing exactly how little of the request the browser controls, because a video job can run for minutes or for hours and the browser gives you no way to change that mid-flight.</p>
+  <pre data-lang="bash"><code># MiniMax-H3: the clip and its 32 kHz stereo soundtrack, denoised together in one latent.
+# No size flags: text-to-video runs at 640×384 and an uploaded keyframe sizes the canvas
+# by MiniMax's 768p recipe; --video-width/--video-height would pin one size for every mode
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --host 127.0.0.1 \
+    --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-steps 20 --video-frames 22
+
+# The other checkpoint: identity/appearance references into a new scene, at 640×384
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --host 127.0.0.1 \
+    --model ./models/minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-steps 20 --video-frames 22</code></pre>
+  <p>FL2VA and Ref2VA are separate checkpoints for keyframe and reference modes. The single <code>config/minimax-h3-fl2va.json</code> downloads both, plus the shared Qwen3-VL-32B encoder, both VAEs and the pinned tokenizer files. The model switches denoisers per request; <code>/api/models</code> advertises the available modes. The config leaves output size to the selected workflow. Manual tokenizer installs can set <code>TS_VIDEO_TOKENIZER</code>.</p>
+  <p>To serve FL2VA on LightX2V's 8- or 4-step Turbo recipe, add its plug-in config. Every clip then samples the plug-in's schedule, so leave <code>--video-steps</code> unset (or set it to the plug-in's count) and send requests without <code>steps</code>, as the Web UI does: a contradicting <code>--video-steps</code> stops startup before anything downloads, and a contradicting request gets a <code>400</code> (a <code>{done, error}</code> event on the stream route). The weights (1.38 GB) download on first use; the 4-step recipe is inferred. → <a href="models-video.html#h3-turbo">Turbo plug-ins</a></p>
+  <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json --host 127.0.0.1 \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json</code></pre>
+  <div class="callout warn"><div class="ic">⏱️</div><p><strong>The browser sends the prompt plus whatever conditioning the loaded model advertises</strong> — a first frame, a last frame, or up to <code>maxReferenceImages</code> reference stills alongside any attached clips and soundtracks — shaped from the <code>video</code> capability object that <code>GET /api/models</code> returns rather than guessed from an architecture name. Frame count, fps, resolution, denoise steps, seed, flow shift, sampler, negative prompt and the guidance cache are <em>not</em> exposed in the UI: they come from the startup flags or the model's own recipe. Guidance has no startup flag at all — <strong>the server takes no <code>--cfg</code></strong> — so a request is the only place to set it, and MiniMax-H3 refuses anything above <code>1.0</code> because it ships CFG-distilled. To set any of these per request, call <a href="http-api.html#video-api"><code>POST /api/video-generate</code></a> or <code>/v1/videos/generations</code> directly.</p></div>
+  <p>What the process decides at startup, and how:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>What decides it</th><th>Setting</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>--model</code> (fixed for the process)</td><td>Which family, and how many denoise passes</td><td><strong>The single biggest cost factor.</strong> MiniMax-H3 is CFG-distilled, so every step is one guidance-free pass — 20 steps by default; its step-distilled schedule comes from a plug-in rather than another checkpoint (next row). A base Wan2.2-TI2V-5B runs the official 50 steps × 2 CFG passes = 100 DiT passes; a step-distilled <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> checkpoint is detected from the file name and runs 4 guidance-free passes. On an M5 Pro at 1088×832 × 121 frames that is ≈3 h 30 m versus 17 m 30 s for the identical request. → <a href="models-video.html#minimax-h3">H3 measurements</a> · <a href="models-video.html#wan">Wan measurements</a> · <a href="models-video.html">downloads</a></td></tr>
+      <tr><td><code>--lora &lt;plug-in&gt;</code> (fixed for the process)</td><td>MiniMax-H3's step-distilled schedule</td><td>The <a href="models-video.html#h3-turbo">LightX2V Turbo plug-ins</a> for the FL2VA checkpoint, <code>config/lora/minimax-h3-fl2v-turbo-8step.json</code> and <code>-4step.json</code>, run every clip in 8 or 4 guidance-free passes instead of 20, on a locked recipe (the 4-step recipe is inferred). Ref2VA refuses them. No Turbo clip timings are recorded yet.</td></tr>
+      <tr><td><code>--video-width N</code> / <code>--video-height N</code></td><td>Default output size</td><td><strong>The main quality lever on the server</strong>, because the Web UI sends no size of its own: without these every clip is generated at the model's default. For MiniMax-H3, leave both unset: text-to-video and references then run at 640×384, and image-to-video and first/last-frame take the canvas from the first keyframe by MiniMax's 768p recipe (1152×768 for a 3:2 photo, 1344×768 for 16:9). Those modes keep the keyframe's framing, and at 640×384 a wide shot's faces blur; the recipe size takes several times longer. Setting both pins one size for every mode, keyframes included, and turns off Studio's “From the first frame” size; when only one of the two is given H3 takes the other from the conditioning image's aspect ratio. Aliases: <code>--width</code> / <code>--height</code>.</td></tr>
+      <tr><td><code>--video-steps N</code></td><td>Default denoise steps</td><td>The quality/time trade-off after resolution. MiniMax-H3 defaults to 20; 16–24 is visibly cleaner, past ~30 gains little, and fewer steps come from a Turbo plug-in (row above). A request's <code>steps</code> overrides it; under a Turbo plug-in both must be unset or equal the plug-in's count, and anything else is refused (at startup, or with a <code>400</code>).</td></tr>
+      <tr><td><code>--video-mode &lt;mode&gt;</code></td><td>Default conditioning mode</td><td>Pins <code>t2v</code> / <code>i2v</code> / <code>fl2v</code> / <code>ref</code> for requests that omit <code>videoMode</code>. Omit it and each request infers its own mode from what it supplies, which is usually what you want; pin it for a deployment that only offers one.</td></tr>
+      <tr><td><code>--video-frames N</code></td><td>Default frame count</td><td>A server-wide <em>default</em>, not a cap: a request that carries <code>frames</code> overrides it. Snapped to the model's temporal grid — <code>4k+1</code> for Wan, <code>17k+5</code> for MiniMax-H3. With the flag omitted the model recipe applies — 49 frames for Wan2.2-TI2V, 33 for the other Wan checkpoints, 22 for MiniMax-H3.</td></tr>
+      <tr><td><code>--fps N</code></td><td>Default playback rate</td><td>Also a default, overridden independently by a request's <code>fps</code>. Omitted, the recipe gives 24 fps for Wan2.2-TI2V and 16 otherwise; MiniMax-H3 is trained at a fixed 24 fps and overrides any other value. FPS changes playback, not the amount of work.</td></tr>
+      <tr><td><code>--audio-vae &lt;path&gt;</code></td><td>Whether a soundtrack comes back</td><td>Only for models that generate audio jointly with the video (<code>minimax_h3_audio_vae_fp32.safetensors</code>). Without it MiniMax-H3 still runs and produces video, just silent — and <code>supportsAudio</code> on <code>/api/models</code> reports <code>false</code>.</td></tr>
+      <tr><td>The request (API only)</td><td>Everything else</td><td><code>width</code>, <code>height</code>, <code>frames</code>, <code>steps</code>, <code>cfg</code>, <code>cfg2</code>, <code>seed</code>, <code>fps</code>, <code>flowShift</code>, <code>sampler</code>, <code>negativePrompt</code>, <code>cfgCacheStride</code>, <code>videoMode</code>, <code>generateAudio</code>, <code>endImage</code>, <code>referenceImages</code>, <code>referenceVideos</code>, <code>referenceAudios</code>, <code>referenceVideoAudios</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The Web-UI-shaped endpoint takes the fields under their JSON names; the same body works on <code>/api/video-generate</code> (one MP4 back) and <code>/api/video-generate/stream</code> (SSE denoise progress). Generations are serialized process-wide, so one job runs at a time:</p>
+  <pre data-lang="bash"><code>curl -s http://127.0.0.1:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{
+        "prompt": "a red fox trotting through falling snow, cinematic",
+        "width": 640, "height": 384,
+        "frames": 22, "fps": 24,
+        "steps": 8, "cfg": 1.0, "seed": 42,
+        "videoMode": "t2v",
+        "generateAudio": true
+      }'</code></pre>
+  <p>The reply is <code>{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }</code>; <code>audioUrl</code> points at the sidecar WAV and is <code>null</code> when the model produced no track. Wan takes the same body with its own knobs instead — <code>"flowShift": 5.0</code>, <code>"sampler": "unipc"</code>, <code>"negativePrompt"</code>, <code>"cfgCacheStride": 2</code> — none of which MiniMax-H3 needs, because it runs guidance-free at <code>"cfg": 1.0</code> (under a Turbo plug-in, a <code>flowShift</code> or <code>sampler</code> other than the plug-in's own is refused).</p>
+  <p>An <code>"image"</code> field carries a base64 conditioning frame (a <code>data:…;base64,</code> prefix is accepted); <code>"imagePath"</code>, <code>"endImage"</code> and every <code>reference*</code> entry are the Web UI's form and must name files already returned by <code>/api/upload</code> — anything resolving outside the upload directory is rejected. The OpenAI-shaped <code>POST /v1/videos/generations</code> takes the same parameters but spells the size as <code>"size": "832x480"</code> and the negative prompt as <code>"negative_prompt"</code>. Full request/response shapes are on the <a href="http-api.html#video-api">HTTP API</a> page.</p>
+  <div class="callout tip"><div class="ic">💡</div><p><strong>Before starting a long job, size it.</strong> Cost is dominated by DiT tokens (<code>latent_frames × (h/2) × (w/2)</code>) and self-attention is O(tokens²), so frames and frame area matter far more than steps. On MiniMax-H3 the order is resolution, then frames, then steps — it is already guidance-free, and its one distillation lever is a <a href="models-video.html#h3-turbo">Turbo plug-in</a> (FL2VA only), which samples 8 or 4 passes instead of 20. On Wan: use a step-distilled checkpoint, cut frames, cut frame area (but not below ~0.3 MP), cut steps on base checkpoints, then <code>"cfgCacheStride": 2</code> or <code>3</code> for 1.30× / 1.43×. 480p (≈0.4 MP) is a resolution Wan is trained at, so it is a real output mode rather than a degraded one.</p></div>
+  </details>
+
+  <h2 id="reference">Full reference</h2>
+  <p>Expand the table you need; each summary can be focused and toggled with the keyboard.</p>
+
+  <h3 id="options">Server options</h3>
+  <details>
+    <summary>All server options and behavior</summary>
   <p>Options are case-insensitive and also accept the <code>--option=value</code> form. Unlike the CLI, the server refuses to start on an unknown option or a stray positional argument, and suggests the closest known option when one is within two edits.</p>
   <div class="table-scroll">
   <table>
@@ -175,7 +247,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
     <tbody>
       <tr><td><code>--model &lt;path&gt;</code></td><td>GGUF file to host (required for inference).</td></tr>
       <tr><td><code>--mmproj &lt;path|none&gt;</code></td><td>Explicit multimodal projector: an mmproj GGUF, or — for the Gemma 4 family, DiffusionGemma included — a HuggingFace <code>.safetensors</code> shard holding the vision tower (<code>diffusiongemma-26B-A4B-it</code> is published without an mmproj). A bare filename resolves next to the model; pass <code>none</code> to disable it. Requires <code>--model</code>; there is no automatic projector scan.</td></tr>
-      <tr><td><code>--embeddings</code> · <code>--embedding-threads &lt;N&gt;</code> · <code>--embedding-context-size &lt;N&gt;</code></td><td>Host a GGUF embedding encoder instead of a chat model (see <a href="#embeddings">Embedding service</a>); requires <code>--model</code>, forbids <code>--mmproj</code>, and supports <code>cpu</code>, <code>ggml_cpu</code>, <code>ggml_metal</code> and <code>ggml_cuda</code>. The generation routes (chat, Responses, Ollama, <code>/v1/systemone</code>, and <code>/api/image-generate</code>, <code>/api/image-edit</code>, <code>/api/video-generate</code> with their <code>/stream</code> forms) answer 400 <code>This server hosts an embedding model. Use /v1/embeddings or /api/embed.</code>; an explicit <code>--backend</code> this machine does not have exits 2 with <code>error: model load refused: Backend 'X' is not supported on this machine.</code> The other two set the encoder's CPU threads and its maximum tokens per input, and require <code>--embeddings</code>.</td></tr>
+      <tr><td><code>--embeddings</code> · <code>--embedding-threads &lt;N&gt;</code> · <code>--embedding-context-size &lt;N&gt;</code></td><td>Host a GGUF embedding encoder instead of a chat model (see <a href="#embeddings">Embedding service</a>); requires <code>--model</code>. Snowflake/MiniLM support <code>cpu</code>, <code>ggml_cpu</code>, <code>ggml_metal</code> and <code>ggml_cuda</code>; EmbeddingGemma 2 additionally implements direct <code>cuda</code>/<code>mlx</code> and accepts media through a matching <code>--mmproj</code>. Vulkan embeddings are unimplemented; availability does not establish all-backend media quality or performance parity. The generation routes (chat, Responses, Ollama, <code>/v1/systemone</code>, and <code>/api/image-generate</code>, <code>/api/image-edit</code>, <code>/api/video-generate</code> with their <code>/stream</code> forms) answer 400 <code>This server hosts an embedding model. Use /v1/embeddings or /api/embed.</code>; an explicit <code>--backend</code> this machine does not have exits 2 with <code>error: model load refused: Backend 'X' is not supported on this machine.</code> The other two set the encoder's CPU threads and its maximum tokens per input, and require <code>--embeddings</code>.</td></tr>
       <tr><td><code>--backend &lt;type&gt;</code></td><td>Default backend: <code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>, <code>ggml_vulkan</code> (default: <code>ggml_metal</code> on macOS, <code>ggml_cpu</code> elsewhere; env <code>BACKEND</code>).</td></tr>
       <tr><td><code>--tp &lt;N&gt;</code></td><td>Tensor-parallel degree, for sharding weights within layers only (default 1; env <code>TENSORSHARP_TP_DEGREE</code>). Requires a supported model and GPU backend. Mutually exclusive with <code>--layer-split</code>; unsupported requests fail at startup.</td></tr>
       <tr><td><code>--layer-split &lt;N&gt;</code></td><td>Local GPU count for whole-layer placement on supported architectures; env <code>TENSORSHARP_LAYER_SPLIT_DEGREE</code>. Single-node only; cannot be combined with TP or distributed TP settings.</td></tr>
@@ -183,7 +255,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
       <tr><td><code>--gpu-device &lt;N&gt;</code></td><td>Vulkan device index for the <code>ggml_vulkan</code> backend on multi-GPU hosts (default: 0; env <code>TS_GGML_VULKAN_DEVICE</code>).</td></tr>
       <tr><td><code>--list-gpus</code></td><td>List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit.</td></tr>
       <tr><td><code>--port &lt;N&gt;</code> · <code>--host &lt;address&gt;</code> · <code>--urls &lt;urls&gt;</code></td><td>Listen port (default <code>5000</code>; env <code>PORT</code>), bind address (default <code>0.0.0.0</code>; env <code>HOST</code>), or full semicolon-separated listen URLs for cases the other two cannot express (falls back to <code>ASPNETCORE_URLS</code>; <code>--port</code> / <code>--host</code> win when both are given).</td></tr>
-      <tr><td><code>--no-webui</code></td><td>Do not serve the bundled Web UI; <code>GET /</code> answers the plain liveness text. Every API endpoint, <code>/uploads</code> included, stays up. Env: <code>TS_NO_WEBUI</code> (any value but <code>0</code>).</td></tr>
+      <tr><td><code>--no-webui</code></td><td>Do not serve the bundled Web UI; <code>GET /</code> answers the liveness response. Every API endpoint, <code>/uploads</code> included, stays up. Env: <code>TS_NO_WEBUI</code> (any value but <code>0</code>).</td></tr>
       <tr><td><code>--help</code></td><td>Print the full parameter reference and exit; it is also shown when no arguments are supplied. Inference always requires a startup <code>--model</code>.</td></tr>
       <tr><td><code>--config &lt;path&gt;</code></td><td>Read options from a JSON <a href="#config">config file</a> (command-line options override it). Supports <code>${variables}</code> and auto-downloading models via <code>{ "path": ..., "urls": [...] }</code>. Repeatable.</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Generation limit for every endpoint (Web UI, Ollama and OpenAI alike): fills in when a request omits it, and caps a request that asks for more (default: <code>20000</code>, which only fills in).</td></tr>
@@ -233,8 +305,11 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
   </table>
   </div>
   <div class="callout tip"><div class="ic">✅</div><p>Per-request fields (<code>temperature</code>, <code>top_p</code>, <code>seed</code>, <code>stop</code>, …) fill in every parameter you did not configure here. For one you did configure, your value wins unless the server runs with <code>--sampling-precedence request</code>. The <code>chat.start</code> log line prints the sampler each request actually ran with.</p></div>
+  </details>
 
-  <h2 id="env">Environment variables</h2>
+  <h3 id="env">Environment variables</h3>
+  <details>
+    <summary>Environment variables, defaults and state directories</summary>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Variable</th><th>Description</th></tr></thead>
@@ -260,8 +335,11 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
   </table>
   </div>
   <p class="page-foot-note">The server listens on <code>http://0.0.0.0:5000</code> by default; <code>--port</code>, <code>--host</code> and <code>--urls</code> (or the <code>PORT</code> / <code>HOST</code> / <code>ASPNETCORE_URLS</code> environment variables) move it, and the Docker Space images set <code>PORT=7860</code>.</p>
+  </details>
 
-  <h2 id="tunables">Continuous-batching tunables</h2>
+  <h3 id="tunables">Continuous-batching tunables</h3>
+  <details>
+    <summary>Continuous batching and scheduler parameters</summary>
   <p>The scheduler / engine knobs are read at process start. Set them via the environment (or the <code>--continuous-batching</code> flags, which translate to them).</p>
   <div class="table-scroll">
   <table>
@@ -271,7 +349,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
       <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>Per-step token budget (default <code>4096</code>).</td></tr>
       <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>Maximum in-flight sequences (default <code>16</code>).</td></tr>
       <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>Per-request prefill cap while a decode is active (default <code>256</code>); prefill-only steps fill the complete token budget.</td></tr>
-      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>Prefill chunk size when at most one sequence is in the system — caps all solo prefill chunks (default <code>8192</code>).</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>Prefill chunk size when at most one sequence is in the system — caps all solo prefill chunks (default <code>8192</code>, bounded by <code>TS_SCHED_MAX_BATCHED_TOKENS</code>). Left unset, a model that sizes its own lone-prompt steps does so instead: Muse Spark with pipelined prefill takes 8192-token steps, joining a remainder of up to 2048 tokens to the step before, and may exceed that budget. Setting it turns the model's steps off; the engine log says which applies.</td></tr>
       <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>Decode tokens before a sequence switch (default <code>256</code> = block size).</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS</code> / <code>TS_SCHED_BLOCK_SIZE</code></td><td>Physical blocks in the engine pool (default <code>256</code>) / tokens per block (default <code>16</code> for a family that reuses only whole pages, otherwise <code>256</code>).</td></tr>
       <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> disables all runtime prefix reuse across requests (= what <code>--no-prefix-cache</code> sets).</td></tr>
@@ -280,6 +358,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
   </table>
   </div>
   <p>The full environment-variable surface (MLX tunables, MTP knobs, diffusion) is on the <a href="api-reference.html#env-vars">API Reference</a> page and the <a href="advanced.html">Advanced</a> page.</p>
+  </details>
 
   <div class="content-footer">
     <a href="cli.html">← Command Line</a>

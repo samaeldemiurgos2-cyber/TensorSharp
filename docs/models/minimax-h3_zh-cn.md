@@ -153,18 +153,19 @@ FL2VA 上 1280×768×107 的首尾帧片段有 34,991 个打包 token，此时�
 | `minimax_h3_video_vae_fp16.safetensors` | 5.21 GB | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) 视频 VAE |
 | `minimax_h3_audio_vae_fp32.safetensors` | 0.61 GB | 同仓库，音频 VAE；静音输出可省略 |
 
-一套约 35.5 GB；第二种去噪器共用编码器、VAEs 和分词器。
+一个去噪器和共享组件约 35.5 GB；单个配置会下载两个去噪器与共享组件，约 46.1 GB，
+视频聊天和 Studio 可在不重启的情况下切换首尾帧与参考模式。
 伴随文件可放在去噪器旁，或用 `--video-text-encoder`、`--video-vae`、`--audio-vae`
-指定。`config/minimax-h3-fl2va.json` 与 `config/minimax-h3-ref2va.json`
-下载网络文件，默认 `ggml_cuda`、22 帧、24 fps，命令行后端优先；只有 ref2va 配置固定
-640×384，fl2va 配置把尺寸交给模型（文生视频 640×384，关键帧按[配方画布](#尺寸与设置)）。
-服务端步数使用 `--video-steps`，CLI 使用 `--diffusion-steps`；两份配置不写步数与 CFG，
+指定。`config/minimax-h3-fl2va.json` 会自动下载完整网络与分词器，默认 `ggml_cuda`、22 帧、24 fps，
+命令行后端优先；配置把尺寸交给模型（文生视频与参考模式 640×384，关键帧按[配方画布](#尺寸与设置)）。
+服务端步数使用 `--video-steps`，CLI 使用 `--diffusion-steps`；配置不写步数与 CFG，
 由模型采用默认 20 步和 CFG 1。
 
-**手动安装还需要分词器。** 文本 GGUF 不带分词器，配置也不会下载它。
+**配置会自动下载分词器。** 文本 GGUF 不带分词器；配置会下载并校验
+`vocab.json`、`merges.txt` 和 `tokenizer_config.json`。手动安装时可将这三份文件放在编码器旁，
+或设置 `TS_VIDEO_TOKENIZER`。
 将 [MiniMaxAI/MiniMax-H3 的 processor 文件](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor)
-`vocab.json`、`merges.txt`、`tokenizer_config.json` 放在编码器旁，
-或以 `TS_VIDEO_TOKENIZER` 指向其目录。TensorAgent 目录会自动下载这三份文件。
+包含这些分词器文件。TensorAgent 目录也会自动下载它们。
 视觉输入需要 `tokenizer_config.json` 中的特殊标记；缺失时图片或片段参考在视觉塔前
 就会被拒绝，避免默默忽略输入。纯文本或纯音频参考不需要这些视觉标记。
 已发布 GGUF 没有元数据，TensorSharp 按张量表识别；声明时也接受
@@ -179,6 +180,8 @@ FL2VA 上 1280×768×107 的首尾帧片段有 34,991 个打包 token，此时�
 | 尾帧（可带首帧） | `fl2v` | FL2VA |
 | 参考图、片段、音轨 | `ref` | Ref2VA |
 
+单个配置会下载两个分区，因此同一个加载模型可提供所有表中模式。
+
 `--video-mode` 可显式选择，否则按输入推断。关键帧不能与命名参考混用；
 分区不符时会拒绝。关键帧同时编码为视频潜变量和 Qwen3-VL 特征，按输出比例中心裁剪；
 未指定尺寸时使用图像比例。Ref2VA 保持参考自身比例，不以参考改变输出画布。
@@ -189,7 +192,7 @@ TensorSharp.Cli --config config/minimax-h3-fl2va.json --backend ggml_metal \
   --image start.png --end-image end.png --video-mode fl2v \
   --prompt "A slow cinematic push-in" --diffusion-seed 42 --output morph.mp4
 
-TensorSharp.Cli --config config/minimax-h3-ref2va.json --backend ggml_metal \
+TensorSharp.Cli --config config/minimax-h3-fl2va.json --backend ggml_metal \
   --ref-image person.jpg --ref-audio song.wav --video-mode ref \
   --prompt "She performs on a small club stage" --diffusion-seed 42 --output stage.mp4
 ```
@@ -411,9 +414,9 @@ ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4
 
 ## 在 TensorAgent Mac 应用里
 
-32 GB 档位提供 **MiniMax-H3**（`minimax-h3-fl2va-q4k`）和
-**MiniMax-H3 References**（`minimax-h3-ref2va-q4k`），自动下载带哈希校验的网络和三份
-分词器文件。首个条目把一张上传图作为首帧，两张作为首尾帧；参考条目接受参考媒体。
+32 GB 档位提供一个 **MiniMax-H3** 条目（`minimax-h3-fl2va-q4k`），自动下载带哈希校验的
+FL2VA 与 Ref2VA 去噪器、共享网络和三份分词器文件。在 Video Studio 中可选择首尾帧模式或参考模式；
+切换时只更换活动去噪器，已加载的模型和共享组件保持就绪。
 目录可用性不等于已完成每个模型/设备的验证；当前 Windows 与 iOS 的媒体生成未验证。
 完整应用与构建说明见 [TensorAgent](../../TensorAgent/README.md)。
 

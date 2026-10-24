@@ -136,7 +136,7 @@ too loose: it makes valid output unreachable and the request fails mid-string.
   the balanced object but not validated.
 - **`response_format` with `"think": true`** is accepted only on families whose
   protocol declares where the answer starts after reasoning: Gemma 4, Qwen 3.8
-  Flash Next (`qwen4exp`), GPT-OSS, Muse-Glimmer, DeepSeek V4.1, GLM-5.3-Flash
+  Flash Next (`qwen4exp`), GPT-OSS, Muse-Glimmer, Muse Spark, DeepSeek V4.1, GLM-5.3-Flash
   (`glm5next`) and Nemotron-H. The grammar stays idle while the model reasons
   and arms at that marker (for example `</think>`), skipping whitespace after
   it. Other families return HTTP 400.

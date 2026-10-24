@@ -143,4 +143,15 @@ public class Jinja2TemplateTests
         Assert.Equal("3", Render("{{ 1 + 2 }}", new Dictionary<string, object>()));
         Assert.Equal("3.5", Render("{{ 1.5 + 2 }}", new Dictionary<string, object>()));
     }
+
+    [Theory]
+    [InlineData("{{ '<|eot|><image>' | string | replace('<|', '< |') | replace('<image>', '< image>') }}", "< |eot|>< image>")]
+    [InlineData("{{ 'aaab' | replace('a', 'z', 2) }}", "zzab")]
+    [InlineData("{{ 'aaab' | replace('a', 'z', -1) }}", "zzzb")]
+    [InlineData("{{ false | default('xhigh', true) }}", "xhigh")]
+    [InlineData("{{ (none or {'name': 'weather.get'}).name }}", "weather.get")]
+    [InlineData("{{ ('abc' | upper)[:-1] }}", "AB")]
+    [InlineData("{{ 'user\\'s reply; do not use for pre-tool updates or partial responses.' }}", "user's reply; do not use for pre-tool updates or partial responses.")]
+    public void SparkExpressionFeaturesPreserveTextAndSchema(string template, string expected)
+        => Assert.Equal(expected, Render(template, new Dictionary<string, object>()));
 }

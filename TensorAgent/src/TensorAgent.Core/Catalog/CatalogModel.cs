@@ -67,6 +67,8 @@ public enum CatalogFileRole
     /// <summary>A two-stage video model's x2 latent upscaler (LTX 2.5), run between its
     /// half-size and full-size denoising passes.</summary>
     LatentUpscaler,
+    /// <summary>The optional LTX 2.5 Ingredients IC-LoRA for identity/appearance references.</summary>
+    IngredientsLora,
 }
 
 /// <summary>One downloadable artifact of a catalog entry.</summary>

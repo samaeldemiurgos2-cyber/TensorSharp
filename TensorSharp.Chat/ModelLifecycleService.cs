@@ -343,7 +343,7 @@ namespace TensorSharp.Server
                 }
 
                 loadSw.Stop();
-                long modelBytes = SafeGetFileSize(modelPath);
+                long modelBytes = _model.ModelFilePaths.Sum(SafeGetFileSize);
                 long mmProjBytes = SafeGetFileSize(mmProjPath);
                 _logger.LogInformation(LogEventIds.ModelLoadCompleted,
                     "Loaded model {Model} (architecture={Architecture}, backend={Backend}, modelBytes={ModelBytes}, mmproj={MmProjFile}, mmprojBytes={MmProjBytes}) in {ElapsedMs:F1} ms",

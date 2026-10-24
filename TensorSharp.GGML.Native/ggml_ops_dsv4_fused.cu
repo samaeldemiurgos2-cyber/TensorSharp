@@ -1084,6 +1084,14 @@ static enum ggml_status tsg_dsv4_backend_graph_compute(ggml_backend_t backend, g
                  d->kind == TSG_ATTN_F32_SOFTMAX || d->kind == TSG_ATTN_MASK_COMPACT ||
                  d->kind == TSG_ATTN_VISION_F32)
             tsg_attention_cuda_compute(node, c->cuda_backend);
+        else if (d->kind == TSG_DSV41_TP_MOE)
+        {
+            // Enqueues every rank's work behind this stream and makes this
+            // stream wait for the gathered output; nothing waits on the host.
+            GGML_ASSERT(d->device_launch != nullptr);
+            d->device_launch(d->object, node, (void *) stream, c->device);
+            CUDA_CHECK(cudaSetDevice(c->device));
+        }
         else
         {
             tsg_dsv4_fused_launch(d, node, stream);

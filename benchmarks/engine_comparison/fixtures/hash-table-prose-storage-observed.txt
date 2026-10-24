@@ -1,0 +1,43 @@
+A hash table (also called a hash map, dictionary, associative array) is a data structure that implements an associative array abstract data type: a structure that can map keys to values. It is one of the most important and widely used data structures in computer science, forming the basis for Python `dict`, Java `HashMap`, JavaScript `Object`/`Map`, Go `map`, C++ `unordered_map`, etc.
+
+We will cover it in depth: the core idea, hash functions, collisions and collision resolution, resizing/rehashing, complexity analysis, implementation details, and a full worked example.
+
+### 1. The Core Idea: Array + Hash Function
+
+An array gives O(1) access by index: `array[i]` is instant. But arrays only work with integer indices 0...n-1.
+
+We want to do `map["apple"] = 5` or `map[123456789] = "hello"` - arbitrary keys.
+
+Idea: Convert any key into an array index.
+
+We do this with a **hash function** `h(key)`.
+
+Conceptually:
+
+```
+index = h(key) % capacity
+```
+
+Where:
+- `h(key)` turns the key into a (large) integer, called the hash code.
+- `capacity` is the size of the underlying array (often called buckets, slots, or table).
+- `% capacity` (modulo) compresses the hash code into the range [0, capacity-1].
+
+Then we store the (key, value) pair at `table[index]`.
+
+Lookup: Re-compute `index = h(key) % capacity` and look at `table[index]`.
+
+If there were no collisions, this would be perfect O(1) insertion, lookup, and deletion.
+
+#### What is a Hash Function?
+
+A hash function takes a key of arbitrary type/size and returns a fixed-size integer.
+
+A good hash function for hash tables should be:
+
+1.  **Deterministic:** `h(k)` is always the same for the same `k`.
+2.  **Uniform / Well-distributed:** It should spread keys evenly across the output range. If it clusters keys together, we get many collisions.
+3.  **Fast to compute:** It's called on every operation.
+4.  **Avalanche effect (desirable):** Small change in key -> large change in hash.
+
+It does **NOT** need to be cryptographically secure. In fact, cryptographic hashes like SHA-256 are too slow for hash tables. Non-cryptographic

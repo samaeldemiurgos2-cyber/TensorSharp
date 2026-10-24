@@ -50,12 +50,12 @@ curl -L -o models/tokenizer_config.json https://huggingface.co/MiniMaxAI/MiniMax
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
     --backend ggml_metal --prompt "a red fox trotting through falling snow, cinematic" \
     --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output fox.mp4</code></pre>
-  <p>分词器文件必须放在编码器旁边，或 <code>TS_VIDEO_TOKENIZER</code> 指向的位置：<code>hf download MiniMaxAI/MiniMax-H3 processor/vocab.json … --local-dir models</code> 会保留 <code>processor/</code> 这一层目录，而加载器从不去那里找。<code>tokenizer_config.json</code> 最容易漏掉，也是唯一定义 <code>&lt;|vision_start|&gt;</code>、<code>&lt;|image_pad|&gt;</code> 与 <code>&lt;|vision_end|&gt;</code> 的文件。文生视频不需要它，参考全是录音的请求也不需要；缺了它，带关键帧、或参考中含照片或视频片段的请求会在视觉塔运行之前被拒绝——以前图片会被放到提示词的错误位置上、悄悄被忽略。</p>
+  <p>文本编码器 GGUF 不带分词器。随仓库提供的配置会将已固定版本的 <code>vocab.json</code>、<code>merges.txt</code> 与 <code>tokenizer_config.json</code> 下载到编码器旁边。<code>tokenizer_config.json</code> 定义 <code>&lt;|vision_start|&gt;</code>、<code>&lt;|image_pad|&gt;</code> 与 <code>&lt;|vision_end|&gt;</code>；手动安装时可用 <code>TS_VIDEO_TOKENIZER</code> 指定目录。</p>
 
-  <p>也可以把四个网络都写进配置文件，让第一次运行自动下载——<code>config/minimax-h3-fl2va.json</code> 用于关键帧，<code>config/minimax-h3-ref2va.json</code> 用于参考。两者只有 <code>model</code> 一项与尺寸不同（FL2VA 配置把尺寸交给模型，Ref2VA 配置固定 640×384），因此文本编码器与两个 VAE 只下载一次并共用（总计约 35.5 GB）。上面那三个分词器文件是自动下载唯一补不上的东西，因为它们不是命令行选项：</p>
+  <p>单个配置 <code>config/minimax-h3-fl2va.json</code> 会下载两种模式各自的去噪器、共享的文本编码器与 VAE，以及分词器文件（总计约 46 GB）。同一个加载中的服务可在首尾帧与参考模式间切换，无需重启：</p>
   <pre data-lang="bash"><code>dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-ref2va.json</code></pre>
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json</code></pre>
 
   <h3 id="h3-modes">一张图代表什么</h3>
   <p>一张图对 H3 有两种<strong>完全不同</strong>的含义，而且用<strong>不同的检查点</strong>。不指定时会自动推断，<code>--video-mode</code> 用于显式声明。</p>

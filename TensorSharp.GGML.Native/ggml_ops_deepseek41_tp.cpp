@@ -8,6 +8,9 @@
 #include "ggml_ops_tp_collective.h"
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
+#if defined(TSG_GGML_USE_CUDA)
+#include "ggml_ops_deepseek41_tp_cuda.h"
+#endif
 
 #include <algorithm>
 #include <condition_variable>
@@ -17,6 +20,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -145,6 +149,24 @@ void warm_layer(int layer, const reader & gate, const reader & up, const reader 
 #endif
 }
 
+// Release an uploaded layer's source ranges from the page cache. Linux only:
+// macOS has no POSIX_FADV_DONTNEED, and Windows reads through stdio.
+void release_source_pages(std::initializer_list<const source *> sources)
+{
+#if defined(__linux__)
+    for (const source * src : sources)
+    {
+        const int fd = open(src->path.c_str(), O_RDONLY);
+        if (fd < 0) continue;
+        const size_t bytes = ggml_row_size(src->type, src->ne[0]) * src->ne[1] * src->ne[2];
+        posix_fadvise(fd, (off_t) src->offset, (off_t) bytes, POSIX_FADV_DONTNEED);
+        close(fd);
+    }
+#else
+    (void) sources;
+#endif
+}
+
 // Keep transfer storage alive across layers and forwards. CUDA's asynchronous
 // tensor copies only overlap reliably when the host pages are pinned. Ask the
 // unwrapped device for its host buffer type; ggml falls back to ordinary host
@@ -236,7 +258,16 @@ struct graph
     ggml_tensor * input = nullptr, * ids = nullptr, * weights = nullptr, * output = nullptr;
     ggml_tensor * hidden = nullptr, * hidden_input = nullptr;
     tsg_dsv4_fused_desc quant_strip, down_strip;
-    ~graph() { if (ctx) ggml_free(ctx); }
+    // Small (decode, verify, batched-decode) shapes own their scratch, so their
+    // tensor addresses never move and ggml-cuda can replay its captured CUDA
+    // graphs. Larger shapes share the rank's allocator.
+    ggml_gallocr_t own = nullptr;
+    uint64_t last_used = 0;
+    ~graph()
+    {
+        if (own) ggml_gallocr_free(own);
+        if (ctx) ggml_free(ctx);
+    }
 };
 
 struct rank_layer
@@ -264,6 +295,9 @@ struct rank_state
     host_staging transfer;
     float * result = nullptr;
     size_t weight_bytes = 0;
+    // LRU stamps for this rank's graphs. Rank-private: the host-driven path
+    // acquires every rank's graph concurrently from the worker pool.
+    uint64_t tick = 0;
     ~rank_state()
     {
         layers.clear();
@@ -311,8 +345,15 @@ std::vector<strip> split_weights(int64_t width, ggml_type down_type, int ranks, 
 
 std::vector<strip> split_outputs(int64_t width, int ranks, int layer)
 {
-    const int64_t alignment = width % 128 == 0 && width / 128 >= ranks ? 128 : 2;
-    return split(width, alignment, ranks, layer);
+    // 128 keeps the owned quantized strip kernel eligible (ne[1] % 128). 64 and
+    // then 32 (ggml-cuda's MMF_ROWS_PER_BLOCK) keep F16/BF16 down projections on
+    // the same matrix kernel as the unsplit tensor: any other row count drops
+    // into ggml's sorted-expert fallback, which syncs its stream and, for F16,
+    // accumulates in F16 (2.8e-3 relative error at 3 and 5 ranks on width 256).
+    for (const int64_t alignment : {int64_t(128), int64_t(64), int64_t(32)})
+        if (width % alignment == 0 && width / alignment >= ranks)
+            return split(width, alignment, ranks, layer);
+    return split(width, 2, ranks, layer);
 }
 
 struct executor::impl
@@ -323,10 +364,23 @@ struct executor::impl
         int id = 0;
         int64_t embedding = 0;
         float clamp = 0;
+        // The graph node's descriptor: TSG_DSV41_TP_MOE pointing back here.
+        tsg_dsv4_fused_desc desc;
+        // The device-resident pair (launch, then gather): the layer device
+        // computes the shared expert between them while the ranks run.
+        tsg_dsv4_fused_desc launch_desc, gather_desc;
     };
+    // Shapes up to this many tokens keep a private, stable scratch allocation.
+    static constexpr int64_t persistent_tokens = 16;
+    // Rank graphs kept per layer (decode, verify, batched decode, prefill
+    // chunks, the YOCO tail); the least recently used one is replaced.
+    static constexpr size_t graphs_per_layer = 6;
     int used;
     int load_threads;
+    bool drop_source_cache = false;
     int host_gather_tokens = 0;
+    bool automatic_host_gather = true;
+    bool gather_resolved = false;
     std::vector<std::unique_ptr<rank_state>> ranks;
     std::map<int, std::unique_ptr<layer>> layers;
     workers pool;
@@ -335,6 +389,7 @@ struct executor::impl
     std::vector<float> pageable_hidden;
 #if defined(TSG_GGML_USE_CUDA)
     tsg::TpF32Gather * device_gather = nullptr;
+    tsg_dsv41_tp_cuda::exchange * exchange = nullptr;
 #endif
 #if defined(TSG_GGML_TEST_HOOKS)
     int64_t test_position = 0;
@@ -363,7 +418,7 @@ struct executor::impl
     {
         require(devices.size() >= 2 && devices.size() <= 16 && used > 0,
                 "V4.1 TP requires two to sixteen ranks and positive expert count");
-        const bool automatic_host_gather = std::getenv("TS_DSV41_TP_HOST_TOKENS") == nullptr;
+        automatic_host_gather = std::getenv("TS_DSV41_TP_HOST_TOKENS") == nullptr;
         if (const char * configured = std::getenv("TS_DSV41_TP_HOST_TOKENS"))
         {
             char * end = nullptr;
@@ -391,6 +446,33 @@ struct executor::impl
             require(rank->allocator != nullptr, "Cannot initialize V4.1 TP scratch allocator");
             ranks.push_back(std::move(rank));
         }
+    }
+
+    ~impl()
+    {
+#if defined(TSG_GGML_USE_CUDA)
+        // Drains every rank and layer queue before the rank backends go away.
+        tsg_dsv41_tp_cuda::destroy(exchange);
+        tsg::tp_cuda_f32_gather_free(device_gather);
+#endif
+    }
+
+    bool device_resident() const
+    {
+#if defined(TSG_GGML_USE_CUDA)
+        for (const auto & rank : ranks) if (!rank->cuda_backend) return false;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // The host-driven (CPU node) path's private NCCL gather, created on first
+    // use: the device-resident path never needs it or its device staging.
+    void resolve_gather()
+    {
+        if (gather_resolved) return;
+        gather_resolved = true;
 #if defined(TSG_GGML_USE_CUDA)
         std::vector<ggml_backend_t> backends;
         for (const auto & rank : ranks) if (rank->cuda_backend) backends.push_back(rank->cuda_backend);
@@ -405,15 +487,6 @@ struct executor::impl
         }
         if (device_gather && host_gather_tokens)
             std::fprintf(stderr, "[dsv41-tp] pinned host activation gather for batches <= %d tokens; private F32 NCCL above.\n", host_gather_tokens);
-#else
-        (void) automatic_host_gather;
-#endif
-    }
-
-    ~impl()
-    {
-#if defined(TSG_GGML_USE_CUDA)
-        tsg::tp_cuda_f32_gather_free(device_gather);
 #endif
     }
 
@@ -425,6 +498,11 @@ struct executor::impl
         graph * slot = found == weights.graphs.end() ? nullptr : found->second.get();
         if (!slot)
         {
+            // A new shape may grow the rank's shared scratch or replace a
+            // cached graph, freeing memory the rank's queue can still be
+            // using under device-resident execution. Drain the rank first;
+            // this happens once per new shape, not per token.
+            ggml_backend_synchronize(rank.backend);
             pending = std::make_unique<graph>();
             slot = pending.get();
             auto & g = *slot;
@@ -468,6 +546,12 @@ struct executor::impl
                 {
                     ggml_prec_set_acc(out, GGML_PREC_F32);
                     ggml_prec_set_src(out, GGML_PREC_F32, 1);
+                }
+                else if (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_BF16)
+                {
+                    // MMF ignores this; a shape that still reaches ggml's
+                    // cuBLAS fallback then accumulates in F32, not F16.
+                    ggml_prec_set_acc(out, GGML_PREC_F32);
                 }
                 return out;
             };
@@ -520,28 +604,168 @@ struct executor::impl
                 require(ggml_backend_supports_op(rank.backend, ggml_graph_node(g.gf, i)),
                         "V4.1 TP rank cannot execute its local MoE graph");
         }
-        // All layer graphs use one scratch allocation per rank. Clear only
-        // this graph's temporary bindings; its weights live in separate contexts.
-        for (auto * t = ggml_get_first_tensor(slot->ctx); t; t = ggml_get_next_tensor(slot->ctx, t))
+        if (tokens <= persistent_tokens)
         {
-            t->data = nullptr;
-            t->buffer = nullptr;
-            t->extra = nullptr;
+            // Allocated once; the addresses stay fixed for the graph's life.
+            if (!slot->own)
+            {
+                slot->own = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rank.backend));
+                require(slot->own != nullptr, "Cannot create V4.1 TP rank scratch allocator");
+                require(ggml_gallocr_alloc_graph(slot->own, slot->gf), "Cannot allocate V4.1 TP rank scratch");
+            }
         }
-        require(ggml_gallocr_alloc_graph(rank.allocator, slot->gf), "Cannot allocate V4.1 TP rank scratch");
+        else
+        {
+            // Larger shapes share one scratch allocation per rank. Clear only
+            // this graph's temporary bindings; its weights live in separate
+            // contexts. Every rank graph runs on the rank's one queue, so a
+            // later layer's reuse of these addresses is ordered after this one.
+            for (auto * t = ggml_get_first_tensor(slot->ctx); t; t = ggml_get_next_tensor(slot->ctx, t))
+            {
+                t->data = nullptr;
+                t->buffer = nullptr;
+                t->extra = nullptr;
+            }
+            require(ggml_gallocr_alloc_graph(rank.allocator, slot->gf), "Cannot allocate V4.1 TP rank scratch");
+        }
+        slot->last_used = ++rank.tick;
         // Publish only a complete, allocated graph. A rank construction or
         // allocation exception must leave the same shape retryable later.
         if (pending)
         {
-            if (weights.graphs.size() >= 4) weights.graphs.erase(weights.graphs.begin());
+            if (weights.graphs.size() >= graphs_per_layer)
+            {
+                // Least recently used, so the hot decode shape survives prompts
+                // of new lengths. The rank was drained above.
+                auto oldest = weights.graphs.begin();
+                for (auto it = weights.graphs.begin(); it != weights.graphs.end(); ++it)
+                    if (it->second->last_used < oldest->second->last_used) oldest = it;
+                weights.graphs.erase(oldest);
+            }
             weights.graphs.emplace(tokens, std::move(pending));
         }
         return *slot;
     }
 
+    // The message of whatever a hook caught; the hooks must not throw.
+    static std::string caught()
+    {
+        try { throw; }
+        catch (const std::exception & error) { return error.what(); }
+        catch (...) { return "V4.1 TP layer failed with a non-standard exception"; }
+    }
+
+#if defined(TSG_GGML_USE_CUDA)
+    // Device-resident execution: called from the layer device's fused backend
+    // while it submits its subgraph. Enqueues every rank and returns.
+    void launch(layer & spec, ggml_tensor * dst, void * stream, int device)
+    {
+        std::vector<tsg_dsv41_tp_cuda::rank_work> work;
+        tsg_dsv41_tp_cuda::layer_work node;
+        prepare(spec, dst, stream, device, work, node);
+        node.dst = dst;
+        // Not require(call, error.c_str()): argument order is unspecified, and
+        // c_str() taken before the call would point at the string's old buffer.
+        std::string error;
+        if (!tsg_dsv41_tp_cuda::enqueue(*exchange, node, work, error)) throw std::runtime_error(error);
+    }
+
+    // The split form: `node` is the launch node (sources x, weights, ids).
+    void launch_split(layer & spec, ggml_tensor * node_tensor, void * stream, int device)
+    {
+        std::vector<tsg_dsv41_tp_cuda::rank_work> work;
+        tsg_dsv41_tp_cuda::layer_work node;
+        prepare(spec, node_tensor, stream, device, work, node);
+        std::string error;
+        if (!tsg_dsv41_tp_cuda::launch(*exchange, node, work, error)) throw std::runtime_error(error);
+    }
+
+    void prepare(layer & spec, ggml_tensor * node_tensor, void * stream, int device,
+                 std::vector<tsg_dsv41_tp_cuda::rank_work> & work, tsg_dsv41_tp_cuda::layer_work & node)
+    {
+        const ggml_tensor * x = node_tensor->src[0], * weights = node_tensor->src[1], * ids = node_tensor->src[2];
+        const int64_t tokens = x->ne[1];
+        work.assign(ranks.size(), tsg_dsv41_tp_cuda::rank_work());
+        for (size_t r = 0; r < ranks.size(); ++r)
+        {
+            auto & rank = *ranks[r];
+            auto & g = acquire(rank, spec, tokens, (int) r);
+            const auto & weight = *rank.layers.at(spec.id);
+            auto & item = work[r];
+            item.backend = rank.backend;
+            item.cuda_backend = rank.cuda_backend;
+            item.gate_graph = g.gate_graph;
+            item.down_graph = g.down_graph;
+            item.input = g.input;
+            item.ids = g.ids;
+            item.weights = g.weights;
+            item.hidden = g.hidden;
+            item.hidden_input = g.hidden_input;
+            item.output = g.output;
+            item.first_row = weight.first_row;
+            item.first_output = weight.first_output;
+        }
+        node.x = x;
+        node.ids = ids;
+        node.weights = weights;
+        node.dst = nullptr;
+        node.stream = stream;
+        node.device = device;
+        node.embedding = spec.embedding;
+        node.full_rows = ranks.front()->layers.at(spec.id)->full_rows;
+        node.used = used;
+        node.tokens = tokens;
+        if (!exchange) exchange = tsg_dsv41_tp_cuda::create((int) ranks.size());
+    }
+
+    static void device_hook(void * object, ggml_tensor * dst, void * stream, int device)
+    {
+        auto & spec = *(layer *) object;
+        try { spec.owner->launch(spec, dst, stream, device); }
+        catch (...)
+        {
+            if (spec.owner->failure.empty()) spec.owner->failure = caught();
+            tsg_dsv41_tp_cuda::poison(dst, stream, device);
+        }
+    }
+
+    static void device_launch_hook(void * object, ggml_tensor * node, void * stream, int device)
+    {
+        auto & spec = *(layer *) object;
+        try { spec.owner->launch_split(spec, node, stream, device); }
+        catch (...)
+        {
+            // The gather that follows finds no launched layer and poisons its output.
+            if (spec.owner->failure.empty()) spec.owner->failure = caught();
+        }
+    }
+
+    static void device_gather_hook(void * object, ggml_tensor * dst, void * stream, int device)
+    {
+        auto & spec = *(layer *) object;
+        std::string error = "V4.1 TP exchange was never created";
+        if (!spec.owner->exchange || !tsg_dsv41_tp_cuda::gather(*spec.owner->exchange, dst, stream, device, error))
+        {
+            if (spec.owner->failure.empty()) spec.owner->failure = error;
+            tsg_dsv41_tp_cuda::poison(dst, stream, device);
+        }
+    }
+#endif
+
+    // The device-resident pair has no host form; reaching it on the CPU
+    // backend is a placement bug, reported like any rank failure.
+    static void split_host_hook(void * object, ggml_tensor * dst)
+    {
+        auto & spec = *(layer *) object;
+        if (spec.owner->failure.empty())
+            spec.owner->failure = "V4.1 TP launch/gather nodes must run on the layer device's fused CUDA backend";
+        std::fill_n((float *) dst->data, ggml_nelements(dst), std::numeric_limits<float>::quiet_NaN());
+    }
+
     void compute(layer & spec, ggml_tensor * dst, const ggml_tensor * x,
                  const ggml_tensor * weights, const ggml_tensor * ids)
     {
+        resolve_gather();
         const int64_t tokens = x->ne[1];
         const int64_t full_hidden = ranks.front()->layers.at(spec.id)->full_rows;
         const size_t hidden_count = size_t(full_hidden) * used * tokens;
@@ -687,21 +911,23 @@ struct executor::impl
         }
     }
 
-    static void callback(ggml_tensor * dst, const ggml_tensor * x, const ggml_tensor * weights,
-                         const ggml_tensor * ids, int ith, int, void * opaque)
+    // Host-driven execution (the node on the CPU backend): every rank runs
+    // synchronously through host staging or the private NCCL gather.
+    static void host_hook(void * object, ggml_tensor * dst)
     {
-        if (ith != 0) return;
-        auto & spec = *(layer *) opaque;
+        auto & spec = *(layer *) object;
+        const ggml_tensor * x = dst->src[0], * weights = dst->src[1], * ids = dst->src[2];
         try { spec.owner->compute(spec, dst, x, weights, ids); }
-        catch (const std::exception & error)
+        catch (...)
         {
+            const std::string error = caught();
             // The stream-ordered gate phase can leave work in
             // flight when a later graph/gather/submit operation fails. Drain
             // every rank without replacing the original request error.
             try { spec.owner->pool.run([&](int rank) {
                 ggml_backend_synchronize(spec.owner->ranks[rank]->backend);
             }); } catch (...) {}
-            if (spec.owner->failure.empty()) spec.owner->failure = error.what();
+            if (spec.owner->failure.empty()) spec.owner->failure = error;
             std::fill_n((float *) dst->data, ggml_nelements(dst), std::numeric_limits<float>::quiet_NaN());
         }
     }
@@ -719,6 +945,7 @@ void executor::add_layer(int id, const source & gate, const source & up, const s
             state->used <= gate.ne[2], "V4.1 TP expert tensor shapes disagree");
     auto strips = split_weights(gate.ne[1], down.type, (int) state->ranks.size(), id);
     auto output_strips = split_outputs(down.ne[1], (int) state->ranks.size(), id);
+    {
     reader gate_file(gate), up_file(up), down_file(down);
     warm_layer(id, gate_file, up_file, down_file, state->load_threads);
     state->pool.run([&](int r) {
@@ -745,15 +972,41 @@ void executor::add_layer(int id, const source & gate, const source & up, const s
         rank.weight_bytes += ggml_nbytes(weights->gate) + ggml_nbytes(weights->up) + ggml_nbytes(weights->down);
         rank.layers.emplace(id, std::move(weights));
     });
+    }
+    // The readers' mappings are gone, so the pages are plain page cache now.
+    if (state->drop_source_cache) release_source_pages({&gate, &up, &down});
     auto layer = std::make_unique<impl::layer>();
     layer->owner = state.get();
     layer->id = id;
     layer->embedding = gate.ne[0];
     layer->clamp = clamp_limit;
+    layer->desc.kind = TSG_DSV41_TP_MOE;
+    layer->desc.i0 = id;
+    layer->desc.object = layer.get();
+    layer->desc.host_compute = &impl::host_hook;
+    for (auto * split : {&layer->launch_desc, &layer->gather_desc})
+    {
+        split->kind = TSG_DSV41_TP_MOE;
+        split->i0 = id;
+        split->object = layer.get();
+        split->host_compute = &impl::split_host_hook;
+    }
+    layer->launch_desc.i1 = 1;
+    layer->gather_desc.i1 = 2;
+#if defined(TSG_GGML_USE_CUDA)
+    if (state->device_resident())
+    {
+        layer->desc.device_launch = &impl::device_hook;
+        layer->launch_desc.device_launch = &impl::device_launch_hook;
+        layer->gather_desc.device_launch = &impl::device_gather_hook;
+    }
+#endif
     state->layers.emplace(id, std::move(layer));
 }
 
+void executor::set_drop_source_cache(bool drop) { state->drop_source_cache = drop; }
 bool executor::has_layer(int layer) const { return state->layers.count(layer) != 0; }
+bool executor::device_resident() const { return state->device_resident(); }
 size_t executor::rank_weight_bytes(int rank) const { return state->ranks.at(rank)->weight_bytes; }
 void executor::begin_forward() { state->failure.clear(); }
 std::string executor::error() const { return state->failure; }
@@ -765,6 +1018,7 @@ void executor::test_pipelined_upload(bool enabled) { state->pipelined_upload = e
 void executor::test_device_gather(bool enabled)
 {
 #if defined(TSG_GGML_USE_CUDA)
+    state->resolve_gather();
     require(!enabled || state->device_gather != nullptr, "Device gather benchmark requires an available private CUDA collective");
 #else
     require(!enabled, "Device gather benchmark requires CUDA");
@@ -774,7 +1028,8 @@ void executor::test_device_gather(bool enabled)
 void executor::test_gate_fence(bool enabled) { state->gate_fence = enabled; }
 #endif
 
-ggml_tensor * executor::build(ggml_context * ctx, int layer, ggml_tensor * x, ggml_tensor * weights, ggml_tensor * ids)
+ggml_tensor * executor::build(ggml_context * ctx, int layer, ggml_tensor * x, ggml_tensor * weights, ggml_tensor * ids,
+                              ggml_tensor * after)
 {
     auto & spec = *state->layers.at(layer);
     require(x->type == GGML_TYPE_F32 && x->ne[0] == spec.embedding && x->ne[2] == 1 && x->ne[3] == 1 &&
@@ -782,11 +1037,28 @@ ggml_tensor * executor::build(ggml_context * ctx, int layer, ggml_tensor * x, gg
             ids->type == GGML_TYPE_I32 && ids->ne[0] == state->used && ids->ne[1] == x->ne[1],
             "Invalid V4.1 TP MoE inputs");
     // Unfused routing returns a top-k view with the original expert-count
-    // column stride. Materialize it before the host broadcast reads bytes.
+    // column stride. Materialize it before the exchange reads bytes.
     if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
     if (!ggml_is_contiguous(weights)) weights = ggml_cont(ctx, weights);
     if (!ggml_is_contiguous(ids)) ids = ggml_cont(ctx, ids);
-    auto * output = ggml_map_custom3(ctx, x, weights, ids, impl::callback, 1, &spec);
+    ggml_tensor * args[] = {x, weights, ids};
+    if (after)
+    {
+        require(state->device_resident(), "V4.1 TP launch/gather nodes need CUDA ranks");
+        // Graph order follows sources depth-first: launch (and its inputs),
+        // then `after`, then the gather. The layer device computes `after`
+        // while the ranks run; the gather only waits for them.
+        auto * launch = ggml_custom_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1, args, 3,
+                                       tsg_dsv4_fused_cpu, 1, &spec.launch_desc);
+        ggml_format_name(launch, "v41_moe_tp_launch.%d", layer);
+        ggml_tensor * ordered[] = {launch, after};
+        auto * output = ggml_custom_4d(ctx, GGML_TYPE_F32, spec.embedding, x->ne[1], 1, 1, ordered, 2,
+                                       tsg_dsv4_fused_cpu, 1, &spec.gather_desc);
+        ggml_format_name(output, "v41_moe_tensor_parallel.%d", layer);
+        return output;
+    }
+    auto * output = ggml_custom_4d(ctx, GGML_TYPE_F32, spec.embedding, x->ne[1], 1, 1, args, 3,
+                                   tsg_dsv4_fused_cpu, 1, &spec.desc);
     ggml_format_name(output, "v41_moe_tensor_parallel.%d", layer);
     return output;
 }

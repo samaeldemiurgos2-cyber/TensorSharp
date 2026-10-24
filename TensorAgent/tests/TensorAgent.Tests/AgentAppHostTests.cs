@@ -579,11 +579,10 @@ public sealed class AgentAppHostTests : IDisposable
     }
 
     /// <summary>
-    /// The LoRA sheet of MiniMax-H3's keyframes entry lists its two Turbo plug-ins, and the
-    /// references entry has no sheet: the plug-ins are not for it.
+    /// MiniMax-H3 has one catalog row. Its LoRA sheet lists the two FL2VA Turbo plug-ins.
     /// </summary>
     [Fact]
-    public async Task TheKeyframesEntrysSheetOffersItsTurboPlugIns()
+    public async Task TheMiniMaxH3EntrysSheetOffersItsTurboPlugIns()
     {
         StartServing(Paths with { DeviceMemoryGB = 48 });
         ReportLoaded(_host!, LoraCatalog.MiniMaxH3Keyframes);
@@ -595,10 +594,6 @@ public sealed class AgentAppHostTests : IDisposable
                 sheet.GetProperty("loras").EnumerateArray().Select(l => l.GetProperty("id").GetString()));
             Assert.All(sheet.GetProperty("loras").EnumerateArray(), l => Assert.Equal("Speed", l.GetProperty("kind").GetString()));
 
-            ReportLoaded(_host!, "minimax-h3-ref2va-q4k");
-            sheet = await Get("/api/agent/loras");
-            Assert.False(sheet.GetProperty("supportsLoras").GetBoolean());
-            Assert.Equal(0, sheet.GetProperty("loras").GetArrayLength());
         }
         finally
         {

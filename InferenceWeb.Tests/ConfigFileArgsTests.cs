@@ -194,7 +194,7 @@ public class ConfigFileArgsTests : IDisposable
         string configDir = Path.Combine(repoRoot, "config");
         if (!Directory.Exists(configDir)) return;
 
-        var understood = new HashSet<string>(StringComparer.Ordinal) { "path", "url", "urls", "sha256", "files" };
+        var understood = new HashSet<string>(StringComparer.Ordinal) { "path", "url", "urls", "sha256", "optional", "files" };
 
         foreach (string path in Directory.GetFiles(configDir, "*.json"))
         {
@@ -212,7 +212,7 @@ public class ConfigFileArgsTests : IDisposable
                         Assert.True(
                             understood.Contains(field.Name),
                             $"{where} has field {Quote(field.Name)}, which ConfigFileArgs does not read "
-                            + "-- a download entry is { path, urls[, sha256, files] }.");
+                            + "-- a download entry is { path, urls[, sha256, optional, files] }.");
                     }
 
                     Assert.True(
@@ -220,6 +220,45 @@ public class ConfigFileArgsTests : IDisposable
                         $"{where} names no urls, so it cannot download on a machine that lacks the file.");
                 }
             }
+        }
+    }
+
+    [Fact]
+    public void MiniMaxH3Config_PreviewBothDenoisersAndTokenizerCompanionsWithoutDownloading()
+    {
+        string repoRoot = FindRepoRoot();
+        if (repoRoot is null) return;
+        string configDir = Path.Combine(repoRoot, "config");
+        string configuredRoot = Environment.GetEnvironmentVariable("TENSORSHARP_MODELS");
+        string modelRoot = string.IsNullOrWhiteSpace(configuredRoot)
+            ? Path.Combine(repoRoot, "models")
+            : Path.IsPathRooted(configuredRoot) ? configuredRoot : Path.Combine(configDir, configuredRoot);
+        modelRoot = Path.GetFullPath(modelRoot);
+
+        const string configName = "minimax-h3-fl2va.json";
+        string config = Path.Combine(configDir, configName);
+        Assert.True(File.Exists(config), config);
+        ConfigExpansionPreview preview = null;
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            ConfigFileArgs.Expand(["--config", config], TextWriter.Null, interactiveProgress: false, preflight: value =>
+            {
+                preview = value;
+                throw new InvalidOperationException("Stop after the no-download preview.");
+            }));
+        Assert.Equal("Stop after the no-download preview.", error.Message);
+        Assert.NotNull(preview);
+
+        Assert.Contains("--model", preview.Tokens);
+        Assert.Contains("--video-text-encoder", preview.Tokens);
+        foreach (string name in new[]
+                 {
+                     "minimax_h3_fl2va_pruned-Q4_K.gguf", "minimax_h3_ref2va_pruned-Q4_K.gguf",
+                     "vocab.json", "merges.txt", "tokenizer_config.json",
+                 })
+        {
+            string localPath = Path.Combine(modelRoot, name);
+            Assert.True(File.Exists(localPath) || preview.IsPending(localPath),
+                $"{configName} must reuse or download {name} at {localPath}.");
         }
     }
 

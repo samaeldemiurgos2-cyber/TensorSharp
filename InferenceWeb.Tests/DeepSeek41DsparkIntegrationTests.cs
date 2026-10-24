@@ -141,7 +141,7 @@ public sealed class DeepSeek41DsparkIntegrationTests(ITestOutputHelper output)
         {
             ["MAX_CONTEXT"] = "1024", ["TS_DSV4_UBATCH"] = "32", ["TS_DSV4_THREADS"] = "2",
             ["TS_DSV41_ENGRAM_THREADS"] = "2", ["TS_DSV41_ENGRAM_WARM"] = "0",
-            ["TS_DSV41_REWIND_CHECKPOINT"] = "1",
+            ["TS_DSV41_REWIND_CHECKPOINT"] = "1", ["TS_DSV41_YOCO_KEEP"] = "0",
         };
         foreach (var (key, value) in required)
         {

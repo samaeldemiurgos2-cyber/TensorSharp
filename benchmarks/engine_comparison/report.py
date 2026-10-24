@@ -3,7 +3,7 @@
 Aggregate the per-cell JSON results into a markdown report + CSV.
 
 Reads results/*.json (written by run_matrix.py) and produces:
-  * docs/engine_comparison_report.md  - human-readable tables
+  * docs/validation/engine-comparison/report.md - local human-readable tables
   * results/results.csv                - flat machine-readable dump
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ if _cfg_arg:
 import config
 
 RESULTS_DIR = config.RESULTS_DIR
-REPORT_PATH = config.REPO_ROOT / "docs" / "engine_comparison_report.md"
+REPORT_PATH = config.REPO_ROOT / "docs" / "validation" / "engine-comparison" / "report.md"
 CSV_PATH = RESULTS_DIR / "results.csv"
 
 # Columns are (engine, backend, tp) triples discovered in the results, ordered

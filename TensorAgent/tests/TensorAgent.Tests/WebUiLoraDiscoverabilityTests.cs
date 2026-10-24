@@ -41,7 +41,7 @@ public sealed partial class WebUiPageTests
     [InlineData("{ loaded: 'qwen.gguf', architecture: 'qwen_image' }", "{ supportsLoras: false, loras: [{ id: 'film' }] }")]
     [InlineData("{ loaded: 'qwen.gguf', architecture: 'qwen_image' }", "{ supportsLoras: true, loras: [] }")]
     [InlineData("{ loaded: 'qwen.gguf', architecture: 'qwen_image' }", "{ supportsLoras: true, loadedModelFile: 'different.gguf', loras: [{ id: 'film' }] }")]
-    // MiniMax-H3 References: a video model the host offers no plug-ins.
+    // MiniMax-H3 reference mode uses Ref2VA, which takes no FL2VA Turbo plug-ins.
     [InlineData("{ loaded: 'h3-ref.gguf', architecture: 'minimax-h3', video: { family: 'minimax-h3', supportsReferenceConditioning: true, maxReferenceImages: 9 } }",
         "{ supportsLoras: false, loras: [] }")]
     public void UnsupportedModelsHaveNoLoraEntry(string model, string loras)

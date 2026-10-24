@@ -40,7 +40,7 @@ public sealed class Ltx25CatalogTests : IDisposable
     }
 
     [Fact]
-    public void ExperimentalEntryPinsTheAuthenticFourFileSet()
+    public void ExperimentalEntryPinsFiveBaseFilesAndTheOptionalIngredientsAdapter()
     {
         CatalogModel model = Assert.Single(ModelCatalog.BuiltIn, m => m.Family == CatalogFamily.Ltx25);
         Assert.Equal("LTX 2.5 Distilled", model.DisplayName);
@@ -52,20 +52,28 @@ public sealed class Ltx25CatalogTests : IDisposable
         Assert.Equal(48, model.MinDeviceMemoryGB);
         Assert.NotEmpty(model.Notes!);
         Assert.Equal(43_077_008_276, model.TotalBytes);
-        Assert.Equal(5, model.Files.Count);
-        Assert.All(model.Files, file => Assert.False(file.Optional));
+        Assert.Equal(6, model.Files.Count);
+        Assert.Equal(44_385_795_748, model.TotalBytesWithOptional);
+        Assert.All(model.Files.Where(file => file.Role != CatalogFileRole.IngredientsLora), file => Assert.False(file.Optional));
+        Assert.True(Assert.Single(model.Files, file => file.Role == CatalogFileRole.IngredientsLora).Optional);
         Assert.Equal("55442750eb0013d94fffaa4dadb577c5f4dc07107ec04389d41444f6e517d980", model.Weights.Sha256);
         // Unsloth's ungated repository, the distilled checkpoint from its distilled/ folder (its root
         // holds the dev checkpoint the engine refuses), and every companion from the same revision.
         Assert.StartsWith("https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/distilled/", model.Weights.Url);
         Assert.Contains("distilled", model.Weights.FileName);
+        CatalogFile[] baseCompanions = model.Files.Where(file => file.Role is not (CatalogFileRole.Weights or CatalogFileRole.IngredientsLora)).ToArray();
         Assert.Equal(new[] { CatalogFileRole.TextEncoder, CatalogFileRole.Vae, CatalogFileRole.AudioVae, CatalogFileRole.LatentUpscaler },
-            model.Files.Skip(1).Select(file => file.Role));
-        Assert.All(model.Files.Skip(1), file => Assert.StartsWith("https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/", file.Url));
+            baseCompanions.Select(file => file.Role));
+        Assert.All(baseCompanions, file => Assert.StartsWith("https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/ac3c540c6025903784336e99b2dc179385c4c3b7/", file.Url));
         Assert.Contains("with-proj", model.Files.Single(file => file.Role == CatalogFileRole.TextEncoder).FileName);
         Assert.Contains("video-vae-conv", model.Files.Single(file => file.Role == CatalogFileRole.Vae).FileName);
         // The two-stage recipe's x2 spatial (not temporal) latent upscaler.
         Assert.Contains("spatial-upscaler-x2", model.Files.Single(file => file.Role == CatalogFileRole.LatentUpscaler).FileName);
+        CatalogFile ingredients = model.Files.Single(file => file.Role == CatalogFileRole.IngredientsLora);
+        Assert.Equal("ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors", ingredients.FileName);
+        Assert.Equal(1_308_787_472, ingredients.Bytes);
+        Assert.Equal("ff873a5beada3c579a8137c7c53343916f78bcc9a529ba910143073fe8715e95", ingredients.Sha256);
+        Assert.StartsWith("https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Ingredients/resolve/12040e4091ac2008d3906a594e31a7fb1ab9d546/", ingredients.Url);
         // The authentic custom Gemma file embeds its tokenizer assets.
         Assert.DoesNotContain(model.Files, file => file.Role == CatalogFileRole.Tokenizer);
     }
@@ -92,6 +100,12 @@ public sealed class Ltx25CatalogTests : IDisposable
             Assert.Equal(file.Sha256, configured.GetProperty("sha256").GetString());
             Assert.Equal(file.Url, configured.GetProperty("urls")[0].GetString()!.Replace("${hf}", "https://huggingface.co", StringComparison.Ordinal));
         }
+        CatalogFile ingredients = Entry.Files.Single(file => file.Role == CatalogFileRole.IngredientsLora);
+        JsonElement configuredIngredients = preset.RootElement.GetProperty("model").GetProperty("files")[0];
+        Assert.Equal(ingredients.FileName, Path.GetFileName(configuredIngredients.GetProperty("path").GetString()));
+        Assert.Equal(ingredients.Sha256, configuredIngredients.GetProperty("sha256").GetString());
+        Assert.Equal(ingredients.Url, configuredIngredients.GetProperty("urls")[0].GetString()!.Replace("${hf}", "https://huggingface.co", StringComparison.Ordinal));
+        Assert.True(configuredIngredients.GetProperty("optional").GetBoolean());
     }
 
     [Fact]
@@ -158,7 +172,7 @@ public sealed class Ltx25CatalogTests : IDisposable
     }
 
     [Fact]
-    public async Task AvailableFixtureDownloadsAllFiveFilesAndPublishesThemBeforeActivation()
+    public async Task AvailableFixtureDownloadsTheIngredientsAdapterAndPublishesItBeforeActivation()
     {
         byte[] bytes=new byte[32];
         BitConverter.GetBytes(0x46554747u).CopyTo(bytes,0);
@@ -171,13 +185,13 @@ public sealed class Ltx25CatalogTests : IDisposable
         var service=new ModelService(NullLogger<ModelService>.Instance,(path,_,_,_)=>
         {
             loads++;loadedPath=path;
-            foreach(string variable in new[]{"TS_VIDEO_TEXT_ENCODER","TS_VIDEO_VAE","TS_VIDEO_AUDIO_VAE","TS_VIDEO_UPSCALER"})published[variable]=Environment.GetEnvironmentVariable(variable);
+            foreach(string variable in new[]{"TS_VIDEO_TEXT_ENCODER","TS_VIDEO_VAE","TS_VIDEO_AUDIO_VAE","TS_VIDEO_UPSCALER","TS_LTX25_INGREDIENTS_LORA"})published[variable]=Environment.GetEnvironmentVariable(variable);
             throw new InvalidDataException("Fixture reached the model loader; production inference is covered by the real E2E probe.");
         });
         var paths=new AgentPaths(Path.Combine(_root,"data"),Path.Combine(_root,"cache")){DeviceMemoryGB=128};
         using var host=new AgentAppHost(paths,modelService:service,backends:[new BackendOption("cpu","CPU")]);
-        await host.Models.DownloadAsync(model,null,CancellationToken.None);
-        Assert.Equal(5,files.Requests);
+        await host.Models.DownloadAsync(model,null,CancellationToken.None,new[]{CatalogFileRole.IngredientsLora});
+        Assert.Equal(6,files.Requests);
         Assert.Equal(InstallState.Installed,host.Models.StateOf(model));
         foreach(var file in model.Files)Assert.Equal(bytes,File.ReadAllBytes(host.Models.PathFor(model,file)));
         var error=Assert.Throws<InvalidOperationException>(()=>host.UseModel(model,warmAfterwards:false));
@@ -188,6 +202,7 @@ public sealed class Ltx25CatalogTests : IDisposable
         Assert.Equal(host.Models.PathFor(model,model.Files.Single(f=>f.Role==CatalogFileRole.Vae)),published["TS_VIDEO_VAE"]);
         Assert.Equal(host.Models.PathFor(model,model.Files.Single(f=>f.Role==CatalogFileRole.AudioVae)),published["TS_VIDEO_AUDIO_VAE"]);
         Assert.Equal(host.Models.PathFor(model,model.Files.Single(f=>f.Role==CatalogFileRole.LatentUpscaler)),published["TS_VIDEO_UPSCALER"]);
+        Assert.Equal(host.Models.PathFor(model,model.Files.Single(f=>f.Role==CatalogFileRole.IngredientsLora)),published["TS_LTX25_INGREDIENTS_LORA"]);
         Assert.Null(Environment.GetEnvironmentVariable("TS_VIDEO_TOKENIZER"));
         DiffusionCompanions.Publish(null,host.Models);
         Assert.All(published.Keys,k=>Assert.Null(Environment.GetEnvironmentVariable(k)));
@@ -216,7 +231,7 @@ public sealed class Ltx25CatalogTests : IDisposable
         var store=new ModelStore(Path.Combine(_root,"models"));Directory.CreateDirectory(store.DirectoryFor(model));
         foreach(var file in model.Files)File.CreateSymbolicLink(store.PathFor(model,file),source);
         Assert.Equal(InstallState.Installed,store.StateOf(model));
-        Assert.Equal(4,DiffusionCompanions.Publish(model,store).Count);
+        Assert.Equal(5,DiffusionCompanions.Publish(model,store).Count);
     }
 
     [Fact]

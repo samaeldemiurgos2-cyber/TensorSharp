@@ -7,7 +7,7 @@
     playhead: 0, zoom: 65, snap: true, busy: false, jobs: [], proposal: null, tab: 'clip',
     previewRevision: null, previewJob: null, sourcePreview: false, sourcePreviewAssetId: null, timer: null, epoch: 0, previousFocus: null, generationDrafts: [], deleteDialog: null,
     // The Generate form's state, one shot form per project, so no re-render, poll or tab switch loses an unsent shot.
-    shotForms: new Map(), picker: null, loadTake: null, highlight: null, capabilitiesAt: 0, ticks: 0,
+    shotForms: new Map(), picker: null, loadTake: null, highlight: null, capabilitiesAt: 0, ticks: 0, inspectorPressed: false,
     // What Escape closes first: the newest open picker or narrow-screen panel, before Studio itself.
     layers: [] };
   const ui = {};
@@ -196,11 +196,11 @@
     if (window.addEventListener) { window.addEventListener('focus', returned); window.addEventListener('tensorsharp:model-changed', returned); }
     // A redraw a background event asked for while someone was typing waits until they leave the field.
     // Not while a pointer is held: replacing the pressed button between mousedown and mouseup would swallow its click.
-    let pressed = false; const flush = () => { if (S.inspectorDirty && !editingInspector()) { S.inspectorDirty = false; renderInspector(); } };
-    const released = () => { if (pressed) { pressed = false; setTimeout(flush, 0); } };
-    ui.inspector.addEventListener('pointerdown', () => { pressed = true; }, true);
+    const flush = () => { if (S.inspectorDirty && !S.inspectorPressed && !editingInspector()) { S.inspectorDirty = false; renderInspector(); } };
+    const released = () => { if (S.inspectorPressed) { S.inspectorPressed = false; setTimeout(flush, 0); } };
+    ui.inspector.addEventListener('pointerdown', () => { S.inspectorPressed = true; }, true);
     document.addEventListener('pointerup', released, true); document.addEventListener('pointercancel', released, true);
-    ui.inspector.addEventListener('focusout', () => setTimeout(() => { if (!pressed) flush(); }, 0));
+    ui.inspector.addEventListener('focusout', () => setTimeout(flush, 0));
   }
   function editingInspector() {
     const a = document.activeElement;
@@ -247,7 +247,7 @@
     if (S.timer) clearTimeout(S.timer); poll();
     ui.projectSelect.focus();
   }
-  function close() { if (!S.root) return; if (S.deleteDialog) S.deleteDialog(false); S.root.hidden = true; S.layers = []; S.picker = null; if (ui.video) ui.video.pause(); if (S.timer) clearTimeout(S.timer); S.timer = null; if (S.previousFocus && S.previousFocus.isConnected) S.previousFocus.focus(); }
+  function close() { if (!S.root) return; if (S.deleteDialog) S.deleteDialog(false); S.root.hidden = true; S.layers = []; S.picker = null; S.inspectorPressed = false; if (ui.video) ui.video.pause(); if (S.timer) clearTimeout(S.timer); S.timer = null; if (S.previousFocus && S.previousFocus.isConnected) S.previousFocus.focus(); }
   async function poll() {
     if (!S.root || S.root.hidden) return;
     try {
@@ -426,6 +426,14 @@
         const use = el('div', 'ts-asset-frames'); use.appendChild(el('span', 'ts-hint', tr('studio.continueVideo', 'Make the next segment:')));
         const b = button(tr('studio.continueFromLast', 'Continue from last frame'), () => continueFrom(a.id, 'last'));
         b.setAttribute('aria-label', tr('studio.continueFromLastNamed', 'Continue from the last frame of {name}', { name: a.name })); use.appendChild(b);
+        const videoReferenceModel = videoModels().find(model => model.available && model.referenceVideos && (model.modes || []).includes('ref'));
+        if (videoReferenceModel) {
+          const referenceLabel = videoReferenceModel.referencesWithFirstFrame
+            ? tr('studio.asVideoReferenceAndContinue', 'Reference full video and continue from its end')
+            : tr('studio.asVideoReference', 'Use as full video reference');
+          const reference = button(referenceLabel, () => useVideoReference(a.id));
+          reference.setAttribute('aria-label', tr('studio.asVideoReferenceNamed', 'Use full video as reference: {name}', { name: a.name })); use.appendChild(reference);
+        }
         card.appendChild(use);
       }
       const more = el('details', 'ts-more'); more.appendChild(el('summary', '', tr('studio.more', 'More'))); const extra = row(more);
@@ -722,7 +730,7 @@
   async function removeSelected() { const c = clip(); if (c) { await change([{ type: 'removeClip', clipId: c.id }]); S.selected = null; renderInspector(); } }
   function renderInspector() {
     if (!S.project) return;
-    if (S.background > 0 && editingInspector()) { S.inspectorDirty = true; return; } // no caret, IME or keyboard is lost to a poll
+    if (S.background > 0 && (S.inspectorPressed || editingInspector())) { S.inspectorDirty = true; return; } // no click, caret, IME or keyboard is lost to a poll
     // A re-render (a poll, a finished job, a capability change) keeps focus, caret and scroll where the person left them.
     const active = document.activeElement, keep = active && within(active, ui.inspector) && active.dataset && active.dataset.focusKey
       ? { key: active.dataset.focusKey, start: active.selectionStart, end: active.selectionEnd } : null;
@@ -821,13 +829,13 @@
   const GENERATION_MODES = ['t2v', 'i2v', 'fl2v', 'keyframes', 'ref'];
   // Takes saved before modes were explicit carry only their inputs; the host infers the same way.
   function inferMode(request) {
-    return (request.referenceAssetIds || []).length ? 'ref' : (request.temporalConditions || []).length ? 'keyframes'
+    return (request.referenceAssetIds || []).length || (request.referenceVideoAssetIds || []).length ? 'ref' : (request.temporalConditions || []).length ? 'keyframes'
       : request.endConditioningAssetId ? 'fl2v' : request.conditioningAssetId ? 'i2v' : 't2v';
   }
   // A ref take that also starts on a frame was made from the frame slots (a chain segment keeping a character).
   function useOf(mode, request) { return mode === 'ref' ? request && request.conditioningAssetId ? 'frames' : 'ref' : mode === 'keyframes' ? mode : 'frames'; }
   // Reference photos added beside the frame slots keep a character: the shot is then ref, starting on the first frame if any.
-  function shotMode(d) { return d.use === 'frames' ? d.refs.length ? 'ref' : d.last ? 'fl2v' : hasFirst(d) ? 'i2v' : 't2v' : d.use; }
+  function shotMode(d) { return d.use === 'frames' ? d.refs.length || (d.videoRefs || []).length ? 'ref' : d.last ? 'fl2v' : hasFirst(d) ? 'i2v' : 't2v' : d.use; }
   // ref sends its first frame only where it shows one: beside the frame slots, or in the reference view of a model that keeps both.
   function sendsFirst(d, m) { const mode = shotMode(d); return mode === 'i2v' || mode === 'fl2v' || mode === 'keyframes' || mode === 'ref' && (d.use === 'frames' || !!m.referencesWithFirstFrame); }
   function imageAssets() { return S.project.assets.filter(a => a.kind === 'image' && !a.missing); }
@@ -844,7 +852,11 @@
     // A planned shot that continues a video names it until the frame is taken.
     const pending = !first && s.firstFrameFrom && tr('studio.shotContinues', 'Continues “{name}”', { name: sourceName(s.firstFrameFrom) });
     if (mode === 'ref') {
-      const refs = tr('studio.shotReferences', 'Uses {count} reference photo(s)', { count: s.referenceCount != null ? s.referenceCount : (s.referenceAssetIds || []).length });
+      const imageCount = s.referenceCount != null ? s.referenceCount : (s.referenceAssetIds || []).length;
+      const videoCount = s.referenceVideoCount != null ? s.referenceVideoCount : (s.referenceVideoAssetIds || []).length;
+      const refs = videoCount
+        ? tr('studio.shotReferencesMedia', 'Uses {images} reference photo(s) and {videos} full video(s)', { images: imageCount, videos: videoCount })
+        : tr('studio.shotReferences', 'Uses {count} reference photo(s)', { count: imageCount });
       return first ? startText(first) + ' · ' + refs : pending ? pending + ' · ' + refs : refs;
     }
     if (mode === 'keyframes') return tr('studio.shotKeyframes', 'Hits {count} photo(s) at set moments', { count: s.guideCount != null ? s.guideCount : (s.temporalConditions || []).length });
@@ -879,10 +891,10 @@
   // A convenience copy in this browser: the shot form also survives a WebView reload within one launch.
   function saveShotForm(d) { try { window.localStorage.setItem(shotFormKey(), JSON.stringify(d)); } catch (_) { /* Storage can be disabled. */ } }
   function storedShotForm() {
-    try { const v = JSON.parse(window.localStorage.getItem(shotFormKey()) || 'null'); return v && typeof v === 'object' && typeof v.prompt === 'string' && Array.isArray(v.guides) && Array.isArray(v.refs) ? v : null; }
+    try { const v = JSON.parse(window.localStorage.getItem(shotFormKey()) || 'null'); return v && typeof v === 'object' && typeof v.prompt === 'string' && Array.isArray(v.guides) && Array.isArray(v.refs) && (v.videoRefs == null || Array.isArray(v.videoRefs)) ? v : null; }
     catch (_) { return null; }
   }
-  function blankShotForm() { return { modelId: null, use: 'frames', first: '', last: '', guides: [], refs: [], prompt: '', negativePrompt: '', seed: -1, shotId: null, sizeSource: 'image', recipeNote: null, lengthNote: null, chainSizePending: false, sizeNote: null, firstFrom: null }; }
+  function blankShotForm() { return { modelId: null, use: 'frames', first: '', last: '', guides: [], refs: [], videoRefs: [], prompt: '', negativePrompt: '', seed: -1, shotId: null, sizeSource: 'image', recipeNote: null, lengthNote: null, chainSizePending: false, sizeNote: null, firstFrom: null }; }
   function referenceMinimum(d, m) {
     const minimum = m.referenceMinFrames || 0; if (shotMode(d) !== 'ref' || !(Number(d.frameCount) < minimum)) return;
     const offset = m.temporalOffset || 0, grid = m.temporalMultiple || 1;
@@ -918,7 +930,7 @@
     const mode = request.mode || inferMode(request), from = !request.conditioningAssetId && take.firstFrameFrom || null;
     Object.assign(d, { use: useOf(mode, from ? { conditioningAssetId: from.assetId } : request), first: request.conditioningAssetId || '', firstFrom: from && { assetId: from.assetId, frame: from.frame },
       last: request.endConditioningAssetId || '',
-      guides: (request.temporalConditions || []).map(guide => Object.assign({}, guide)), refs: (request.referenceAssetIds || []).slice(),
+      guides: (request.temporalConditions || []).map(guide => Object.assign({}, guide)), refs: (request.referenceAssetIds || []).slice(), videoRefs: (request.referenceVideoAssetIds || []).slice(),
       prompt: request.prompt || '', negativePrompt: request.negativePrompt || '', seed: request.seed == null ? -1 : request.seed, shotId: request.shotId || null });
     resetSettings(d, m);
     // A planned shot names no model (the assistant plans before one is loaded): its nonzero size and length still apply.
@@ -985,11 +997,11 @@
   function dropMissingPhotos(d) {
     for (const slot of ['first', 'last']) if (d[slot] && !imageAsset(d[slot])) d[slot] = '';
     if (d.firstFrom && (d.first || !videoAsset(d.firstFrom.assetId))) d.firstFrom = null;
-    d.refs = d.refs.filter(ref => imageAsset(ref)); for (const guide of d.guides) if (guide.assetId && !imageAsset(guide.assetId)) guide.assetId = '';
+    d.refs = d.refs.filter(ref => imageAsset(ref)); d.videoRefs = (d.videoRefs || []).filter(ref => videoAsset(ref)); for (const guide of d.guides) if (guide.assetId && !imageAsset(guide.assetId)) guide.assetId = '';
   }
   // A take's shot id is kept while the shot is the same (its description and photos), so a re-run is "take 2"; a changed
   // description or photo starts a new shot.
-  function shotKey(d) { return JSON.stringify([d.prompt.trim(), d.use, d.first || d.firstFrom, d.last, d.refs, d.guides.map(g => g.assetId)]); }
+  function shotKey(d) { return JSON.stringify([d.prompt.trim(), d.use, d.first || d.firstFrom, d.last, d.refs, d.videoRefs || [], d.guides.map(g => g.assetId)]); }
   // From the library: a photo becomes the first or last frame of the next take, and Generate opens on it.
   function useFrame(assetId, slot) {
     if (!S.project) return; const d = shotFormFor(S.project.id);
@@ -1005,15 +1017,32 @@
   function useReference(assetId) {
     if (!S.project) return; const d = shotFormFor(S.project.id);
     // A model that takes references takes only so many; one that takes none says why in the Generate form.
-    const m = videoModels().find(x => x.available);
+    const m = videoModels().find(x => x.available && x.modelId === d.modelId) || videoModels().find(x => x.available);
     if (m && m.maxReferences > 0 && !d.refs.includes(assetId) && d.refs.length >= m.maxReferences) {
       status(tr('studio.referenceLimit', 'This model accepts at most {count} reference images.', { count: m.maxReferences }), true); return;
     }
     if (d.use === 'keyframes') d.use = 'frames';
-    d.useChosen = true; if (!d.refs.includes(assetId)) d.refs.push(assetId); saveShotForm(d); S.picker = null; dropLayer('picker');
+    d.useChosen = true; d.refusal = null; if (!d.refs.includes(assetId)) d.refs.push(assetId); saveShotForm(d); S.picker = null; dropLayer('picker');
     showPanel('inspector', 'generate');
     announce(tr('studio.referenceAdded', 'Picture {index}: {name}', { index: d.refs.indexOf(assetId) + 1, name: photoName(assetId) }));
-    focusKey(ui.inspector, d.use === 'ref' ? 'tile-' + assetId : 'ref-' + assetId + '-remove');
+    focusKey(ui.inspector, 'ref-' + assetId + '-remove');
+  }
+  // A full clip stays a temporal reference in ref mode; unlike Continue from last frame, it is not reduced to a still.
+  function useVideoReference(assetId) {
+    if (!S.project) return; const source = videoAsset(assetId), d = shotFormFor(S.project.id);
+    const m = videoModels().find(x => x.available && x.modelId === d.modelId) || videoModels().find(x => x.available);
+    if (!source || !m || !m.referenceVideos || !(m.modes || []).includes('ref')) {
+      status(tr('studio.videoReferenceUnavailable', 'The loaded model cannot use full video references.'), true); return;
+    }
+    if (!d.videoRefs.includes(assetId) && d.videoRefs.length >= (m.maxReferenceVideos || 0)) {
+      status(tr('studio.referenceVideoLimit', 'This model accepts at most {count} full video reference(s).', { count: m.maxReferenceVideos || 0 }), true); return;
+    }
+    if (!d.videoRefs.includes(assetId)) d.videoRefs.push(assetId);
+    if (m.referencesWithFirstFrame && !d.first && !pendingFirst(d)) d.firstFrom = { assetId, frame: -1 };
+    d.use = 'ref'; d.useChosen = true; d.refusal = null; saveShotForm(d); S.picker = null; dropLayer('picker');
+    showPanel('inspector', 'generate');
+    announce(tr('studio.videoReferenceAdded', 'Full video reference added: {name}', { name: source.name }));
+    focusKey(ui.inspector, 'video-ref-' + assetId + '-remove');
   }
   // The canvas the model's recipe gives the shot's photo (the first frame, else the last), when this mode sizes from one.
   function imageCanvas(d, m) {
@@ -1041,7 +1070,7 @@
       steps: Number(d.steps), cfgScale: Number(d.cfgScale), seed: Number(d.seed), generateAudio: !!(m.audioOutput && d.generateAudio),
       conditioningAssetId: usesFirst && d.first || null, endConditioningAssetId: usesLast && d.last || null, shotId: d.shotId && d.shotKey === shotKey(d) ? d.shotId : id(),
       temporalConditions: keyframes ? d.guides.map(g => ({ assetId: g.assetId, frameIndex: Number(g.frameIndex), strength: Number(g.strength) })) : [],
-      referenceAssetIds: mode === 'ref' ? d.refs.slice() : [],
+      referenceAssetIds: mode === 'ref' ? d.refs.slice() : [], referenceVideoAssetIds: mode === 'ref' ? (d.videoRefs || []).slice() : [],
       // The recipe the shown steps belong to, never the reused take's: the host refuses a shot planned for another.
       samplingRecipe: m.samplingRecipe || null };
   }
@@ -1059,8 +1088,9 @@
     if (mode === 'keyframes' && !d.guides.length) return { message: tr('studio.guideRequired', 'Add at least one timed image keyframe.'), focus: 'guide-add' };
     if (mode === 'keyframes' && d.guides.some(g => !imageAsset(g.assetId) || !Number.isInteger(Number(g.frameIndex)) || Number(g.frameIndex) < 0 || Number(g.frameIndex) >= frames || !(Number(g.strength) > 0 && Number(g.strength) <= 1)))
       return { message: tr('studio.invalidGuides2', 'Each keyframe needs a photo, an output frame within the take, and a strength above 0 and at most 1.'), focus: null };
-    if (mode === 'ref' && !d.refs.length) return { message: tr('studio.referenceRequired', 'Select at least one reference image.'), focus: d.use === 'ref' ? 'refs' : 'refs-section' };
-    if (mode === 'ref' && d.refs.length > (m.maxReferences || 0)) return { message: tr('studio.referenceLimit', 'This model accepts at most {count} reference images.', { count: m.maxReferences || 0 }), focus: d.use === 'ref' ? 'refs' : 'refs-section' };
+    if (mode === 'ref' && !d.refs.length && !(d.videoRefs || []).length) return { message: tr('studio.referenceRequired', 'Select at least one reference image or video.'), focus: 'refs-section' };
+    if (mode === 'ref' && d.refs.length > (m.maxReferences || 0)) return { message: tr('studio.referenceLimit', 'This model accepts at most {count} reference images.', { count: m.maxReferences || 0 }), focus: 'refs-section' };
+    if (mode === 'ref' && (d.videoRefs || []).length > (m.maxReferenceVideos || 0)) return { message: tr('studio.referenceVideoLimit', 'This model accepts at most {count} full video reference(s).', { count: m.maxReferenceVideos || 0 }), focus: 'refs-section' };
     if (mode === 'ref' && m.referenceMinFrames && frames < m.referenceMinFrames) return { message: tr('studio.referenceFrames', 'Reference generation with this model needs at least {frames} output frames.', { frames: m.referenceMinFrames }), focus: 'length' };
     return null;
   }
@@ -1130,9 +1160,14 @@
   }
   // Puts a chosen photo where the picker was opened: a frame slot, a keyframe guide, or the reference list.
   function applyPick(target, assetId) {
-    const d = shotFormFor(S.project.id); S.picker = null; dropLayer('picker');
+    const d = shotFormFor(S.project.id);
+    const m = videoModels().find(x => x.modelId === d.modelId) || videoModels().find(x => x.available);
+    if (target === 'ref' && !d.refs.includes(assetId) && m && d.refs.length >= (m.maxReferences || 0)) {
+      status(tr('studio.referenceLimit', 'This model accepts at most {count} reference images.', { count: m.maxReferences || 0 }), true); return;
+    }
+    d.refusal = null; S.picker = null; dropLayer('picker');
     let key = 'tile-' + assetId;
-    if (target === 'ref') { if (!d.refs.includes(assetId)) d.refs.push(assetId); if (d.use !== 'ref') key = 'ref-' + assetId + '-remove'; }
+    if (target === 'ref') { if (!d.refs.includes(assetId)) d.refs.push(assetId); key = 'ref-' + assetId + '-remove'; }
     else if (/^guide:/.test(target)) { const guide = d.guides[Number(target.slice(6))]; if (guide) guide.assetId = assetId; key = target.replace(':', '-') + '-choose'; }
     else { d[target] = assetId; if (target === 'first') d.firstFrom = null; chainPicked(d, target, assetId); key = 'slot-' + target + '-change'; }
     saveShotForm(d); renderInspector(); focusKey(ui.inspector, key);
@@ -1142,7 +1177,7 @@
   function generationForm(body) {
     const repaint = key => {
       if (ui.inspector && !within(body, ui.inspector)) { renderInspector(); if (key) focusKey(ui.inspector, key) || focusRegion(ui.inspector); return; }
-      body.replaceChildren(); generationForm(body); if (key && !focusKey(body, key)) focusKey(body, 'frames-section') || focusRegion(body);
+      body.replaceChildren(); generationForm(body); if (key && !focusKey(body, key)) focusKey(body, 'refs-section') || focusKey(body, 'frames-section') || focusRegion(body);
     };
     body.appendChild(el('h3', '', tr('studio.generateTitle', 'Generate a new take')));
     body.appendChild(el('p', 'ts-hint', tr('studio.generateIntro', 'The loaded video model makes it on this host. Finished takes appear in the library.')));
@@ -1189,11 +1224,11 @@
       announce(assetId ? (slot === 'first' ? tr('studio.firstFrameSet', 'First frame: {name}', { name: photoName(assetId) }) : tr('studio.lastFrameSet', 'Last frame: {name}', { name: photoName(assetId) }))
         : slot === 'first' ? tr('studio.firstFrameRemoved', 'First frame removed') : tr('studio.lastFrameRemoved', 'Last frame removed'));
     };
-    const openPicker = target => { capture(); d.refusal = null; S.picker = { projectId: S.project.id, target }; repaint('picker-heading'); };
-    const pickerReturn = target => target === 'ref' ? d.use === 'ref' ? 'refs-import' : 'refs-add' : /^guide:/.test(target) ? target.replace(':', '-') + '-choose' : 'slot-' + target + (d[target] ? '-change' : '-choose');
+    const openPicker = (target, returnKey) => { capture(); d.refusal = null; S.picker = { projectId: S.project.id, target, returnKey }; repaint('picker-heading'); };
+    const pickerReturn = target => target === 'ref' ? 'refs-add' : /^guide:/.test(target) ? target.replace(':', '-') + '-choose' : 'slot-' + target + (d[target] ? '-change' : '-choose');
     // A video chosen for the first frame is continued: its last frame is taken into the library, then fills the slot.
     const pickVideoFrame = async (target, assetId) => { capture(); const stillId = await extractFrame(assetId, 'last'); if (stillId && S.project) applyPick(target, stillId); };
-    const closePicker = () => { capture(); const target = S.picker && S.picker.target; S.picker = null; dropLayer('picker'); repaint(target && pickerReturn(target)); };
+    const closePicker = () => { capture(); const picker = S.picker; S.picker = null; dropLayer('picker'); repaint(picker && (picker.returnKey || pickerReturn(picker.target))); };
     function slotTile(slot) {
       const usable = slotUsable(m, slot), required = slot === 'first' && firstRequired(m), tile = el('div', 'ts-slot'); tile.dataset.slot = slot; tile.setAttribute('role', 'group');
       const title = el('span', 'ts-slot-title', slot === 'first' ? tr('studio.firstFrameTitle', 'First frame') : tr('studio.lastFrameTitle', 'Last frame')); title.id = 'ts-slot-' + slot + '-' + id(); tile.setAttribute('aria-labelledby', title.id);
@@ -1251,7 +1286,7 @@
       return tile;
     }
     // The library's photos as tiles, inline under what they fill: on a phone the inspector is already an overlay.
-    function pickerPanel(target, chosen, choose) {
+    function pickerPanel(target, chosen, choose, chooseVideo) {
       pushLayer('picker', closePicker);
       const panel = el('div', 'ts-picker'); panel.setAttribute('role', 'region');
       const heading = el('h4', '', target === 'first' ? tr('studio.pickFirst', 'Choose the first frame') : target === 'last' ? tr('studio.pickLast', 'Choose the last frame')
@@ -1259,14 +1294,27 @@
       heading.id = 'ts-picker-' + id(); heading.tabIndex = -1; heading.dataset.focusKey = 'picker-heading'; panel.setAttribute('aria-labelledby', heading.id);
       const head = el('div', 'ts-picker-head'), cancel = button(tr('studio.cancel', 'Cancel'), closePicker); head.append(heading, cancel); panel.appendChild(head);
       const grid = el('div', 'ts-picker-grid'), importAllowed = !S.capabilities || S.capabilities.importAvailable !== false; panel.appendChild(grid);
-      if (importAllowed) { const add = button(tr('studio.importPhoto', 'Import a photo…'), () => { capture(); importPhoto(target); }, 'ts-picker-tile ts-picker-import'); add.dataset.focusKey = 'picker-import'; grid.appendChild(add); }
+      if (importAllowed) { const add = button(tr('studio.importPhoto', 'Import a photo…'), () => { capture(); importPhoto(target); }, 'ts-picker-tile ts-picker-import'); add.dataset.focusKey = 'picker-import'; add.disabled = target === 'ref' && d.refs.length >= (m.maxReferences || 0); grid.appendChild(add); }
       for (const a of imageAssets()) {
         const tile = button('', () => choose(a.id), 'ts-picker-tile'); tile.dataset.assetId = a.id; tile.dataset.focusKey = 'tile-' + a.id; tile.setAttribute('aria-label', a.name);
-        if (a.id === chosen) tile.setAttribute('aria-current', 'true');
+        tile.disabled = target === 'ref' && !d.refs.includes(a.id) && d.refs.length >= (m.maxReferences || 0);
+        if (a.id === chosen || target === 'ref' && d.refs.includes(a.id)) tile.setAttribute('aria-current', 'true');
         const img = thumbnail(a, 'ts-picker-thumb'); if (img) tile.appendChild(img); tile.appendChild(el('span', 'ts-picker-name', a.name)); grid.appendChild(tile);
       }
       if (!imageAssets().length) panel.appendChild(el('p', 'ts-empty', importAllowed ? tr('studio.noPhotos', 'No photos in this project yet. Import one to use it here.')
         : tr('studio.noPhotosNoImport', 'This project has no photos, and importing isn’t available on this host.')));
+      if (target === 'ref' && m.referenceVideos && videoAssets().length) {
+        panel.appendChild(el('h5', 'ts-picker-sub', tr('studio.pickReferenceVideo', 'Or use a full video as a reference')));
+        const videos = el('div', 'ts-picker-grid'); panel.appendChild(videos);
+        for (const a of videoAssets()) {
+          const tile = button('', () => chooseVideo ? chooseVideo(a.id) : useVideoReference(a.id), 'ts-picker-tile');
+          tile.dataset.assetId = a.id; tile.dataset.focusKey = 'video-' + a.id; tile.setAttribute('aria-label', a.name);
+          tile.disabled = !(d.videoRefs || []).includes(a.id) && (d.videoRefs || []).length >= (m.maxReferenceVideos || 0);
+          if ((d.videoRefs || []).includes(a.id)) tile.setAttribute('aria-current', 'true');
+          const img = thumbnail(a, 'ts-picker-thumb', false, true); if (img) tile.appendChild(img);
+          tile.append(el('span', 'ts-picker-name', a.name), el('span', 'ts-picker-tag', tr('studio.fullVideoTag', 'full video'))); videos.appendChild(tile);
+        }
+      }
       // A long video is made as a chain: the next take can start where a video in the library ends.
       if (target === 'first' && videoAssets().length) {
         const sub = el('h5', 'ts-picker-sub', tr('studio.pickVideoFrame', 'Or continue a video from its last frame')); panel.appendChild(sub);
@@ -1280,36 +1328,68 @@
       }
       return panel;
     }
-    // Reference photos beside the frame slots: a person or object to keep the same, so a chain keeps its character from
-    // segment to segment. Shown even where the model cannot use them, saying why (never a silent drop).
-    function referenceSection(parent) {
-      const box = el('section', 'ts-gen-refs'); parent.appendChild(box);
-      const heading = el('h4', '', tr('studio.characterTitle', 'Keep a character the same (optional)')); heading.tabIndex = -1; heading.dataset.focusKey = 'refs-section'; box.appendChild(heading);
-      // A shot that starts on a frame (a chain segment) hears why that model cannot also keep a character: the reason
-      // names what it can do instead, which the plain "no references here" reason does not.
-      const blocked = hasFirst(d) && !m.referencesWithFirstFrame && m.referencesWithFirstFrameUnavailableReason ? m.referencesWithFirstFrameUnavailableReason
-        : !(m.modes || []).includes('ref') ? (m.unavailableModes || {}).ref || tr('studio.refuseMode', 'The loaded model can’t make this kind of shot.')
-        : d.last ? tr('studio.referenceWithLastHint', 'Reference photos can’t be combined with a last frame.')
-        : hasFirst(d) && !m.referencesWithFirstFrame ? tr('studio.referenceWithFirst', 'The loaded model can’t keep a character from reference photos while starting on a frame. Remove the first frame or the reference photos.')
-        : null;
-      box.appendChild(el('p', 'ts-hint', blocked || tr('studio.characterHelp', 'Photos of who or what should look the same, such as the main character of a chained video. The take does not start or end on them.')));
-      const list = el('div', 'ts-ref-list'); box.appendChild(list);
+    // Both Generate views expose the selected media with explicit removal, including full videos added from the library.
+    function selectedReferences(parent) {
+      const list = el('div', 'ts-ref-list'); parent.appendChild(list);
       d.refs.forEach((ref, index) => {
         const a = imageAsset(ref), item = el('div', 'ts-ref-item'); if (!a) return;
         const img = thumbnail(a, 'ts-guide-thumb'); if (img) item.appendChild(img);
         item.appendChild(el('span', 'ts-picker-name', tr('studio.referenceTileOn', '{name}, picture {index}', { name: a.name, index: index + 1 })));
         const remove = button(tr('studio.removePhoto', 'Remove'), () => {
-          capture(); d.refs = d.refs.filter(x => x !== ref); saveShotForm(d); repaint(d.refs.length ? 'ref-' + d.refs[0] + '-remove' : 'refs-add');
+          capture(); d.refs = d.refs.filter(x => x !== ref); d.refusal = null; S.picker = null; dropLayer('picker'); saveShotForm(d);
+          const next = d.refs[Math.min(index, d.refs.length - 1)];
+          repaint(next ? 'ref-' + next + '-remove' : 'refs-add');
           announce(tr('studio.referenceRemoved', 'Removed {name}. Order: {list}', { name: a.name, list: d.refs.map((x, i) => (i + 1) + '. ' + photoName(x)).join(', ') || tr('studio.none', 'None') }));
         });
         remove.dataset.focusKey = 'ref-' + ref + '-remove'; remove.setAttribute('aria-label', tr('studio.removeReferenceNamed', 'Remove reference photo ({name})', { name: a.name }));
         item.appendChild(remove); list.appendChild(item);
       });
+      (d.videoRefs || []).forEach((ref, index) => {
+        const a = videoAsset(ref), item = el('div', 'ts-ref-item'); if (!a) return;
+        const img = thumbnail(a, 'ts-guide-thumb', false, true); if (img) item.appendChild(img);
+        item.appendChild(el('span', 'ts-picker-name', tr('studio.videoReferenceTileOn', '{name}, full video reference', { name: a.name })));
+        const remove = button(tr('studio.removePhoto', 'Remove'), () => {
+          capture(); d.videoRefs = d.videoRefs.filter(x => x !== ref); d.refusal = null; S.picker = null; dropLayer('picker'); saveShotForm(d);
+          const next = d.videoRefs[Math.min(index, d.videoRefs.length - 1)];
+          repaint(next ? 'video-ref-' + next + '-remove' : 'refs-video-add');
+          announce(tr('studio.videoReferenceRemoved', 'Removed video reference {name}.', { name: a.name }));
+        });
+        remove.dataset.focusKey = 'video-ref-' + ref + '-remove'; remove.setAttribute('aria-label', tr('studio.removeVideoReferenceNamed', 'Remove video reference ({name})', { name: a.name }));
+        item.appendChild(remove); list.appendChild(item);
+      });
+    }
+    function referencePicker(parent, blocked) {
+      if (!blocked && m.referenceVideos && (d.videoRefs || []).length < (m.maxReferenceVideos || 0)) {
+        const addVideo = button(tr('studio.addVideoReference', '+ Add full video reference'), () => openPicker('ref', 'refs-video-add'), 'ts-slot-pick'); addVideo.dataset.focusKey = 'refs-video-add';
+        addVideo.setAttribute('aria-expanded', String(!!S.picker && S.picker.target === 'ref')); parent.appendChild(addVideo);
+      }
+      if (S.picker && S.picker.target === 'ref') parent.appendChild(pickerPanel('ref', null, assetId => { capture(); applyPick('ref', assetId); }, assetId => { capture(); useVideoReference(assetId); }));
+    }
+    // Reference photos beside the frame slots: a person or object to keep the same, so a chain keeps its character from
+    // segment to segment. Shown even where the model cannot use them, saying why (never a silent drop).
+    function referenceSection(parent) {
+      const box = el('section', 'ts-gen-refs'); parent.appendChild(box);
+      const framesView = d.use === 'frames';
+      const heading = el('h4', '', framesView ? tr('studio.characterTitle', 'Keep a character the same (optional)')
+        : m.referenceVideos ? tr('studio.referenceMediaTitle', 'Reference images and videos') : tr('studio.referencePhotosTitle', 'Reference photos'));
+      heading.tabIndex = -1; heading.dataset.focusKey = 'refs-section'; box.appendChild(heading);
+      // A shot that starts on a frame (a chain segment) hears why that model cannot also keep a character: the reason
+      // names what it can do instead, which the plain "no references here" reason does not.
+      const blocked = !framesView ? null : hasFirst(d) && !m.referencesWithFirstFrame && m.referencesWithFirstFrameUnavailableReason ? m.referencesWithFirstFrameUnavailableReason
+        : !(m.modes || []).includes('ref') ? (m.unavailableModes || {}).ref || tr('studio.refuseMode', 'The loaded model can’t make this kind of shot.')
+        : d.last ? tr('studio.referenceWithLastHint', 'Reference photos can’t be combined with a last frame.')
+        : hasFirst(d) && !m.referencesWithFirstFrame ? tr('studio.referenceWithFirst', 'The loaded model can’t keep a character from reference photos while starting on a frame. Remove the first frame or the reference photos.')
+        : null;
+      const referenceHelp = m.referenceVideos
+        ? tr('studio.characterVideoHelp', 'Reference photos and full videos guide appearance; videos also provide temporal context. They do not pin the take’s first or last frame.')
+        : tr('studio.characterHelp', 'Photos of who or what should look the same, such as the main character of a chained video. The take does not start or end on them.');
+      box.appendChild(el('p', 'ts-hint', blocked || referenceHelp));
+      selectedReferences(box);
       if (!blocked && d.refs.length < (m.maxReferences || 0)) {
         const add = button(tr('studio.addReference', '+ Add reference photo'), () => openPicker('ref'), 'ts-slot-pick'); add.dataset.focusKey = 'refs-add';
         add.setAttribute('aria-expanded', String(!!S.picker && S.picker.target === 'ref')); acceptDrops(add, assetId => { capture(); applyPick('ref', assetId); }); box.appendChild(add);
       }
-      if (S.picker && S.picker.target === 'ref') box.appendChild(pickerPanel('ref', null, assetId => { capture(); applyPick('ref', assetId); }));
+      referencePicker(box, blocked);
       // MiniMax-H3 names the photos Picture 1, 2, ... in this order; say so where the description can use it.
       if (d.refs.length && !blocked) box.appendChild(el('p', 'ts-hint', tr('studio.referenceOrder', 'Order sent to the model: {list}', { list: d.refs.map((ref, i) => (i + 1) + '. ' + photoName(ref)).join(' · ') })));
       // LTX Ingredients is trained at one size; a chain segment keeps its video's size instead, and says so.
@@ -1379,30 +1459,13 @@
         capture(); d.guides.push({ assetId: '', frameIndex: Math.max(0, Number(d.frameCount) - 1), strength: 1 }); saveShotForm(d); openPicker('guide:' + (d.guides.length - 1));
       }); addGuide.dataset.focusKey = 'guide-add'; section.appendChild(addGuide);
     } else {
-      section.append(el('h4', '', tr('studio.referencePhotosTitle', 'Reference photos')),
-        el('p', 'ts-hint', tr('studio.referencesHelp2', 'Your photos show who or what to include; the take does not start or end on them. Choose up to {count}.', { count: m.maxReferences })));
       // A model that keeps references while starting on a frame can continue a video here too.
       if (m.referencesWithFirstFrame) {
         const start = el('div', 'ts-slots'); start.appendChild(slotTile('first')); section.appendChild(start);
         if (S.picker && S.picker.target === 'first') section.appendChild(pickerPanel('first', d.first, assetId => { capture(); applyPick('first', assetId); }));
         chainHints(section);
       }
-      const grid = el('div', 'ts-picker-grid ts-refs'); grid.dataset.focusKey = 'refs'; grid.tabIndex = -1; section.appendChild(grid);
-      const importAllowed = !S.capabilities || S.capabilities.importAvailable !== false;
-      if (importAllowed) { const add = button(tr('studio.importPhoto', 'Import a photo…'), () => { capture(); importPhoto('ref'); }, 'ts-picker-tile ts-picker-import'); add.dataset.focusKey = 'refs-import'; grid.appendChild(add); }
-      // Order is meaningful (MiniMax-H3 numbers them as pictures), so the tiles keep the order they were chosen in.
-      for (const a of imageAssets()) {
-        const order = d.refs.indexOf(a.id) + 1, tile = button('', () => {
-          capture(); d.refs = d.refs.filter(ref => ref !== a.id); if (!order) d.refs.push(a.id); saveShotForm(d); repaint('tile-' + a.id);
-          announce(order ? tr('studio.referenceRemoved', 'Removed {name}. Order: {list}', { name: a.name, list: d.refs.map((ref, i) => (i + 1) + '. ' + photoName(ref)).join(', ') || tr('studio.none', 'None') })
-            : tr('studio.referenceAdded', 'Picture {index}: {name}', { index: d.refs.length, name: a.name }));
-        }, 'ts-picker-tile'); tile.dataset.assetId = a.id; tile.dataset.focusKey = 'tile-' + a.id; tile.setAttribute('aria-pressed', String(!!order));
-        tile.setAttribute('aria-label', order ? tr('studio.referenceTileOn', '{name}, picture {index}', { name: a.name, index: order }) : a.name);
-        const img = thumbnail(a, 'ts-picker-thumb'); if (img) tile.appendChild(img); tile.appendChild(el('span', 'ts-picker-name', a.name));
-        if (order) tile.appendChild(el('span', 'ts-ref-badge', String(order))); grid.appendChild(tile);
-      }
-      if (!imageAssets().length) section.appendChild(el('p', 'ts-empty', importAllowed ? tr('studio.noPhotos', 'No photos in this project yet. Import one to use it here.') : tr('studio.noPhotosNoImport', 'This project has no photos, and importing isn’t available on this host.')));
-      if (d.refs.length) section.appendChild(el('p', 'ts-hint', tr('studio.referenceOrder', 'Order sent to the model: {list}', { list: d.refs.map((ref, i) => (i + 1) + '. ' + photoName(ref)).join(' · ') })));
+      referenceSection(section);
       if (m.referenceMinFrames) section.appendChild(el('p', 'ts-hint', tr('studio.referenceFrames', 'Reference generation with this model needs at least {frames} output frames.', { frames: m.referenceMinFrames })));
     }
     const uses = usesOffered(m);
@@ -1500,7 +1563,7 @@
       const size = shownSize(d, m), frames = Number(d.frameCount);
       const sent = shotRequest(d, m);
       summary.textContent = [shotText({ mode: sent.mode, conditioningAssetId: sent.conditioningAssetId, firstFrameFrom: sendsFirst(d, m) ? pendingFirst(d) : null,
-        endConditioningAssetId: sent.endConditioningAssetId, temporalConditions: d.guides, referenceAssetIds: d.refs }),
+        endConditioningAssetId: sent.endConditioningAssetId, temporalConditions: d.guides, referenceAssetIds: d.refs, referenceVideoAssetIds: d.videoRefs }),
         tr('studio.summaryLength', '{seconds} s ({frames} frames)', { seconds: secondsLabel(frames, d.fps), frames }),
         size.auto && !size.width ? tr('studio.summarySizePhoto', 'sized from the photo') : size.width + ' × ' + size.height,
         audio && d.generateAudio ? tr('studio.summarySound', 'with sound') : ''].filter(Boolean).join(' · ');

@@ -82,6 +82,31 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(json.loads(reply["content"])["temperature_c"], 19)
         self.assertTrue(metrics["usage_present"])
 
+    def test_raw_usage_preserves_cache_work_for_streaming_and_blocking(self):
+        for cached in (0, 9):
+            with self.subTest(cached=cached):
+                usage = {"prompt_tokens": 12, "completion_tokens": 1,
+                         "prompt_tokens_details": {"cached_tokens": cached}}
+                chunk = {"choices": [{"delta": {"content": "42"}, "finish_reason": "stop"}],
+                         "usage": usage}
+                with patch.object(engines.requests, "post", return_value=StreamResponse([chunk])):
+                    self.assertEqual(usage, engines._run_streaming("http://unused", {}, 10)["raw_usage"])
+                response = engines.requests.Response()
+                response.status_code = 200
+                response._content = json.dumps({"choices": [{"message": {"role": "assistant", "content": "42"},
+                    "finish_reason": "stop"}], "usage": usage}).encode()
+                with patch.object(engines.requests, "post", return_value=response):
+                    self.assertEqual(usage, engines._run_blocking("http://unused", {}, 10)["raw_usage"])
+
+    def test_missing_usage_remains_unknown_in_both_transport_modes(self):
+        with patch.object(engines.requests, "post", return_value=StreamResponse([])):
+            self.assertEqual({}, engines._run_streaming("http://unused", {}, 10)["raw_usage"])
+        response = engines.requests.Response()
+        response.status_code = 200
+        response._content = b'{}'
+        with patch.object(engines.requests, "post", return_value=response):
+            self.assertEqual({}, engines._run_blocking("http://unused", {}, 10)["raw_usage"])
+
     def test_stream_error_does_not_become_successful_empty_completion(self):
         with patch.object(engines.requests, "post", return_value=StreamResponse([
                 {"error": {"message": "out of memory"}}])):
@@ -192,6 +217,136 @@ class ValidationTests(unittest.TestCase):
         )
         result = self.decode_result(content, scenario="decode_8k")
         self.assertEqual(result["status"], "ok", result)
+
+    def test_decode_accepts_complete_observed_modulo_explanation(self):
+        content = (Path(__file__).parent / 'fixtures/hash-table-modulo-observed.txt').read_text(encoding='utf-8')
+        self.assertIn('index = h(key) % m', content)
+        self.assertIn('table[index] = value', content)
+        self.assertIn('index = h(k) mod m', content)
+        result = self.decode_result(content)
+        self.assertEqual('ok', result['status'], result)
+        staggered = (Path(__file__).parent / 'fixtures/hash-table-modulo-staggered-observed.txt').read_text(encoding='utf-8')
+        self.assertIn('i = hash(key) % capacity', staggered)
+        self.assertIn('table[i] = value', staggered)
+        result = self.decode_result(staggered)
+        self.assertEqual('ok', result['status'], result)
+
+    def test_decode_accepts_varied_hash_modulo_storage_forms(self):
+        introduction = ('A hash table associates keys and values in an array. Collisions need separate handling. '
+                        'The following insertion has two steps: calculate a location, then store the value there. '
+                        'The table has a positive capacity. Lookup applies the identical calculation to find the entry. ')
+        for operation in ('index = h(key) % m; table[index] = value',
+                          'idx = hash(k) mod capacity\nbuckets[idx] = (key, value)',
+                          'slot_index = HASH_FUNCTION(key) modulo 16; slots[slot_index] = value',
+                          'bucket = hashcode(key) % bucket_count\narray[bucket] = value',
+                          'i = hash(key) % capacity; table[i] = value'):
+            with self.subTest(operation=operation):
+                self.assertIsNone(validation.decode_content_error(introduction + operation))
+
+    def test_decode_modulo_does_not_accept_promises_refusals_or_unrelated_arithmetic(self):
+        introduction = ('A hash table has keys and values, arrays and collisions. '
+                        'This passage only names these topics without explaining their relationships. ') * 3
+        bad = [
+            'I will later explain modulo arithmetic and how values enter an array.',
+            'I cannot explain `index = h(key) % m`; please ask someone else.',
+            'index = year % 12; table[index] = value',
+            'index = timestamp modulo capacity; table[index] = value',
+            'index = h(year) % m; table[index] = value',
+            'index = h(key) % m; table[other] = value',
+            'index = h(key) % m; I promise to show storage later.',
+            'index = h(key) % m; table[index] = None',
+        ]
+        for tail in bad:
+            with self.subTest(tail=tail):
+                error = validation.decode_content_error(introduction + tail)
+                self.assertIsNotNone(error)
+                self.assertIn('hash-to-index or collision mechanics', error)
+
+    # This vocabulary-only prefix intentionally cannot satisfy either mechanics
+    # branch by itself. Each test therefore exercises the new prose branch.
+    PROSE_STORAGE_TOPICS = (
+        'A hash table associates keys and values. An array supplies indexed storage. Collisions can happen. '
+        'This paragraph supplies only vocabulary, without a technical mechanism. ' * 5
+    )
+
+    def test_decode_accepts_observed_prose_storage_through_computed_index(self):
+        content = (Path(__file__).parent / 'fixtures/hash-table-prose-storage-observed.txt').read_text(encoding='utf-8')
+        self.assertIn('index = h(key) % capacity', content)
+        self.assertIn('Then we store the (key, value) pair at `table[index]`.', content)
+        for scenario in ('decode', 'decode_8k'):
+            with self.subTest(scenario=scenario):
+                result = self.decode_result(content, scenario=scenario)
+                self.assertEqual('ok', result['status'], result)
+                self.assertEqual(content, result['validated_content'])
+
+    def test_decode_accepts_present_prose_storage_operations_and_same_indices(self):
+        for index, operation, object_, target in (
+                ('index', 'store', 'the (key, value) pair', 'table'),
+                ('idx', 'put', 'the value', 'array'),
+                ('i', 'insert', 'the key-value pair', 'buckets'),
+                ('bucket_index', 'store', 'value', 'slots')):
+            with self.subTest(index=index, operation=operation):
+                content = (self.PROSE_STORAGE_TOPICS +
+                           f'\n{index} = hash(key) % capacity\nThen we {operation} {object_} at `{target}[{index}]`.')
+                result = self.decode_result(content)
+                self.assertEqual('ok', result['status'], result)
+
+    def test_decode_prose_storage_rejects_future_promises(self):
+        for sentence in ('We will store the value at table[index].',
+                         'We would store the value at table[index].',
+                         'Later, we store the value at table[index].',
+                         'We promise to store the value at table[index].',
+                         'We store the value at table[index] in a future explanation.'):
+            with self.subTest(sentence=sentence):
+                content = self.PROSE_STORAGE_TOPICS + '\nindex = h(key) % capacity\n' + sentence
+                self.assertIn('hash-to-index or collision mechanics', validation.decode_content_error(content))
+
+    def test_decode_prose_storage_rejects_negation_and_refusal(self):
+        for sentence in ('We do not store the value at table[index].',
+                         'We never store the value at table[index].',
+                         'We store no value at table[index].',
+                         'Do not store the value at table[index].',
+                         'We refuse to explain this.\nWe store the value at table[index].',
+                         "I can't describe hash tables.\nWe store the value at table[index]."):
+            with self.subTest(sentence=sentence):
+                content = self.PROSE_STORAGE_TOPICS + '\nindex = h(key) % capacity\n' + sentence
+                self.assertIn('hash-to-index or collision mechanics', validation.decode_content_error(content))
+
+    def test_decode_prose_storage_requires_prior_nearby_hash_and_same_index(self):
+        for operation in ('index = h(key) % capacity\nWe store the value at table[other].',
+                          'index = length(key) % capacity\nWe store the value at table[index].',
+                          'We store the value at table[index].\nindex = h(key) % capacity',
+                          'index = h(key) % capacity\n' + ('Extra text. ' * 60) + 'We store the value at table[index].',
+                          'We store the value at table[index].'):
+            with self.subTest(operation=operation):
+                self.assertIn('hash-to-index or collision mechanics',
+                              validation.decode_content_error(self.PROSE_STORAGE_TOPICS + '\n' + operation))
+
+    def test_decode_prose_storage_rejects_quoted_promises_and_conditionals(self):
+        for sentence in ('The next answer will say: "We store the value at table[index]."',
+                         'If we can, we store the value at table[index].',
+                         'We store the value at table[index] only if an explanation is provided.'):
+            with self.subTest(sentence=sentence):
+                content = self.PROSE_STORAGE_TOPICS + '\nindex = h(key) % capacity\n' + sentence
+                self.assertIn('hash-to-index or collision mechanics', validation.decode_content_error(content))
+
+    def test_decode_code_storage_still_satisfies_the_same_minimum(self):
+        content = self.PROSE_STORAGE_TOPICS + '\nindex = h(key) % capacity\ntable[index] = value'
+        result = self.decode_result(content)
+        self.assertEqual('ok', result['status'], result)
+
+    def test_decode_observed_prose_storage_still_requires_exact_tokens_and_valid_finish(self):
+        content = (Path(__file__).parent / 'fixtures/hash-table-prose-storage-observed.txt').read_text(encoding='utf-8')
+        for tokens in (None, '512', 511, 513, True):
+            with self.subTest(tokens=tokens):
+                result = self.decode_result(content, tokens=tokens)
+                self.assertEqual('fail', result['status'])
+                self.assertIn('completion_tokens', result['detail'])
+        for finish in ('error', 'tool_calls', 'content_filter', 'unknown'):
+            with self.subTest(finish=finish):
+                result = self.decode_result(content, finish=finish)
+                self.assertEqual('fail', result['status'])
+                self.assertIn('finish_reason=length or stop', result['detail'])
 
     def test_decode_does_not_blanket_reject_a_refusal_prefix_before_an_explanation(self):
         content = "I can't help with that. Let me address the actual request directly. " + self.HASH_EXPLANATION

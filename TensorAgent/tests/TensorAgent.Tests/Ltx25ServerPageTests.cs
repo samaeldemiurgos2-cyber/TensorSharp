@@ -19,7 +19,7 @@ public sealed class Ltx25ServerPageTests
     [InlineData("end")]
     [InlineData("video")]
     [InlineData("audio")]
-    public void ActualServerPageRoutesDistilledImageKeyframesAndRefusesUnimplementedAdapters(string media)
+    public void ActualServerPageRoutesDistilledImageKeyframesAndVideoContinuations(string media)
     {
         var repo=new DirectoryInfo(AppContext.BaseDirectory);
         while(repo is not null&&!File.Exists(Path.Combine(repo.FullName,"TensorSharp.slnx")))repo=repo.Parent;
@@ -71,7 +71,7 @@ public sealed class Ltx25ServerPageTests
             int at=result.Stdout.IndexOf("<<RESULT>>",StringComparison.Ordinal);Assert.True(at>=0,result.Stdout+result.Stderr);
             using var json=JsonDocument.Parse(result.Stdout[(at+10)..].Trim());var actual=json.RootElement;
             Assert.True(actual.GetProperty("routed").GetBoolean());
-            if(media is "video" or "audio"){Assert.Empty(actual.GetProperty("calls").EnumerateArray());Assert.Equal("Unsupported input",actual.GetProperty("status").GetString());return;}
+            if(media=="audio"){Assert.Empty(actual.GetProperty("calls").EnumerateArray());Assert.Equal("Unsupported input",actual.GetProperty("status").GetString());return;}
             var call=Assert.Single(actual.GetProperty("calls").EnumerateArray());Assert.Equal("/api/video-generate/stream",call.GetProperty("url").GetString());
             var body=call.GetProperty("payload");
             // Identity sheets keep their trained 768x448; every other LTX request leaves the output size to the server/model.
@@ -88,6 +88,7 @@ public sealed class Ltx25ServerPageTests
                 Assert.False(built[1].TryGetProperty("stillImagePaths",out _));
             }
             if(media=="image"){Assert.Equal("a.png",body.GetProperty("imagePath").GetString());Assert.Equal("i2v",body.GetProperty("videoMode").GetString());}
+            if(media=="video"){Assert.Equal(new[]{"a.mp4"},body.GetProperty("continueFromVideos").EnumerateArray().Select(v=>v.GetString()));Assert.Equal("i2v",body.GetProperty("videoMode").GetString());}
             if(media=="pair"){Assert.Equal("a.png",body.GetProperty("imagePath").GetString());Assert.Equal("b.png",body.GetProperty("endImage").GetString());Assert.Equal("fl2v",body.GetProperty("videoMode").GetString());}
             if(media=="identity"){Assert.Equal("ref",body.GetProperty("videoMode").GetString());Assert.Equal(new[]{"a.png","b.png"},body.GetProperty("referenceImages").EnumerateArray().Select(v=>v.GetString()));Assert.False(body.TryGetProperty("imageConditions",out _));}
             if(media is "multiple" or "longmultiple" or "indexed" or "end")

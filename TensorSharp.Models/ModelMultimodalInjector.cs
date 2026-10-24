@@ -584,8 +584,13 @@ namespace TensorSharp.Models
         /// img_end "&lt;|image_end|&gt;").
         /// </summary>
         internal List<int> ProcessMuseGlimmerHistory(MuseGlimmerModel model, List<ChatMessage> history, List<int> inputTokens)
+            => ProcessMuseGlimmerHistory(model.VisionEncoder, history, inputTokens);
+
+        // Muse Spark publishes the same Muse-Glimmer vision tower and image-token
+        // contract. Keep image caching/placeholder expansion shared by both models.
+        internal List<int> ProcessMuseGlimmerHistory(MuseGlimmerVisionEncoder encoder, List<ChatMessage> history, List<int> inputTokens)
         {
-            if (model.VisionEncoder == null)
+            if (encoder == null)
                 return inputTokens;
 
             int patchId = _model.Tokenizer.LookupToken("<|patch|>");
@@ -594,7 +599,7 @@ namespace TensorSharp.Models
             if (patchId < 0 || imageStartId < 0 || imageEndId < 0)
                 return inputTokens;
 
-            var processor = model.VisionEncoder.ImageProcessor;
+            var processor = encoder.ImageProcessor;
             int searchFrom = 0;
 
             foreach (var message in history)
@@ -604,7 +609,7 @@ namespace TensorSharp.Models
 
                 foreach (var imagePath in message.ImagePaths)
                 {
-                    CachedEmbedding cached = GetOrCreateMuseGlimmerVisionEmbedding(model, processor, imagePath);
+                    CachedEmbedding cached = GetOrCreateMuseGlimmerVisionEmbedding(encoder, processor, imagePath);
                     int tokenPosition = FindTokenPosition(inputTokens, patchId, searchFrom);
                     if (tokenPosition < 0)
                         continue;
@@ -624,12 +629,12 @@ namespace TensorSharp.Models
         }
 
         private CachedEmbedding GetOrCreateMuseGlimmerVisionEmbedding(
-            MuseGlimmerModel model, MuseGlimmerImageProcessor processor, string imagePath)
+            MuseGlimmerVisionEncoder encoder, MuseGlimmerImageProcessor processor, string imagePath)
         {
             return GetOrCreateCachedEmbedding(_visionCache, imagePath, fullPath =>
             {
                 var (pixels, imageWidth, imageHeight) = processor.ProcessImage(fullPath);
-                Tensor embeddings = model.VisionEncoder.Encode(pixels, imageWidth, imageHeight);
+                Tensor embeddings = encoder.Encode(pixels, imageWidth, imageHeight);
                 return CreateCachedEmbedding(fullPath, embeddings);
             });
         }
@@ -1196,7 +1201,7 @@ namespace TensorSharp.Models
             if (imagePaths.Count == 0)
                 return inputTokens;
             if (!model.IsVisionEncoderLoaded)
-                throw new InvalidOperationException("Image input requires the prepared deepseek41.vision.gguf companion.");
+                throw new InvalidOperationException("Image input requires a V4.1 vision companion: --mmproj with the prepared deepseek41.vision.gguf or llama.cpp's deepseek41v mmproj.");
 
             int imageId = model.ImageTokenId;
             int placeholders = 0;

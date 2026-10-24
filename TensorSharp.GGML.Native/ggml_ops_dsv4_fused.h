@@ -63,6 +63,12 @@ enum tsg_dsv4_fused_kind : int32_t
     // Qwen4Exp prefill: sum_k round(expert[k] * route[k]) in expert order.
     // Separate F32 multiplies/adds match its materialized upstream graph.
     TSG_Q4E_EXPERT_REDUCE       = 25,
+    // V4.1 routed-MoE tensor parallelism: src x[embedding,tokens],
+    // weights[1,used,tokens], ids I32[used,tokens] -> dst[embedding,tokens].
+    // `object` is the TP executor's layer; on the CUDA backend the node is
+    // enqueued across every rank without a host synchronization
+    // (device_launch), on the CPU backend it runs host_compute.
+    TSG_DSV41_TP_MOE            = 26,
 };
 
 #define TSG_DSV4_FUSED_MAGIC 0x5453445356344655ull  // "TSDSV4FU"
@@ -73,6 +79,13 @@ struct tsg_dsv4_fused_desc
     int32_t  kind = 0;
     int32_t  i0 = 0, i1 = 0, i2 = 0, i3 = 0;
     float    f0 = 0.0f, f1 = 0.0f;
+    // TSG_DSV41_TP_MOE only. Function pointers keep the fused backend free of
+    // a link dependency on the TP executor. Neither hook lets an exception out
+    // (one a rank graph throws included): the executor records the failure
+    // and turns dst into NaNs.
+    void *   object = nullptr;
+    void   (*host_compute)(void * object, struct ggml_tensor * dst) = nullptr;
+    void   (*device_launch)(void * object, struct ggml_tensor * dst, void * cuda_stream, int device) = nullptr;
 };
 
 // CPU reference implementation (ggml_custom_op_t signature); used when a

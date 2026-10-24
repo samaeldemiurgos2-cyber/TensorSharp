@@ -1268,6 +1268,24 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.False(options.WebUiEnabled);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Build_ApiOnlyHostingKeepsModelLoadingAndPrefixReuse(bool useEnvironment)
+    {
+        _env.Set("TS_NO_WEBUI", useEnvironment ? "1" : null);
+        _env.Set("TS_SCHED_PREFIX_CACHE", "1");
+        string[] args = useEnvironment
+            ? ["--model", "model.gguf"]
+            : ["--model", "model.gguf", "--no-webui"];
+        ServerOptionsBuilder.ApplyPrefixCacheCliFlag(args);
+        var options = ServerOptionsBuilder.Build(args, _baseDir);
+        Assert.False(options.WebUiEnabled);
+        Assert.EndsWith("model.gguf", options.StartupModelPath);
+        Assert.True(options.PrefixCacheEnabled);
+        Assert.True(SchedulerConfig.FromEnvironment().EnablePrefixCaching);
+    }
+
     [Fact]
     public void Build_NoWebUiEnvVar_DisablesWebUi()
     {

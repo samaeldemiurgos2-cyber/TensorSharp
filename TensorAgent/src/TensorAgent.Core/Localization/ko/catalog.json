@@ -22,8 +22,7 @@
   "catalog.license.qwenImage": "Qwen 연구 라이선스(비상업용); 텍스트 인코더는 Apache-2.0",
   "catalog.model.minimaxH3.parameters": "33B 오디오·동영상 DiT(AdaLN 분기 제거 시 20B) + Qwen3-VL-32B 텍스트 인코더",
   "catalog.model.minimaxH3.quantization": "Q4_K(DiT) / Q4_K_M(텍스트 인코더)",
-  "catalog.model.minimaxH3Fl2va.notes": "설명으로 자체 사운드트랙이 있는 짧은 동영상을 만들고, 첨부한 사진에 움직임을 주거나, 두 사진 사이를 이어 줍니다. 두 사진은 첫 프레임과 마지막 프레임으로 사용됩니다. 32 GB의 시스템 메모리(RAM)가 필요합니다. MiniMax 라이선스는 EU, 영국, 대한민국, 미국에서의 사용을 허용하지 않습니다.",
-  "catalog.model.minimaxH3Ref2va.notes": "최대 9개의 첨부 사진, 영상, 녹음에 있는 사람, 사물, 장소, 소리를 활용하여 자체 사운드트랙이 있는 짧은 동영상을 만듭니다. 장면에 누가 또는 무엇이 나오는지 설명하세요. 참고 자료가 외형을 정하고 설명이 장면 속 배치를 정합니다. 32 GB의 시스템 메모리(RAM)가 필요합니다. MiniMax 라이선스는 EU, 영국, 대한민국, 미국에서의 사용을 허용하지 않습니다.",
+  "catalog.model.minimaxH3.notes": "설명으로 자체 사운드트랙이 있는 짧은 동영상을 만들고, 첨부한 사진에 움직임을 주거나, 첫 사진과 마지막 사진 사이를 이어 주거나, 최대 9개의 첨부 사진·영상·녹음에 있는 사람·사물·장소·소리를 장면에 담을 수 있습니다. Video Studio에서 첫 프레임 및 마지막 프레임 모드 또는 참고 모드를 선택하세요. 32 GB의 시스템 메모리(RAM)가 필요합니다. MiniMax 라이선스는 EU, 영국, 대한민국, 미국에서의 사용을 허용하지 않습니다.",
   "catalog.license.minimaxH3": "MiniMax H3 커뮤니티 라이선스",
   "catalog.lora.viggleTurbo.purpose": "전체 모델에 가까운 품질로 40단계 대신 6단계만에 이미지를 생성하고 편집합니다.",
   "catalog.license.qwenResearch": "Qwen 연구 라이선스(비상업용)",
@@ -67,6 +66,6 @@
   "catalog.extended.744b40b.parameters": "7440억(활성 400억)",
   "catalog.extended.384experts.parameters": "MoE, 라우팅 전문가 384개",
   "catalog.extended.14bExpert.parameters": "전문가당 140억",
-  "catalog.model.ltx25.notes": "48kHz 스테레오 오디오를 포함한 실험적 텍스트/이미지 동영상 생성입니다. LTX 2.5 Distilled는 CFG 1에서 절반 크기로 Ancestral Euler 8단계, 잠재 공간 2배 업스케일, 다듬기 3단계를 실행하며 첫/마지막 프레임과 위치 및 강도를 지정한 여러 이미지 키프레임을 지원합니다. 이미지는 출력 타임라인을 유도합니다. 인물 참조 및 동영상/오디오 어댑터에는 별도 체크포인트가 필요합니다. 고정 다운로드는 총 43.08GB이며 접근 제한이 없는 저장소에서 받으므로 Hugging Face 계정이 필요 없습니다. 기기 메모리 등급은 보수적으로 48GB이며 짧은 1024×1024 영상으로 검증했습니다.",
-  "catalog.license.ltx25": "LTX-2.5 및 Gemma 약관"
+  "catalog.model.ltx25.notes": "48kHz 스테레오 오디오를 포함한 실험적 텍스트/이미지 동영상 생성입니다. LTX 2.5 Distilled는 CFG 1에서 절반 크기로 Ancestral Euler 8단계, 잠재 공간 2배 업스케일, 다듬기 3단계를 실행하며 첫/마지막 프레임과 여러 이미지 키프레임을 지원합니다. 이미지는 출력 타임라인을 유도합니다. 선택 항목인 Ingredients IC-LoRA(1.31GB)는 인물·외모 참조를 추가하며 Hugging Face 승인과 토큰이 필요합니다. 제한 없는 기본 파일 5개의 합계는 43.08GB입니다. 기기 메모리 등급은 보수적으로 48GB이며 짧은 1024×1024 영상으로 검증했습니다.",
+  "catalog.license.ltx25": "LTX-2.5, Ingredients IC-LoRA 및 Gemma 약관"
 }

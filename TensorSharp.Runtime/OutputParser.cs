@@ -2484,6 +2484,14 @@ namespace TensorSharp.Runtime
     {
         private enum MState { LookingForStart, ParsingHeader, ParsingContent }
 
+        private readonly bool _hasCommentaryChannel;
+        private IReadOnlyList<ToolFunction>? _tools;
+
+        public MuseGlimmerOutputParser() : this(hasCommentaryChannel: false) { }
+
+        public MuseGlimmerOutputParser(bool hasCommentaryChannel)
+            => _hasCommentaryChannel = hasCommentaryChannel;
+
         private MState _state;
         private readonly StringBuilder _buffer = new();
         private readonly StringBuilder _toolArgs = new();
@@ -2510,6 +2518,7 @@ namespace TensorSharp.Runtime
 
         public void Init(bool enableThinking, List<ToolFunction>? tools)
         {
+            _tools = tools;
             _buffer.Clear();
             _toolArgs.Clear();
             _state = MState.ParsingHeader;
@@ -2732,7 +2741,10 @@ namespace TensorSharp.Runtime
         private bool IsToolCall() =>
             _currentRecipient != null &&
             !string.Equals(_currentRecipient, "self", StringComparison.Ordinal) &&
-            !string.Equals(_currentRecipient, "user", StringComparison.Ordinal);
+            !string.Equals(_currentRecipient, "user", StringComparison.Ordinal) &&
+            // Muse Spark's commentary is a public intermediate update, not a
+            // function name. Its body belongs in the content stream.
+            !(_hasCommentaryChannel && string.Equals(_currentRecipient, "commentary", StringComparison.Ordinal));
 
         private void EmitContent(
             string content, StringBuilder contentSb, StringBuilder thinkingSb, StringBuilder toolTextSb)
@@ -2753,7 +2765,7 @@ namespace TensorSharp.Runtime
         {
             if (IsToolCall())
             {
-                var tc = BuildAtemToolCall(_currentRecipient!, _toolArgs.ToString(), _callIndex);
+                var tc = BuildAtemToolCall(_currentRecipient!, _toolArgs.ToString(), _callIndex, _tools);
                 if (tc != null) { toolCalls.Add(tc); _callIndex++; }
             }
             _toolArgs.Clear();
@@ -2767,11 +2779,12 @@ namespace TensorSharp.Runtime
         ///   <atem:parameter name="k">v</atem:parameter>
         /// </atem:invoke></atem:function_calls>
         /// ]]>
-        /// Values are JSON-decoded when they parse as JSON (lists/objects/numbers/
-        /// booleans, which is how the template serialises them) and kept as text
-        /// otherwise.
+        /// Declared string parameters are kept verbatim, as the template renders
+        /// them. Other values are JSON-decoded when possible, with a text fallback
+        /// for incomplete or untyped calls.
         /// </summary>
-        internal static ToolCall? BuildAtemToolCall(string recipient, string body, int index)
+        internal static ToolCall? BuildAtemToolCall(string recipient, string body, int index,
+            IReadOnlyList<ToolFunction>? tools = null)
         {
             string name = recipient;
             const string invokeOpen = "<atem:invoke name=\"";
@@ -2783,6 +2796,15 @@ namespace TensorSharp.Runtime
                 if (nameEnd > nameStart) name = body.Substring(nameStart, nameEnd - nameStart);
             }
             if (string.IsNullOrEmpty(name)) return null;
+
+            ToolFunction? definition = null;
+            if (tools != null)
+                foreach (var tool in tools)
+                    if (string.Equals(tool.Name, name, StringComparison.Ordinal))
+                    {
+                        definition = tool;
+                        break;
+                    }
 
             var args = new Dictionary<string, object?>();
             const string paramOpen = "<atem:parameter name=\"";
@@ -2802,7 +2824,12 @@ namespace TensorSharp.Runtime
                 if (valEnd < 0) break;
                 string key = body.Substring(keyStart, keyEnd - keyStart);
                 string raw = body.Substring(valStart, valEnd - valStart);
-                args[key] = ParseAtemValue(raw);
+                // ATEM has no quote delimiter for strings. For a string schema,
+                // null, 123, or even "Paris" are literal text, not JSON values.
+                // Match llama.cpp's schema-directed Muse parameter parser.
+                bool isString = definition?.Parameters?.TryGetValue(key, out var parameter) == true
+                    && string.Equals(parameter.Type, "string", StringComparison.Ordinal);
+                args[key] = isString ? raw : ParseAtemValue(raw);
                 pos = valEnd + paramClose.Length;
             }
             return new ToolCall { Name = name, Arguments = args, Index = index };
@@ -2814,9 +2841,9 @@ namespace TensorSharp.Runtime
             if (t.Length == 0) return raw;
             if (t == "true") return true;
             if (t == "false") return false;
-            if (t == "null") return string.Empty;
+            if (t == "null") return null;
             char c0 = t[0];
-            if (c0 == '[' || c0 == '{' || c0 == '-' || (c0 >= '0' && c0 <= '9'))
+            if (c0 == '[' || c0 == '{' || c0 == '"' || c0 == '-' || (c0 >= '0' && c0 <= '9'))
             {
                 try
                 {

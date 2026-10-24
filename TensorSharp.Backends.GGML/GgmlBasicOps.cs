@@ -566,6 +566,32 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Spark CUDA projection preserving F32 input/weight precision across
+        /// shard and batch shapes. Weight shape is [output,input]. This explicit
+        /// entry point leaves ordinary and quantized matmul policies unchanged.
+        /// </summary>
+        public static void MuseSparkProjectionFloat32(Tensor result, Tensor input, Tensor weight)
+        {
+            if (result?.Storage is not GgmlStorage resultStorage ||
+                resultStorage.Allocator is not GgmlAllocator allocator ||
+                allocator.Context.BackendType != GgmlBackendType.Cuda)
+                throw new NotSupportedException("Spark explicit-F32 projection requires a GGML CUDA result.");
+            if (input == null || weight == null ||
+                result.DimensionCount != 2 || input.DimensionCount != 2 || weight.DimensionCount != 2 ||
+                result.ElementType != DType.Float32 || input.ElementType != DType.Float32 || weight.ElementType != DType.Float32 ||
+                ReferenceEquals(result.Storage, input.Storage) || ReferenceEquals(result.Storage, weight.Storage) ||
+                result.Sizes[0] != input.Sizes[0] || result.Sizes[1] != weight.Sizes[0] || input.Sizes[1] != weight.Sizes[1] ||
+                !result.IsContiguous() || !weight.IsContiguous() ||
+                !TryCreateStandardView(result, out GgmlTensorView2D resultView) ||
+                !TryCreateStandardView(input, out GgmlTensorView2D inputView) ||
+                !TryCreateRawView(weight, out GgmlTensorView2D weightView))
+                throw new ArgumentException("Spark explicit-F32 projection requires distinct row-contiguous F32 tensors and row-major weights.");
+            // Direct calls bypass OpRegistry; preserve an active layer/rank pin.
+            GgmlNative.SetActiveRankIfUnpinned(resultStorage.DeviceId);
+            GgmlNative.MuseSparkProjectionFloat32(resultView, inputView, weightView);
+        }
+
+        /// <summary>
         /// Quantized linear forward: result = m1 * quantizedWeight^T.
         /// The quantized weight data is stored in native GGUF format with GGML type.
         /// ne0 = inDim (shared dimension), ne1 = outDim.
@@ -617,6 +643,12 @@ namespace TensorSharp.GGML
 
         /// <summary>The GPU rank subsequent GGML ops on this thread run on.</summary>
         public static int GetActiveRank() => GgmlNative.GetActiveRank();
+
+        /// <summary>Keep per-op dispatch on a whole-layer placement rank until restored.</summary>
+        public static bool PinRank(int rank) => GgmlNative.PinRank(rank);
+
+        /// <summary>Restore the previous rank and pin state after a placement scope.</summary>
+        public static void RestoreRankPin(bool previous, int previousRank) => GgmlNative.RestorePin(previous, previousRank);
 
         /// <summary>
         /// True when a model's fused whole-model graph can be run tensor-parallel
@@ -751,6 +783,104 @@ namespace TensorSharp.GGML
         /// Release every rank's parked tensor-parallel matmul+add graph.
         /// </summary>
         public static void ReleaseFusedMatmulAddTpGraphs() => GgmlNative.ReleaseFusedMatmulAddTpGraphs();
+
+        /// <summary>Prepare Q/K from packed [Q|K|V|gate] rows in one graph.
+        /// Learned per-head RMS scales precede optional interleaved RoPE. KV storage is unchanged.</summary>
+        public static void MuseSparkPrepareQK(Tensor query, Tensor key, Tensor packed,
+            Tensor queryNorm, Tensor keyNorm, int[] positions, int queryHeads, int kvHeads,
+            int headDim, float eps, bool applyRope, int ropeDim, float freqBase, float freqScale)
+        {
+            ArgumentNullException.ThrowIfNull(query);
+            ArgumentNullException.ThrowIfNull(key);
+            ArgumentNullException.ThrowIfNull(packed);
+            ArgumentNullException.ThrowIfNull(queryNorm);
+            ArgumentNullException.ThrowIfNull(keyNorm);
+            if (queryHeads <= 0 || kvHeads <= 0 || headDim <= 0 || queryHeads % kvHeads != 0 ||
+                !float.IsFinite(eps) || eps <= 0)
+                throw new ArgumentOutOfRangeException(nameof(headDim), "Invalid Q/K geometry or epsilon.");
+            long qWidth = (long)queryHeads * headDim, kWidth = (long)kvHeads * headDim;
+            if (query.DimensionCount != 2 || key.DimensionCount != 2 || packed.DimensionCount != 2 ||
+                query.Sizes[0] != packed.Sizes[0] || key.Sizes[0] != packed.Sizes[0] ||
+                query.Sizes[1] != qWidth || key.Sizes[1] != kWidth || packed.Sizes[1] != 2 * (qWidth + kWidth) ||
+                !query.IsContiguous() || !key.IsContiguous() || packed.Strides[1] != 1 || packed.Strides[0] < packed.Sizes[1])
+                throw new ArgumentException("Q/K preparation requires matching packed rows and contiguous Q/K outputs.");
+            foreach (var weight in new[] { queryNorm, keyNorm })
+                if (weight.DimensionCount != 1 || weight.Strides[0] != 1 || weight.Sizes[0] != headDim)
+                    throw new ArgumentException("Q/K preparation requires one learned weight per head channel.");
+            if (applyRope && (positions == null || positions.Length != packed.Sizes[0] ||
+                ropeDim <= 0 || ropeDim > headDim || ropeDim % 2 != 0 ||
+                !float.IsFinite(freqBase) || freqBase <= 0 || !float.IsFinite(freqScale) || freqScale <= 0))
+                throw new ArgumentException("Invalid Q/K RoPE positions or parameters.");
+            foreach (var tensor in new[] { query, key, packed, queryNorm, keyNorm })
+                if (tensor.ElementType != DType.Float32 || !HasNativeBufferStorage(tensor))
+                    throw new ArgumentException("Q/K preparation requires native-backed Float32 tensors.");
+            if (!TryCreateStandardView(query, out GgmlTensorView2D qView) ||
+                !TryCreateStandardView(key, out GgmlTensorView2D kView) ||
+                !TryCreateStandardView(packed, out GgmlTensorView2D packedView))
+                throw new NotSupportedException("Q/K preparation requires supported tensor layouts.");
+            if (query.Storage is GgmlStorage storage) GgmlNative.SetActiveRankIfUnpinned(storage.DeviceId);
+            GgmlNative.MuseSparkPrepareQK(qView, kView, packedView, GetBufferStart(queryNorm), GetBufferStart(keyNorm),
+                positions, queryHeads, kvHeads, headDim, eps, applyRope, ropeDim, freqBase, freqScale);
+        }
+
+        /// <summary>Spark-only weighted per-head RMS with optional sigmoid gate.
+        /// Returns true only after successful reusable-scratch execution; false means fresh allocation.</summary>
+        public static bool MuseSparkNormGate(Tensor result, Tensor input, Tensor gamma, Tensor gate,
+            float eps, bool reuseScratch = true)
+        {
+            ArgumentNullException.ThrowIfNull(result);
+            ArgumentNullException.ThrowIfNull(input);
+            ArgumentNullException.ThrowIfNull(gamma);
+            if (!float.IsFinite(eps) || eps <= 0) throw new ArgumentOutOfRangeException(nameof(eps));
+            if (input.DimensionCount != 2 || result.DimensionCount != 2 || !result.Sizes.SequenceEqual(input.Sizes) ||
+                !result.IsContiguous() || input.Strides[1] != 1 || input.Strides[0] < input.Sizes[1] ||
+                gamma.DimensionCount != 1 || gamma.Strides[0] != 1 || gamma.Sizes[0] <= 0 ||
+                input.Sizes[1] % gamma.Sizes[0] != 0)
+                throw new ArgumentException("Spark norm requires 2D rows, contiguous output and a per-head channel weight.");
+            if (gate != null && (gate.DimensionCount != 2 || !gate.Sizes.SequenceEqual(input.Sizes) ||
+                gate.Strides[1] != 1 || gate.Strides[0] < gate.Sizes[1]))
+                throw new ArgumentException("Spark norm gate must match input rows and width.");
+            foreach (var tensor in new[] { result, input, gamma, gate })
+                if (tensor != null && (tensor.ElementType != DType.Float32 || !HasNativeBufferStorage(tensor)))
+                    throw new ArgumentException("Spark norm requires native-backed Float32 tensors.");
+            GgmlTensorView2D gateView = default;
+            if (!TryCreateStandardView(result, out GgmlTensorView2D resultView) ||
+                !TryCreateStandardView(input, out GgmlTensorView2D inputView) ||
+                (gate != null && !TryCreateStandardView(gate, out gateView)))
+                throw new NotSupportedException("Spark norm requires supported layouts.");
+            if (result.Storage is GgmlStorage storage) GgmlNative.SetActiveRankIfUnpinned(storage.DeviceId);
+            return GgmlNative.MuseSparkNormGate(resultView, inputView, GetBufferStart(gamma), gateView,
+                checked((int)gamma.Sizes[0]), eps, gate != null, reuseScratch);
+        }
+
+        /// <summary>Compute alpha * stream + beta * RMSNorm(branch * optionalPreScale).
+        /// Preserves Muse Spark's scale-before-normalization order in one native graph.</summary>
+        public static void MuseSparkPostNormResidual(Tensor result, Tensor stream, Tensor branch,
+            Tensor alpha, Tensor beta, Tensor preScale, float eps)
+        {
+            if (!float.IsFinite(eps) || eps <= 0)
+                throw new ArgumentOutOfRangeException(nameof(eps));
+            if (result.DimensionCount != 2 || stream.DimensionCount != 2 || branch.DimensionCount != 2 ||
+                !result.Sizes.SequenceEqual(stream.Sizes) || !result.Sizes.SequenceEqual(branch.Sizes))
+                throw new ArgumentException("Muse Spark residual requires matching 2D tensors.");
+            if (!result.IsContiguous() || !stream.IsContiguous() || !branch.IsContiguous())
+                throw new NotSupportedException("Muse Spark residual requires contiguous tensors.");
+            foreach (var tensor in new[] { result, stream, branch, alpha, beta, preScale })
+                if (tensor != null && (tensor.ElementType != DType.Float32 || !HasNativeBufferStorage(tensor)))
+                    throw new ArgumentException("Muse Spark residual requires native-backed Float32 tensors.");
+            foreach (var weight in new[] { alpha, beta, preScale })
+                if (weight != null && (weight.DimensionCount != 1 || weight.Strides[0] != 1 || weight.Sizes[0] != result.Sizes[1]))
+                    throw new ArgumentException("Muse Spark residual requires contiguous channel weights.");
+            if (alpha == null || beta == null) throw new ArgumentNullException(alpha == null ? nameof(alpha) : nameof(beta));
+            if (!TryCreateStandardView(result, out GgmlTensorView2D resultView) ||
+                !TryCreateStandardView(stream, out GgmlTensorView2D streamView) ||
+                !TryCreateStandardView(branch, out GgmlTensorView2D branchView))
+                throw new NotSupportedException("Muse Spark residual requires supported tensor layouts.");
+            if (result.Storage is GgmlStorage storage) GgmlNative.SetActiveRankIfUnpinned(storage.DeviceId);
+            GgmlNative.MuseSparkPostNormResidual(resultView, streamView, branchView,
+                GetBufferStart(alpha), GetBufferStart(beta), preScale == null ? IntPtr.Zero : GetBufferStart(preScale),
+                checked((int)result.Sizes[1]), eps);
+        }
 
         /// <summary>
         /// Fused RMSNorm + residual add in a single GGML graph dispatch:
@@ -1619,6 +1749,12 @@ namespace TensorSharp.GGML
             GgmlNative.InvalidateHostBuffer(GetBufferStart(tensor));
         }
         public static long DeviceCopyCacheResidentBytes() => GgmlNative.DeviceCopyCacheResidentBytes();
+
+        /// <summary>Probe an existing exact-size device copy on the active rank.
+        /// Does not allocate or upload. The caller must separately establish that
+        /// its uploading operation completed successfully.</summary>
+        public static bool HasResidentDeviceCopy(IntPtr key, long rawBytes)
+            => GgmlNative.HasResidentDeviceCopy(key, rawBytes);
         public static bool TryGetBackendMemory(out long freeBytes, out long totalBytes) => GgmlNative.TryGetBackendMemory(out freeBytes, out totalBytes);
         /// <summary>True once a GPU command buffer has failed in this process; see
         /// <see cref="GgmlNative.HasBackendFailure"/>. Sticky until <see cref="RecreateBackend"/>.</summary>
@@ -2786,7 +2922,7 @@ namespace TensorSharp.GGML
         public static void FusedPrefillAttentionF16KV(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
             int numHeads, int numKvHeads, int headDim,
             int seqLen, int kvLen, int kvCacheLen,
-            int maskStartPos, int slidingWindow, float scale)
+            int maskStartPos, int slidingWindow, float scale, bool museSpark2DUploads = false)
         {
             if (q == null) throw new ArgumentNullException(nameof(q));
             if (kCache == null) throw new ArgumentNullException(nameof(kCache));
@@ -2807,7 +2943,7 @@ namespace TensorSharp.GGML
                 qPtr, kPtr, vPtr, outPtr,
                 numHeads, numKvHeads, headDim,
                 seqLen, kvLen, kvCacheLen,
-                maskStartPos, slidingWindow, scale);
+                maskStartPos, slidingWindow, scale, museSpark2DUploads);
         }
 
         /// <summary>
@@ -3763,12 +3899,18 @@ namespace TensorSharp.GGML
             MoEActivation activation,
             float oaiAlpha = 1.702f,
             float oaiLimit = 7.0f,
-            bool runOnCpu = false)
+            bool runOnCpu = false,
+            float[] postExpertNorm = null,
+            float postExpertNormEps = 1e-8f)
         {
             if (hiddenIn == null) throw new ArgumentNullException(nameof(hiddenIn));
             if (hiddenOut == null) throw new ArgumentNullException(nameof(hiddenOut));
             if (selectedExperts == null) throw new ArgumentNullException(nameof(selectedExperts));
             if (routingWeights == null) throw new ArgumentNullException(nameof(routingWeights));
+            if (postExpertNorm != null && postExpertNorm.Length != hiddenDim)
+                throw new ArgumentException("postExpertNorm must contain hiddenDim scales.", nameof(postExpertNorm));
+            if (postExpertNorm != null && (!float.IsFinite(postExpertNormEps) || postExpertNormEps <= 0))
+                throw new ArgumentOutOfRangeException(nameof(postExpertNormEps));
 
             if (!(hiddenIn.Storage is GgmlStorage))
                 throw new ArgumentException("hiddenIn must be a GGML tensor.", nameof(hiddenIn));
@@ -3829,6 +3971,7 @@ namespace TensorSharp.GGML
             fixed (float* gateBiasPtr = gateBias)
             fixed (float* upBiasPtr = upBias)
             fixed (float* downBiasPtr = downBias)
+            fixed (float* postExpertNormPtr = postExpertNorm)
             {
                 GgmlNative.MoEFFNPrefillSwiGLUQuant(
                     hiddenInPtr, hiddenOutPtr, seqLen, hiddenDim, nFf,
@@ -3840,7 +3983,8 @@ namespace TensorSharp.GGML
                     gateBias != null ? (IntPtr)gateBiasPtr : IntPtr.Zero,
                     upBias   != null ? (IntPtr)upBiasPtr   : IntPtr.Zero,
                     downBias != null ? (IntPtr)downBiasPtr : IntPtr.Zero,
-                    activationType, oaiAlpha, oaiLimit, runOnCpu);
+                    activationType, oaiAlpha, oaiLimit, runOnCpu,
+                    (IntPtr)postExpertNormPtr, postExpertNormEps);
             }
         }
 

@@ -119,6 +119,8 @@ public sealed class ModelDownloadManager : IDisposable
         CatalogFileRole.TextEncoder,
         CatalogFileRole.Vae,
         CatalogFileRole.VisionProjector,
+        // LTX 2.5's gated Ingredients adapter enables Video Studio identity references.
+        CatalogFileRole.IngredientsLora,
     };
 
     /// <summary>Raised for every progress report and every state change, on the reporting thread.</summary>

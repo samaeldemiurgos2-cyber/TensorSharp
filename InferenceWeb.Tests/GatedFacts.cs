@@ -277,6 +277,14 @@ namespace InferenceWeb.Tests
             Skip = TestGates.CudaDevicesSkip(devices)
                 ?? (modelEnvVar == null ? null : TestGates.ModelSkip(modelEnvVar, ggufContains));
         }
+
+        /// <summary>The GGML backend the test constructs; skips unless the process pins it (<see cref="TestGates.GgmlPinSkip"/>).</summary>
+        public BackendType GgmlBackend
+        {
+            get => _ggmlBackend;
+            set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
+        }
+        private BackendType _ggmlBackend;
     }
 
     /// <summary>[Theory] variant of <see cref="CudaFactAttribute"/>.</summary>

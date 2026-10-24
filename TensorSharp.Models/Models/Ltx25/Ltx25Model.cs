@@ -25,7 +25,8 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     /// <summary>True when frames come from the diffusion decoder rather than the convolutional one.</summary>
     internal bool UsesDiffusionDecoder => DiffusionVaePath != null;
     internal string AudioVaePath { get; }
-    internal string ReferenceLoraPath { get; }
+    private string _referenceLoraPath;
+    internal string ReferenceLoraPath => Volatile.Read(ref _referenceLoraPath);
     /// <summary>The x2 spatial latent upscaler between the half- and full-size passes.</summary>
     internal string LatentUpscalerPath { get; }
     internal IAllocator DirectAllocator => _allocator;
@@ -69,12 +70,12 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
             if (!string.IsNullOrWhiteSpace(configuredReference))
             {
                 if (!File.Exists(configuredReference)) throw new FileNotFoundException("The configured LTX Ingredients adapter does not exist.", configuredReference);
-                ReferenceLoraPath = Path.GetFullPath(configuredReference);
+                _referenceLoraPath = Path.GetFullPath(configuredReference);
             }
             else
             {
                 string reference = Path.Combine(directory, "loras", "ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors");
-                if (File.Exists(reference)) ReferenceLoraPath = reference;
+                if (File.Exists(reference)) _referenceLoraPath = Path.GetFullPath(reference);
             }
             Config = new ModelConfig { Architecture = ArchitectureId, VocabSize = 0 };
         }
@@ -366,11 +367,62 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
 
     public string VideoModelFamily => ArchitectureId;
     public int DefaultPreviewFrames => 17;
+    public int FrameCountMultiple => 8;
+    public int FrameCountOffset => 1;
+    public int DefaultPreviewFps => 24;
+    public int DefaultOutputWidth => Ltx25GenerationSettings.DefaultSize;
+    public int DefaultOutputHeight => Ltx25GenerationSettings.DefaultSize;
+    public int ResolutionMultiple => 64;
+    public int MinimumReferenceFrames => Ltx25ReferenceConditioning.MinimumFrames;
     public bool SupportsAudio => true;
     public bool SupportsImageConditioning => MediaCodecs.VideoEncoder.SupportsH264ImageConditioning;
     public bool SupportsEndImageConditioning => SupportsImageConditioning;
     public bool SupportsKeyframeConditioning => SupportsImageConditioning;
     public bool SupportsReferenceConditioning => ReferenceLoraPath != null;
+
+    /// <summary>
+    /// Attach the Ingredients adapter to this loaded model without rebuilding the
+    /// checkpoint. Returns false when a generation currently owns the model; Studio
+    /// can retry on its next capability refresh.
+    /// </summary>
+    public bool TryLoadIngredientsAdapter(string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        string fullPath = Path.GetFullPath(path);
+        if (!File.Exists(fullPath)) throw new FileNotFoundException("The configured LTX Ingredients adapter does not exist.", fullPath);
+        if (_allocator is MlxAllocator && !MlxWorker.Shared.IsOnWorkerThread && ReferenceLoraPath is { } currentPath &&
+            !string.Equals(currentPath, fullPath, StringComparison.Ordinal))
+        {
+            // Replacing an adapter can dispose cached MLX projections. First reject a
+            // live generation without waiting behind its worker; otherwise perform the
+            // replacement on that worker. Initial attachment only reads safetensors
+            // metadata and is safe on the capability-query thread.
+            if (!Monitor.TryEnter(_generationLock)) return false;
+            Monitor.Exit(_generationLock);
+            return MlxWorker.Shared.Invoke(() => TryLoadIngredientsAdapter(fullPath));
+        }
+        if (!Monitor.TryEnter(_generationLock)) return false;
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (string.Equals(ReferenceLoraPath, fullPath, StringComparison.Ordinal)) return true;
+            _denoiser?.LoadIngredientsAdapter(fullPath);
+            Volatile.Write(ref _referenceLoraPath, fullPath);
+            return true;
+        }
+        finally { Monitor.Exit(_generationLock); }
+    }
+
+    /// <summary>Attach a configured or conventional sibling adapter when it has appeared after model load.</summary>
+    public bool TryLoadIngredientsAdapterIfPresent()
+    {
+        string configured = Environment.GetEnvironmentVariable("TS_LTX25_INGREDIENTS_LORA");
+        string path = !string.IsNullOrWhiteSpace(configured)
+            ? configured
+            : Path.Combine(Path.GetDirectoryName(CheckpointPath)!, "loras", "ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors");
+        return File.Exists(path) && TryLoadIngredientsAdapter(path);
+    }
+
     public int MaxReferenceImages => Ltx25ImageConditioning.MaxImages;
     protected override float[] ForwardCore(int[] tokens) => throw new NotSupportedException("LTX is a video-generation model; use GenerateVideo().");
     protected override void ResetKVCacheCore() { }

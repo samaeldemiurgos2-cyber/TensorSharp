@@ -112,8 +112,8 @@ public static class LoraSelection
     /// same family sits out this one's work and the plan says so (<see cref="LoraPlan.SatOut"/>):
     /// a speed plug-in on a Qwen-Image 2.1 Turbo entry, which is step-distilled already, any
     /// plug-in not validated on a Qwen-Image entry, which <see cref="CatalogLora.AlsoFor"/> lists,
-    /// and a MiniMax-H3 plug-in on the references entry, which the keyframes checkpoint's Turbo
-    /// was not made for. Another family's plug-ins are not named: they were never meant for this
+    /// and a MiniMax-H3 Turbo plug-in during reference mode, where the active Ref2VA denoiser
+    /// ignores FL2VA-only adapters. Another family's plug-ins are not named: they were never meant for this
     /// model. A known plug-in that is no longer installed, or a hand-edited choice with two speed
     /// plug-ins for the model, is an error rather than a silent omission: the user would
     /// otherwise get a picture or clip without the plug-in they turned on, with nothing to say so.

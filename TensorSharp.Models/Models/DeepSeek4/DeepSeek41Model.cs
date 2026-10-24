@@ -84,7 +84,7 @@ namespace TensorSharp.Models
             lock (NativeSync)
             {
                 if (_vision == IntPtr.Zero)
-                    throw new InvalidOperationException("Image input requires the prepared deepseek41.vision.gguf companion.");
+                    throw new InvalidOperationException("Image input requires a V4.1 vision companion: --mmproj with the prepared deepseek41.vision.gguf or llama.cpp's deepseek41v mmproj.");
                 var (patches, grid) = ImageProcessor.ProcessImage(path);
                 var output = new float[checked(grid.TokenCount * Config.HiddenSize)];
                 int rows = GgmlDeepSeek41VisionNative.Encode(_vision, patches, grid.PatchRows, grid.PatchColumns, output);
@@ -104,7 +104,7 @@ namespace TensorSharp.Models
                 lock (NativeSync)
                 {
                     if (_vision == IntPtr.Zero)
-                        throw new InvalidOperationException("Image input requires the prepared deepseek41.vision.gguf companion.");
+                        throw new InvalidOperationException("Image input requires a V4.1 vision companion: --mmproj with the prepared deepseek41.vision.gguf or llama.cpp's deepseek41v mmproj.");
                     if (embeddings.DimensionCount != 2 || embeddings.Sizes[1] != Config.HiddenSize)
                         throw new ArgumentException("V4.1 image embeddings must have shape [rows, text hidden size].");
                     int rows = checked((int)embeddings.Sizes[0]);

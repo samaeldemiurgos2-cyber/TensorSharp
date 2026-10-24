@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using TensorSharp.Cuda;
@@ -55,6 +56,7 @@ public sealed class Ltx25Denoiser : IDisposable
 {
     private readonly GgufFile _file;
     private readonly DirectContext _ctx;
+    private readonly IAllocator _allocator;
     private readonly CudaLtx25ProjectionSession _cudaProjection;
     private readonly CudaLtx25AttentionSession _cudaAttention;
     private readonly bool _forceCudaAttention;
@@ -65,7 +67,8 @@ public sealed class Ltx25Denoiser : IDisposable
     private readonly Dictionary<string, DirectLinear> _linears = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Tensor> _weights = new(StringComparer.Ordinal);
     private readonly object _sync = new();
-    private readonly Ltx25LoraAdapter _referenceLora;
+    private Ltx25LoraAdapter _referenceLora;
+    private string _referenceLoraPath;
     private bool _useReferenceLora;
     private CancellationToken _cancellationToken;
     private RopeCache _ropeCache;
@@ -128,12 +131,17 @@ public sealed class Ltx25Denoiser : IDisposable
     public Ltx25Denoiser(string checkpoint, IAllocator allocator, string referenceLoraPath = null)
     {
         ArgumentNullException.ThrowIfNull(allocator);
+        _allocator = allocator;
         _file = new GgufFile(checkpoint);
         try
         {
             Config = Ltx25Config.FromGguf(_file);
             _ctx = new DirectContext(allocator);
-            if (referenceLoraPath != null) _referenceLora = new(referenceLoraPath, _file, Config, allocator);
+            if (referenceLoraPath != null)
+            {
+                _referenceLoraPath = Path.GetFullPath(referenceLoraPath);
+                _referenceLora = new(_referenceLoraPath, _file, Config, allocator);
+            }
             if (allocator is CudaAllocator cuda)
             {
                 _cudaProjection = new(cuda, Environment.GetEnvironmentVariable("TS_LTX25_CUDA_REQUIRE_TILE") == "1");
@@ -145,6 +153,23 @@ public sealed class Ltx25Denoiser : IDisposable
             }
         }
         catch { _cudaAttention?.Dispose(); _cudaProjection?.Dispose(); _referenceLora?.Dispose(); _ctx?.Dispose(); _file.Dispose(); throw; }
+    }
+
+    /// <summary>Attach or replace the Ingredients adapter between denoiser forwards.</summary>
+    internal void LoadIngredientsAdapter(string path)
+    {
+        string fullPath = Path.GetFullPath(path);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_referenceLora != null && string.Equals(_referenceLoraPath, fullPath, StringComparison.Ordinal))
+                return;
+            var loaded = new Ltx25LoraAdapter(fullPath, _file, Config, _allocator);
+            Ltx25LoraAdapter previous = _referenceLora;
+            _referenceLora = loaded;
+            _referenceLoraPath = fullPath;
+            previous?.Dispose();
+        }
     }
 
     private DirectLinear Linear(string name)

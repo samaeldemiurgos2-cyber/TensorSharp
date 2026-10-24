@@ -16,13 +16,11 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 支持的模型</div>
   <h1>支持的模型</h1>
-  <p class="lede">TensorSharp 加载 GGUF 格式的模型，并从文件的 <code>general.architecture</code> 元数据自动识别架构——MiniMax-H3 与不带元数据的 Qwen-Image-2.1 GGUF（如 Unsloth 的 Q8_0）是例外，它们完全没有元数据，只能靠张量表来识别。选择适合你硬件的量化（低内存用 <code>Q4_K_M</code>，更高质量用 <code>Q8_0</code>）。</p>
-  <div class="callout note"><div class="ic">📘</div><p><strong>Gemma 4 E4B 是《From Tensors to Tokens》采用的示例模型。</strong>配套图书提供从张量基础到多模态推理的连贯构建过程；这组参考页面则提供最新下载与能力细节。<a href="book_zh-cn.html">了解本书 →</a></p></div>
+  <p class="lede">先选要得到的输出，再核对输入、模型文件、后端与验证范围。图像、视频或音频输入与生成这些媒体是不同的能力；下表将它们分开。</p>
+  <p><a href="getting-started_zh-cn.html">首次运行 →</a> · <a href="#table">按家族比较 →</a> · <a href="#support-status">阅读支持状态 →</a></p>
 
-  <p><strong>嵌入模型：</strong> Snowflake Arctic Embed L v2.0、MiniLM，以及支持文本与可选图像/音频/视频输入的 EmbeddingGemma 2。通过 <code>--embeddings</code> 提供兼容 OpenAI/Ollama 的向量 API；后端支持依模型而定。<a href="embeddings_zh-cn.html">模型、API 与验证范围 →</a></p>
-
-  <h2 id="browse">浏览模型参考</h2>
-  <p>完整参考分为五个页面。如果你已经确定要用哪个模型，从"模型下载"开始；如果还在挑选，从对应的分类页面开始。</p>
+  <h2 id="browse">按任务浏览</h2>
+  <p>沿用下面五个参考页面：选模型看任务分类，已确定模型看下载。每个家族的具体文件、内存与运行命令仍在其页面中。</p>
   <div class="card-grid">
     <a class="card" href="embeddings_zh-cn.html"><div class="ic">🔎</div><h3>嵌入模型与语义检索</h3><p>Snowflake、MiniLM 与 EmbeddingGemma 2：文本和多模态向量、API 与检索质量。</p></a>
     <a class="card" href="models-downloads_zh-cn.html"><div class="ic">⬇️</div><h3>模型下载</h3><p>所有 GGUF，以及各家族所需的投影器、VAE、编码器与草稿模型。</p></a>
@@ -31,7 +29,64 @@
     <a class="card" href="models-video_zh-cn.html"><div class="ic">🎬</div><h3>视频生成</h3><p>LTX 2.5 与 MiniMax-H3 联合生成视频与立体声；Wan 2.1 / 2.2 生成视频。</p></a>
   </div>
 
-  <h2 id="table">支持的架构</h2>
+  <h2 id="support-status">如何阅读支持状态</h2>
+  <p><strong>已实现</strong>表示代码路径存在；<strong>条件支持</strong>需要指定变体、后端或伴随文件；<strong>实验性</strong>表示明确存在实现或验证限制；<strong>夹具级验证</strong>只覆盖小型合成或组件夹具；<strong>已测量</strong>仅指记录的检查点、硬件、工作负载与构建；<strong>不支持</strong>表示被拒绝或尚未实现。输入能力与验证状态需要分别阅读。</p>
+  <p>按模型卡片选择量化与内存配置。一个量化名称、组件测试或成功加载都不能说明所有设备上的质量与完整运行情况。</p>
+
+  <h2 id="table">按输入、输出与条件比较家族</h2>
+  <div class="table-scroll"><table>
+    <thead><tr><th>模型家族 / 卡片</th><th>输入</th><th>输出 / 任务</th><th>条件与证据</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/gemma4_zh-cn.md">Gemma 4</a></td><td>文本、图像、视频、音频</td><td>文本</td><td>条件支持：媒体输入需要匹配投影器。可从 E4B Q8_0 原生 GGML 路径开始。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwen35_zh-cn.md">Qwen 3.5 / 3.6 / 3.8 27B</a></td><td>文本、图像</td><td>文本</td><td>条件支持：NextN 需要保留草稿块的 GGUF；核对变体与后端。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwen38-flash-next_zh-cn.md">Qwen 3.8 Flash Next</a></td><td>文本、图像、视频</td><td>文本</td><td>条件支持：内存放置、张量并行及独立 MTP 头取决于量化与后端。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/bonsai2_zh-cn.md">Bonsai2 27B</a></td><td>文本；图像需投影器</td><td>文本</td><td>条件支持：仅单设备 GGML。已记录的 Metal 与有限 CPU 检查不能覆盖其他设备。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/gptoss_zh-cn.md">GPT OSS</a></td><td>文本</td><td>文本</td><td>已实现：显式思考模式与工具；后端与缓存要求见卡片。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/nemotron_zh-cn.md">Nemotron-H / Omni</a></td><td>文本；Omni 图像；有条件的音频</td><td>文本</td><td>条件支持：音频需要公开 GGUF 未附带的 Parakeet 伴随文件。不支持投机解码。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/mistral3_zh-cn.md">Mistral 3</a></td><td>文本、图像</td><td>文本</td><td>不支持：显式思考模式与工具。验证范围以具体检查点与后端为准。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/hunyuan-dense_zh-cn.md">Hunyuan Dense</a></td><td>文本</td><td>文本</td><td>已实现：单设备文本路径；不支持工具、张量并行与层切分。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/glm_zh-cn.md">GLM 5.x</a></td><td>文本；仅 5.3-Flash 支持图像</td><td>文本</td><td>条件支持：5.2/5.3 仅文本。NextN 不支持启用张量并行的运行；CPU 参考路径有数值限制。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/deepseek4_zh-cn.md">DeepSeek V4 Flash</a></td><td>文本</td><td>文本</td><td>条件支持：核对内存与放置；可选的 DSpark 投机解码需要匹配草稿器。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/deepseek41_zh-cn.md">DeepSeek V4.1 Flash / 1017</a></td><td>文本；有条件的图像与视频</td><td>文本</td><td>实验性：路由 MoE TP / DSpark。纯 C# CPU 为夹具级验证；1017 默认 YOCO prefill 是近似计算。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/muse-spark_zh-cn.md">Muse Spark</a></td><td>文本；图像需 Spark 投影器</td><td>文本</td><td>条件支持：需要多 GPU 或大容量主机内存。已记录 CUDA 测量不能覆盖所有后端；不支持音频。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/muse-glimmer_zh-cn.md">Muse-Glimmer</a></td><td>文本、图像</td><td>文本</td><td>条件支持：图像需投影器，工具使用 ATEM，可选投机解码需独立 DFlash 草稿器；核对后端限制。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/diffusiongemma_zh-cn.md">DiffusionGemma</a></td><td>文本、图像</td><td>文本</td><td>不支持：聊天音频、video_url 与工具。Web UI 视频以抽取图像提供。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev_zh-cn.md">Jev (DiffusionGemma)</a></td><td>文本、图像、抽取的文档 / 帧 / 转录</td><td>类型化决策</td><td>条件支持：抽样视频帧及已配置 ASR 的转录；核对导入与概率语义限制。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwenimage21_zh-cn.md">Qwen-Image-2.1</a></td><td>文本、可选参考 / 蒙版图像</td><td>图像 / 图像编辑</td><td>条件支持：匹配编码器 / VAE 与采样配方；组件验证覆盖随后端变化。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/ltx-2.5_zh-cn.md">LTX 2.5 Distilled</a></td><td>文本、图像关键帧；可选身份参考图</td><td>视频 + 48 kHz 立体声</td><td>实验性：使用当前两阶段配方与伴随模型；不支持 Vulkan 与多 GPU。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/minimax-h3_zh-cn.md">MiniMax-H3</a></td><td>文本、关键帧或由检查点决定的参考媒体</td><td>视频 + 32 kHz 立体声</td><td>条件支持：FL2VA / Ref2VA 是不同检查点。组件门控与完整生成验证范围不同。</td></tr>
+      <tr><td><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/wan_zh-cn.md">Wan 2.1 / 2.2</a></td><td>文本；图像取决于变体</td><td>视频（无音频）</td><td>条件支持：按变体匹配编码器 / VAE、采样器与步数；不支持多 GPU。</td></tr>
+    </tbody>
+  </table></div>
+  <p>媒体输入通常需要匹配的伴随文件。DeepSeek 1017 默认 YOCO prefill 为近似计算；Nemotron Omni 的公开伴随文件没有 Parakeet 音频塔。工具和多 GPU 的具体条件见下方详细参考与各模型卡。</p>
+  <p><strong>向量输出：</strong>文本 / 代码与部分媒体输入可交给嵌入编码器；<a href="embeddings_zh-cn.html">Snowflake、MiniLM 与 EmbeddingGemma 2 的输入、API 和验证范围 →</a></p>
+
+  <h2 id="fast-lane">选择有测量依据的运行路径</h2>
+  <p>先核对检查点与后端，再阅读对应测量。<a href="benchmarks_zh-cn.html#deepseek41">DeepSeek 1017：精确与近似 YOCO</a> · <a href="benchmarks_zh-cn.html#muse-spark">Muse Spark：提示长度与放置模式</a>。条件、质量代价和构建范围都需与结果一起阅读。</p>
+  <details id="measured-reference">
+    <summary>查看完整测量条件、工具协议与多 GPU 限制</summary>
+
+  <p>先按工作负载选择模型与后端。这里最新选取的对比使用不同硬件、量化与计时方法，不能据此对所有模型或后端排名。</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>模型 / 任务</th><th>记录的路径与范围</th><th>结果与局限</th></tr></thead>
+    <tbody>
+      <tr><td>DeepSeek V4.1 Flash 1017 prefill</td><td>2026-10-22–23，五张 A40，UD-IQ2_XXS，TP5，单请求，约 1.8K token 提示，输出 256 token</td><td>精确 563.9 tok/s，对照 llama.cpp 按层切分 174.6（3.23×）；默认近似 YOCO 为 960.5（5.50×），困惑度为近似 2.4978、精确 2.4811、参照 2.4697。内部计时，不是 TTFT。<a href="benchmarks_zh-cn.html#deepseek41">条件与质量代价 →</a></td></tr>
+      <tr><td>Muse Spark 长提示与生成</td><td>报告更新于 2026-10-22（未记录测量日期），十张 A40，UD-IQ3_XXS，32K 上下文</td><td>按层切分，4,075 token 提示的 prefill 为 999.7 对 483.2 tok/s（2.07×，输出上限 32）；TP 单请求 decode 为 22.63 对 16.19（1.40×，167 token 提示、输出上限 256）。对照 llama.cpp 的对应模式；没有可用 P2P，参照未启用 NCCL。<a href="benchmarks_zh-cn.html#muse-spark">完整范围 →</a></td></tr>
+      <tr><td>其他文本模型</td><td>启用投机解码、张量并行或 CPU 专家卸载前，检查<a href="backends_zh-cn.html">后端指南</a>与<a href="models-text_zh-cn.html">模型支持范围</a>。</td><td>这些控制改变内存、延迟与质量之间的取舍；某个检查点与互连的结果不能预测另一种配置。</td></tr>
+      <tr><td>图像与视频生成</td><td>使用检查点对应的采样配方、分辨率与伴随模型。<a href="models-image_zh-cn.html">图像配方 →</a> · <a href="models-video_zh-cn.html">视频配方 →</a></td><td>步数、组件耗时与完整生成延迟是不同指标，上述文本对比不覆盖媒体生成。</td></tr>
+    </tbody>
+  </table></div>
+  <p class="page-foot-note">工具支持同时要求会声明工具的提示词渲染器与匹配的结构化输出解析器。Qwen 3.8 Flash Next（<code>qwen4exp</code>）通过 Qwen 3.5 解析器返回结构化调用，因此调用者定义的工具、Agent Skills 工具、代码执行工具，以及服务端的<a href="agentic_zh-cn.html#sub-agents">子智能体委派</a>都会提供给它。Mistral 3 与 Hunyuan Dense 既不渲染工具声明也不渲染工具结果，DiffusionGemma 不渲染工具声明且会拒绝带工具的请求，因此这三个家族既不会获得上述任何工具，也不参与子智能体委派。</p>
+  <p class="page-foot-note">LTX 2.5、MiniMax-H3、Wan、DiffusionGemma 与 Hunyuan Dense 拒绝多 GPU 模式。Qwen 3.8 Flash Next 支持符合量化条件的本地 GGML CUDA TP 与 <code>--layer-split N</code>；DeepSeek V4 使用整层放置。GLM 支持两种显式本地模式；Qwen-Image 仅支持扩散 Transformer 的本地张量并行。DeepSeek V4.1 支持 <code>--layer-split N</code> 与实验性 routed-MoE <code>--tp N</code>。Muse Spark 的原生执行器两种模式都支持——GGML CUDA/Vulkan 上的 <code>--layer-split N</code> 与 GGML CUDA 上的 <code>--tp N</code>——仅限单节点；GGML Vulkan 上的 <code>--tp N</code> 走它的逐算子路径。</p>
+
+  </details>
+
+  <h2 id="reference">架构与实现详细参考</h2>
+  <p><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/README_zh-cn.md">模型选择索引</a> · <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/capability-reference_zh-cn.md">完整能力与实现矩阵</a> · <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/PROJECT_STATUS_zh-cn.md">项目状态</a></p>
+  <details id="implementation-reference">
+    <summary>查看原始架构键、协议、加载与实现条件</summary>
+  <p class="lede">TensorSharp 加载 GGUF 格式的模型，并从文件的 <code>general.architecture</code> 元数据自动识别架构——MiniMax-H3 与不带元数据的 Qwen-Image-2.1 GGUF（如 Unsloth 的 Q8_0）是例外，它们完全没有元数据，只能靠张量表来识别。选择适合你硬件的量化（低内存用 <code>Q4_K_M</code>，更高质量用 <code>Q8_0</code>）。</p>
+  <p><strong>嵌入模型：</strong> Snowflake Arctic Embed L v2.0、MiniLM，以及支持文本与可选图像/音频/视频输入的 EmbeddingGemma 2。通过 <code>--embeddings</code> 提供兼容 OpenAI/Ollama 的向量 API；后端支持依模型而定。<a href="embeddings_zh-cn.html">模型、API 与验证范围 →</a></p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>架构</th><th>GGUF 架构键</th><th>示例模型</th><th>多模态</th><th>思考</th><th>工具</th><th>MTP 推测</th></tr></thead>
@@ -47,6 +102,7 @@
       <tr><td><strong>Hunyuan Dense</strong></td><td><code>hunyuan-dense</code></td><td>腾讯稠密 Hunyuan 解码器，例如 Hy-MT2 系列——GQA，其 per-head QK-norm 在 NeoX RoPE <em>之后</em>，随后是 SwiGLU。单设备</td><td>仅文本</td><td class="no">不支持</td><td class="no">不支持</td><td class="no">—</td></tr>
       <tr><td><strong>Mistral 3</strong></td><td><code>mistral3</code>；以及标为 <code>llama</code> 的 Mistral Small 3.x 文件（Tekken 分词器，带 <code>[INST]</code> / <code>[SYSTEM_PROMPT]</code> token）</td><td>Mistral-Small-3.1-24B-Instruct</td><td>图像</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
       <tr><td><strong>Muse-Glimmer</strong></td><td><code>muse-glimmer</code>、<code>muse_glimmer</code></td><td>Muse-Glimmer-30B（交错滑动窗口 + NoPE 全注意力层，注意力输出门控）</td><td>图像</td><td class="yes">是</td><td class="yes">是（ATEM）</td><td class="yes">是（DFlash 块草稿模型，独立 GGUF）</td></tr>
+      <tr><td><strong>Muse Spark</strong></td><td><code>muse-spark</code>、<code>muse_spark</code></td><td>Muse-Spark-Open-816B-A42B（816B 稀疏 MoE，每 token 激活约 42B；46 个带 RoPE 的滑动窗口层与 16 个全局 NoPE 层，256 个路由专家 top-8）。在 <code>ggml_cuda</code> / <code>ggml_vulkan</code> 上默认由 TensorSharp 自有的原生整模型执行器运行（只有 CUDA 做过整模型实测）；需要多张 GPU——十张 A40 能完整放下 UD-IQ3_XXS 量化——否则需要大容量主机内存来存放显存放不下的专家堆栈</td><td>图像，经由共享的 Muse-Glimmer 视觉编码器与该发布自带的 mmproj；不支持音频</td><td class="yes">是</td><td class="yes">是（ATEM）</td><td class="no">没有训练过的草稿器——只有无权重的 n-gram 推测（<code>--spec --spec-type ngram</code>）</td></tr>
       <tr><td><strong>Bonsai2 27B</strong></td><td><code>qwen35</code>，外加 <code>prism.hadamard.*</code> 元数据与 PQ2_0 / PTQ1_0 张量</td><td><code>Ternary-Bonsai-2-27B-PQ2_0.gguf</code> / <code>-PTQ1_0.gguf</code>（稠密 Qwen 3.5 混合架构，48 层 GatedDeltaNet + 16 层全注意力）。权重在加载时无损转码为 GGML Q2_0，并应用 PRISM 的带符号 Hadamard 变换；仅支持单设备 GGML 后端（<code>cpu</code>、<code>cuda</code>、<code>mlx</code> 与 <code>--tp</code> 均被拒绝）。仅在 Metal（M5 Pro）上验证过</td><td>配合伴随 mmproj 支持图像</td><td class="yes">支持</td><td class="yes">支持</td><td class="no">—</td></tr>
       <tr><td><strong>DiffusionGemma</strong></td><td><code>diffusion-gemma</code>、<code>diffusion_gemma</code></td><td>diffusion-gemma 文本扩散 GGUF；同时提供 Jev 类型化决策端点 <code>POST /v1/systemone</code></td><td>图像（聊天与 Jev 决策），视觉塔即 Gemma 4 的视觉塔，可从 mmproj GGUF 或上游 <code>model-00011-of-00011.safetensors</code> 分片加载；音频与视频会被拒绝</td><td class="no">否（提示词不开启思考；模型自发写出的思考块只有在 <code>think: true</code> 时才作为推理内容返回）</td><td class="no">否（带工具的请求会被拒绝）</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen-Image-2.1</strong></td><td><code>qwen_image</code>、<code>qwen-image</code>（无元数据的 GGUF 靠张量表识别）</td><td>Qwen-Image-2.1 DiT（+ 专用 2.1 VAE 与 Qwen3-VL-8B 伴随文件）</td><td>文本 → 图像与图像编辑（RGBA）；LoRA 插件</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
@@ -58,29 +114,8 @@
   </div>
   <p class="page-foot-note">各模型的详细架构卡（前向图、组件、参数，以及 TensorSharp 如何优化 prefill/decode）位于仓库的 <code>docs/models/</code> 下。</p>
 
-  <h2 id="fast-lane">哪个更快——每个家族最关键的那一项设置</h2>
-  <p>视频家族使用不同配方：LTX 2.5 Distilled 固定采用半尺寸 8 步与放大后 3 步精修；MiniMax-H3 使用 CFG 1，步数、尺寸与参考数量影响成本；Wan 的步数蒸馏检查点会在加载时自动识别。各家族的实测范围见下表与模型卡。</p>
-  <div class="table-scroll">
-  <table>
-    <thead><tr><th>家族</th><th>快车道</th><th>实测效果</th></tr></thead>
-    <tbody>
-      <tr><td><strong>MiniMax-H3</strong></td><td><strong>它本身就经过 CFG 蒸馏</strong>，所以 <code>--cfg 1.0</code> 不变；减少步数靠的是插件，而不是另一个权重。在 FL2VA 上加载 <strong>LightX2V Turbo 插件</strong>（<code>--lora config/lora/minimax-h3-fl2v-turbo-8step.json</code>，或配方为推断所得的 <code>-4step.json</code>）：按自己锁定的调度只跑 8 或 4 步（默认 20 步），需下载 1.38 GB。再把省下的时间花在 <code>--width</code> / <code>--height</code> 上</td><td>2026-10-15，同精度前后对照：M5 Pro MLX 143.264 → 125.426 s，A40 直接 CUDA 220.456 → 178.667 s，解码 RGB/音频完全一致。640×384×22、20 步；包含加载与编码，非热模型服务基准。尚无 Turbo 片段的耗时记录。<a href="benchmarks_zh-cn.html#minimax-h3">完整条件 →</a> · <a href="models-video_zh-cn.html#h3-turbo">Turbo 插件 →</a></td></tr>
-      <tr><td><strong>Wan 视频</strong></td><td><strong>加载步数蒸馏检查点</strong>——DiT 文件名中含 <code>Turbo</code>、<code>distill</code>、<code>Lightning</code>、<code>lightx2v</code>、<code>FastWan</code>、<code>-dmd</code> 或 <code>…-4steps-…</code> 即被自动识别，无需任何参数</td><td><strong>100 次 DiT 前向 → 4 次</strong>，关闭引导。同一条 1088×832×121 帧图生视频请求，M5 Pro / <code>ggml_metal</code>：<strong>约 3 小时 30 分 → 17 分 30 秒</strong></td></tr>
-      <tr><td>Wan 视频</td><td><code>--cfg-cache-stride 2</code> / <code>3</code>——仅适用于未蒸馏的基础检查点</td><td>50 步下 1.30× / 1.43×（100 次前向只跑 77 / 70 次）。属于近似方法；在本就无引导的蒸馏检查点上没有意义</td></tr>
-      <tr><td>Qwen-Image-2.1</td><td>加载<strong>步数蒸馏 LoRA 插件</strong>（<code>--lora config/lora/qwen-image-2.1-viggle-turbo.json</code> 以及其他随附的 4–8 步配方），出草图时再用 <code>--width 1024 --height 1024</code>——默认的 CFG 1 本身就是每步一次 Transformer 预测</td><td>1K 正方形的潜在图像 token 数只有 2K 默认值的四分之一。M5 Pro（<code>ggml_metal</code>、Q4_K_M）：1024×1024、默认 40 步整体耗时 327.6 s（启用前缀 KV 缓存之前为 330.5 s；生成从该缓存获益很少）；1024×1024、Viggle Turbo 的 6 步整体耗时 54.5 s（每步 7.94 s）。更早的一次运行中，2048×2048、25 步用时 1548.7 s。图像编辑从默认开启的前缀 KV 缓存中获益最多：M5 Pro 上 1024² 每步快 1.73–2.91×</td></tr>
-      <tr><td>DeepSeek V4</td><td>用 <code>--draft-model</code> 加载 DSpark 块级草稿器（仅 <code>cuda</code> / <code>ggml_cuda</code>）</td><td>4×A40、200 个贪心 token：decode 26.0 → 34.0 tok/s（<code>cuda</code>）、26.4 → 37.1 tok/s（<code>ggml_cuda</code>），接受率 69%；5 轮对话中可达 1.5–2.0×。输出保持不变</td></tr>
-      <tr><td>Muse-Glimmer</td><td>用 <code>--draft-model</code> 加载 DFlash 块级草稿器（<em>不要</em>传任何采样参数，它需要纯贪心）</td><td>RTX PRO 6000、128 个贪心 token：60 token 提示下 35.0 → 50.9 tok/s，2 050 token 下 33.5 → 43.5。在 Apple Silicon 上目前并不划算（20.7 → 13.9 tok/s），那里请用普通 decode</td></tr>
-      <tr><td>Qwen 3.6 / Gemma 4</td><td>在 CLI 或服务端加 <code>--spec</code>——Qwen 3.6 用 <code>-MTP-</code> GGUF 内嵌的 NextN 块，Gemma 4 用独立的 <code>--draft-model</code> 草稿（只要给出 <code>--draft-model</code> 就会自动开启推测）</td><td>仅在单独（无并发）序列上启用，并且只在有收益处启用：Qwen 3.6 的内嵌 NextN 块在所有后端上都被认为有收益，而 Gemma 4 的独立草稿头只在各 ggml 后端（包括 <code>ggml_cpu</code>）与直连 <code>cuda</code> 后端上启用——在纯 C# 的 <code>cpu</code> 后端与 MLX 上 Gemma 4 走标准 decode。可用 <code>--spec-draft</code>（默认 8）与 <code>--spec-pmin</code>（默认 0.15）调节</td></tr>
-      <tr><td>CPU 上的 DiffusionGemma 与 Qwen-Image-2.1</td><td>用 <code>--backend cpu</code>，而不是 <code>ggml_cpu</code>——下一行的例外</td><td>i7-11800H、8 核：DiffusionGemma-26B-A4B 对一个 54 token 的新提示做 Jev 读取用时 0.92 s，<code>ggml_cpu</code> 为 1.57 s；对同一提示的后续读取为 0.22–0.25 s（<code>cpu</code> 缓存 prompt K/V，<code>ggml_cpu</code> 不缓存）；Qwen-Image-2.1 在 512×512、Pruna 5 步 LoRA 下 118 s 对 295.7 s</td></tr>
-      <tr><td>所有文本家族</td><td>选对 <code>--backend</code>：NVIDIA 用 <code>ggml_cuda</code>，Apple Silicon 用 <code>ggml_metal</code>，CPU 用 <code>ggml_cpu</code>（而非 <code>cpu</code>）——DiffusionGemma 除外，见上一行</td><td>RTX 3080 Laptop、gemma-4-26B-A4B QAT：<code>ggml_cuda</code> decode 78.7 tok/s，直连 <code>cuda</code> 后端 35.3；prefill 1832 对 128。Apple Silicon、Muse-Glimmer-30B：<code>ggml_metal</code> prefill 413.6，<code>mlx</code> 仅 29.0</td></tr>
-      <tr><td>装不下的 MoE</td><td><code>--n-cpu-moe N</code> / <code>--cpu-moe</code>——把前 N 层的路由专家权重留在系统内存</td><td>以 decode 换显存；但只要能避免显存溢出就是净赚：gpt-oss-20b 在 16 GB 卡上 16.2 → 2.9 GB，<code>--n-cpu-moe 12</code> 把 WDDM 换页导致的 0.3 tok/s 变成 25.4</td></tr>
-      <tr><td>GLM 5.x</td><td><code>TS_GLM_UBATCH=2048</code> —— 显存允许时把 prefill 微批调大</td><td>3× RTX PRO 6000、GLM-5.2 UD-IQ2_XXS：pp2048 从 918.9 到 1145.8 t/s，pp4096 从 864.7 到 1048.7 t/s；decode 受访存约束，仍是约 43.9 tok/s。256 个专家 top-8 的情况下，分块太小会让每个专家 GEMM 的 tile 大半是填充</td></tr>
-      <tr><td>多 GPU</td><td>在直连 <code>cuda</code> 与 GGML CUDA / Vulkan 上使用 <code>--tp N</code>（环境变量 <code>TENSORSHARP_TP_DEGREE</code>）</td><td>Muse-Glimmer-30B UD-IQ2_XXS、2× RTX PRO 4000：prefill 1171 → 1569（1.34×），decode 40.2 → 63.2 tok/s（1.57×）。它还能跑单卡完全装不下的模型——但前提是互连付得起这笔账：在没有 NVLink 的 PCIe 主机上，逐层的 all-reduce 可能比拆分省下的还贵，GLM-5.2 在 3× RTX PRO 6000 上就从 pp2048 915.9 / tg64 43.9 掉到 <code>--tp 3</code> 的 505.6 / 17.6。GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 的原生 TP 都只支持本地单进程——<code>--tp-node-id</code> / <code>--tp-peers</code> 对整个家族都会在模型构造之前被拒绝。GLM-5.3 上从来没有跑过 <code>--tp 1</code> 以上的配置：这个模式是接受的，但 MLA 与索引器缓存会按 rank 复制，缓存占用随 N 成倍增长、能装下的上下文也更短；唯一有记录的算术是一次装不下——<code>--tp 8</code> 每个 rank 需要 41.7 GiB，而 A40 只有 46 GB</td></tr>
-    </tbody>
-  </table>
-  </div>
-  <p class="page-foot-note">工具支持同时要求会声明工具的提示词渲染器与匹配的结构化输出解析器。Qwen 3.8 Flash Next（<code>qwen4exp</code>）通过 Qwen 3.5 解析器返回结构化调用，因此调用者定义的工具、Agent Skills 工具、代码执行工具，以及服务端的<a href="agentic_zh-cn.html#sub-agents">子智能体委派</a>都会提供给它。Mistral 3 与 Hunyuan Dense 既不渲染工具声明也不渲染工具结果，DiffusionGemma 不渲染工具声明且会拒绝带工具的请求，因此这三个家族既不会获得上述任何工具，也不参与子智能体委派。</p>
-  <p class="page-foot-note">LTX 2.5、MiniMax-H3、Wan、DiffusionGemma 与 Hunyuan Dense 拒绝多 GPU 模式。Qwen 3.8 Flash Next 支持符合量化条件的本地 GGML CUDA TP 与 <code>--layer-split N</code>；DeepSeek V4 使用整层放置。GLM 支持两种显式本地模式；Qwen-Image 仅支持扩散 Transformer 的本地张量并行。DeepSeek V4.1 支持 <code>--layer-split N</code> 与实验性 routed-MoE <code>--tp N</code>。</p>
+  </details>
+  <div class="callout note"><div class="ic">📘</div><p><strong>Gemma 4 E4B 是《From Tensors to Tokens》采用的示例模型。</strong>配套图书提供从张量基础到多模态推理的连贯构建过程；这组参考页面则提供最新下载与能力细节。<a href="book_zh-cn.html">了解本书 →</a></p></div>
 
   <div class="content-footer">
     <a href="backends_zh-cn.html">← 计算后端</a>

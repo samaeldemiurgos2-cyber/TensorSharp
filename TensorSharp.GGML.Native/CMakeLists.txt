@@ -274,6 +274,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_bonsai.cpp
     ggml_ops_attention_alloc.cpp
     ggml_ops_attention_precision.cpp
+    ggml_ops_muse_spark_attention.cpp
     ggml_ops_flash_attn_guard.cpp
     ggml_ops_matmul.cpp
     ggml_ops_matmul_precision.cpp
@@ -300,6 +301,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_gemma4_verify.cpp
     ggml_ops_gemma4_moe.cpp
     ggml_ops_muse_glimmer.cpp
+    ggml_ops_muse_spark.cpp
     ggml_ops_muse_glimmer_vision.cpp
     ggml_ops_dflash.cpp
     ggml_ops_diffusion.cpp
@@ -319,6 +321,8 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_deepseek41_vision.cpp
     ggml_ops_embeddings.cpp
     ggml_ops_glm_dsa.cpp
+    ggml_ops_muse_spark_exec.cpp
+    ggml_ops_muse_spark_tp.cpp
     ggml_ops_dsv4_fused_cpu.cpp
     ggml_ops_paged_attention.cpp
     ggml_ops_tensor_parallel.cpp
@@ -343,7 +347,7 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_matmul_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_attention_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_q8_precision.cu)
-    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu ggml_ops_deepseek41_tp_cuda.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
     # Wan / Qwen-Image VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu).
     # Optional: the VAE falls back to ggml's im2col+GEMM when cuDNN is absent.
@@ -379,6 +383,32 @@ if (TENSORSHARP_GGML_NATIVE_IOS)
 else()
     add_library(GgmlOps SHARED ${TSG_GGMLOPS_SOURCES})
 endif()
+
+# With NCCL, ggml-cuda's VMM scratch pool shares every chunk with all
+# peer-capable GPUs, which CUDA refuses past eight peers per GPU. Every target
+# that links the static ggml-cuda routes ggml's cuMemSetAccess through
+# TensorSharp's guard (see ggml_ops_cuda_vmm_peer_guard.cpp) instead of a
+# patched ggml. GNU ld and lld rewrite the references inside the static
+# ggml-cuda archive too; a NO_VMM build never calls it. Windows builds have no
+# NCCL, so there the file only supplies the no-op NCCL policy.
+function(tsg_add_cuda_vmm_peer_guard target)
+    target_sources(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ggml_ops_cuda_vmm_peer_guard.cpp")
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    if (TSG_USE_NCCL)
+        target_compile_definitions(${target} PRIVATE TSG_GGML_CUDA_NCCL=1)
+    endif()
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT GGML_CUDA_NO_VMM)
+        target_compile_definitions(${target} PRIVATE TSG_CUDA_VMM_PEER_GUARD=1)
+        get_target_property(TSG_GUARD_TYPE ${target} TYPE)
+        if (TSG_GUARD_TYPE STREQUAL "SHARED_LIBRARY")
+            target_compile_definitions(${target} PRIVATE TSG_CUDA_VMM_PEER_GUARD_HIDDEN=1)
+        endif()
+        target_link_options(${target} PRIVATE "$<HOST_LINK:LINKER:--wrap=cuMemSetAccess>")
+        target_link_libraries(${target} PRIVATE CUDA::cuda_driver)
+    endif()
+endfunction()
 
 if (WIN32)
     # Re-export the statically-linked ggml C API so the managed layer
@@ -419,6 +449,7 @@ endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_CUDA=1)
     target_link_libraries(GgmlOps PRIVATE CUDA::cublas)
+    tsg_add_cuda_vmm_peer_guard(GgmlOps)
     if (TSG_HAVE_CUDNN)
         target_include_directories(GgmlOps PRIVATE ${TSG_CUDNN_INCLUDE_DIR})
         # Deliberately NOT linked -- resolved with LoadLibrary/dlopen at run time.
@@ -618,6 +649,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
     add_executable(GgmlOpsDsv41EngramTest tests/dsv41_engram_test.cpp)
     add_test(NAME deepseek41-engram-hash-lookup COMMAND GgmlOpsDsv41EngramTest)
+    add_executable(GgmlOpsMuseSparkTpSplitTest tests/muse_spark_tp_split_test.cpp ggml_ops_muse_spark_tp.cpp)
+    target_include_directories(GgmlOpsMuseSparkTpSplitTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsMuseSparkTpSplitTest PRIVATE ggml-base)
+    add_test(NAME muse-spark-tp-split-plan COMMAND GgmlOpsMuseSparkTpSplitTest)
     add_executable(GgmlOpsDsv41EngramGgufTest tests/dsv41_engram_gguf_test.cpp)
     target_link_libraries(GgmlOpsDsv41EngramGgufTest PRIVATE ggml-base)
     add_test(NAME deepseek41-engram-embedded-gguf COMMAND GgmlOpsDsv41EngramGgufTest)
@@ -664,13 +699,21 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND NOT WIN32)
         target_compile_definitions(GgmlOpsDsv41TpTest PRIVATE TSG_GGML_USE_CUDA=1)
         target_sources(GgmlOpsDsv41TpTest PRIVATE ggml_ops_dsv4_fused.cu ggml_ops_matmul_precision.cu
-            ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_tp_probe.cu)
+            ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_tp_probe.cu
+            ggml_ops_deepseek41_tp_cuda.cu)
         target_include_directories(GgmlOpsDsv41TpTest PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsDsv41TpTest PRIVATE ggml-cuda CUDA::cublas ${CMAKE_DL_LIBS})
         add_test(NAME deepseek41-quantized-strip-projections-cuda
                  COMMAND GgmlOpsDsv41TpTest --cuda 1 --quant-strip-only)
         set_tests_properties(deepseek41-quantized-strip-projections-cuda PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 600)
+        # A rank graph that throws on the device-resident exchange: rank 0,
+        # a worker rank, then both. A regression aborts or hangs, hence the
+        # timeout.
+        add_test(NAME deepseek41-tp-resident-failure-cuda
+                 COMMAND GgmlOpsDsv41TpTest --cuda 2 --resident-failure-only)
+        set_tests_properties(deepseek41-tp-resident-failure-cuda PROPERTIES
             SKIP_RETURN_CODE 77 TIMEOUT 600)
         # Multi-device tests are explicit: a one-GPU CI lane must not claim
         # that its skipped multi-device checks established tensor parallelism.
@@ -749,12 +792,20 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsDsv41RawGatherTest PRIVATE ggml-base)
     add_test(NAME deepseek41-compact-raw-gather COMMAND GgmlOpsDsv41RawGatherTest)
 
+    add_executable(GgmlOpsDsv41YocoTest tests/dsv41_yoco_test.cpp)
+    target_include_directories(GgmlOpsDsv41YocoTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME deepseek41-yoco-policy COMMAND GgmlOpsDsv41YocoTest)
     add_executable(GgmlOpsDsv41TruncateTest tests/dsv41_truncate_test.cpp)
     target_include_directories(GgmlOpsDsv41TruncateTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-truncate-guards COMMAND GgmlOpsDsv41TruncateTest)
     add_executable(GgmlOpsDsv41DsparkRingTest tests/dsv41_dspark_ring_test.cpp)
     target_include_directories(GgmlOpsDsv41DsparkRingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-dspark-ring-guards COMMAND GgmlOpsDsv41DsparkRingTest)
+    add_executable(GgmlOpsDsv41VisionClipTest tests/dsv41_vision_clip_test.cpp)
+    target_include_directories(GgmlOpsDsv41VisionClipTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
+    target_link_libraries(GgmlOpsDsv41VisionClipTest PRIVATE GgmlOps ggml-base)
+    add_test(NAME deepseek41-vision-clip-mmproj COMMAND GgmlOpsDsv41VisionClipTest)
     add_executable(GgmlOpsDsv41RetentionTest tests/dsv41_retention_test.cpp)
     target_include_directories(GgmlOpsDsv41RetentionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-retention-budget COMMAND GgmlOpsDsv41RetentionTest)
@@ -939,12 +990,65 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     )
     target_link_libraries(GgmlOpsGetRowsQuantTest PRIVATE GgmlOps)
 
+    # Test-only observability; regular production builds expose no probe ABI.
+    target_compile_definitions(GgmlOps PRIVATE TSG_GGML_TEST_DIAGNOSTICS=1)
+    add_executable(GgmlOpsPagedAttentionLifecycleTest tests/paged_attention_lifecycle_test.cpp)
+    target_link_libraries(GgmlOpsPagedAttentionLifecycleTest PRIVATE GgmlOps)
+    add_test(NAME paged-attention-lifecycle-cpu COMMAND GgmlOpsPagedAttentionLifecycleTest cpu)
+    set_tests_properties(paged-attention-lifecycle-cpu PROPERTIES RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME paged-attention-lifecycle-cuda COMMAND GgmlOpsPagedAttentionLifecycleTest cuda)
+        add_test(NAME paged-attention-lifecycle-cuda-multi COMMAND GgmlOpsPagedAttentionLifecycleTest multi)
+        set_tests_properties(paged-attention-lifecycle-cuda paged-attention-lifecycle-cuda-multi
+            PROPERTIES RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endif()
+
     # The standalone MoE kernel's uploaded biases must never share memory with an
     # activation a fused backend kernel writes while still reading them.
     add_executable(GgmlOpsMoeFusedBiasAliasTest tests/moe_fused_bias_alias_test.cpp)
+    add_executable(GgmlOpsMuseSparkMoeTest tests/muse_spark_moe_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkMoeTest PRIVATE GgmlOps)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_executable(GgmlOpsAttentionDeviceCacheTest tests/attention_device_cache_test.cpp)
+        target_link_libraries(GgmlOpsAttentionDeviceCacheTest PRIVATE GgmlOps)
+        add_test(NAME attention-device-cache-cuda COMMAND GgmlOpsAttentionDeviceCacheTest)
+        set_tests_properties(attention-device-cache-cuda PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    add_test(NAME muse-spark-moe-cpu COMMAND GgmlOpsMuseSparkMoeTest cpu)
+    set_tests_properties(muse-spark-moe-cpu PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(GgmlOpsMuseSparkCpuMoeScratchTest tests/muse_spark_cpu_moe_scratch_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkCpuMoeScratchTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-cpu-moe-scratch-off COMMAND GgmlOpsMuseSparkCpuMoeScratchTest off)
+    add_test(NAME muse-spark-cpu-moe-scratch-on COMMAND GgmlOpsMuseSparkCpuMoeScratchTest on)
+    add_test(NAME muse-spark-moe-cpu-reuse COMMAND GgmlOpsMuseSparkMoeTest cpu)
+    add_test(NAME moe-fused-bias-alias-cpu-reuse COMMAND GgmlOpsMoeFusedBiasAliasTest cpu)
+    # Each test is a new process: native startup getenv does not depend on .NET
+    # environment propagation. Legacy/non-Spark allocation must stay unchanged.
+    set_tests_properties(muse-spark-cpu-moe-scratch-off muse-spark-moe-cpu
+        PROPERTIES ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=0;TS_CPU_MOE_THREADS=2")
+    set_tests_properties(muse-spark-cpu-moe-scratch-on muse-spark-moe-cpu-reuse moe-fused-bias-alias-cpu-reuse
+        PROPERTIES ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=1;TS_CPU_MOE_THREADS=2")
+    set_tests_properties(muse-spark-cpu-moe-scratch-off muse-spark-cpu-moe-scratch-on
+        muse-spark-moe-cpu-reuse moe-fused-bias-alias-cpu-reuse
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-moe-cuda COMMAND GgmlOpsMuseSparkMoeTest cuda)
+        set_tests_properties(muse-spark-moe-cuda PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME muse-spark-moe-cuda-multi COMMAND GgmlOpsMuseSparkMoeTest cuda-multi)
+        set_tests_properties(muse-spark-moe-cuda-multi PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME muse-spark-moe-cuda-reuse COMMAND GgmlOpsMuseSparkMoeTest cuda)
+        add_test(NAME muse-spark-moe-cuda-multi-reuse COMMAND GgmlOpsMuseSparkMoeTest cuda-multi)
+        set_tests_properties(muse-spark-moe-cuda muse-spark-moe-cuda-multi PROPERTIES
+            ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=0;TS_CPU_MOE_THREADS=2")
+        set_tests_properties(muse-spark-moe-cuda-reuse muse-spark-moe-cuda-multi-reuse PROPERTIES
+            ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=1;TS_CPU_MOE_THREADS=2"
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
     target_link_libraries(GgmlOpsMoeFusedBiasAliasTest PRIVATE GgmlOps)
     add_test(NAME moe-fused-bias-alias-cpu COMMAND GgmlOpsMoeFusedBiasAliasTest cpu)
     set_tests_properties(moe-fused-bias-alias-cpu PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(moe-fused-bias-alias-cpu PROPERTIES
+        ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=0;TS_CPU_MOE_THREADS=2")
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         add_test(NAME moe-fused-bias-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda)
         set_tests_properties(moe-fused-bias-alias-cuda PROPERTIES SKIP_RETURN_CODE 77)
@@ -955,6 +1059,77 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
 
     add_executable(GgmlOpsAddmmVectorTest tests/addmm_vector_test.cpp)
+    # One-shot return/exception injection is present only in native test builds.
+    set_property(SOURCE ggml_ops_matmul.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    add_executable(GgmlOpsAddmmQuantCacheRecoveryTest tests/addmm_quant_cache_recovery_test.cpp)
+    target_link_libraries(GgmlOpsAddmmQuantCacheRecoveryTest PRIVATE GgmlOps)
+    add_test(NAME addmm-quant-cache-recovery-cpu COMMAND GgmlOpsAddmmQuantCacheRecoveryTest cpu)
+    set_tests_properties(addmm-quant-cache-recovery-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME addmm-quant-cache-recovery-cuda COMMAND GgmlOpsAddmmQuantCacheRecoveryTest cuda)
+        set_tests_properties(addmm-quant-cache-recovery-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    endif()
+    add_executable(GgmlOpsResidentDeviceCopyTest tests/resident_device_copy_test.cpp)
+    add_executable(GgmlOpsMuseSparkProjectionPrecisionTest tests/muse_spark_projection_precision_test.cpp)
+    add_executable(GgmlOpsMuseSparkAttentionPrecisionTest tests/muse_spark_attention_precision_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkAttentionPrecisionTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-attention-precision-cpu COMMAND GgmlOpsMuseSparkAttentionPrecisionTest cpu)
+    set_tests_properties(muse-spark-attention-precision-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-attention-precision-cuda COMMAND GgmlOpsMuseSparkAttentionPrecisionTest cuda)
+        add_test(NAME muse-spark-attention-precision-cuda-multi COMMAND GgmlOpsMuseSparkAttentionPrecisionTest cuda-multi)
+        set_tests_properties(muse-spark-attention-precision-cuda muse-spark-attention-precision-cuda-multi
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240 RUN_SERIAL TRUE)
+    endif()
+    target_link_libraries(GgmlOpsMuseSparkProjectionPrecisionTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-projection-precision-cpu COMMAND GgmlOpsMuseSparkProjectionPrecisionTest cpu)
+    set_tests_properties(muse-spark-projection-precision-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-projection-precision-cuda COMMAND GgmlOpsMuseSparkProjectionPrecisionTest cuda)
+        add_test(NAME muse-spark-projection-precision-cuda-multi COMMAND GgmlOpsMuseSparkProjectionPrecisionTest cuda-multi)
+        set_tests_properties(muse-spark-projection-precision-cuda muse-spark-projection-precision-cuda-multi
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 RUN_SERIAL TRUE)
+    endif()
+    target_link_libraries(GgmlOpsResidentDeviceCopyTest PRIVATE GgmlOps)
+    add_test(NAME resident-device-copy-cpu COMMAND GgmlOpsResidentDeviceCopyTest cpu)
+    set_tests_properties(resident-device-copy-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_executable(GgmlOpsMuseSparkResidualTest tests/muse_spark_residual_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkResidualTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-residual-cpu COMMAND GgmlOpsMuseSparkResidualTest cpu)
+    add_executable(GgmlOpsMuseSparkKv2DUploadTest tests/muse_spark_kv_2d_upload_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkKv2DUploadTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-kv-2d-cpu COMMAND GgmlOpsMuseSparkKv2DUploadTest cpu)
+    set_tests_properties(muse-spark-kv-2d-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-kv-2d-cuda COMMAND GgmlOpsMuseSparkKv2DUploadTest cuda)
+        add_test(NAME muse-spark-kv-2d-cuda-multi COMMAND GgmlOpsMuseSparkKv2DUploadTest multi)
+        set_tests_properties(muse-spark-kv-2d-cuda muse-spark-kv-2d-cuda-multi
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    endif()
+    add_executable(GgmlOpsMuseSparkNormGateTest tests/muse_spark_norm_gate_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkNormGateTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-norm-gate-cpu COMMAND GgmlOpsMuseSparkNormGateTest cpu)
+    set_tests_properties(muse-spark-norm-gate-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-norm-gate-cuda COMMAND GgmlOpsMuseSparkNormGateTest cuda)
+        add_test(NAME muse-spark-norm-gate-cuda-multi COMMAND GgmlOpsMuseSparkNormGateTest multi)
+        set_tests_properties(muse-spark-norm-gate-cuda muse-spark-norm-gate-cuda-multi PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endif()
+    add_executable(GgmlOpsMuseSparkQKPrepTest tests/muse_spark_qk_prep_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkQKPrepTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-qk-prep-cpu COMMAND GgmlOpsMuseSparkQKPrepTest cpu)
+    set_tests_properties(muse-spark-qk-prep-cpu PROPERTIES SKIP_RETURN_CODE 77)
+    if (GGML_CUDA)
+        add_test(NAME muse-spark-qk-prep-cuda COMMAND GgmlOpsMuseSparkQKPrepTest cuda)
+        set_tests_properties(muse-spark-qk-prep-cuda PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    set_tests_properties(muse-spark-residual-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-residual-cuda COMMAND GgmlOpsMuseSparkResidualTest cuda)
+        set_tests_properties(muse-spark-residual-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        add_test(NAME resident-device-copy-cuda COMMAND GgmlOpsResidentDeviceCopyTest cuda)
+        set_tests_properties(resident-device-copy-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endif()
     target_include_directories(GgmlOpsAddmmVectorTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     )
@@ -1042,4 +1217,35 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS AND TENSORSHARP_GGML_NATIVE_ENABLE_CUDA 
         ggml-cuda ggml-cpu ggml-base CUDA::cudart ${CMAKE_DL_LIBS})
     add_test(NAME cuda-f32-row-gather COMMAND GgmlOpsTpCollectiveGatherTest)
     set_tests_properties(cuda-f32-row-gather PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+endif()
+
+# ggml-cuda's scratch pool on every visible GPU through GgmlOps, i.e. through
+# the cuMemSetAccess guard that keeps 10+ peer-capable GPUs working.
+if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS AND TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND
+    CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT GGML_CUDA_NO_VMM)
+    add_executable(GgmlOpsCudaVmmPeerGuardTest tests/cuda_vmm_peer_guard_test.cpp)
+    target_include_directories(GgmlOpsCudaVmmPeerGuardTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
+    target_link_libraries(GgmlOpsCudaVmmPeerGuardTest PRIVATE GgmlOps CUDA::cudart)
+    if (TSG_USE_NCCL)
+        # ggml then asks to share pool memory, so the wrapper must be what saved it.
+        target_compile_definitions(GgmlOpsCudaVmmPeerGuardTest PRIVATE TSG_GGML_CUDA_NCCL=1)
+    endif()
+    add_test(NAME cuda-vmm-peer-guard COMMAND GgmlOpsCudaVmmPeerGuardTest)
+    set_tests_properties(cuda-vmm-peer-guard PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+endif()
+
+# Test executables that link the static ggml-cuda themselves (instead of only
+# GgmlOps) need the same guard, or they abort on 10+ peer-capable GPUs; it also
+# supplies tsg::tp_cuda_respect_vmm_peer_limit to those compiling the TP probes.
+if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS AND TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+    get_property(TSG_ALL_TARGETS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(TSG_TARGET IN LISTS TSG_ALL_TARGETS)
+        get_target_property(TSG_TARGET_TYPE ${TSG_TARGET} TYPE)
+        get_target_property(TSG_TARGET_LIBS ${TSG_TARGET} LINK_LIBRARIES)
+        if (TSG_TARGET_TYPE STREQUAL "EXECUTABLE" AND TSG_TARGET_LIBS AND
+            ("ggml-cuda" IN_LIST TSG_TARGET_LIBS OR "ggml" IN_LIST TSG_TARGET_LIBS))
+            tsg_add_cuda_vmm_peer_guard(${TSG_TARGET})
+        endif()
+    endforeach()
 endif()

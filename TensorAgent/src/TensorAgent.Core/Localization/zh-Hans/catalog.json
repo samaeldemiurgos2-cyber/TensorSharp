@@ -22,8 +22,7 @@
   "catalog.license.qwenImage": "Qwen 研究许可（非商业用途）；文本编码器采用 Apache-2.0",
   "catalog.model.minimaxH3.parameters": "330 亿参数音视频 DiT（裁剪 AdaLN 分支后为 200 亿）+ Qwen3-VL-32B 文本编码器",
   "catalog.model.minimaxH3.quantization": "Q4_K（DiT）/ Q4_K_M（文本编码器）",
-  "catalog.model.minimaxH3Fl2va.notes": "根据描述生成自带音轨的短视频，让附加的照片动起来，或在两张照片之间生成过渡（分别作为首帧和尾帧）。需要 32 GB 系统内存（RAM）。MiniMax 的许可不涵盖欧盟、英国、韩国或美国的使用。",
-  "catalog.model.minimaxH3Ref2va.notes": "生成自带音轨的短视频，呈现最多九个附加照片、视频片段和录音中的人物、物品、地点或声音。请说明镜头中出现谁或什么：参考素材提供外观，描述决定它们在场景中的安排。需要 32 GB 系统内存（RAM）。MiniMax 的许可不涵盖欧盟、英国、韩国或美国的使用。",
+  "catalog.model.minimaxH3.notes": "根据描述生成自带音轨的短视频，让附加的照片动起来、连接首尾照片，或呈现最多九个附加照片、视频片段和录音中的人物、物品、地点或声音。可在 Video Studio 中选择首帧与尾帧模式或参考模式。需要 32 GB 系统内存（RAM）。MiniMax 的许可不涵盖欧盟、英国、韩国或美国的使用。",
   "catalog.license.minimaxH3": "MiniMax H3 社区许可",
   "catalog.lora.viggleTurbo.purpose": "用 6 步代替 40 步生成和编辑图片，质量接近完整模型。",
   "catalog.license.qwenResearch": "Qwen 研究许可（非商业用途）",
@@ -67,6 +66,6 @@
   "catalog.extended.744b40b.parameters": "7440 亿（激活 400 亿）",
   "catalog.extended.384experts.parameters": "MoE，384 个路由专家",
   "catalog.extended.14bExpert.parameters": "每个专家 140 亿",
-  "catalog.model.ltx25.notes": "实验性原生文/图生视频，含48kHz立体声音频。LTX2.5 Distilled使用CFG1：先以一半尺寸运行8步Ancestral Euler，再做2倍潜空间放大和3步精修，支持首尾帧及指定位置和强度的多个图像关键帧。图像引导输出时间线；身份参考及视频/音频适配器需要独立检查点。固定版本文件共43.08GB，来自无访问限制的仓库，无需Hugging Face账号。设备内存档位保守设为48GB；已用短时1024×1024视频验证。",
-  "catalog.license.ltx25": "LTX-2.5 和 Gemma 条款"
+  "catalog.model.ltx25.notes": "实验性原生文/图生视频，含48kHz立体声音频。LTX2.5 Distilled使用CFG1：先以一半尺寸运行8步Ancestral Euler，再做2倍潜空间放大和3步精修，支持首尾帧及多个图像关键帧。图像引导输出时间线。可选的Ingredients IC-LoRA（1.31GB）支持身份和外观参考；该模型受限，需获得Hugging Face授权并配置令牌。五个不受限的基础文件共43.08GB。设备内存档位保守设为48GB；已用短时1024×1024视频验证。",
+  "catalog.license.ltx25": "LTX-2.5、Ingredients IC-LoRA 和 Gemma 条款"
 }

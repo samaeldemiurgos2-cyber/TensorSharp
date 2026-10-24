@@ -176,6 +176,7 @@ def _run_blocking(url: str, body: dict, timeout_s: float) -> dict:
         "tool_call_details": tool_calls,
         "assistant_message": msg,
         "usage_present": "prompt_tokens" in usage and "completion_tokens" in usage,
+        "raw_usage": usage,
         "decode_timing_source": "request_wall",
         "reasoning_text": msg.get("reasoning_content") or "",
         "output_text": text,
@@ -215,7 +216,10 @@ def _run_streaming(url: str, body: dict, timeout_s: float,
         # an explicit charset to Latin-1, corrupting multilingual content and
         # tool arguments before the JSON parser receives them.
         resp.encoding = "utf-8"
-        for raw in resp.iter_lines(decode_unicode=True):
+        # Yield complete SSE lines immediately. requests' default 512-byte read
+        # can hold a flushed short token until later frames arrive, inflating
+        # TTFT and delaying staggered-request admission in the validator.
+        for raw in resp.iter_lines(chunk_size=1, decode_unicode=True):
             if response_log is not None:
                 # Keep the wire output even if parsing or validation later
                 # fails. The default benchmark path allocates no capture list.
@@ -315,6 +319,7 @@ def _run_streaming(url: str, body: dict, timeout_s: float,
         "tool_call_details": tool_calls,
         "assistant_message": assistant_message,
         "usage_present": "prompt_tokens" in usage and "completion_tokens" in usage,
+        "raw_usage": usage,
         "decode_timing_source": "server" if pps and pps > 0 else "stream_window",
         "server_timings": srv_timings,
         "reasoning_text": "".join(reasoning_parts),

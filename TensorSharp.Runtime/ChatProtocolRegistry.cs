@@ -290,6 +290,31 @@ namespace TensorSharp.Runtime
             // ---- Others -----------------------------------------------------
             Register(new ChatProtocol
             {
+                Id = "muse-spark",
+                Architectures = new[] { "muse-spark", "muse_spark" },
+                Render = _ => throw new InvalidOperationException(
+                    "Muse Spark requires a compatible embedded GGUF chat template; refusing a generic chat-format fallback."),
+                TemplateAssistantHeaderAnchor = "<|start|>assistant",
+                DirectAnswerGenerationSuffix = " to=user<|message|>",
+                ThinkingBudgetUsesOutputParser = true,
+                ThinkingBudgetTransitionText = "<|eom|><|start|>assistant to=user<|message|>",
+                ThinkingBudgetToolTransitionText = "<|eom|><|start|>assistant",
+                RendersReasoningEffort = true,
+                SharesTemplatePreamble = true,
+                AppendMediaPlaceholders = (msg, sb) =>
+                {
+                    if (msg.IsVideo && msg.ImagePaths is { Count: > 0 })
+                        sb.Append("<|video|>");
+                    else if (msg.ImagePaths != null)
+                        foreach (var _ in msg.ImagePaths) sb.Append("<|patch|>");
+                },
+                CreateOutputParser = () => new MuseGlimmerOutputParser(hasCommentaryChannel: true),
+                OutputParserAlwaysRequired = true,
+                ThinkingGrammarActivationTrigger = "to=user<|message|>",
+            });
+
+            Register(new ChatProtocol
+            {
                 Id = "muse-glimmer",
                 Architectures = new[] { "muse-glimmer", "muse_glimmer" },
                 TemplateAssistantHeaderAnchor = "<|start|>assistant",

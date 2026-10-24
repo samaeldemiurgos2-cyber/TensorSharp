@@ -270,7 +270,7 @@ public sealed class LoraCatalogTests : IDisposable
 
     private const string H3Turbo8 = "minimax-h3-fl2v-turbo-8step";
     private const string H3Turbo4 = "minimax-h3-fl2v-turbo-4step";
-    private const string H3References = "minimax-h3-ref2va-q4k";
+    private const string RetiredH3ReferencesEntry = "minimax-h3-ref2va-q4k";
 
     /// <summary>
     /// The two MiniMax-H3 Turbo plug-ins, pinned to the bytes verified on 2026-10-16 (a
@@ -310,22 +310,21 @@ public sealed class LoraCatalogTests : IDisposable
     }
 
     /// <summary>
-    /// The Turbo plug-ins are offered where they apply and nowhere else: on the keyframes entry,
-    /// not on References (the same tensors, which the engine refuses them on by file name), LTX
-    /// 2.5 or a Qwen-Image entry, whose sheet keeps its own fourteen.
+    /// The Turbo plug-ins are offered on MiniMax-H3's unified catalog row, whose primary FL2VA
+    /// denoiser they target; the retired Ref2VA row is no longer in the catalog.
     /// </summary>
     [Fact]
-    public void TheTurboPlugInsAreOfferedOnlyOnTheKeyframesEntry()
+    public void TheTurboPlugInsAreOfferedOnTheUnifiedMiniMaxH3Entry()
     {
         Assert.Equal(new[] { H3Turbo8, H3Turbo4 },
             LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.MiniMaxH3Keyframes), ModelCatalog.BuiltIn).Select(l => l.Id));
-        Assert.Empty(LoraCatalog.Offered(ModelCatalog.Find(H3References), ModelCatalog.BuiltIn));
+        Assert.Null(ModelCatalog.Find(RetiredH3ReferencesEntry));
         Assert.Empty(LoraCatalog.Offered(ModelCatalog.Find("ltx-2.5-distilled-q4kxl"), ModelCatalog.BuiltIn));
         Assert.DoesNotContain(LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.QwenImage), ModelCatalog.BuiltIn), l => l.Id.StartsWith("minimax-h3", StringComparison.Ordinal));
         Assert.All(new[] { H3Turbo8, H3Turbo4 }, id =>
         {
             CatalogLora lora = LoraCatalog.Find(id)!;
-            Assert.False(lora.AppliesTo(H3References));
+            Assert.False(lora.AppliesTo(RetiredH3ReferencesEntry));
             Assert.False(lora.AppliesTo(LoraCatalog.QwenImage));
         });
     }
@@ -356,12 +355,12 @@ public sealed class LoraCatalogTests : IDisposable
 
     /// <summary>
     /// What a clip is made with, from one choice that holds both families' plug-ins. The
-    /// keyframes entry takes its Turbo and names nothing it skips from Qwen-Image; References
-    /// says why the Turbo sits out; LTX and Qwen-Image never name a MiniMax-H3 plug-in. Two
-    /// MiniMax-H3 speed plug-ins saved by hand, or one whose files have gone, refuse the clip.
+    /// MiniMax-H3 entry takes its FL2VA Turbo and names nothing it skips from Qwen-Image; LTX
+    /// and Qwen-Image never name a MiniMax-H3 plug-in. Two H3 speed plug-ins saved by hand, or
+    /// one whose files have gone, refuse the clip.
     /// </summary>
     [Fact]
-    public void AClipIsPlannedFromTheChoiceForItsOwnCheckpoint()
+    public void AClipIsPlannedFromTheChoiceForItsOwnModel()
     {
         LoraStore store = StoreWith(Viggle, Film, H3Turbo8, H3Turbo4);
         var choices = new[] { new ImageLoraChoice(Viggle, 1f), new ImageLoraChoice(Film, 0.7f), new ImageLoraChoice(H3Turbo8, 0.2f) };
@@ -380,10 +379,9 @@ public sealed class LoraCatalogTests : IDisposable
         Assert.Equal(8, recipe.Steps);
         Assert.Equal(LoraCliFlags.MiniMaxH3PluginType, LoraCliFlags.DeclaredPluginType(spec));
 
-        LoraPlan references = LoraSelection.Plan(choices, H3References, store, editing: false, out error)!;
+        LoraPlan references = LoraSelection.Plan(choices, RetiredH3ReferencesEntry, store, editing: false, out error)!;
         Assert.Null(error);
-        Assert.Empty(references.Specs);
-        Assert.Equal("LightX2V Turbo 8-Step sits out: made for MiniMax-H3's keyframes checkpoint", references.SatOut);
+        Assert.Same(LoraPlan.None, references);
 
         Assert.Same(LoraPlan.None, LoraSelection.Plan(choices, "ltx-2.5-distilled-q4kxl", store, editing: false, out _));
         LoraPlan picture = LoraSelection.Plan(choices, LoraCatalog.QwenImage, store, editing: false, out _)!;

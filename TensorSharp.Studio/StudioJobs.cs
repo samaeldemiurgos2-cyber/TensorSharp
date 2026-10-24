@@ -127,7 +127,8 @@ public sealed partial class StudioService
     {
         if (generation == null) throw new StudioException("generation_unavailable", "No native generation adapter is connected to this host.");
         request = StudioJson.Clone(request);
-        if (request.TemporalConditions is null || request.ReferenceAssetIds is null || request.TemporalConditions.Any(c => c is null) || request.ReferenceAssetIds.Any(id => id is null))
+        if (request.TemporalConditions is null || request.ReferenceAssetIds is null || request.ReferenceVideoAssetIds is null ||
+            request.TemporalConditions.Any(c => c is null) || request.ReferenceAssetIds.Any(id => id is null) || request.ReferenceVideoAssetIds.Any(id => id is null))
             throw new StudioException("invalid_conditioning", "Conditioning collections must not be null.");
         var project = await GetProjectAsync(request.ProjectId, cancellationToken);
         var (capability, imageCanvas) = await AdmitAsync(request, cancellationToken);
@@ -197,8 +198,11 @@ public sealed partial class StudioService
                 ? lastReason : "The selected model cannot pin a last frame.");
         if (request.ConditioningAssetId != null && !capability.ImageConditioning || request.GenerateAudio == true && !capability.AudioOutput)
             throw new StudioException("unsupported_conditioning", "The selected model does not support a requested image/audio conditioning mode.");
-        if (request.TemporalConditions.Count > 0 && !capability.TemporalGuidance || request.ReferenceAssetIds.Count > 0 && !capability.IdentityReferences || request.ReferenceAssetIds.Count > capability.MaxReferences || request.TemporalConditions.Count > 32)
-            throw new StudioException("unsupported_conditioning", "Temporal guidance or identity-reference images exceed this model's capabilities.");
+        if (request.TemporalConditions.Count > 0 && !capability.TemporalGuidance ||
+            request.ReferenceAssetIds.Count > 0 && !capability.IdentityReferences || request.ReferenceAssetIds.Count > capability.MaxReferences ||
+            request.ReferenceVideoAssetIds.Count > 0 && !capability.ReferenceVideos || request.ReferenceVideoAssetIds.Count > capability.MaxReferenceVideos ||
+            request.TemporalConditions.Count > 32)
+            throw new StudioException("unsupported_conditioning", "Temporal guidance or identity-reference media exceed this model's capabilities.");
         foreach (var guide in request.TemporalConditions)
             if (guide.FrameIndex < -1 || guide.FrameIndex >= request.FrameCount || !float.IsFinite(guide.Strength) || guide.Strength is <= 0 or > 1)
                 throw new StudioException("invalid_conditioning", "Temporal guide indices and strengths must fit the output frame range and (0, 1].");
@@ -212,12 +216,22 @@ public sealed partial class StudioService
     }
     Dictionary<string, string> ResolveConditioning(StudioGenerationRequest request, StudioProject project)
     {
-        var ids = request.ReferenceAssetIds.Concat(request.TemporalConditions.Select(c => c.AssetId)).Concat(new[] { request.ConditioningAssetId, request.EndConditioningAssetId }.OfType<string>()).Distinct(StringComparer.Ordinal);
+        var imageIds = request.ReferenceAssetIds.Concat(request.TemporalConditions.Select(c => c.AssetId))
+            .Concat(new[] { request.ConditioningAssetId, request.EndConditioningAssetId }.OfType<string>());
+        var ids = imageIds.Select(id => (Id: id, Kind: "image"))
+            .Concat(request.ReferenceVideoAssetIds.Select(id => (Id: id, Kind: "video")))
+            .GroupBy(item => item.Id, StringComparer.Ordinal).Select(group =>
+            {
+                if (group.Select(item => item.Kind).Distinct(StringComparer.Ordinal).Count() != 1)
+                    throw new StudioException("invalid_conditioning", "A reference asset cannot be used as both an image and a video.");
+                return group.First();
+            });
         var paths = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var id in ids)
+        foreach (var (id, kind) in ids)
         {
             var asset = project.Assets.FirstOrDefault(a => a.Id == id) ?? throw new StudioException("asset_not_found", "A conditioning asset does not belong to the project.");
-            if (asset.Kind != "image") throw new StudioException("invalid_conditioning", "Conditioning assets must be still images.");
+            if (asset.Kind != kind) throw new StudioException("invalid_conditioning", kind == "video"
+                ? "Video reference assets must be full video clips." : "Frame and image-reference assets must be still images.");
             paths.Add(id, GetSnapshotAssetPath(project, id));
         }
         return paths;
@@ -310,7 +324,8 @@ public sealed partial class StudioService
             ModelId = r.ModelId, Mode = r.Mode ?? StudioGenerationModes.Infer(r), Prompt = cut < r.Prompt.Length ? r.Prompt[..cut] + "…" : r.Prompt,
             Width = r.Width, Height = r.Height, FrameCount = r.FrameCount, Fps = r.Fps, Steps = r.Steps, Seed = r.Seed, GenerateAudio = r.GenerateAudio,
             FirstFrameAssetId = r.ConditioningAssetId, LastFrameAssetId = r.EndConditioningAssetId,
-            GuideCount = r.TemporalConditions.Count, ReferenceCount = r.ReferenceAssetIds.Count
+            GuideCount = r.TemporalConditions.Count, ReferenceCount = r.ReferenceAssetIds.Count,
+            ReferenceVideoCount = r.ReferenceVideoAssetIds.Count
         };
     }
 

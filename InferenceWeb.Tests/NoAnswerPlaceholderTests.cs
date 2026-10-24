@@ -67,7 +67,7 @@ public class NoAnswerPlaceholderTests
     {
         string retry = Between(
             Source(),
-            "if (reasonedPastItsBudget && tokenCount == 0",
+            "if (reasonedPastItsBudget && IsNullOrWhiteSpace(visibleAnswer)",
             "if (retryCompleted)");
 
         Assert.Contains("AnswerFrames(", retry, StringComparison.Ordinal);
@@ -145,7 +145,8 @@ public class NoAnswerPlaceholderTests
         string source = Source();
         Assert.Contains("ended this turn without writing an answer", source, StringComparison.Ordinal);
 
-        string guard = Between(source, "&& IsNullOrWhiteSpace(visibleAnswer)", "ended this turn without writing an answer");
-        Assert.True(guard.Length < 400, "the placeholder moved away from its guard");
+        int placeholder = source.LastIndexOf("ended this turn without writing an answer", StringComparison.Ordinal);
+        int guard = source.LastIndexOf("&& IsNullOrWhiteSpace(visibleAnswer)", placeholder, StringComparison.Ordinal);
+        Assert.True(guard >= 0 && placeholder - guard < 400, "the placeholder moved away from its guard");
     }
 }

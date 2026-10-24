@@ -84,6 +84,13 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Enable shared-prefix alignment (see <see cref="AlignSharedPrefixBoundary"/>).</summary>
         public void EnablePrefixCheckpoints() => _alignToSharedPrefix = true;
 
+        // The model's own step size for a lone prompt (ISoloPrefillBudgetModel), set by
+        // the engine unless the configuration chose SoloPrefillChunkSize.
+        private ISoloPrefillBudgetModel? _soloPrefillPolicy;
+
+        /// <summary>Let <paramref name="policy"/> size a lone prompt's prefill steps.</summary>
+        public void SetSoloPrefillPolicy(ISoloPrefillBudgetModel? policy) => _soloPrefillPolicy = policy;
+
         /// <summary>
         /// Cut a prefill chunk at the sequence's public checkpoint boundaries when the chunk
         /// would otherwise run past it, so the state the executor checkpoints is the
@@ -243,7 +250,9 @@ namespace TensorSharp.Runtime.Scheduling
             // the sliding-window boundary. Feed a lone prompt in one big chunk
             // (bounded by the batched-token budget) like the CLI does, keeping it
             // on the fused single-graph prefill path. The moment a 2nd request
-            // appears this reverts to small chunks automatically.
+            // appears this reverts to small chunks automatically. A model with its
+            // own solo step (SoloPrefillStep) may go past the batched-token budget;
+            // a request that arrives meanwhile waits for that one step.
             bool noContention = (_running.Count + _waiting.Count) <= 1;
             int soloPrefillCap = Math.Min(
                 _cfg.SoloPrefillChunkSize, _cfg.MaxNumBatchedTokens);
@@ -320,6 +329,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int cap = GetPrefillCap(
                     noContention, hasActiveDecode, tokenBudget,
                     prefillCandidatesRemaining, soloPrefillCap);
+                if (noContention) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
                 int desired = Math.Min(promptUncomputed, cap);
                 int want = Math.Min(desired, tokenBudget);
                 want = AlignRecurrentPrefillBoundary(seq, want, promptUncomputed);
@@ -413,6 +423,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int cap = GetPrefillCap(
                     noContention, hasActiveDecode, tokenBudget,
                     Math.Max(1, prefillCandidatesRemaining), soloPrefillCap);
+                if (noContention) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
                 int desired = Math.Min(promptUncomputed, cap);
                 int want = Math.Min(desired, tokenBudget);
                 want = Math.Min(want, tokenBudget);
@@ -488,6 +499,23 @@ namespace TensorSharp.Runtime.Scheduling
                 new ScheduledSequenceWork(seq, want, isFresh, isPrefill));
             tokenBudget -= want;
             return true;
+        }
+
+        /// <summary>A lone prompt's step from the model's policy, when it has one for this
+        /// position: it replaces the cap and, for this one sequence, the token budget.</summary>
+        private void SoloPrefillStep(SequenceState seq, int promptUncomputed, ref int cap, ref int tokenBudget)
+        {
+            if (_soloPrefillPolicy == null || promptUncomputed <= 0) return;
+            int step = _soloPrefillPolicy.PreferredSoloPrefillTokens(seq.NumComputedTokens, promptUncomputed);
+            if (step <= 0) return;
+            // Image rows replace token embeddings inside the call, which a model
+            // that pipelines its prefill runs one micro-batch at a time: such a
+            // step keeps the scheduler's own, budget-bounded size.
+            int s0 = seq.NumComputedTokens, s1 = s0 + step;
+            foreach (var span in seq.MediaSpans)
+                if (span.Start < s1 && span.End > s0) return;
+            cap = step;
+            tokenBudget = Math.Max(tokenBudget, step);
         }
 
         /// <summary>Choose a latency cap for mixed work, or an even share of the

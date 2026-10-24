@@ -200,7 +200,7 @@ MiniMax-H3 对**一条**无 mask 的打包序列做双向注意力——文本�
 
 #### 后端没有 kernel 的 flash-attention 形状
 
-`ggml_backend_graph_compute` 从不询问 `ggml_backend_supports_op`。因此 ggml-cuda 没有 kernel 的 `GGML_OP_FLASH_ATTN_EXT` 节点会一路走到 `ggml_cuda_flash_attn_ext`，以 `ggml-cuda/fattn.cu:730: fatal error`（`BEST_FATTN_KERNEL_NONE`）终止整个进程。在 ggml 456172ec（`eng/Dockerfile.gb10` 固定的未修改修订版；默认构建跟踪 `master`，见[前置要求](#前置要求)）中，`ggml_cuda_get_best_fattn_kernel` 在以下情况返回 none：
+`ggml_backend_graph_compute` 从不询问 `ggml_backend_supports_op`。因此 ggml-cuda 没有 kernel 的 `GGML_OP_FLASH_ATTN_EXT` 节点会一路走到 `ggml_cuda_flash_attn_ext`，以 `ggml-cuda/fattn.cu:730: fatal error`（`BEST_FATTN_KERNEL_NONE`）终止整个进程。在 ggml 456172ec 中，`ggml_cuda_get_best_fattn_kernel` 在以下情况返回 none：
 
 - K 的 head 大小不是 40、64、72、80、96、112、128 或 256（V 的 head 大小相同），也不是 192（V 为 128）、320（V 为 256）、512 或 576（V 为 512）；
 - head 大小为 192、320、512 或 576，但 grouped-query 路径不成立：它要求 query/KV head 之比至少为 2（192 时为 8 的倍数，320 时为 32 的倍数）、有 mask、没有 ALiBi、KV 长度是 256（`FATTN_KQ_STRIDE`）的倍数，并且未量化的 Q/K/V/mask 的每个 `nb[1..3]` 都能被 16 整除；
@@ -253,7 +253,8 @@ macOS 27 SDK 默认按 Metal 4.1 编译 Metal shader，其地址空间规则会�
 
 ### GB10 / DGX Spark 构建容器（实验性）
 
-`eng/Dockerfile.gb10` 在**原生 Linux ARM64 Docker 构建机**上构建本 checkout 的主解决方案与原生 GGML/CUDA 代码。它固定了 CUDA 13.0.2 组件、.NET SDK 10.0.401 以及未经修改的 GGML 修订版 `456172ec733a135778adcd32d00e576a58232e45`。精度相关 kernel 仍位于 TensorSharp 自有代码中；构建会检查获取到的 ggml 工作树未被修改。SDK 与干净的 Ubuntu 镜像按 digest 固定；NVIDIA 签名软件源提供显式指定版本的编译器、运行时与 cuBLAS 包，从而避免把完整 CUDA devel 镜像的 profiler 与无用数学库拉到小型托管 runner 上。未使用的 cuBLAS 静态库在安装层中删除；动态链接的 CUDA 库及其许可声明保持不变。Ubuntu 构建依赖从 Ubuntu 软件源安装。这是构建/开发镜像，不是部署镜像；下文的 `runtime` 与 `artifacts` target 负责生成并验证部署布局。
+`eng/Dockerfile.gb10` 在**原生 Linux ARM64 Docker 构建机**上构建本 checkout 的主解决方案与原生 GGML/CUDA 代码。它固定了 CUDA 13.0.2 组件、.NET SDK 10.0.401 以及未经修改的 GGML 修订版 `da8e2a54b919557b816b1c2beb432ccb766f7ce0`。
+该修订版提供 TensorSharp Q8 激活 kernel 使用的 CUDA MMQ 精度配置 API；获取的上游工作树必须保持未修改。精度相关 kernel 仍位于 TensorSharp 自有代码中；构建会检查获取到的 ggml 工作树未被修改。SDK 与干净的 Ubuntu 镜像按 digest 固定；NVIDIA 签名软件源提供显式指定版本的编译器、运行时与 cuBLAS 包，从而避免把完整 CUDA devel 镜像的 profiler 与无用数学库拉到小型托管 runner 上。未使用的 cuBLAS 静态库在安装层中删除；动态链接的 CUDA 库及其许可声明保持不变。Ubuntu 构建依赖从 Ubuntu 软件源安装。这是构建/开发镜像，不是部署镜像；下文的 `runtime` 与 `artifacts` target 负责生成并验证部署布局。
 
 在仓库根目录、可用的 ARM64 构建机上运行：
 
@@ -336,7 +337,7 @@ TensorSharp/
 │   ├── Skills/                  # Agent Skills：SKILL.md frontmatter 解析（YamlFrontmatter、SkillManifest）、未配置技能根目录时使用的仓库技能根——从工作目录向上直到 Git 根目录的每个已存在的 .agents/skills（由近及远），排在 <程序目录>/skills 之前（SkillDiscovery）、发现 / 安装 / 查找（SkillRegistry、SkillArchive）、目录边界约束（SkillPathGuard）、提示词规划（SkillPrompt）、内置的 skills_list / skills_read / skills_run 工具与进程内披露循环（SkillTools、SkillAgentLoop、SkillScriptRunner）、共用的参数解析（SkillHostOptions）以及对外客户端（SkillsChatClient），以及各平台沙箱（SkillSandbox、SkillSandboxWindows）及其违规监视器、会话级工作区（SessionWorkspace）
 │   └── CodeExec/                # 文件工具（read_file、write_file）、shell 与 apply_patch：执行引擎（ShellRunner）、提供给模型的四个工具声明——read_file、apply_patch、write_file（仅用于新建文件）与 shell——以及小模型所需的宽松参数读取（ShellTools）、command 参数的解读——把一行命令拆成各个简单命令、判定其中哪些是软件包安装（这决定了这一行到底能不能拿到套接字）、并在 shell 看到之前拦截 apply_patch heredoc（ShellCommand）、会话级的工作目录与导出环境变量——因为没有常驻的 shell 进程，它们通过文件持久化（ShellSession）、shell 的发现与方言（ShellProgram）、补丁信封解析（CodePatch）及其匹配引擎——对参考实现 V4A applier 的逐行移植（V4ADiff）、把一次失败改写成下一条该敲的命令（CodeDiagnostics）、当一次运行是因为模型猜错了库的 API 而失败时，直接从已安装的包里读出真实 API（ApiProbe）、检查命令写入或补丁改动后的文件是否仍能解析（SyntaxCheck）、把宿主的绝对路径从命令的全部输出中改写掉（OutputPaths）、字符串替换编辑器及其容错阶梯——已不再向模型提供，仅为让旧客户端的编辑调用仍能分派而保留（FileEdit）、所有工具与拒绝信息展示文件时共用的带行号清单渲染器（NumberedListing）、注入系统提示词的八条编辑规则（CodePrompt）、发现「为改两行而重打整个文件」的行为（RewriteWatch）、为 import 失败的技能脚本由宿主发起的安装（PackageInstaller）、宿主侧的执行条款（CodeExecOptions）、受限启动——它也可以只启动进程而不等它结束，后台任务即由此实现（ConfinedProcess）、解释器发现（CodeEnvironment）、产物捕获（CodeArtifactStore）、安装期的软件源代理（EgressProxy）、结果记录（CodeExecResult），以及技能层所见的 ICodeRunner 接缝（CodeRunnerAdapter）
 ├── TensorSharp.Models/          # 模型架构实现与多模态编码/注入
-│   ├── Models/<Family>/         # 每个架构一个目录（DeepSeek4、DiffusionGemma、Gemma4、GlmDsa、GptOss、HunyuanDense、MiniMaxH3、Mistral3、MuseGlimmer、Nemotron、Qwen35、Qwen4Exp、QwenImage、WanVideo）
+│   ├── Models/<Family>/         # 每个架构一个目录（DeepSeek4、DiffusionGemma、Gemma4、GlmDsa、GptOss、HunyuanDense、Ltx25、MiniMaxH3、Mistral3、MuseGlimmer、MuseSpark、Nemotron、Qwen35、Qwen4Exp、QwenImage、WanVideo）
 │   │   ├── <Family>Architecture.cs         # 在 Architecture/BuiltInArchitectures.cs 中登记的插件描述符
 │   │   ├── <Family>Model.cs                # 旧的单序列 ModelBase 实现
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch —— 批处理/分页路径（Mistral3、Gemma4、GptOss、HunyuanDense、Qwen35、Nemotron）
@@ -348,6 +349,7 @@ TensorSharp/
 │   │   └── DeepSeek4Model.PerSeqCache.cs   # 让该模型可被服务端托管的原生 per-sequence slot
 │   ├── Models/GlmDsa/           # GLM 5.x：原生执行器驱动、MLA + DSA indexer 逐算子参考实现、序列 slot、NextN/MTP 草稿头
 │   ├── Models/MuseGlimmer/      # Muse-Glimmer：融合整模型前向、视觉编码器、张量并行变体、DFlash 块级草稿器
+│   ├── Models/MuseSpark/        # Muse Spark：原生整模型执行器（按层切分与 `--tp`）的托管驱动（MuseSparkModel.Native.cs）、带注意力/专家张量并行与整层放置的逐算子参考前向（`TS_MUSE_SPARK_NATIVE=0`、Vulkan 上的 `--tp`）、视觉、前缀缓存
 │   ├── Models/MiniMaxH3/        # MiniMax-H3 视频 + 联合 32 kHz 立体声音频：打包序列 DiT、Qwen3-VL 文本编码器与视觉塔、视频与音频 VAE、flow-match 调度器、pipeline
 │   ├── Models/WanVideo/         # Wan 2.1/2.2，仅视频：DiT、UMT5-XXL 文本编码器、因果 3D VAE、UniPC 调度器，以及不依赖 ggml 的 WanDirect* `cuda`/`cpu` 路径
 │   ├── Models/Video/            # 两个视频家族共同实现的接缝：IVideoGenerationModel、VideoGenerationParams/Progress、GeneratedVideoAudio、WAV 写出
@@ -383,6 +385,10 @@ TensorSharp/
 │   ├── ggml_ops_muse_glimmer.cpp          # Muse-Glimmer 整模型前向：decode 用持久图（供 ggml-cuda 捕获 CUDA 图）、prefill 用瞬时图，另含张量并行图
 │   ├── ggml_ops_muse_glimmer_vision.cpp   # Muse-Glimmer ViT 块的设备端实现（最大尺寸图像有 16,224 个 patch，逐算子派发会让每步都经宿主同步）
 │   ├── ggml_ops_dflash.cpp                # Muse-Glimmer DFlash 块级草稿器，每个投机步融合为一张图（草稿块 + 借用主干的 LM head）
+│   ├── ggml_ops_muse_spark_exec.cpp       # Muse Spark 原生整模型执行器：分片 GGUF 加载、最多 16 张 GPU 的整层与按专家栈放置、NUMA 本地主机专家、按 slot 的 F16 KV 与滑动窗口环、每个微批一张图、按层切分的流水线 prefill、批处理 decode/prefill、slot 检查点、基于 ggml meta 后端的张量并行
+│   ├── ggml_ops_muse_spark_tp.cpp         # Muse Spark 原生张量并行切分方案：注意力按 KV 组、路由专家沿 n_ff、输出头按词表行（ctest `muse-spark-tp-split-plan`）
+│   ├── ggml_ops_cuda_vmm_peer_guard.cpp   # Linux `--wrap=cuMemSetAccess` 保护层：CUDA 的 8 个 peer 上限拒绝授权时，让 ggml-cuda 的 VMM 临时内存池只归其所属 GPU（ctest `cuda-vmm-peer-guard`）
+│   ├── ggml_ops_muse_spark{,_attention}.cpp # Muse Spark 逐算子路径：Q/K 预处理、norm/gate 与 post-norm 残差图、显式 F32 的 CUDA 注意力
 │   ├── ggml_ops_dsv4_fused.cu / _cpu.cpp  # DeepSeek V4 在 ggml-cuda 流上的融合自定义算子（及其 CPU 版本）
 │   ├── ggml_ops_gemma4_decode.cpp         # Gemma 4 稠密整模型 decode（CUDA graph 持久化）
 │   ├── ggml_ops_gemma4_batched.cpp        # Gemma 4 稠密 + MoE 按 token 批量 decode
@@ -564,7 +570,7 @@ TensorSharp 采用分层系统结构：
 
 2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析、分页 KV 缓存（`Runtime/Paged/*`）、连续批处理调度器 / 引擎（`Runtime/Scheduling/*`），以及 `IModelArchitecture`、`IBatchedPagedModel`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IBackendExecutionPlan` 等抽象。它刻意不包含智能体层：技能、代码执行与子智能体委派位于 **TensorSharp.AgentHost**，该项目引用运行时、且运行时绝不反向引用，因此只需提供 OpenAI / Ollama 聊天补全的宿主可以只依赖运行时，不携带技能注册表、沙箱与代码执行器。（若该方向被反转，`AgentHostLayeringTests` 会失败。）
 
-3. **TensorSharp.Models** 实现 `ModelBase` 以及已登记的全部 16 个架构描述符（`Architecture/BuiltInArchitectures.cs`）和多模态辅助组件——12 个文本家族（DeepSeek V4 Flash、DeepSeek V4.1 Flash、GLM 5.x、Gemma 4、DiffusionGemma、Qwen 3.5/3.6 系列、Qwen 3.8 Flash Next、GPT OSS、Nemotron-H、Mistral 3、Hunyuan Dense、Muse-Glimmer）与 4 个媒体输出家族（Qwen-Image-2.1、LTX 2.5、MiniMax-H3、Wan 2.1/2.2）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-2.1（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像生成与编辑通过 `GenerateImage()` / `EditImage()` 进行，由它们编排扩散 Transformer、专用 2.1 VAE 与 Qwen3-VL-8B 文本编码器。LoRA 插件（`--lora` / `--lora-scale` / `--lora-config`，由 `TensorSharp.Runtime/LoraSpec.cs` 为两个宿主统一解析）以不合并的方式作用于扩散 Transformer（`QwenImage21LoraSet`）；`config/lora/` 提供十四个预设。视频家族更进一步：`Ltx25Model`、`MiniMaxH3Model` 与 `WanVideoModel` 的 `ForwardCore()` 都直接抛异常，生成统一走 `GenerateVideo(prompt, VideoGenerationParams)`，其背后是 `Models/Video/` 里共享的 `IVideoGenerationModel` 接缝——CLI 与服务端因此只用一条路径驱动这三者，而不必逐个判断具体模型类型。LTX 2.5 通过专用 Gemma 4 编码器、48 kHz AV 去噪器、2 倍潜变量放大器与视频 / 音频 VAE 执行两阶段蒸馏管线（CUDA / MLX / 直接 CPU 执行器）。MiniMax-H3 在同一个打包 latent 里**同时**去噪视频与 32 kHz 立体声音频，共有七张原生整网络计算图（DiT、Qwen3-VL 文本编码器、视觉塔、视频与音频 VAE 的编码与解码）；Wan 2.1/2.2 则是仅视频的家族，其 DiT、UMT5-XXL 编码器与因果 3D VAE 同样以整图方式运行。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构——不带架构元数据的文件例外，它们依据张量识别：MiniMax-H3 公开发布的 GGUF 完全不带元数据（`LooksLikeMiniMaxH3`，经由 `MiniMaxH3Architecture.DetectFromTensors` 接入），不带元数据的 Qwen-Image-2.1 GGUF（例如 Unsloth 的 Q8_0）也是如此（`QwenImageArchitecture.DetectFromTensors`）。以通用 `llama` 标签发布的文件则由描述符的 `RecognizeRelabelledFile` 逐个文件认领，目前只有 Mistral 3 实现了它（例如标为 `llama` 的 Mistral Small 3.1）。
+3. **TensorSharp.Models** 实现 `ModelBase` 以及已登记的全部 17 个架构描述符（`Architecture/BuiltInArchitectures.cs`）和多模态辅助组件——13 个文本家族（DeepSeek V4 Flash、DeepSeek V4.1 Flash、GLM 5.x、Gemma 4、DiffusionGemma、Qwen 3.5/3.6 系列、Qwen 3.8 Flash Next、GPT OSS、Nemotron-H、Mistral 3、Hunyuan Dense、Muse-Glimmer、Muse Spark）与 4 个媒体输出家族（Qwen-Image-2.1、LTX 2.5、MiniMax-H3、Wan 2.1/2.2）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-2.1（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像生成与编辑通过 `GenerateImage()` / `EditImage()` 进行，由它们编排扩散 Transformer、专用 2.1 VAE 与 Qwen3-VL-8B 文本编码器。LoRA 插件（`--lora` / `--lora-scale` / `--lora-config`，由 `TensorSharp.Runtime/LoraSpec.cs` 为两个宿主统一解析）以不合并的方式作用于扩散 Transformer（`QwenImage21LoraSet`）；`config/lora/` 提供十四个预设。视频家族更进一步：`Ltx25Model`、`MiniMaxH3Model` 与 `WanVideoModel` 的 `ForwardCore()` 都直接抛异常，生成统一走 `GenerateVideo(prompt, VideoGenerationParams)`，其背后是 `Models/Video/` 里共享的 `IVideoGenerationModel` 接缝——CLI 与服务端因此只用一条路径驱动这三者，而不必逐个判断具体模型类型。LTX 2.5 通过专用 Gemma 4 编码器、48 kHz AV 去噪器、2 倍潜变量放大器与视频 / 音频 VAE 执行两阶段蒸馏管线（CUDA / MLX / 直接 CPU 执行器）。MiniMax-H3 在同一个打包 latent 里**同时**去噪视频与 32 kHz 立体声音频，共有七张原生整网络计算图（DiT、Qwen3-VL 文本编码器、视觉塔、视频与音频 VAE 的编码与解码）；Wan 2.1/2.2 则是仅视频的家族，其 DiT、UMT5-XXL 编码器与因果 3D VAE 同样以整图方式运行。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构——不带架构元数据的文件例外，它们依据张量识别：MiniMax-H3 公开发布的 GGUF 完全不带元数据（`LooksLikeMiniMaxH3`，经由 `MiniMaxH3Architecture.DetectFromTensors` 接入），不带元数据的 Qwen-Image-2.1 GGUF（例如 Unsloth 的 Q8_0）也是如此（`QwenImageArchitecture.DetectFromTensors`）。以通用 `llama` 标签发布的文件则由描述符的 `RecognizeRelabelledFile` 逐个文件认领，目前只有 Mistral 3 实现了它（例如标为 `llama` 的 Mistral Small 3.1）。
 
 4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps` / `GgmlOps.dll`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Windows/Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。除原生量化 matmul（Q4_K_M、Q8_0 等，无需反量化到 FP32）外，还提供分页注意力（`TSGgml_PagedAttentionForward`，含 / 不含注意力 sinks 两种版本）以及架构特定的批处理内核（Mamba2、GatedDeltaNet）。
 

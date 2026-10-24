@@ -468,19 +468,11 @@ public static partial class ModelCatalog
             denoiser: new CatalogFile(CatalogFileRole.Weights, "minimax_h3_fl2va_pruned-Q4_K.gguf",
                 Hf("unsloth/MiniMax-H3-GGUF", "minimax_h3_fl2va_pruned-Q4_K.gguf"),
                 11_420_663_904, "dd948e08ad0ba3c71bd42f368e283dd82e790f5122a63b276e22a3e0283d0c10"),
-            // Photos are keyframes here: one is the clip's first frame, two its first and last.
-            modalities: CatalogModalities.Image,
-            notes: "catalog.model.minimaxH3Fl2va.notes"),
-        MiniMaxH3(
-            id: "minimax-h3-ref2va-q4k",
-            displayName: "MiniMax-H3 References",
-            // The checkpoint is chosen by the "ref2va" in this name (MiniMaxH3Config.PartitionFromFileName).
-            denoiser: new CatalogFile(CatalogFileRole.Weights, "minimax_h3_ref2va_pruned-Q4_K.gguf",
+            referenceDenoiser: new CatalogFile(CatalogFileRole.SecondaryWeights, "minimax_h3_ref2va_pruned-Q4_K.gguf",
                 Hf("unsloth/MiniMax-H3-GGUF", "minimax_h3_ref2va_pruned-Q4_K.gguf"),
                 11_381_096_544, "2fa5840021cf6967843eaeefde9aaa277e540de02986d5ee3d5b0e6a7a8c9dec"),
-            // Photos, clips and recordings are references for a new scene, up to nine.
             modalities: CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio,
-            notes: "catalog.model.minimaxH3Ref2va.notes"),
+            notes: "catalog.model.minimaxH3.notes"),
         Ltx25Distilled(),
     }.Concat(ExtendedModels()).ToArray();
 
@@ -540,13 +532,13 @@ public static partial class ModelCatalog
         2_786_568_256, "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6", Optional: true);
 
     /// <summary>
-    /// A MiniMax-H3 entry: one of its two denoisers (it is two checkpoints, not a setting)
-    /// plus the files both share. The shared ones are byte-identical between the entries,
-    /// so a second entry links the first one's copies instead of downloading 24 GB again
-    /// (ModelStore), and only its denoiser is new.
+    /// A MiniMax-H3 entry: its primary FL2VA denoiser, the companion Ref2VA denoiser, and
+    /// the files they share. Video Studio switches denoisers per shot while keeping the
+    /// shared text encoder and VAEs loaded with the model.
     /// </summary>
     private static CatalogModel MiniMaxH3(
-        string id, string displayName, CatalogFile denoiser, CatalogModalities modalities, string notes) => new()
+        string id, string displayName, CatalogFile denoiser, CatalogFile referenceDenoiser,
+        CatalogModalities modalities, string notes) => new()
     {
         Id = id,
         DisplayName = displayName,
@@ -557,6 +549,7 @@ public static partial class ModelCatalog
         Files = new[]
         {
             denoiser,
+            referenceDenoiser,
             // Truncated to the 50 layers H3 reads, and carrying the Qwen3-VL vision tower that
             // presents a photo to the prompt.
             new CatalogFile(CatalogFileRole.TextEncoder, "qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
@@ -639,6 +632,8 @@ public static partial class ModelCatalog
         "ltx-2.5-distilled-q4km",
         "qwen-image-2.1-turbo-adq4k",
         "qwen-image-2.1-turbo-q8",
+        // Folded into MiniMax-H3's single catalog entry on 2026-10-19.
+        "minimax-h3-ref2va-q4k",
     };
 
     /// <summary>
@@ -655,6 +650,7 @@ public static partial class ModelCatalog
             ["ltx-2.5-distilled-q4km"] = "ltx-2.5-distilled-q4kxl",
             ["qwen-image-2.1-turbo-adq4k"] = "qwen-image-2.1-turbo-q5ks",
             ["qwen-image-2.1-turbo-q8"] = "qwen-image-2.1-turbo-q8-0",
+            ["minimax-h3-ref2va-q4k"] = "minimax-h3-fl2va-q4k",
         };
 
     /// <summary>Whether <paramref name="id"/> is one of the <see cref="Retired"/> ids.</summary>

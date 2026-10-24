@@ -58,14 +58,28 @@ public:
     // No full expert tensor is allocated on any participating rank.
     void add_layer(int layer, const source & gate, const source & up,
                    const source & down, float clamp_limit);
+    // Release each layer's source pages once its strips are uploaded (the
+    // loader's TS_DSV4_LOAD_DROP_CACHE rule). Set before add_layer.
+    void set_drop_source_cache(bool drop);
     bool has_layer(int layer) const;
     size_t rank_weight_bytes(int rank) const;
 
     // F32 x[embedding,tokens], routing weights[1,used,tokens], and I32 expert
-    // IDs[used,tokens] -> routed output[embedding,tokens]. Pin this boundary
-    // node to CPU; ordinary attention/shared-expert placement stays unchanged.
+    // IDs[used,tokens] -> routed output[embedding,tokens], as a
+    // TSG_DSV41_TP_MOE fused node. Pin it to the layer device's fused CUDA
+    // backend when device_resident(): the node then enqueues every rank behind
+    // that device's stream with no host synchronization. Pinned to the CPU
+    // backend it drives the ranks synchronously from the host instead.
+    //
+    // With `after` (device-resident only), build a launch node and a gather
+    // node instead: ggml then orders `after` (the shared expert) between
+    // them, so the layer device computes it while the ranks run. The returned
+    // gather's src[0] is the launch node; pin both to the layer device.
     ggml_tensor * build(ggml_context * ctx, int layer, ggml_tensor * x,
-                        ggml_tensor * weights, ggml_tensor * ids);
+                        ggml_tensor * weights, ggml_tensor * ids, ggml_tensor * after = nullptr);
+    // Every rank is a CUDA device, so build()'s node can run on a fused
+    // CUDA backend (TensorSharp's ggml_ops_dsv4_fused).
+    bool device_resident() const;
 
     // Native graph callbacks cannot return a status. They fill NaNs on error;
     // callers must inspect this after graph execution and refuse generation.

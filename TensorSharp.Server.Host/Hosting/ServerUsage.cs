@@ -311,9 +311,11 @@ namespace TensorSharp.Server.Host.Hosting
                 new OptionHelp("--draft-model <path>",
                     "A drafter that ships as its own GGUF, whatever its kind: DeepSeek V4's DSpark, the DFlash / " +
                     "DFlash2 drafters for Muse-Glimmer and Qwen 3.8 27B, Qwen 3.8 Flash Next's (qwen4exp) shared " +
-                    "MTP head, Gemma 4's per-token assistant head, or - experimental - a deepseek41-dspark " +
-                    "drafter for DeepSeek V4.1 (ggml_cuda and ggml_cpu only; validated on synthetic fixtures " +
-                    "only, no trained V4.1 drafter measured). " +
+                    "MTP head, Gemma 4's per-token assistant head, or a DSpark drafter for DeepSeek V4.1 " +
+                    "(ggml_cuda and ggml_cpu only): deepseek41-dspark, or the dflash file published beside " +
+                    "unsloth's V4.1-Flash-1017 GGUFs, which must match the target's deepseek41.dspark.* " +
+                    "metadata. Only the dflash Q8_0 drafter has been measured, on ggml_cuda (80% acceptance, " +
+                    "about 1.7x decode on a code prompt); deepseek41-dspark is validated on synthetic fixtures only. " +
                     "The file's own general.architecture decides how it loads (a block drafter is fused before " +
                     "the layer split, a per-token head attaches after) - never its file name, and never a " +
                     "second flag. Naming the file IS the request: speculation turns on with it, no --spec " +

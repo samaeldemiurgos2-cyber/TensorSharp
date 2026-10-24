@@ -35,6 +35,9 @@ namespace TensorSharp.Models
         public IMultimodalInjector MultimodalInjector { get; }
         public IBackendExecutionPlan ExecutionPlan { get; }
 
+        /// <summary>Every GGUF file opened for this checkpoint, including sibling shards.</summary>
+        public IReadOnlyList<string> ModelFilePaths => _gguf?.FilePaths ?? Array.Empty<string>();
+
         protected readonly GgufFile _gguf;
         private readonly GgmlContext _ggmlContext;
         // False when the context belongs to a caller-supplied tensor-parallel group, which
@@ -3014,7 +3017,9 @@ namespace TensorSharp.Models
 
             tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup,
                 out int layerSplit, layerSplitDegree);
-            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit);
+            // Direct executors enumerate physical shards themselves and need the
+            // canonical first path just as the metadata probe does.
+            var context = new ModelCreateContext(probe.FilePaths[0], backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit);
             architecture.ApplyNativeTunables?.Invoke(context);
             ModelBase model = architecture.Factory(context);
             model.VerifyTensorParallelShardedWeights(architecture.Id);

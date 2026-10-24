@@ -835,7 +835,11 @@ namespace TensorSharp.Runtime
             {
                 try
                 {
-                    var preprocessed = InjectMultimodalTokens(messages, architecture);
+                    // Spark escapes control tokens in caller text. Keep media as
+                    // typed content parts so real image placeholders are produced by
+                    // the template, while literal markers in text remain escaped.
+                    var preprocessed = protocol?.Id == "muse-spark"
+                        ? messages : InjectMultimodalTokens(messages, architecture);
                     string effectiveTemplate = EnableGemma4CachedToolReasoningReplay(
                         template, preprocessed, architecture);
                     var jinja = new Jinja2Template(effectiveTemplate);
@@ -858,7 +862,7 @@ namespace TensorSharp.Runtime
                         // user's question is dropped from the prompt entirely and the model
                         // generates text unrelated to the prompt. Detect that here and fall
                         // back to the hardcoded template, which always emits message content.
-                        if (!RenderedContainsLastUserText(result, messages))
+                        if (!RenderedContainsLastUserText(result, messages, protocol?.Id == "muse-spark"))
                         {
                             WarnTemplateFallbackOnce(architecture, "dropped-user-message",
                                 "the rendered prompt dropped the last user message (lightweight-Jinja-engine guard).");
@@ -924,7 +928,8 @@ namespace TensorSharp.Runtime
         /// Returns true (i.e. "looks fine") when there is no user text to verify
         /// (e.g. an image-only turn).
         /// </summary>
-        private static bool RenderedContainsLastUserText(string rendered, List<ChatMessage> messages)
+        private static bool RenderedContainsLastUserText(string rendered, List<ChatMessage> messages,
+            bool escapeMuseControlTokens = false)
         {
             if (messages == null)
                 return true;
@@ -940,6 +945,11 @@ namespace TensorSharp.Runtime
             }
 
             string needle = NormalizeNewlines(lastUserText).Trim();
+            if (escapeMuseControlTokens)
+                needle = needle.Replace("<|", "< |", StringComparison.Ordinal)
+                    .Replace("<image>", "< image>", StringComparison.Ordinal)
+                    .Replace("<video>", "< video>", StringComparison.Ordinal)
+                    .Replace("<audio>", "< audio>", StringComparison.Ordinal);
             if (needle.Length == 0)
                 return true;
 
@@ -1565,6 +1575,7 @@ namespace TensorSharp.Runtime
             // what past turns look like. See ChatProtocol.RendersAssistantReasoning.
             bool passReasoning =
                 ChatProtocolRegistry.For(architecture)?.RendersAssistantReasoning ?? false;
+            bool isMuseSpark = ChatProtocolRegistry.For(architecture)?.Id == "muse-spark";
 
             BuildJinjaToolIds(messages, out string[][] callIds, out string?[] resultIds);
             var msgList = new List<object>();
@@ -1576,6 +1587,22 @@ namespace TensorSharp.Runtime
                     ["role"] = m.Role ?? "",
                     ["content"] = m.Content ?? ""
                 };
+                if (isMuseSpark && m.ImagePaths is { Count: > 0 })
+                {
+                    var parts = new List<object>();
+                    if (m.IsVideo)
+                        parts.Add(new Dictionary<string, object> { ["type"] = "video" });
+                    else
+                        foreach (var _ in m.ImagePaths)
+                            parts.Add(new Dictionary<string, object> { ["type"] = "image" });
+                    parts.Add(new Dictionary<string, object> { ["type"] = "text", ["text"] = m.Content ?? "" });
+                    dict["content"] = parts;
+                }
+                // Spark retains explicitly supplied assistant reasoning in history.
+                // Cached raw-token placeholders clear Thinking before this point,
+                // so their already-framed reasoning is never rendered twice.
+                if (isMuseSpark && m.Role == "assistant" && !string.IsNullOrEmpty(m.Thinking))
+                    dict["reasoning_content"] = m.Thinking;
                 if (resultIds[messageIndex] != null)
                     dict["tool_call_id"] = resultIds[messageIndex]!;
                 if (passReasoning
@@ -1650,6 +1677,8 @@ namespace TensorSharp.Runtime
             // toggling thinking between two turns of one chat diverged the prompt at
             // the tool block and re-prefilled the whole conversation.
             ctx["enable_thinking"] = enableThinking;
+            if (isMuseSpark)
+                ctx["disable_reasoning"] = !enableThinking;
             // Keep an omitted setting undefined so each published template can
             // apply its own default, rather than imposing Harmony's default.
             if (!string.IsNullOrWhiteSpace(reasoningEffort))

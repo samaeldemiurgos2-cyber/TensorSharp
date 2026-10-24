@@ -138,7 +138,9 @@ public sealed class VideoTurnsTests
         Assert.Equal(new[] { 0, 8, 16 }, conditions.EnumerateArray().Select(c => c.GetProperty("frameIndex").GetInt32()));
         Assert.False(payload.ContainsKey("referenceImages"));
         Assert.NotNull(VideoTurns.Read(Body(new { role = "user", content = "x", audioPaths = new[] { "a.wav" } }), model).Error);
-        Assert.NotNull(VideoTurns.Read(Body(new { role = "user", content = "x", videoFilePaths = new[] { "a.mp4" } }), model).Error);
+        var continuation = Payload(VideoTurns.Read(Body(new { role = "user", content = "x", videoFilePaths = new[] { "a.mp4" } }), model));
+        Assert.Equal(new[] { "a.mp4" }, continuation["continueFromVideos"]);
+        Assert.Equal("i2v", continuation["videoMode"]);
         Assert.Contains("Ingredients", VideoTurns.Read(Body(new { role = "user", content = "x", videoMode = "ref",
             stillImagePaths = new[] { "a.png" } }), model).Error);
         Assert.NotNull(VideoTurns.Read(Body(new { role = "user", content = "x",
@@ -244,13 +246,12 @@ public sealed class VideoTurnsTests
         Assert.Null(three.Payload);
         Assert.Contains("two", three.Error);
 
-        VideoTurns.VideoRequest clip = VideoTurns.Read(Body(new
+        Dictionary<string, object> clip = Payload(VideoTurns.Read(Body(new
         {
             role = "user", content = "x", videoFilePaths = new[] { "clip.mp4" },
-        }), new FakeVideoModel { SupportsImageConditioning = true, SupportsEndImageConditioning = true, VideoModelFamily = "minimax-h3" });
-        Assert.Null(clip.Payload);
-        // It names the entry that can, which is what the user can act on.
-        Assert.Contains("MiniMax-H3 References", clip.Error);
+        }), new FakeVideoModel { SupportsImageConditioning = true, SupportsEndImageConditioning = true, VideoModelFamily = "minimax-h3" }));
+        Assert.Equal(new[] { "clip.mp4" }, clip["continueFromVideos"]);
+        Assert.Equal("i2v", clip["videoMode"]);
 
         VideoTurns.VideoRequest sound = VideoTurns.Read(Body(new
         {
@@ -260,21 +261,19 @@ public sealed class VideoTurnsTests
     }
 
     [Fact]
-    public void OnTheReferenceCheckpointEveryAttachmentIsAReference()
+    public void ReferenceModeKeepsPhotosAndSoundsAsReferences()
     {
         Dictionary<string, object> payload = Payload(VideoTurns.Read(Body(new
         {
             role = "user",
             content = "they dance in the rain",
             stillImagePaths = new[] { "p1.png", "p2.png" },
-            // A clip's sampled frames are in imagePaths too; they are not photos.
-            imagePaths = new[] { "p1.png", "p2.png", "frame1.png", "frame2.png" },
-            videoFilePaths = new[] { "clip.mp4" },
+            imagePaths = new[] { "p1.png", "p2.png" },
             audioPaths = new[] { "song.wav" },
         }), References));
 
         Assert.Equal(new[] { "p1.png", "p2.png" }, payload["referenceImages"]);
-        Assert.Equal(new[] { "clip.mp4" }, payload["referenceVideos"]);
+        Assert.False(payload.ContainsKey("referenceVideos"));
         Assert.Equal(new[] { "song.wav" }, payload["referenceAudios"]);
         Assert.Equal("ref", payload["videoMode"]);
         Assert.False(payload.ContainsKey("imagePath"), "a reference is not a first frame");

@@ -15,6 +15,7 @@ using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp.Models.Media;
+using TensorSharp.Models.QwenImage;
 
 namespace TensorSharp.Models
 {
@@ -28,6 +29,42 @@ namespace TensorSharp.Models
     /// </summary>
     public static class MediaHelper
     {
+        /// <summary>Decode the exact final frame of a video into the models' canonical
+        /// RGB01 image representation. This is used when a new generation continues
+        /// from a reference clip; the sparse vision-frame sampler may stop before the
+        /// clip's actual end.</summary>
+        public static RgbImage ExtractLastVideoFrame(string videoPath)
+        {
+            if (string.IsNullOrWhiteSpace(videoPath)) throw new ArgumentNullException(nameof(videoPath));
+            IVideoDecoder decoder = MediaCodecs.Video;
+            VideoInfo info = decoder.Probe(videoPath);
+            if (info.FrameCount <= 0)
+                throw new InvalidOperationException($"Invalid video: fps={info.Fps}, frames={info.FrameCount}");
+
+            RgbImage last = null;
+            decoder.ReadFrames(videoPath, new[] { info.FrameCount - 1 }, (index, bytes, width, height, stride, layout) =>
+            {
+                int channels = layout is PixelLayout.Bgra or PixelLayout.Rgba ? 4 : 3;
+                if (width <= 0 || height <= 0 || stride < width * channels || bytes.Length < (long)stride * height)
+                    throw new InvalidOperationException("The video decoder returned an invalid final-frame buffer.");
+                bool bgr = layout is PixelLayout.Bgr or PixelLayout.Bgra;
+                var rgb = new float[checked(width * height * 3)];
+                float[] alpha = channels == 4 ? new float[checked(width * height)] : null;
+                for (int y = 0; y < height; ++y)
+                    for (int x = 0; x < width; ++x)
+                    {
+                        int source = y * stride + x * channels;
+                        int target = (y * width + x) * 3;
+                        rgb[target] = bytes[source + (bgr ? 2 : 0)] / 255f;
+                        rgb[target + 1] = bytes[source + 1] / 255f;
+                        rgb[target + 2] = bytes[source + (bgr ? 0 : 2)] / 255f;
+                        if (alpha != null) alpha[y * width + x] = bytes[source + 3] / 255f;
+                    }
+                last = new RgbImage(width, height, rgb, alpha);
+            });
+            return last ?? throw new InvalidOperationException($"Could not decode the final frame of '{videoPath}'.");
+        }
+
         /// <summary>
         /// Frames sampled per second of video when no explicit rate is supplied.
         /// Overridable via the <c>VIDEO_SAMPLE_FPS</c> environment variable.

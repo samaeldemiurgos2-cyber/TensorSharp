@@ -73,6 +73,7 @@ namespace TensorSharp.Runtime.Scheduling
             _scheduler = new ContinuousBatchScheduler(cfg, _pool, logger,
                 supportsCrossSequenceKvReuse: model.SupportsCrossSequenceKvReuse,
                 requiresPerBlockCapture: model.RequiresPerBlockCapture);
+            AttachSoloPrefillPolicy(model, cfg, _scheduler, _logger);
             _executor = new BatchExecutor(model, _pool, _scheduler, logger);
             _executor.InitializeRadixCache(cfg);
             // So admission can say WHY a turn reused nothing.
@@ -876,6 +877,39 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             return numBlocks;
+        }
+
+        /// <summary>Let a model with its own lone-prompt steps (<see cref="ISoloPrefillBudgetModel"/>)
+        /// size them, unless the configuration chose <see cref="SchedulerConfig.SoloPrefillChunkSize"/>.
+        /// Returns the policy attached, or null.</summary>
+        internal static ISoloPrefillBudgetModel? AttachSoloPrefillPolicy(object model, SchedulerConfig cfg,
+            ContinuousBatchScheduler scheduler, ILogger logger)
+        {
+            if (model is not ISoloPrefillBudgetModel solo)
+                return null;
+            if (cfg.SoloPrefillChunkSizeChosen)
+            {
+                logger.LogInformation(
+                    "Lone prompts prefill in the configured steps of up to {Tokens} tokens (TS_SCHED_SOLO_PREFILL_CHUNK, " +
+                    "bounded by TS_SCHED_MAX_BATCHED_TOKENS); the model's own lone-prompt steps are not used",
+                    Math.Min(cfg.SoloPrefillChunkSize, cfg.MaxNumBatchedTokens));
+                return null;
+            }
+            int step = solo.PreferredSoloPrefillTokens(0, int.MaxValue / 2);
+            if (step <= 0)
+            {
+                logger.LogInformation(
+                    "The model has no lone-prompt step of its own here (its prefill does not pipeline across devices); " +
+                    "lone prompts prefill in the scheduler's steps of up to {Tokens} tokens",
+                    Math.Min(cfg.SoloPrefillChunkSize, cfg.MaxNumBatchedTokens));
+                return null;
+            }
+            scheduler.SetSoloPrefillPolicy(solo);
+            logger.LogInformation(
+                "Lone prompts prefill in steps of up to about {Tokens} tokens chosen by the model (it pipelines each " +
+                "step across its devices); TS_SCHED_SOLO_PREFILL_CHUNK sets the scheduler's own step instead " +
+                "(bounded by TS_SCHED_MAX_BATCHED_TOKENS)", step);
+            return solo;
         }
 
         /// <summary>

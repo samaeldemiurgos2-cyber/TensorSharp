@@ -370,8 +370,7 @@ if (hostingOptions.EmbeddingsEnabled)
     if (!EmbeddingHosting.TryResolveBackend(hostingOptions, configuredBackendInput, out _, out string? embeddingBackendError))
     {
         // Idempotent, and a no-op when the backend probes initialised nothing.
-        if (!hostingOptions.UsesManagedEmbeddingBackend)
-            GgmlBasicOps.Shutdown();
+        GgmlShutdown.ShutdownIfLoaded();
         Console.Error.WriteLine(ModelLoadRefusal.FormatErrorLine(embeddingBackendError));
         Environment.ExitCode = HostExitCodes.ModelLoadRefused;
         return;
@@ -676,8 +675,7 @@ catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string? loadRefu
         // and the logger providers, so disposing it releases the model and flushes the
         // file log; the ggml backend is a process global and goes last.
         ((IDisposable)app).Dispose();
-        if (!hostingOptions.UsesManagedEmbeddingBackend)
-            GgmlBasicOps.Shutdown();
+        GgmlShutdown.ShutdownIfLoaded();
     });
     return;
 }
@@ -694,7 +692,7 @@ if (!hostingOptions.EmbeddingsEnabled
         startupLogger.LogWarning(LogEventIds.HostConfiguration, "{QwenImageSizeDefault}", sizeWarning);
 }
 
-// Prepare the prompt every conversation shares after the container is live, before
+// Prepare the prompt Web UI conversations share after the container is live, before
 // app.Run binds a socket, so warm-up cannot contend with a real request.
 //
 // The cost is that the first launch after a prompt, skills, model or DATE change does not
@@ -702,7 +700,10 @@ if (!hostingOptions.EmbeddingsEnabled
 // is the trade this feature exists to make: one slow startup instead of one slow first
 // message. Models with persistent checkpoint support can restore the shared prefix on
 // later launches from the store attached above.
-if (!hostingOptions.EmbeddingsEnabled && hostingOptions.PrefixCacheEnabled
+// API-only clients provide their own prompts and tools; warming the Web UI's skills
+// and tool catalog delays readiness without preparing those requests. Model kernel
+// warmup and normal API prefix caching remain enabled independently of this block.
+if (hostingOptions.WebUiEnabled && !hostingOptions.EmbeddingsEnabled && hostingOptions.PrefixCacheEnabled
     && TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment().EnablePrefixCaching
     && !string.IsNullOrWhiteSpace(hostingOptions.StartupModelPath)
     // Image/video diffusion models have no autoregressive chat prefix to prefill.
@@ -756,13 +757,10 @@ StartupBanner.Emit(startupLogger, hostingOptions, hostingOptions.ListenUrls);
 // set is empty; if g_backend (and its MTLBuffer wrappers) outlive the .NET
 // host the assertion aborts the process during exit. ApplicationStopped is
 // too early: DI still owns models whose native draft heads need the backend
-// while being disposed. Release the host and its services first. Shutdown is idempotent and a
-// no-op when no GGML backend was ever initialised. Also hooked onto
-// ProcessExit as a safety net for non-graceful exits.
-if (!hostingOptions.UsesManagedEmbeddingBackend)
-{
-    AppDomain.CurrentDomain.ProcessExit += static (_, _) => GgmlBasicOps.Shutdown();
-}
+// while being disposed. Release the host and its services first. Native shutdown
+// is idempotent, but its P/Invoke must not load GGML just for cleanup on a managed
+// backend. Also hooked onto ProcessExit as a safety net for non-graceful exits.
+AppDomain.CurrentDomain.ProcessExit += static (_, _) => GgmlShutdown.ShutdownIfLoaded();
 
 // Bind the address resolved by ServerOptionsBuilder (--port / --host / --urls,
 // then PORT / HOST / ASPNETCORE_URLS, then http://0.0.0.0:5000). Passing it to
@@ -775,6 +773,5 @@ try
 finally
 {
     await app.DisposeAsync();
-    if (!hostingOptions.UsesManagedEmbeddingBackend)
-        GgmlBasicOps.Shutdown();
+    GgmlShutdown.ShutdownIfLoaded();
 }

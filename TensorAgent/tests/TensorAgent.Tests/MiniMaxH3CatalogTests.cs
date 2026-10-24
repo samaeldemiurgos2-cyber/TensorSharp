@@ -16,16 +16,13 @@ using TensorSharp.Models.MiniMaxH3;
 namespace TensorAgent.Tests;
 
 /// <summary>
-/// The two MiniMax-H3 entries: one model in two checkpoints, which share every file but
-/// the denoiser, and whose files have to be the ones the engine looks for under the
-/// variables it reads - a companion it does not find is a clip that fails, or one that is
-/// silently made with another model's network.
+/// The single MiniMax-H3 entry contains both denoisers and the shared files needed for
+/// Video Studio to switch conditioning modes without reloading the host model.
 /// </summary>
 [Collection(ProcessEnvironmentCollection.Name)]
 public sealed class MiniMaxH3CatalogTests
 {
-    private static CatalogModel Keyframes => ModelCatalog.Find("minimax-h3-fl2va-q4k")!;
-    private static CatalogModel References => ModelCatalog.Find("minimax-h3-ref2va-q4k")!;
+    private static CatalogModel Model => ModelCatalog.Find("minimax-h3-fl2va-q4k")!;
 
     private static readonly string[] VideoVariables =
     [
@@ -38,49 +35,31 @@ public sealed class MiniMaxH3CatalogTests
     ];
 
     [Fact]
-    public void TheTwoEntriesAreTheTwoCheckpointsOfOneModel()
+    public void OneEntryContainsBothCheckpointsAndAllInputModalities()
     {
-        foreach (CatalogModel model in new[] { Keyframes, References })
-        {
-            Assert.Equal(CatalogFamily.MiniMaxH3, model.Family);
-            Assert.Equal(CatalogArchitectureKind.Diffusion, model.Kind);
-            Assert.True(model.IsVideoGenerator);
-            Assert.False(model.IsImageGenerator);
-            Assert.True(model.Modalities.HasFlag(CatalogModalities.VideoOutput | CatalogModalities.AudioOutput));
-            Assert.Equal(0, model.ContextLength);
-            // Every file is required: an optional file of a role the Models page never
-            // offers could not be added later, and without the audio VAE every clip is mute.
-            Assert.All(model.Files, f => Assert.False(f.Optional, $"{model.Id}/{f.FileName} is optional"));
-        }
-
-        // Everything but the denoiser is the same file, byte for byte, which is what lets
-        // the second entry link the first one's copies instead of downloading them.
-        static string Key(CatalogFile f) => $"{f.Role}|{f.FileName}|{f.Url}|{f.Bytes}|{f.Sha256}";
-        Assert.Equal(
-            Keyframes.Files.Where(f => f.Role != CatalogFileRole.Weights).Select(Key),
-            References.Files.Where(f => f.Role != CatalogFileRole.Weights).Select(Key));
-        Assert.NotEqual(Keyframes.Weights.Sha256, References.Weights.Sha256);
-
-        // Photos are keyframes on one and references, beside clips and recordings, on the other.
-        Assert.Equal(CatalogModalities.Image, Keyframes.Modalities & (CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio));
+        Assert.Single(ModelCatalog.BuiltIn.Where(model => model.Family == CatalogFamily.MiniMaxH3));
+        Assert.Equal(CatalogFamily.MiniMaxH3, Model.Family);
+        Assert.Equal(CatalogArchitectureKind.Diffusion, Model.Kind);
+        Assert.True(Model.IsVideoGenerator);
+        Assert.False(Model.IsImageGenerator);
+        Assert.True(Model.Modalities.HasFlag(CatalogModalities.VideoOutput | CatalogModalities.AudioOutput));
+        Assert.Equal(0, Model.ContextLength);
+        Assert.All(Model.Files, f => Assert.False(f.Optional, $"{Model.Id}/{f.FileName} is optional"));
+        Assert.Equal("minimax_h3_fl2va_pruned-Q4_K.gguf", Model.Weights.FileName);
+        Assert.Equal("minimax_h3_ref2va_pruned-Q4_K.gguf",
+            Model.Files.Single(f => f.Role == CatalogFileRole.SecondaryWeights).FileName);
         Assert.Equal(CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio,
-            References.Modalities & (CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio));
+            Model.Modalities & (CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio));
     }
 
     [Fact]
-    public void EachEntryCarriesEveryFileTheDenoiserDoesNot()
+    public void TheEntryCarriesSharedCompanionsForBothDenoisers()
     {
-        foreach (CatalogModel model in new[] { Keyframes, References })
-        {
-            Assert.Single(model.Files, f => f.Role == CatalogFileRole.TextEncoder);
-            Assert.Single(model.Files, f => f.Role == CatalogFileRole.Vae);
-            Assert.Single(model.Files, f => f.Role == CatalogFileRole.AudioVae);
-            // The encoder's GGUF has no tokenizer, and the vision markers live only in
-            // tokenizer_config.json: without it a photo cannot be placed in the prompt.
-            Assert.Equal(
-                new[] { "merges.txt", "tokenizer_config.json", "vocab.json" },
-                model.Files.Where(f => f.Role == CatalogFileRole.Tokenizer).Select(f => f.FileName).Order(StringComparer.Ordinal));
-        }
+        Assert.Single(Model.Files, f => f.Role == CatalogFileRole.TextEncoder);
+        Assert.Single(Model.Files, f => f.Role == CatalogFileRole.Vae);
+        Assert.Single(Model.Files, f => f.Role == CatalogFileRole.AudioVae);
+        Assert.Equal(new[] { "merges.txt", "tokenizer_config.json", "vocab.json" },
+            Model.Files.Where(f => f.Role == CatalogFileRole.Tokenizer).Select(f => f.FileName).Order(StringComparer.Ordinal));
     }
 
     [Fact]
@@ -88,8 +67,9 @@ public sealed class MiniMaxH3CatalogTests
     {
         // The engine reads the partition off the file name (the GGUFs carry no metadata),
         // and the app stores the file under the catalog's name.
-        Assert.Equal(MiniMaxH3Partition.FirstLastFrame, MiniMaxH3Config.PartitionFromFileName(Keyframes.Weights.FileName));
-        Assert.Equal(MiniMaxH3Partition.Reference, MiniMaxH3Config.PartitionFromFileName(References.Weights.FileName));
+        Assert.Equal(MiniMaxH3Partition.FirstLastFrame, MiniMaxH3Config.PartitionFromFileName(Model.Weights.FileName));
+        Assert.Equal(MiniMaxH3Partition.Reference, MiniMaxH3Config.PartitionFromFileName(
+            Model.Files.Single(f => f.Role == CatalogFileRole.SecondaryWeights).FileName));
     }
 
     /// <summary>
@@ -104,9 +84,9 @@ public sealed class MiniMaxH3CatalogTests
         foreach (string literal in new[]
                  {
                      "\"TS_VIDEO_TEXT_ENCODER\"", "\"TS_VIDEO_VAE\"", "\"TS_VIDEO_AUDIO_VAE\"",
-                     $"\"{Keyframes.Files.Single(f => f.Role == CatalogFileRole.TextEncoder).FileName}\"",
-                     $"\"{Keyframes.Files.Single(f => f.Role == CatalogFileRole.Vae).FileName}\"",
-                     $"\"{Keyframes.Files.Single(f => f.Role == CatalogFileRole.AudioVae).FileName}\"",
+                     $"\"{Model.Files.Single(f => f.Role == CatalogFileRole.TextEncoder).FileName}\"",
+                     $"\"{Model.Files.Single(f => f.Role == CatalogFileRole.Vae).FileName}\"",
+                     $"\"{Model.Files.Single(f => f.Role == CatalogFileRole.AudioVae).FileName}\"",
                  })
             Assert.Contains(literal, model, StringComparison.Ordinal);
 
@@ -118,14 +98,14 @@ public sealed class MiniMaxH3CatalogTests
     [Fact]
     public void EveryInstalledCompanionIsPublishedAndTheTokenizerAsItsFolder()
     {
-        using var installation = new FakeInstall(Keyframes, install: m => m.Files);
+        using var installation = new FakeInstall(Model, install: m => m.Files);
 
-        IReadOnlyDictionary<string, string> published = DiffusionCompanions.Publish(Keyframes, installation.Store);
+        IReadOnlyDictionary<string, string> published = DiffusionCompanions.Publish(Model, installation.Store);
 
         Assert.Equal(installation.PathOf(CatalogFileRole.TextEncoder), published["TS_VIDEO_TEXT_ENCODER"]);
         Assert.Equal(installation.PathOf(CatalogFileRole.Vae), published["TS_VIDEO_VAE"]);
         Assert.Equal(installation.PathOf(CatalogFileRole.AudioVae), published["TS_VIDEO_AUDIO_VAE"]);
-        Assert.Equal(installation.Store.DirectoryFor(Keyframes), published["TS_VIDEO_TOKENIZER"]);
+        Assert.Equal(installation.Store.DirectoryFor(Model), published["TS_VIDEO_TOKENIZER"]);
         Assert.Equal(VideoVariables.Order(StringComparer.Ordinal), published.Keys.Order(StringComparer.Ordinal));
         foreach (string variable in VideoVariables)
             Assert.Equal(published[variable], Environment.GetEnvironmentVariable(variable));
@@ -135,10 +115,10 @@ public sealed class MiniMaxH3CatalogTests
     public void ATokenizerFolderMissingAFileIsNotPublished()
     {
         Environment.SetEnvironmentVariable("TS_VIDEO_TOKENIZER", "/somewhere/from/before");
-        using var installation = new FakeInstall(Keyframes,
+        using var installation = new FakeInstall(Model,
             install: m => m.Files.Where(f => f.FileName != "tokenizer_config.json"));
 
-        IReadOnlyDictionary<string, string> published = DiffusionCompanions.Publish(Keyframes, installation.Store);
+        IReadOnlyDictionary<string, string> published = DiffusionCompanions.Publish(Model, installation.Store);
 
         Assert.False(published.ContainsKey("TS_VIDEO_TOKENIZER"));
         Assert.Null(Environment.GetEnvironmentVariable("TS_VIDEO_TOKENIZER"));
@@ -148,11 +128,11 @@ public sealed class MiniMaxH3CatalogTests
     [Fact]
     public void SwitchingFamiliesLeavesNoOtherModelsPathsBehind()
     {
-        using var video = new FakeInstall(Keyframes, install: m => m.Files);
+        using var video = new FakeInstall(Model, install: m => m.Files);
         using var image = new FakeInstall(DiffusionModelFixture.QwenImage21, install: m => m.Files);
 
         DiffusionCompanions.Publish(DiffusionModelFixture.QwenImage21, image.Store);
-        DiffusionCompanions.Publish(Keyframes, video.Store);
+        DiffusionCompanions.Publish(Model, video.Store);
         foreach (string variable in ImageVariables)
             Assert.Null(Environment.GetEnvironmentVariable(variable));
         Assert.NotNull(Environment.GetEnvironmentVariable("TS_VIDEO_TEXT_ENCODER"));
@@ -164,15 +144,13 @@ public sealed class MiniMaxH3CatalogTests
     }
 
     [Fact]
-    public void EachCheckpointIsPointedAtItsOwnFolder()
+    public void BothDenoisersAreStoredBesideTheSharedCompanions()
     {
-        using var keyframes = new FakeInstall(Keyframes, install: m => m.Files);
-        using var references = new FakeInstall(References, install: m => m.Files);
-
-        Assert.Equal(references.PathOf(CatalogFileRole.TextEncoder),
-            DiffusionCompanions.Publish(References, references.Store)["TS_VIDEO_TEXT_ENCODER"]);
-        Assert.Equal(keyframes.PathOf(CatalogFileRole.TextEncoder),
-            DiffusionCompanions.Publish(Keyframes, keyframes.Store)["TS_VIDEO_TEXT_ENCODER"]);
+        using var installation = new FakeInstall(Model, install: m => m.Files);
+        Assert.True(File.Exists(installation.PathOf(CatalogFileRole.Weights)));
+        Assert.True(File.Exists(installation.PathOf(CatalogFileRole.SecondaryWeights)));
+        Assert.Equal(installation.PathOf(CatalogFileRole.TextEncoder),
+            DiffusionCompanions.Publish(Model, installation.Store)["TS_VIDEO_TEXT_ENCODER"]);
     }
 
     /// <summary>
@@ -190,12 +168,12 @@ public sealed class MiniMaxH3CatalogTests
         {
             using var host = new AgentAppHost(paths);
             var store = new ModelStore(paths.ModelsDirectory);
-            Directory.CreateDirectory(store.DirectoryFor(Keyframes));
+            Directory.CreateDirectory(store.DirectoryFor(Model));
             // The weights exist (empty, as a .part rename would leave a short file) and
             // nothing else does.
-            File.WriteAllBytes(store.PathFor(Keyframes, Keyframes.Weights), []);
+            File.WriteAllBytes(store.PathFor(Model, Model.Weights), []);
 
-            var ex = Assert.Throws<FileNotFoundException>(() => host.UseModel(Keyframes, warmAfterwards: false));
+            var ex = Assert.Throws<FileNotFoundException>(() => host.UseModel(Model, warmAfterwards: false));
             Assert.Equal("MiniMax-H3 is not completely downloaded yet.", ex.Message);
             Assert.Equal(AgentAppHost.ModelLoadState.Failed, host.ModelLoad);
         }

@@ -181,8 +181,8 @@ can be selected independently of the required shards.
 
 The runnable examples use **real, public, ungated** Hugging Face URLs, so the files
 auto-download to their local `path` on the first run and are reused afterward.
-Place the MiniMax-H3 tokenizer (`vocab.json`, `merges.txt` and
-`tokenizer_config.json`) by hand; see [below](#video-generation-with-sound-minimax-h3).
+The MiniMax-H3 config also downloads the tokenizer files (`vocab.json`, `merges.txt`
+and `tokenizer_config.json`) beside the text encoder.
 If you already have a file at that `path`, it is used as-is (no download).
 The experimental LTX 2.5 preset described below includes gated
 official companions; it does not download or start inference.
@@ -197,8 +197,7 @@ official companions; it does not download or start inference.
 | [`qwen-image-2.1-turbo.json`](qwen-image-2.1-turbo.json) | Qwen-Image-2.1-Turbo AD-Q4_K + the same VAE, Qwen3-VL-8B and projector | Text-to-image and editing in 8 steps; declares `"qwen-image-variant": "turbo"`; the companions keep their publishers' file names, so a base-model config pointed at the same folder and names downloads them once for both |
 | [`lora/qwen-image-2.1-*.json`](lora/) | Fourteen Qwen-Image-2.1 LoRA plug-ins (each downloads its weights; Fun-Acc also its `pdd_config.json`) | `--lora` plug-ins for Qwen-Image-2.1; Film Stills, Grainscape, Casual Phone Photo and Voxel Style also work with the official 8-step Turbo checkpoint; see [below](#qwen-image-21-lora-plug-ins-lora) |
 | [`lora/minimax-h3-fl2v-turbo-*.json`](lora/) | Two MiniMax-H3 FL2VA LoRA plug-ins (each downloads its 1.38 GB of weights) | `--lora` step-distillation plug-ins for the FL2VA checkpoint: LightX2V Turbo, 8 or 4 steps on a locked recipe; see [below](#minimax-h3-turbo-plug-ins) |
-| [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.5 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, image-to-video, first/last frame |
-| [`minimax-h3-ref2va.json`](minimax-h3-ref2va.json) | MiniMax-H3 Ref2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.4 GB) | The same four networks, reference checkpoint: up to nine stills, clips and soundtracks |
+| [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA + Ref2VA denoisers, shared Qwen3-VL-32B + video/audio VAEs and tokenizer (~46 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, first/last frame and reference mode |
 | [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~12.9 GB) | Video only, 4-step distilled, text- **and** image-to-video |
 | [`wan-video-ti2v-5b.json`](wan-video-ti2v-5b.json) | Wan 2.2 TI2V-5B: DiT + video VAE + UMT5 (~12.9 GB) | Video only, undistilled 50-step reference recipe |
 | [`wan-video-i2v-a14b.json`](wan-video-i2v-a14b.json) | Wan 2.2 I2V-A14B: **two** expert DiTs + Wan 2.1 VAE + UMT5 (~25.6 GB) | Image-to-video, two-expert schedule |
@@ -331,10 +330,18 @@ Notes:
 
 ## Experimental LTX 2.5 preset
 
-[`ltx-2.5-distilled.json`](ltx-2.5-distilled.json) records the verified Q4_K_M
+[`ltx-2.5-distilled.json`](ltx-2.5-distilled.json) records the verified UD-Q4_K_XL
 distilled denoiser, the dedicated Gemma 4 text encoder with LTX projections, the
-convolutional video VAE, the x2 spatial latent upscaler and the audio VAE. All five
-files are pinned by commit and SHA-256, with a combined size of 44.76 GB. Paths use
+convolutional video VAE, the x2 spatial latent upscaler and the audio VAE. The five
+base files are pinned by commit and SHA-256, totaling 43.08 GB. It also declares the
+optional Ingredients IC-LoRA (1.31 GB), pinned to Lightricks commit
+`12040e4091ac2008d3906a594e31a7fb1ab9d546`; the complete download is 44.39 GB when
+that adapter is available. Lightricks gates this adapter: accept its terms and configure
+`HF_TOKEN` or a Hugging Face token file. Config expansion downloads it before loading
+the model when authorized and continues without it otherwise, leaving ordinary video
+generation available. The running server reads the config at startup, so use the
+updated preset on the next launch to have references available from the initial model
+load. Paths use
 `${TENSORSHARP_MODELS:-../models}/ltx25`, including the upstream `text_encoders/`,
 `vae/` and `latent_upscale_models/` subfolders. The preset's output is 1024 × 1024,
 17 frames at 24 fps.
@@ -343,7 +350,8 @@ then the publisher's two-stage distilled recipe: the complete 48-block denoiser
 samples the published eight sigmas (ancestral Euler, CFG 1) at half the output size,
 the latent upscaler doubles it, and three refinement steps run at full size. The
 convolutional video decoder and the 48 kHz stereo audio decoder/vocoder finish.
-TensorAgent offers **Download** and **Use** for **LTX 2.5 Distilled** (Q4_K_M).
+TensorAgent offers **Download** and **Use** for **LTX 2.5 Distilled** (UD-Q4_K_XL + BF16),
+including the Ingredients adapter when optional downloads are enabled (the default).
 The experimental catalog tier is 48 GB; this is not a measured minimum for every
 resolution or duration. Width and height must be multiples of 64 (each pass keeps
 the 32-pixel latent grid), and frame counts must be `8k+1`. First, last and
@@ -472,8 +480,8 @@ Notes:
   `--video-steps` (server) and a request's `steps`, `flowShift` and `sampler` unset, or
   repeat the plug-in's values; anything else is refused, never overridden. Both hosts
   check this before anything downloads, the files of a `--config` included.
-- **FL2VA only.** `minimax-h3-ref2va.json` refuses both files: Ref2VA Turbo is not
-  supported.
+- **FL2VA only.** The shared MiniMax-H3 config includes Ref2VA, which refuses both
+  Turbo plug-ins; Ref2VA Turbo is not supported.
 - **One plug-in, as its config.** MiniMax-H3 takes one of these files, not the bare
   `.safetensors`, because the config declares the checkpoint partition and the
   sampling contract. `--lora-scale` must be ≥ 0: the schedule was distilled at
@@ -572,8 +580,9 @@ latency or quality numbers are published for delegation. See
 ## Video generation with sound (MiniMax-H3)
 
 MiniMax-H3 denoises video **and 32 kHz stereo audio in one packed latent**, so a run
-writes an `.mp4` and a matching `.wav`. Four networks cooperate — denoiser, text
-encoder, video VAE, audio VAE — which makes a config file the practical way to run it:
+writes an `.mp4` and a matching `.wav`. Both conditioning modes need separate denoisers,
+and share the text encoder, video VAE, audio VAE and tokenizer. The single config downloads
+the complete set so chat can switch between frame and reference mode without a restart:
 
 ```bash
 TensorSharp.Server.Host --config config/minimax-h3-fl2va.json
@@ -586,35 +595,33 @@ TensorSharp.Cli --config config/minimax-h3-fl2va.json \
   --image start.png --end-image end.png \
   --prompt "a slow cinematic push-in" --output morph.mp4
 
-# References, on the OTHER checkpoint: up to nine, in any mix of stills, clips
-# and soundtracks. The clip does not reproduce them; it borrows the identity and
-# appearance they carry into a brand-new scene.
-TensorSharp.Cli --config config/minimax-h3-ref2va.json \
+# References: up to nine, in any mix of stills, clips and soundtracks. The clip
+# does not reproduce them; it carries their identity and appearance into a new scene.
+TensorSharp.Cli --config config/minimax-h3-fl2va.json \
+  --video-mode ref \
   --ref-image person.png --ref-image jacket.png --ref-image street.png \
   --prompt "she walks through a night market, neon reflections" --output out.mp4
 ```
 
 | Config | Denoiser | VAEs | Text encoder | Modes |
 |---|---|---|---|---|
-| [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | FL2VA pruned (Q4_K) | H3 video **+ H3 audio** | Qwen3-VL-32B | T2V + I2V + first/last frame |
-| [`minimax-h3-ref2va.json`](minimax-h3-ref2va.json) | Ref2VA pruned (Q4_K) | H3 video **+ H3 audio** | Qwen3-VL-32B | T2V + references (stills, clips, soundtracks) |
+| [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | FL2VA primary + Ref2VA sibling (Q4_K) | H3 video **+ H3 audio** | Qwen3-VL-32B + tokenizer | T2V + I2V + first/last frame + references |
 
 Notes:
 
-- **The first run downloads ~35.5 GB** (~35.4 GB for Ref2VA) — denoiser 10.64 GiB, text encoder 16.97 GiB,
-  video VAE 5.21 GB, audio VAE 0.61 GB. All four come from unsloth, with Comfy-Org
-  listed as a second source for the two VAEs. Each network is loaded and released in
+- **The first run downloads about 46 GB** — both denoisers (10.64 and 10.60 GiB), text
+  encoder (16.97 GiB), video VAE (5.21 GB), audio VAE (0.61 GB) and tokenizer files
+  (~4.2 MB). The denoisers and text encoder come from unsloth; Comfy-Org is a second
+  source for the VAEs. Each network is loaded and released in
   turn, so peak VRAM is `max(...)` and not the sum.
 - **Drop the `audio-vae` entry and you still get video**, just silent — that entry is
   what decodes the audio half of the latent.
-- **The text encoder ships no tokenizer**, and auto-download cannot fill that gap: it
-  only resolves options that are flags, and the tokenizer is not one. Put `vocab.json`,
+- **The text encoder ships no tokenizer**, so the config fetches the pinned `vocab.json`,
   `merges.txt` and `tokenizer_config.json` from
   [MiniMaxAI/MiniMax-H3/processor](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor)
-  (the config comments give pinned `curl` lines)
-  next to the encoder GGUF in `${modelRoot}`, or point `TS_VIDEO_TOKENIZER` at the
-  folder holding them. Without the first two the run stops when the encoder loads.
-  Without `tokenizer_config.json` text-to-video still runs, and so do references that
+  next to the encoder. Manual installs can put them there or point `TS_VIDEO_TOKENIZER`
+  at their folder. Without the first two the run stops when the encoder loads. Without
+  `tokenizer_config.json` text-to-video still runs, and so do references that
   are all sound recordings, but a keyframe, or a photo or clip reference, is refused
   before the vision tower runs: that file alone defines `<|vision_start|>`,
   `<|image_pad|>` and `<|vision_end|>`, and without them the picture used to be placed
@@ -629,18 +636,16 @@ Notes:
   samples exactly the 8 or 4 steps it was distilled for.
 - **`video-frames` snaps to the `17k+5` grid** (5, 22, 39, 56, 73, 90 …), not Wan's
   `4k+1`, and fps is pinned to 24.
-- **`minimax-h3-fl2va.json` leaves the size to the model.** Text-to-video runs at
+- **The config leaves the size to the model.** Text-to-video and reference mode run at
   640×384; `--image` and `--end-image` take the canvas from the first keyframe by
   MiniMax's released 768p recipe (1152×768 for a 3:2 photo, 1344×768 for 16:9), which
   keeps a keyframe's faces from smearing at about 2.4-4.2× the video tokens per frame,
-  so those runs take several times longer. `minimax-h3-ref2va.json` pins 640×384, the
-  size references run at. `--width` and `--height` together (`--video-width` and
+  so those runs take several times longer. `--width` and `--height` together (`--video-width` and
   `--video-height` on the server) pin one size for every mode, keyframes included.
-- **References need the other checkpoint**, which now has its own file. FL2VA and Ref2VA
-  are separate checkpoints rather than a setting: `minimax-h3-fl2va.json` refuses
-  `--ref-image` and `minimax-h3-ref2va.json` refuses `--image` as a keyframe, and each
-  error names the other file. Only the `model` entry and the size pin differ between the
-  two configs, so the text encoder and both VAEs are shared and will not download twice.
+- **Frame and reference modes use separate checkpoints.** This config downloads both
+  denoisers beside one another; TensorSharp chooses the matching one per request and
+  keeps the shared components loaded. A manually installed single-checkpoint folder can
+  still run only the mode for which that denoiser was built.
 - **Ref2VA takes up to nine references in any mix** — `--ref-image` (a still),
   `--ref-video` (a clip, or a folder of frames), `--ref-audio` (a soundtrack), and
   `--ref-video-audio` to give the i-th `--ref-video` its own sound. Each takes its own

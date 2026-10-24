@@ -132,7 +132,8 @@ namespace TensorSharp.Runtime
             }
         }
 
-        /// <summary>Every file this model is stored in, starting with this one.</summary>
+        /// <summary>Every file this model is stored in, starting with the metadata-bearing
+        /// first shard. A physical-only open returns just the requested file.</summary>
         public IReadOnlyList<string> FilePaths
         {
             get
@@ -154,8 +155,9 @@ namespace TensorSharp.Runtime
         ///
         /// <para>Split checkpoints (llama.cpp's <c>gguf-split</c> layout, which every
         /// very large release ships in — GLM-5.2 is six files) put all metadata in the
-        /// first shard and zero tensors in it; the weights live in the siblings.
-        /// Without this, opening the first shard yields a model with no weights.</para>
+        /// first shard, which may contain zero tensors; the weights live in the siblings.
+        /// Opening any shard must resolve that first file for the model metadata as well
+        /// as combine the tensor tables.</para>
         ///
         /// <para>A missing sibling is a hard error: a partially loaded model would
         /// otherwise fail much later as a missing-tensor exception inside a model
@@ -181,17 +183,43 @@ namespace TensorSharp.Runtime
 
             string prefix = m.Groups["prefix"].Value;
             int selfNo = int.Parse(m.Groups["no"].Value);
+            int namedCount = int.Parse(m.Groups["count"].Value);
+            if (namedCount != splitCount || selfNo < 1 || selfNo > splitCount)
+                throw new InvalidDataException(
+                    $"{_path} has an inconsistent split filename: shard {selfNo} of {namedCount}, " +
+                    $"but split.count is {splitCount}.");
 
-            for (int i = 1; i <= splitCount; i++)
+            string RequireShardPath(int number)
             {
-                if (i == selfNo)
-                    continue;
-                string shardPath = Path.Combine(dir, $"{prefix}-{i:D5}-of-{splitCount:D5}.gguf");
-                if (!File.Exists(shardPath))
+                string path = Path.Combine(dir, $"{prefix}-{number:D5}-of-{splitCount:D5}.gguf");
+                if (!File.Exists(path))
                     throw new FileNotFoundException(
-                        $"{_path} is shard {selfNo} of {splitCount}, but {Path.GetFileName(shardPath)} is missing. " +
-                        "Every shard of a split GGUF must sit in the same directory.", shardPath);
+                        $"{_path} is shard {selfNo} of {splitCount}, but {Path.GetFileName(path)} is missing. " +
+                        "Every shard of a split GGUF must sit in the same directory.", path);
+                return path;
+            }
 
+            if (selfNo != 1)
+            {
+                // Later shards commonly contain only split.* metadata. Make shard 1
+                // the primary physical file, rather than copying its metadata onto a
+                // stream whose tensor offsets/alignment still belong to another shard.
+                // The selected shard is reopened once below as an ordinary sibling.
+                string firstPath = RequireShardPath(1);
+                _stream.Dispose();
+                _path = firstPath;
+                _stream = File.OpenRead(firstPath);
+                Metadata.Clear();
+                Tensors.Clear();
+                Parse();
+                if (GetUint32("split.count", 0) != splitCount)
+                    throw new InvalidDataException($"{firstPath} declares a different split.count from the selected shard.");
+                selfNo = 1;
+            }
+
+            for (int i = 2; i <= splitCount; i++)
+            {
+                string shardPath = RequireShardPath(i);
                 var shard = new GgufFile(shardPath, isShard: true);
                 _shards.Add(shard);
                 foreach (var kv in shard.Tensors)

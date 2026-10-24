@@ -1314,6 +1314,89 @@ namespace TensorSharp.Runtime.Scheduling
                 }
             }
 
+            // ---- Batched fused prefill ----
+            // Concurrent arrivals' prompt chunks evaluate in ONE fused graph when the
+            // model supports it, so they share every weight read instead of prefilling
+            // one after another. Only plain chunks qualify: a request whose holder must
+            // first be created around an injected prefix, rewound from a retained
+            // state, or fed media embeddings keeps the per-sequence loop below.
+            if (options.BatchedFusedDecodeEnabled && n >= 2)
+            {
+                var prefillWork = new List<ScheduledSequenceWork>(n);
+                foreach (var work in output.ScheduledWork)
+                {
+                    var seq = work.Sequence;
+                    if (!work.IsPrefill || (handledBatched != null && handledBatched.Contains(seq.RequestId)))
+                        continue;
+                    if (_pendingRetainedFusedTruncations.ContainsKey(seq.RequestId))
+                        continue;
+                    if (!fused.HasFusedSequenceCache(seq.RequestId) && (seq.NumComputedTokens > 0 || seq.UsesLiveCacheContinuation))
+                        continue;
+                    if (_model.MultimodalInjector != null && _model.MultimodalInjector.HasPendingEmbeddings(seq.RequestId))
+                        continue;
+                    prefillWork.Add(work);
+                }
+                if (prefillWork.Count >= 2)
+                {
+                    int pn = prefillWork.Count;
+                    var reqIds = new string[pn];
+                    var chunks = new int[pn][];
+                    var starts = new int[pn];
+                    for (int i = 0; i < pn; i++)
+                    {
+                        var seq = prefillWork[i].Sequence;
+                        reqIds[i] = seq.RequestId;
+                        starts[i] = seq.NumComputedTokens;
+                        chunks[i] = BuildPrefillChunk(seq, prefillWork[i]);
+                    }
+                    var outLogits = new float[pn][];
+                    try
+                    {
+                        long started = Stopwatch.GetTimestamp();
+                        if (fused.TryForwardBatchedFusedPrefill(reqIds, chunks, starts, outLogits))
+                        {
+                            long ticksPerSequence = (Stopwatch.GetTimestamp() - started) / pn;
+                            handledBatched ??= new HashSet<string>(StringComparer.Ordinal);
+                            for (int i = 0; i < pn; i++)
+                            {
+                                var seq = prefillWork[i].Sequence;
+                                seq.LastLogits = outLogits[i];
+                                seq.AdvanceComputedTokens(chunks[i].Length);
+                                MaybeCheckpointSharedPrefix(seq);
+                                results.Add(new SequenceStepResult
+                                {
+                                    Sequence = seq,
+                                    TokensForwarded = chunks[i].Length,
+                                    SampledToken = -1,
+                                    IsPrefill = true,
+                                    FullBlocksCaptured = 0,
+                                    ForwardElapsedTicks = ticksPerSequence,
+                                });
+                                handledBatched.Add(seq.RequestId);
+                            }
+                            if (handledBatched.Count == n)
+                                return results;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // As for the batched decode: caches may be partially written,
+                        // so fail the affected prefills rather than retrying them.
+                        handledBatched ??= new HashSet<string>(StringComparer.Ordinal);
+                        _logger.LogError(ex, "Batched fused prefill failed for {Count} sequences; failing the affected requests.", pn);
+                        foreach (var work in prefillWork)
+                        {
+                            var seq = work.Sequence;
+                            seq.Error = ex;
+                            results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
+                            handledBatched.Add(seq.RequestId);
+                        }
+                        if (handledBatched.Count == n)
+                            return results;
+                    }
+                }
+            }
+
             foreach (var work in output.ScheduledWork)
             {
                 // Decode subset already served by the batched fast path
@@ -3438,6 +3521,18 @@ namespace TensorSharp.Runtime.Scheduling
         /// previously that decline degraded every in-flight decode to a serial
         /// weight sweep for the step. Default true.</summary>
         bool CanBatchDecode(string requestId, int position) => true;
+
+        /// <summary>Prefill several sequences' prompt chunks in ONE fused graph:
+        /// sequence i evaluates <paramref name="tokens"/>[i] starting at
+        /// <paramref name="positions"/>[i] (its holder's head) against its own
+        /// per-request holder, allocating a fresh holder for a request that has
+        /// none yet. Concurrent arrivals then share every weight read instead of
+        /// prefilling one after another. On success writes each sequence's
+        /// last-token logits into <paramref name="outLogits"/>[i] and returns
+        /// true; false (nothing advanced) leaves the step to the per-sequence
+        /// loop. Default false (opt-in).</summary>
+        bool TryForwardBatchedFusedPrefill(
+            IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] positions, float[][] outLogits) => false;
     }
 
     /// <summary>Per-step metadata for the batched paged attention path.

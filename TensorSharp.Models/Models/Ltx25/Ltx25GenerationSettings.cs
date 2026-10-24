@@ -39,9 +39,12 @@ public sealed record Ltx25GenerationSettings(int Width, int Height, int Frames, 
     public static Ltx25GenerationSettings Resolve(VideoGenerationParams parameters, bool supportsIdentityReferences = false)
     {
         ArgumentNullException.ThrowIfNull(parameters);
-        if (parameters.ReferenceVideoPaths is { Count: > 0 } || parameters.ReferenceAudioPaths is { Count: > 0 } ||
-            parameters.ReferenceVideoAudioPaths is { Count: > 0 })
-            throw new NotSupportedException("LTX video/audio reference workflows are not implemented by this distilled image preset; use temporal image guides or Ingredients identity images.");
+        if (parameters.ReferenceAudioPaths is { Count: > 0 } || parameters.ReferenceVideoAudioPaths is { Count: > 0 })
+            throw new NotSupportedException("LTX audio-reference workflows are not implemented by this distilled preset.");
+        if (parameters.ReferenceVideoPaths is { Count: > 0 } && parameters.Mode != "ref")
+            throw new ArgumentException("LTX full-video references require Ingredients ref mode.");
+        if (parameters.ReferenceVideoPaths is { Count: > Ltx25ReferenceConditioning.MaxVideos })
+            throw new ArgumentException($"LTX Ingredients accepts at most {Ltx25ReferenceConditioning.MaxVideos} reference video.");
         bool identity = parameters.Mode == "ref";
         if (identity && !supportsIdentityReferences)
             throw new NotSupportedException("LTX identity/appearance references require the separate Ingredients IC-LoRA. This preset accepts temporal image guides in i2v, fl2v or keyframes mode.");

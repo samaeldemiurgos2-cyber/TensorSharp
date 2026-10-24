@@ -93,7 +93,7 @@ public sealed class Ltx25MediaCapabilityTests
         // Deliberately avoid constructing or disposing a native model in this test.
         var model = (Ltx25Model)RuntimeHelpers.GetUninitializedObject(typeof(Ltx25Model));
         if (referenceLora)
-            typeof(Ltx25Model).GetField("<ReferenceLoraPath>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
+            typeof(Ltx25Model).GetField("_referenceLoraPath", BindingFlags.Instance | BindingFlags.NonPublic)!
                 .SetValue(model, "metadata-only-ingredients.safetensors");
         return model;
     }

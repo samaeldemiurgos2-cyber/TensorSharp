@@ -58,7 +58,7 @@ public class DeepSeek41PrefillDefaultsDocsTests
         long queries = NativeConstant(policy, "TSG_PRECISION_DECODE_COLUMNS");
         long keys = NativeConstant(policy, "TSG_DSV41_SPARSE_MIN_KEYS");
         Assert.Equal(8, queries);
-        Assert.Equal(8192, keys);
+        Assert.Equal(2048, keys);
         // accepted -> documented: the attention dispatch and the banner both go through the gate.
         Assert.Contains("inline int tsg_dsv41_owned_sparse_capacity(", policy);
         Assert.Contains("std::atoi(sparse_env) == 0", policy);
@@ -90,6 +90,47 @@ public class DeepSeek41PrefillDefaultsDocsTests
             Assert.Contains("--benchmark-dsv41-prefill", text);
         }
         Assert.Contains("--benchmark-dsv41-prefill", Read("TensorSharp.GGML.Native", "tests", "attention_precision_test.cpp"));
+    }
+
+    [Fact]
+    public void YocoBoundedReplay_DefaultOn_CodeAndDocsAgree()
+    {
+        if (RepoRoot is null) return;
+        string policy = Read("TensorSharp.GGML.Native", "dsv41_yoco.h");
+        string loader = Read("TensorSharp.GGML.Native", "ggml_ops_deepseek4.cpp");
+        long keep = NativeConstant(policy, "default_keep");
+        Assert.Equal(140, keep);
+        Assert.Contains("return n_swa + 8;", policy);
+        // accepted -> documented: one spelling, every banner state.
+        Assert.Equal("TS_DSV41_YOCO_KEEP", DeepSeek41Architecture.YocoKeepVariable);
+        Assert.Contains("tsg_dsv41_yoco::parse(getenv(\"TS_DSV41_YOCO_KEEP\"), hp.n_swa)", loader);
+        Assert.Contains("YOCO bounded replay%s: layers %d..%d prefill only the last %lld positions", loader);
+        Assert.Contains("\" (default)\"", loader);
+        Assert.Contains("YOCO bounded replay: off (TS_DSV41_YOCO_KEEP=0)", loader);
+        Assert.Contains("YOCO bounded replay: off for this checkpoint (%s)", loader);
+        Assert.Contains("YOCO bounded replay: inactive with a 1-token prefill micro-batch", loader);
+
+        // documented -> accepted
+        string en = Row(Read("docs", "env_var_feature_matrix.md"), "TS_DSV41_YOCO_KEEP", "env_var_feature_matrix.md");
+        string zh = Row(Read("docs", "env_var_feature_matrix_zh-cn.md"), "TS_DSV41_YOCO_KEEP", "env_var_feature_matrix_zh-cn.md");
+        Assert.Contains("On by default", en);
+        Assert.Contains("| `140` (on) |", en);
+        Assert.Contains("`0` runs every layer over every position", en);
+        Assert.Contains("at least the sliding window + 8 (136)", en);
+        Assert.Contains("--backend cuda", en);
+        Assert.Contains("TS_DSV4_UBATCH=1", en);
+        Assert.Contains("默认开启", zh);
+        Assert.Contains("| `140`（开） |", zh);
+        Assert.Contains("`0` 让每一层处理每个位置", zh);
+        Assert.Contains("136", zh);
+        Assert.Contains("--backend cuda", zh);
+        Assert.Contains("TS_DSV4_UBATCH=1", zh);
+        foreach (string card in new[] { "deepseek41.md", "deepseek41_zh-cn.md" })
+        {
+            string text = Read("docs", "models", card);
+            Assert.Contains("TS_DSV41_YOCO_KEEP=0", text);
+            Assert.Contains("140", text);
+        }
     }
 
     [Fact]

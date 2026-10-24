@@ -22,8 +22,7 @@
   "catalog.license.qwenImage": "Qwen Research License (non-commercial); text encoder Apache-2.0",
   "catalog.model.minimaxH3.parameters": "33B audio-video DiT (20B with its AdaLN branches pruned) + Qwen3-VL-32B text encoder",
   "catalog.model.minimaxH3.quantization": "Q4_K (DiT) / Q4_K_M (text encoder)",
-  "catalog.model.minimaxH3Fl2va.notes": "Makes a short video with its own soundtrack from a description, brings an attached photo to life, or runs between two photos (the first and the last frame). Needs 32 GB of system memory (RAM). MiniMax's license does not cover use in the EU, the UK, South Korea or the US.",
-  "catalog.model.minimaxH3Ref2va.notes": "Makes a short video with its own soundtrack that features the people, things, places or sounds in up to nine attached photos, clips and recordings. Say who or what is in the shot: a reference gives their look, the description puts them in the scene. Needs 32 GB of system memory (RAM). MiniMax's license does not cover use in the EU, the UK, South Korea or the US.",
+  "catalog.model.minimaxH3.notes": "Makes a short video with its own soundtrack from a description, brings an attached photo to life, runs between first and last photos, or features people, things, places or sounds from up to nine attached photos, clips and recordings. Choose first-frame & last-frame mode or reference mode in Video Studio. Needs 32 GB of system memory (RAM). MiniMax's license does not cover use in the EU, the UK, South Korea or the US.",
   "catalog.license.minimaxH3": "MiniMax H3 Community License",
   "catalog.lora.viggleTurbo.purpose": "Pictures and edits in 6 steps instead of 40, close to the full model's quality.",
   "catalog.license.qwenResearch": "Qwen Research License (non-commercial)",
@@ -67,6 +66,6 @@
   "catalog.extended.744b40b.parameters": "744B (40B active)",
   "catalog.extended.384experts.parameters": "MoE, 384 routed experts",
   "catalog.extended.14bExpert.parameters": "14B per expert",
-  "catalog.model.ltx25.notes": "Experimental native text/image-to-video with 48 kHz stereo audio. LTX 2.5 Distilled runs 8 ancestral Euler steps at half size, a x2 latent upscale and 3 refinement steps, at CFG 1 and accepts first/last frames or multiple image keyframes with position and strength. These guide the output timeline; identity reference and video/audio adapters need separate checkpoints. Pinned downloads total 43.08 GB from an ungated repository; no Hugging Face account is needed. Conservative 48 GB device tier; validated on short 1024×1024 clips.",
-  "catalog.license.ltx25": "LTX-2.5 and Gemma terms"
+  "catalog.model.ltx25.notes": "Experimental native text/image-to-video with 48 kHz stereo audio. LTX 2.5 Distilled runs 8 ancestral Euler steps at half size, a x2 latent upscale and 3 refinement steps, at CFG 1 and accepts first/last frames or multiple image keyframes with position and strength. These guide the output timeline. The optional 1.31 GB Ingredients IC-LoRA adds identity references; it is gated and needs Hugging Face approval and a token. The five ungated base files total 43.08 GB. Conservative 48 GB device tier; validated on short 1024×1024 clips.",
+  "catalog.license.ltx25": "LTX-2.5, Ingredients IC-LoRA and Gemma terms"
 }

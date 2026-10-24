@@ -48,7 +48,7 @@ constexpr int64_t TSG_PRECISION_DECODE_COLUMNS = 8;
 
 // Smallest attention key extent (raw ring plus visible compressed rows) at
 // which DeepSeek V4.1 prefill hands the owned F32 attention a sparse capacity.
-constexpr int64_t TSG_DSV41_SPARSE_MIN_KEYS = 8192;
+constexpr int64_t TSG_DSV41_SPARSE_MIN_KEYS = 2048;
 
 // Sparse capacity DeepSeek V4.1's owned F32 attention (the default CUDA path,
 // tsg_attention_f32_on_backend) gets for one launch; 0 selects the dense
@@ -68,8 +68,15 @@ constexpr int64_t TSG_DSV41_SPARSE_MIN_KEYS = 8192;
 // 1,547-1,549 / 6,864.6 ms at 8,960 / 33,536 / 66,304 keys, compacted 34.4 /
 // 34.1-34.3 / 34.8 ms. Against a decomposed F32 reference the compacted kernel
 // stays within max_abs 1.5e-7 (rel_l2 7.5e-7), the tiled one 8.9e-8 (4.8e-7).
-// Below 8,192 keys every launch keeps the dense kernels, so short prompts are
-// unchanged bit for bit.
+//
+// Why 2,048 keys: CUDA runs a compacted MLA launch (one shared F16 K=V head
+// of width 512) on its MQA kernel, which loads each key tile once for four
+// heads; that made the sparse cost a constant 16.1-16.3 ms for 1,024 queries
+// (8.0 ms against partial_kernel's 34.4 at 512 queries x 8,960 keys), while
+// tiled grows about 9 us per key: 12.4 / 15.9 / 22.5 / 32.1 / 47.2 / 63.8 ms
+// at 1,408 / 1,792 / 2,560 / 3,584 / 5,120 / 6,656 keys (A40, 64 heads,
+// --benchmark-sparse 1024 KEYS 64 5 640). The crossover is near 1,800 keys.
+// Below the threshold every launch keeps the dense kernels.
 //
 // Why only above TSG_PRECISION_DECODE_COLUMNS queries: a DSpark verify (six
 // rows) must keep the split-key kernel single-token decode uses, or the rows

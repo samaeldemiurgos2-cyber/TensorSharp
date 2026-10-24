@@ -93,8 +93,7 @@ The fast-path claim is backed by three independent routing details:
   linear `Forward()` path that reaches that fused whole-model decode instead of
   the general batched per-op route.
 
-See the [engine-comparison report](../engine_comparison_report.md), the measured
-[E4B prefill performance record](../perf/gemma4-prefill-cuda-graph-design.md),
+See the [E4B prefill engineering note](../perf/gemma4-prefill-cuda-graph-design.md)
 and the [N=1 scheduler documentation](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
 
 Multimodal CLI one-shot (the text prompt comes from a file via `--input`; with

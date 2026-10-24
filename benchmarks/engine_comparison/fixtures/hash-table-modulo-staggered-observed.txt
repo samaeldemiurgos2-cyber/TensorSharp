@@ -1,0 +1,39 @@
+A hash table (also called a hash map, dictionary, associative array) is a data structure that implements an abstract map from keys to values. It provides very fast average-case lookup, insertion, and deletion by translating keys into array indices using a hash function.
+
+We will cover this in detail: the core idea, hash functions, collisions and collision resolution strategies, resizing / rehashing / load factor, complexity analysis, worked example step-by-step, implementation considerations, and variants.
+
+### 1. The Core Idea: Array + Hash Function
+
+An array gives O(1) access by index: `array[i]` is instant. But we want to look up by arbitrary keys like strings `"apple"`, integers `123456789`, objects, etc.
+
+A hash table bridges this gap:
+
+1.  You have an underlying array (often called `buckets`, `slots`, or `table`) of size `m` (capacity). Indices are `0` to `m-1`.
+2.  You have a **hash function** `h(k)` that takes a key `k` and returns an integer.
+3.  To store or find a key `k`, you compute `index = h(k) mod m` and look at that position in the array.
+
+Conceptually:
+```
+put(key, value):
+  i = hash(key) % capacity
+  table[i] = value
+
+get(key):
+  i = hash(key) % capacity
+  return table[i]
+```
+
+If every key mapped to a unique index, this would be perfect O(1). The entire difficulty of hash tables comes from **collisions**.
+
+### 2. Hash Functions
+
+A hash function takes a key of arbitrary type/size and maps it to a fixed-range integer.
+
+#### 2.1 Properties of a Good Hash Function
+
+1.  **Deterministic:** `h(k)` must always return the same value for the same `k`.
+2.  **Uniform Distribution:** It should spread keys evenly across the `m` buckets. If it clusters keys, you get many collisions and performance degrades. Ideally, for any two distinct keys, `P(h(k1) == h(k2)) = 1/m`.
+3.  **Efficient to Compute:** It will be called on every operation, so it must be fast.
+4.  **Avalanche Effect (desirable):** A small change in the key (e.g., `"cat"` vs `"car"`) should produce a very different hash.
+
+It does *not* need

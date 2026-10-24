@@ -626,6 +626,20 @@ button.primary:hover { background: var(--accent-hover); }
   flex-wrap: wrap;
 }
 
+.video-generation-controls {
+  display: flex;
+  flex: 0 0 100%;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 2px 4px;
+  color: var(--text2);
+  font-size: 13px;
+}
+.video-generation-controls label { display: inline-flex; align-items: center; gap: 6px; }
+.video-generation-controls select { max-width: min(280px, 65vw); }
+.video-generation-hint { flex-basis: 100%; font-size: 12px; }
+
 .attachment-chip {
   display: inline-flex;
   align-items: center;
@@ -1352,6 +1366,10 @@ let currentArchitecture = null;
 // MiniMax-H3 Ref2VA and a refused request on FL2VA, so this decides the shape of a
 // video request rather than merely labelling it.
 let currentVideoCaps = null;
+let videoComposerModelId = null;
+let videoComposerMode = 'auto';
+let videoComposerFrames = 0;
+let videoComposerResolution = 'default';
 // Architectures whose /api/models 'architecture' id means "this model generates video".
 // The id comes from GGUF metadata, so it is matched rather than renamed.
 const VIDEO_ARCHITECTURES = new Set(['wan', 'wan2.1', 'wan2.2', 'minimax-h3', 'ltx-2.5']);
@@ -1435,6 +1453,12 @@ function updateStatusBadge(data) {
   currentLoadedModel = data.loaded || null;
   currentArchitecture = data.architecture || null;
   currentVideoCaps = data.video || null;
+  if (currentLoadedModel !== videoComposerModelId) {
+    videoComposerModelId = currentLoadedModel;
+    videoComposerMode = 'auto';
+    videoComposerFrames = 0;
+    videoComposerResolution = 'default';
+  }
   renderAttachments();
 
   if (!currentLoadedModel) {
@@ -1583,12 +1607,201 @@ async function uploadFiles(files) {
     if (uploaded.length !== files.length || uploaded.some(file => !file || !file.ok || !file.file)) {
       throw new Error('The server did not return every uploaded file. Please try again.');
     }
+    // Keep the source canvas size with each attachment so the video composer can offer
+    // its original resolution and smaller choices with the same aspect ratio. Browser
+    // metadata reads never block an upload failure: unsupported formats keep the model
+    // default option until their dimensions are available another way.
+    for (let i = 0; i < uploaded.length; i++) {
+      const dimensions = await readMediaDimensions(files[i], uploaded[i].mediaType);
+      if (dimensions) Object.assign(uploaded[i], dimensions);
+    }
     pendingAttachments.push(...uploaded);
     renderAttachments();
     uploaded.forEach(file => { if (file.warning) alert(file.warning); });
   } catch (e) {
     alert('Upload error: ' + e.message);
   }
+}
+
+async function readMediaDimensions(file, mediaType) {
+  if (!file || !['image', 'video'].includes(mediaType)) return null;
+  const url = URL.createObjectURL(file);
+  try {
+    if (mediaType === 'image') {
+      const image = new Image();
+      image.decoding = 'async';
+      image.src = url;
+      try { await image.decode(); } catch { return null; }
+      return image.naturalWidth > 0 && image.naturalHeight > 0
+        ? { width: image.naturalWidth, height: image.naturalHeight } : null;
+    }
+
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.muted = true;
+    video.src = url;
+    try {
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Video metadata timed out')), 8000);
+        video.onloadedmetadata = () => { clearTimeout(timeout); resolve(); };
+        video.onerror = () => { clearTimeout(timeout); reject(new Error('Video metadata unavailable')); };
+        video.load();
+      });
+    } catch { return null; }
+    return video.videoWidth > 0 && video.videoHeight > 0
+      ? { width: video.videoWidth, height: video.videoHeight } : null;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function alignVideoFrames(frames, caps = currentVideoCaps, direction = 'up') {
+  const multiple = Math.max(1, Number(caps?.frameCountMultiple) || 1);
+  const offset = Number.isInteger(Number(caps?.frameCountOffset)) ? Number(caps.frameCountOffset) : 1;
+  const steps = (frames - offset) / multiple;
+  const n = direction === 'nearest' ? Math.round(steps) : Math.ceil(steps);
+  return Math.max(offset, offset + n * multiple);
+}
+
+function defaultVideoFrames(caps = currentVideoCaps) {
+  const configured = Number(caps?.configuredFrames) || 0;
+  const recommended = Number(caps?.defaultPreviewFrames) || 17;
+  return alignVideoFrames(configured > 0 ? configured : recommended, caps);
+}
+
+function selectedVideoFrames(caps = currentVideoCaps) {
+  return videoComposerFrames > 0 ? videoComposerFrames : defaultVideoFrames(caps);
+}
+
+function videoResolutionChoices(caps = currentVideoCaps) {
+  const choices = [{ value: 'default', label: 'Model default' }];
+  const source = pendingAttachments.find(att =>
+    (att.mediaType === 'image' || att.mediaType === 'video')
+    && Number(att.width) > 0 && Number(att.height) > 0);
+  let baseWidth = source ? Number(source.width) : Number(caps?.defaultOutputWidth);
+  let baseHeight = source ? Number(source.height) : Number(caps?.defaultOutputHeight);
+  if (!source && currentArchitecture === 'ltx-2.5' && videoComposerMode === 'ref') {
+    baseWidth = 768;
+    baseHeight = 448;
+  }
+  if (!(baseWidth > 0 && baseHeight > 0)) return choices;
+
+  const grid = Math.max(1, Number(caps?.resolutionMultiple) || 16);
+  const seen = new Set();
+  for (const scale of [1, 0.75, 0.5, 0.375]) {
+    const width = Math.max(grid, Math.round(baseWidth * scale / grid) * grid);
+    const height = Math.max(grid, Math.round(baseHeight * scale / grid) * grid);
+    const value = `${width}x${height}`;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    const size = `${width} × ${height}`;
+    let label;
+    if (scale === 1 && source) {
+      label = `Original input · ${source.width} × ${source.height}`;
+      if (width !== source.width || height !== source.height)
+        label += ` (model grid ${size})`;
+    } else if (scale === 1) {
+      label = `Model size · ${size}`;
+    } else {
+      label = `${Math.round(scale * 100)}% · ${size}`;
+    }
+    choices.push({ value, label, width, height });
+  }
+  return choices;
+}
+
+function videoModeChoices(caps) {
+  const choices = [['auto', 'Automatic']];
+  if (!caps) return choices;
+  if (caps.supportsTextToVideo !== false) choices.push(['t2v', 'Text to video']);
+  if (caps.supportsImageConditioning) choices.push(['i2v', 'First frame']);
+  if (caps.supportsImageConditioning && caps.supportsEndImageConditioning)
+    choices.push(['fl2v', 'First and last frame']);
+  if (caps.supportsKeyframeConditioning) choices.push(['keyframes', 'Timed keyframes']);
+  if (caps.supportsReferenceConditioning) choices.push(['ref', 'Reference mode']);
+  return choices;
+}
+
+function appendVideoGenerationControls() {
+  const caps = currentVideoCaps;
+  if (!caps) return;
+  const controls = document.createElement('div'); controls.className = 'video-generation-controls';
+  const modeLabel = document.createElement('label'); modeLabel.textContent = 'Video mode ';
+  const mode = document.createElement('select'); mode.id = 'video-mode-select'; mode.setAttribute('aria-label', 'Video generation mode');
+  for (const [value, text] of videoModeChoices(caps)) {
+    const option = document.createElement('option'); option.value = value; option.textContent = text; mode.appendChild(option);
+  }
+  if (!videoModeChoices(caps).some(([value]) => value === videoComposerMode)) videoComposerMode = 'auto';
+  mode.value = videoComposerMode;
+  mode.addEventListener('change', () => {
+    videoComposerMode = mode.value;
+    const minRef = Math.max(0, Number(caps.minimumReferenceFrames) || 0);
+    if (videoComposerMode === 'ref' && minRef > 0 && selectedVideoFrames(caps) < minRef)
+      videoComposerFrames = alignVideoFrames(minRef, caps);
+    renderAttachments();
+    document.getElementById('video-mode-select')?.focus();
+  });
+  modeLabel.appendChild(mode);
+
+  const framesLabel = document.createElement('label'); framesLabel.textContent = 'Clip length ';
+  const length = document.createElement('select'); length.id = 'video-length-select'; length.setAttribute('aria-label', 'Video clip length');
+  const fps = Math.max(1, Number(caps.defaultPreviewFps) || 24);
+  const current = selectedVideoFrames(caps);
+  const modelDefault = defaultVideoFrames(caps);
+  const secondsFor = frames => `${((frames - 1) / fps).toFixed(1)} s`;
+  const addLength = (frames, label) => {
+    const effectiveFrames = frames || current;
+    if (videoComposerMode === 'ref' && Number(caps.minimumReferenceFrames) > 0 && effectiveFrames < Number(caps.minimumReferenceFrames)) return;
+    const option = document.createElement('option'); option.value = String(frames); option.textContent = label; length.appendChild(option);
+  };
+  const minimumReferenceFrames = Number(caps.minimumReferenceFrames) || 0;
+  if (videoComposerMode !== 'ref' || modelDefault >= minimumReferenceFrames)
+    addLength(0, `Model default · ${modelDefault} frames · ${secondsFor(modelDefault)}`);
+  const seen = new Set([current]);
+  for (const seconds of [1, 2, 4, 5, 10]) {
+    const frames = alignVideoFrames(1 + seconds * fps, caps, 'nearest');
+    if (seen.has(frames)) continue;
+    seen.add(frames);
+    addLength(frames, `${seconds} s · ${frames} frames (${secondsFor(frames)})`);
+  }
+  if (videoComposerFrames > 0 && !Array.from(length.options).some(option => Number(option.value) === videoComposerFrames)) {
+    addLength(videoComposerFrames, `${secondsFor(videoComposerFrames)} · ${videoComposerFrames} frames`);
+  }
+  length.value = String(videoComposerFrames);
+  length.addEventListener('change', () => {
+    videoComposerFrames = Number(length.value);
+    renderAttachments();
+    document.getElementById('video-length-select')?.focus();
+  });
+  framesLabel.appendChild(length);
+  const resolutionLabel = document.createElement('label'); resolutionLabel.textContent = 'Output resolution ';
+  const resolution = document.createElement('select'); resolution.id = 'video-resolution-select';
+  resolution.setAttribute('aria-label', 'Output video resolution');
+  const resolutions = videoResolutionChoices(caps);
+  for (const choice of resolutions) {
+    const option = document.createElement('option');
+    option.value = choice.value;
+    option.textContent = choice.label;
+    resolution.appendChild(option);
+  }
+  if (!resolutions.some(choice => choice.value === videoComposerResolution)) videoComposerResolution = 'default';
+  resolution.value = videoComposerResolution;
+  resolution.addEventListener('change', () => {
+    videoComposerResolution = resolution.value;
+    resolution.focus();
+  });
+  resolutionLabel.appendChild(resolution);
+  controls.append(modeLabel, framesLabel, resolutionLabel);
+  if (videoComposerMode === 'ref') {
+    const help = document.createElement('span'); help.className = 'video-generation-hint';
+    help.textContent = 'Attached images and videos guide appearance; they are not pinned as output frames.';
+    controls.appendChild(help);
+  } else if (videoComposerMode === 'fl2v') {
+    const help = document.createElement('span'); help.className = 'video-generation-hint';
+    help.textContent = 'Attach two images in order: first frame, then last frame.';
+    controls.appendChild(help);
+  }
+  attachmentsDiv.appendChild(controls);
 }
 
 // The file name is the client's own and can contain markup, so these builders
@@ -1598,33 +1811,9 @@ function renderAttachments() {
   // their place on the control now in the same slot, or the message box.
   const focusSlot = Array.from(attachmentsDiv.querySelectorAll('.remove')).indexOf(document.activeElement);
   attachmentsDiv.innerHTML = '';
+  appendVideoGenerationControls();
   let imageNum = 0;
   const totalImages = pendingAttachments.filter(a => a.mediaType === 'image').length;
-  if (totalImages && currentVideoCaps?.supportsKeyframeConditioning && !currentVideoCaps.referenceMode) {
-    const label = document.createElement('label'); label.textContent = 'Clip length ';
-    const length = document.createElement('select'); length.setAttribute('aria-label', 'Video clip length');
-    for (const [value, text] of [[17, '0.7 s preview'], [33, '1.4 s'], [97, '4 s'], [121, '5 s']]) {
-      const option = document.createElement('option'); option.value = String(value); option.textContent = text; length.appendChild(option);
-    }
-    length.value = String(currentVideoCaps.clipFrames || currentVideoCaps.defaultPreviewFrames || 17);
-    length.addEventListener('change', () => { currentVideoCaps.clipFrames = Number(length.value); renderAttachments(); });
-    label.appendChild(length); attachmentsDiv.appendChild(label);
-  }
-  if (totalImages && currentVideoCaps?.supportsKeyframeConditioning && currentVideoCaps?.supportsReferenceConditioning) {
-    const label = document.createElement('label'); label.textContent = 'Image guidance ';
-    const choice = document.createElement('select'); choice.setAttribute('aria-label', 'Image guidance mode');
-    for (const [value, text] of [['keyframes', 'First/last and timed frames'], ['ref', 'Identity references (Ingredients)']]) {
-      const option = document.createElement('option'); option.value = value; option.textContent = text; choice.appendChild(option);
-    }
-    choice.value = currentVideoCaps.referenceMode ? 'ref' : 'keyframes';
-    choice.addEventListener('change', () => { currentVideoCaps.referenceMode = choice.value === 'ref'; renderAttachments(); });
-    label.appendChild(choice); attachmentsDiv.appendChild(label);
-    if (currentVideoCaps.referenceMode) {
-      const help = document.createElement('span'); help.className = 'image-selection-role'; help.style.flexBasis = '100%';
-      help.textContent = 'Describe the target scene and each reference image by its position. Clean subject images without text work best. Multiple references may retain the sheet’s panel layout; one image gives more predictable composition.';
-      attachmentsDiv.appendChild(help);
-    }
-  }
   pendingAttachments.forEach((att, idx) => {
     const name = String(att.fileName || att.file || '');
     let icon = '\u{1F4C4}';
@@ -1675,7 +1864,8 @@ function renderAttachments() {
     attachmentHost.appendChild(thumb && thumb.url && !att.thumbFailed
       ? buildAttachmentThumb(att, idx, name, thumb, chip)
       : chip());
-    if (keyframeImage && !currentVideoCaps.referenceMode) appendVideoKeyframeControls(attachmentHost, att, imageNum - 1, totalImages);
+    if (keyframeImage && (videoComposerMode === 'auto' || videoComposerMode === 'keyframes'))
+      appendVideoKeyframeControls(attachmentHost, att, imageNum - 1, totalImages);
     if (selectableImage) {
       const controls = document.createElement('div');
       controls.className = 'image-selection-controls';
@@ -1715,7 +1905,7 @@ function videoImageConditions(attachments, frames) {
 }
 
 function appendVideoKeyframeControls(host, attachment, index, count) {
-  const frames = currentVideoCaps.clipFrames || currentVideoCaps.defaultPreviewFrames || 17;
+  const frames = selectedVideoFrames();
   const controls = document.createElement('div');
   controls.className = 'image-selection-controls';
   controls.style.flexWrap = 'wrap';
@@ -2831,11 +3021,17 @@ async function sendMessage() {
 
   if (imagePaths.length > 0) msg.imagePaths = imagePaths;
   if (stillImagePaths.length > 0) msg.stillImagePaths = stillImagePaths;
-  if (currentVideoCaps?.supportsKeyframeConditioning && currentVideoCaps.clipFrames) msg.videoFrames = currentVideoCaps.clipFrames;
-  if (stillImagePaths.length && currentVideoCaps?.supportsKeyframeConditioning && currentVideoCaps.referenceMode) {
-    msg.videoMode = 'ref';
-  } else if (currentVideoCaps?.supportsKeyframeConditioning) {
-    const conditions = videoImageConditions(attachmentsCopy, currentVideoCaps.clipFrames || currentVideoCaps.defaultPreviewFrames || 17);
+  if (currentVideoCaps) {
+    if (videoComposerFrames > 0) msg.videoFrames = videoComposerFrames;
+    if (videoComposerMode !== 'auto') msg.videoMode = videoComposerMode;
+    const resolution = videoResolutionChoices().find(choice => choice.value === videoComposerResolution);
+    if (resolution && resolution.width > 0 && resolution.height > 0) {
+      msg.videoWidth = resolution.width;
+      msg.videoHeight = resolution.height;
+    }
+  }
+  if (currentVideoCaps?.supportsKeyframeConditioning && (videoComposerMode === 'auto' || videoComposerMode === 'keyframes')) {
+    const conditions = videoImageConditions(attachmentsCopy, selectedVideoFrames());
     if (conditions) msg.imageConditions = conditions;
   }
   const editSource = attachmentsCopy.find(att => att.mediaType === 'image');
@@ -2860,6 +3056,10 @@ async function sendMessage() {
         mediaType: att.mediaType || 'text'
       };
       if (att.frames && att.frames.length) stored.frames = [...att.frames];
+      if (Number.isInteger(att.width) && att.width > 0 && Number.isInteger(att.height) && att.height > 0) {
+        stored.width = att.width;
+        stored.height = att.height;
+      }
       if (att.fileBacked === true) stored.fileBacked = true;
       if (att.previewUrl) stored.previewUrl = att.previewUrl;
       if (att.editUrl) stored.editUrl = att.editUrl;
@@ -3079,13 +3279,9 @@ function fmtDuration(s) {
 
 async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
   bubbleText.textContent = 'Starting video generation… (this takes a few minutes)';
-  // What attached media MEANS depends on the checkpoint, and only the server knows
-  // which one is loaded. A reference model (MiniMax-H3 Ref2VA) takes stills, clips
-  // and soundtracks as identity and appearance references for a brand-new scene and
-  // accepts several at once; a keyframe model takes the first still as the opening
-  // frame and, where it does first-and-last, a second as the closing one. Sending the
-  // attachments down the wrong one of those is not a degraded clip, it is a refused
-  // request, so the payload is shaped from /api/models rather than guessed here.
+  // What attached media MEANS depends on the loaded model. Photos become image guides
+  // or appearance references. A video attached for MiniMax-H3 or LTX 2.5 continues
+  // from its exact last frame; a second video can pin the new take's ending.
   // With no capability block (an older server, or a model that reports none) this
   // falls through to exactly the single-image request the UI has always sent.
   const caps = currentVideoCaps || {};
@@ -3096,43 +3292,146 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
     : userMsg.imagePaths || []);
   const clips = userMsg.videoFilePaths || [];
   const sounds = userMsg.audioPaths || [];
+  const requestedMode = userMsg.videoMode || 'auto';
   const payload = { prompt: userMsg.content || '' };
+  if (Number(userMsg.videoWidth) > 0 && Number(userMsg.videoHeight) > 0) {
+    payload.width = Number(userMsg.videoWidth);
+    payload.height = Number(userMsg.videoHeight);
+  }
+  const requestedFrames = Number(userMsg.videoFrames) || Number(caps.configuredFrames) || Number(caps.defaultPreviewFrames);
+  if (requestedFrames > 0) payload.frames = requestedFrames;
   let mode = 'Text-to-Video';
   let unused = 0;
 
   if (currentArchitecture === 'ltx-2.5') {
-    if (clips.length || sounds.length) {
-      bubbleText.textContent = 'LTX 2.5 accepts image keyframes. Video and audio reference adapters require separate checkpoints.';
+    if (sounds.length) {
+      bubbleText.textContent = 'LTX 2.5 does not accept audio reference inputs.';
       statsDiv.textContent = 'Unsupported input';
       return;
     }
     // No width/height: the server's --video-width/--video-height (the preset sets
     // 1024x1024) or the model's own default applies. LTX 2.5 plans motion at half the
     // output size, so a 512x512 output would plan hands and faces on a 256x256 grid.
-    Object.assign(payload, { frames: userMsg.videoFrames || 17, fps: 24,
+    Object.assign(payload, { frames: userMsg.videoFrames || caps.configuredFrames || caps.defaultPreviewFrames || 17,
+      fps: caps.defaultPreviewFps || 24,
       steps: 8, cfg: 1, sampler: 'euler_ancestral', flowShift: 0, videoMode: 't2va', generateAudio: true });
   }
 
-  if (caps.supportsKeyframeConditioning && userMsg.videoMode === 'ref') {
-    if (!caps.supportsReferenceConditioning || !stills.length || stills.length > caps.maxReferenceImages) {
-      bubbleText.textContent = 'Identity references require the installed Ingredients adapter and uploaded images.';
+  const frameCount = Number(payload.frames) || Number(userMsg.videoFrames) || Number(caps.configuredFrames) || Number(caps.defaultPreviewFrames) || 17;
+  const hasConditioning = stills.length || clips.length || sounds.length || userMsg.imageConditions || userMsg.image_conditions;
+  const referenceRequested = requestedMode === 'ref' || requestedMode === 'auto' &&
+    caps.supportsReferenceConditioning && !caps.supportsImageConditioning && hasConditioning;
+
+  if (referenceRequested) {
+    if (!caps.supportsReferenceConditioning) {
+      bubbleText.textContent = 'Reference mode is unavailable for the loaded video model.';
+      statsDiv.textContent = 'Unsupported mode'; return;
+    }
+    const maxImages = Number(caps.maxReferenceImages) || 0;
+    if (stills.length > maxImages) {
+      bubbleText.textContent = `This model accepts up to ${maxImages} reference images.`;
       statsDiv.textContent = 'Unsupported input'; return;
     }
-    Object.assign(payload, { width: 768, height: 448, frames: 121, fps: 24,
-      videoMode: 'ref', referenceImages: stills });
-    mode = 'Identity references (Ingredients)';
+    if (!stills.length && !clips.length && !sounds.length) {
+      bubbleText.textContent = 'Reference mode needs at least one reference image, video or soundtrack.';
+      statsDiv.textContent = 'Missing reference'; return;
+    }
+    if (stills.length) payload.referenceImages = stills;
+    if (clips.length) payload.referenceVideos = clips;
+    if (sounds.length) payload.referenceAudios = sounds;
+    payload.videoMode = 'ref';
+    const minimum = Number(caps.minimumReferenceFrames) || 0;
+    payload.frames = Math.max(frameCount, minimum);
+    if (currentArchitecture === 'ltx-2.5') {
+      if (!(payload.width > 0 && payload.height > 0)) Object.assign(payload, { width: 768, height: 448 });
+      mode = 'Identity references (Ingredients)';
+    } else mode = 'Reference-to-Video';
+    const parts = [];
+    if (stills.length) parts.push(stills.length + (stills.length === 1 ? ' image' : ' images'));
+    if (clips.length) parts.push(clips.length + (clips.length === 1 ? ' clip' : ' clips'));
+    if (sounds.length) parts.push(sounds.length + (sounds.length === 1 ? ' soundtrack' : ' soundtracks'));
+    if (parts.length) mode += ' · ' + parts.join(' + ');
+  } else if (requestedMode === 't2v') {
+    if (caps.supportsTextToVideo === false) {
+      bubbleText.textContent = 'The loaded model needs a first-frame image.';
+      statsDiv.textContent = 'Unsupported mode'; return;
+    }
+    if (hasConditioning) {
+      bubbleText.textContent = 'Text-to-video mode does not use attached images, videos or soundtracks. Choose a conditioning mode or remove them.';
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    payload.videoMode = 't2v';
+  } else if (clips.length) {
+    if (requestedMode === 'keyframes' || stills.length || sounds.length || userMsg.imageConditions || userMsg.image_conditions) {
+      bubbleText.textContent = 'Use video continuations by themselves; remove attached photos, keyframes or sound.';
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    if (clips.length > 2) {
+      bubbleText.textContent = 'Use one or two videos. The first ends where the new clip starts; the second ends where it finishes.';
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    if (!caps.supportsImageConditioning || clips.length === 2 && !caps.supportsEndImageConditioning) {
+      bubbleText.textContent = 'Video continuation needs first-frame conditioning on the loaded model.';
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    if (requestedMode === 'fl2v' && clips.length < 2) {
+      bubbleText.textContent = 'First-and-last-frame mode needs two videos or two images.';
+      statsDiv.textContent = 'Missing last frame'; return;
+    }
+    payload.continueFromVideos = clips;
+    payload.videoMode = clips.length === 1 ? 'i2v' : 'fl2v';
+    mode = clips.length === 1 ? 'Continue from last frame' : 'Continue between last frames';
+  } else if (requestedMode === 'i2v' || requestedMode === 'fl2v') {
+    if (sounds.length || clips.length || userMsg.imageConditions || userMsg.image_conditions) {
+      bubbleText.textContent = 'First-frame modes use images only. Remove attached videos, soundtracks or timed keyframes.';
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    if (!caps.supportsImageConditioning || requestedMode === 'fl2v' && !caps.supportsEndImageConditioning) {
+      bubbleText.textContent = `The loaded model does not support ${requestedMode === 'i2v' ? 'first-frame' : 'first-and-last-frame'} conditioning.`;
+      statsDiv.textContent = 'Unsupported mode'; return;
+    }
+    const needed = requestedMode === 'fl2v' ? 2 : 1;
+    if (stills.length < needed) {
+      bubbleText.textContent = requestedMode === 'fl2v'
+        ? 'First-and-last-frame mode needs two images: first frame, then last frame.'
+        : 'First-frame mode needs an image to animate.';
+      statsDiv.textContent = needed === 2 ? 'Missing frame' : 'Missing image'; return;
+    }
+    payload.imagePath = stills[0];
+    payload.videoMode = requestedMode;
+    if (requestedMode === 'fl2v') payload.endImage = stills[1];
+    unused = stills.length - needed;
+    mode = requestedMode === 'i2v' ? 'Image-to-Video' : 'First-and-last-frame';
+  } else if (requestedMode === 'keyframes') {
+    if (!caps.supportsKeyframeConditioning || !stills.length) {
+      bubbleText.textContent = 'Timed keyframes need a model that supports them and at least one attached image.';
+      statsDiv.textContent = 'Unsupported mode'; return;
+    }
+    if (clips.length || sounds.length) {
+      bubbleText.textContent = 'Timed keyframes cannot be combined with video or soundtrack attachments.';
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    const max = Number(caps.maxReferenceImages) || stills.length;
+    if (stills.length > max) {
+      bubbleText.textContent = `This model accepts up to ${max} image keyframes.`;
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    const conditions = userMsg.imageConditions || userMsg.image_conditions;
+    payload.imageConditions = conditions || stills.map((imagePath, index) => ({ imagePath,
+      frameIndex: stills.length < 2 ? 0 : Math.round(index * (frameCount - 1) / (stills.length - 1)), strength: 1 }));
+    payload.videoMode = 'keyframes';
+    mode = 'Timed image keyframes';
   } else if (caps.supportsKeyframeConditioning) {
     const conditions = userMsg.imageConditions || userMsg.image_conditions;
-    const max = caps.maxReferenceImages || payload.frames || caps.defaultPreviewFrames || 17;
+    const max = Number(caps.maxReferenceImages) || frameCount;
     if (stills.length > max || (Array.isArray(conditions) && conditions.length > max)) {
       bubbleText.textContent = `This model accepts up to ${max} image keyframes.`;
       statsDiv.textContent = 'Unsupported input';
       return;
     }
     if (conditions || stills.length > 2) {
-      const frames = payload.frames || caps.defaultPreviewFrames || 17;
       payload.imageConditions = conditions || stills.map((imagePath, index) => ({ imagePath,
-        frameIndex: Math.round(index * (frames - 1) / (stills.length - 1)), strength: 1 }));
+        frameIndex: Math.round(index * (frameCount - 1) / (stills.length - 1)), strength: 1 }));
       payload.videoMode = 'keyframes';
       mode = 'Image keyframes';
     } else if (stills.length) {
@@ -3140,21 +3439,18 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
       if (stills.length > 1) { payload.endImage = stills[1]; payload.videoMode = 'fl2v'; mode = 'First-and-last-frame'; }
     }
   } else if (caps.supportsReferenceConditioning) {
-    const cap = caps.maxReferenceImages > 0 ? caps.maxReferenceImages : stills.length;
+    const cap = Number(caps.maxReferenceImages) || stills.length;
     const refs = stills.slice(0, cap);
     unused = stills.length - refs.length;
     if (refs.length) payload.referenceImages = refs;
     if (clips.length) payload.referenceVideos = clips;
     if (sounds.length) payload.referenceAudios = sounds;
-    // The UI has already chosen reference semantics from the loaded checkpoint.
-    // Carry that choice into this request so a startup --video-mode i2v cannot
-    // turn the attached references into an image-less keyframe request.
     if (refs.length || clips.length || sounds.length) payload.videoMode = 'ref';
     const parts = [];
     if (refs.length) parts.push(refs.length + (refs.length === 1 ? ' image' : ' images'));
     if (clips.length) parts.push(clips.length + (clips.length === 1 ? ' clip' : ' clips'));
     if (sounds.length) parts.push(sounds.length + (sounds.length === 1 ? ' soundtrack' : ' soundtracks'));
-    mode = parts.length ? 'Reference-to-Video \u00b7 ' + parts.join(' + ') : 'Text-to-Video';
+    mode = parts.length ? 'Reference-to-Video · ' + parts.join(' + ') : 'Text-to-Video';
   } else if (stills.length > 0) {
     payload.imagePath = stills[0];
     payload.videoMode = 'i2v';
@@ -3165,6 +3461,13 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
       mode = 'First-and-last-frame';
     }
     unused = stills.length - (payload.endImage ? 2 : 1);
+  }
+  if (!hasConditioning && requestedMode === 'auto') {
+    if (caps.supportsTextToVideo === false) {
+      bubbleText.textContent = 'The loaded model needs a first-frame image. Attach one or choose another video model.';
+      statsDiv.textContent = 'Missing image'; return;
+    }
+    payload.videoMode = 't2v';
   }
   statsDiv.textContent = mode +
     (unused > 0 ? ' (' + unused + (unused === 1 ? ' image' : ' images') + ' not used)' : '');

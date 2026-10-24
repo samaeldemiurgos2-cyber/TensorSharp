@@ -151,6 +151,39 @@ def strip_json_fence(text):
     return rest.strip()
 
 
+def _has_hash_modulo_storage(text):
+    """Recognize a concrete hash-to-index operation followed by value storage.
+
+    A percent sign, topic keywords, or a promise to discuss modulo is not enough.
+    Require a hash/key expression and storage through the same computed index.
+    This remains a minimum coverage check, not a proof of factual correctness.
+    """
+    assignment = (r"\b(?P<index>index|idx|i|bucket(?:_index)?|slot(?:_index)?)\s*=\s*"
+                  r"(?:h|hash|hash_function|hashcode)\s*\(\s*(?:key|k)\s*\)\s*"
+                  r"(?:%|\bmod(?:ulo)?\b)\s*(?:[a-z_]\w*|[1-9]\d*)")
+    for match in re.finditer(assignment, text, re.IGNORECASE):
+        index = re.escape(match.group('index'))
+        storage = (r"\b(?:table|buckets?|slots?|array)\s*\[\s*" + index +
+                   r"\s*\]\s*=\s*(?:value\b|\(\s*key\s*,\s*value\s*\))")
+        if re.search(storage, text[match.end():], re.IGNORECASE):
+            return True
+        # Equivalent affirmative prose is sufficient under the same minimum
+        # hash-to-index contract. Require an immediate present-tense storage
+        # sentence, the same index variable, and no future/negated continuation.
+        refusal = (r"\b(?:I|we)\s+(?:cannot|can't|won't|will\s+not|refuse\s+to|"
+                   r"decline\s+to|am\s+unable\s+to|are\s+unable\s+to)\s+"
+                   r"(?:explain|describe|answer|provide|discuss|help|cover)\b")
+        prose = (r"(?:^|[\n.!?])\s*(?:then\s+)?we\s+(?:store|put|insert)\s+"
+                 r"(?:the\s+)?(?:value|(?:\(\s*key\s*,\s*value\s*\)|key[-\s]+value)\s+pair)\s+"
+                 r"(?:at|in(?:to)?)\s+`?(?:table|buckets?|slots?|array)\s*\[\s*" + index +
+                 r"\s*\]`?\s*(?=[.!?]|$)")
+        prose_match = re.search(prose, text[match.end():], re.IGNORECASE)
+        if (not re.search(refusal, text, re.IGNORECASE)
+                and prose_match is not None and prose_match.end() <= 600):
+            return True
+    return False
+
+
 def decode_content_error(text):
     """Minimum technical coverage, not a semantic quality or factuality score.
 
@@ -176,7 +209,8 @@ def decode_content_error(text):
          r"\b(?:index|indices|bucket|slot|position|location)\b"),
     )
     missing = [label for label, *patterns in coverage
-               if not all(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)]
+               if not all(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+               and not (label == 'hash-to-index or collision mechanics' and _has_hash_modulo_storage(text))]
     if missing:
         return "decode answer lacks minimum technical coverage: " + ", ".join(missing)
     return None
@@ -253,7 +287,7 @@ def execute_tool(name, metrics, step):
 
 def run_case(url, model, engine, name, tag, thinking=False, stream=True, timeout=1200,
              structured_tool_results=False, max_tokens=None, serial_tool_workflows=False,
-             accept_fenced_json=False):
+             accept_fenced_json=False, extra_body=None):
     spec = case_spec(name, tag)
     if max_tokens is not None:
         if max_tokens < 1:
@@ -273,7 +307,7 @@ def run_case(url, model, engine, name, tag, thinking=False, stream=True, timeout
     try:
         count = {"multi_turn": 2, "tool_round_trip": 2, "agentic": 3}.get(name, 1)
         for step in range(count):
-            extra = {**SAMPLING, **engines.thinking_body(engine, thinking)}
+            extra = {**SAMPLING, **engines.thinking_body(engine, thinking), **(extra_body or {})}
             if serial_workflow:
                 # Dependent fixture calls must consume the previous result.
                 # This is a client constraint; execute_tool still validates

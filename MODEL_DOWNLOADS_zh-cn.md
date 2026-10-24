@@ -28,6 +28,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF)，Pixtral 投影器 `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` |
 | Hunyuan Dense | 腾讯稠密 Hunyuan 检查点（`hunyuan-dense`） | 任何 `general.architecture` 为 `hunyuan-dense` 的 GGUF 均可加载，例如 Hy-MT2 系列（参考对话模板取自 `tencent/Hy-MT2-1.8B`）。仅文本、单设备，没有投影器也没有草稿模型。见 [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
 | Muse-Glimmer | Muse-Glimmer-30B（稠密，支持图像） | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF)，如 `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` 或 `Muse-Glimmer-30B-Q8_0.gguf`；`general.architecture` 为 `muse-glimmer` / `muse_glimmer`。图像输入需同仓库的 `mmproj-Muse-Glimmer-30B-Q8_0.gguf`：传 `--image` 时 CLI 会在模型旁边找到它，服务端则需用 `--mmproj` 指定。可选提速产物：同仓库的 DFlash 分块 draft `dflash-kquant.gguf`，或更新的 DFlash2 draft [z-lab/Muse-Glimmer-30B-DFlash2-GGUF](https://huggingface.co/z-lab/Muse-Glimmer-30B-DFlash2-GGUF)（16 GB 显卡上优先选 `-Q4_K_M`，见 [speculative_decoding.md](docs/speculative_decoding.md#what-to-expect) 中关于 draft 大小的说明），用 `--draft-model` 加载即可无损推测解码——不要传任何采样参数，它只在纯贪心下生效 |
+| Muse Spark | Muse-Spark-Open-816B-A42B（816B-A42B MoE，支持图像） | [unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF)：每个量化档一个子目录，各为一组分片：`UD-IQ3_XXS/` 为 8 个分片、317 GiB（即实测所用的量化），`UD-Q3_K_XL/` 为 10 个分片、374 GiB，`UD-Q4_K_XL/` 为 12 个分片。同一量化档的所有分片需放在同一目录，`--model` 指向其中任意一片即可；后续分片只含切分元数据，不能单独作为模型加载。`general.architecture` 为 `muse-spark` / `muse_spark`。图像输入需用 `--mmproj` 指定仓库根目录下的 `mmproj-Q8_0.gguf`（2.2 GB）；Muse-Glimmer-30B 的投影器输出宽度不同，会被拒绝。实测配置为十张 46 GB A40，全部专家都放在显存中（见下方运行示例）。没有草稿器：投机解码只能用无权重的 n-gram |
 | DeepSeek V4.1 | DeepSeek-V4.1-Flash（`deepseek41`，384 个路由专家） | [smalinin/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/tree/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5)，固定 revision `d1de55c19f95172c882906cc83c0e55932d26a63`——`Q2_K-Q5/` 下十个分片，共 335,382,014,624 字节（312.349 GiB），Engram 表为 Q5_K，并恢复 F32 mHC 与 BF16 Engram 门控张量。所有分片放在同一目录，`--model` 指向第一个分片。原七分片 vcruz Q2 存在敏感张量量化问题，不再推荐。修复版头部与十个完整文件哈希均已校验，双卡按层切分与实验性路由专家 TP 下的有限普通/DSpark 文本/图像 HTTP 检查均已通过，回答以 EOS 完成，服务正常退出。另行进行的 24-token 普通/DSpark 文本/图像配对检查，在两种模式下均匹配 token ID 与 `max_tokens` 结束原因，DSpark 实际参与解码且进程正常退出；这些有限续写与 HTTP 的 EOS 检查分开记录。两个图像配对中 DSpark 都更慢。简短的重复文本预热对照也已完成：每种模式一次预热、三次计时，每对输入 69 token、输出 24 token，token ID 与结束原因完全一致，DSpark 实际参与解码且进程正常退出。小样本与大量磁盘换页限制了这些结果，不声明通用质量/性能、提速、跨节点执行或完整模型 TP 通过。每次重新下载仍须校验哈希。GGUF 已包含 Engram 权重与哈希常量，无需生成 Engram 或单独的 Engram 文件。`eng/dsv41-prepare-vision.py` 生成约 970 MB 的可选视觉伴随文件，图像与视频经 `--mmproj` 使用。服务后端为 `ggml_cuda`；`ggml_cpu` 与 `cpu` 是正确性与可移植性路径，而非服务路径——`--backend cpu` 用纯 C# 执行器 `DeepSeek4CpuExecutor` 跑完整的 V4.1 计算图，不依赖 ggml、原生库与 GPU；它同样直接读取内嵌的 Engram 元数据，而视觉伴随文件不会跟到这个后端上（`LoadVisionEncoder` 会抛异常），因此该后端上没有图像也没有视频。V4 的草稿模型会被拒绝；`deepseek41-dspark` 草稿模型可在 `ggml_cuda` / `ggml_cpu` 上经 `--draft-model` 加载，属于实验性路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分与实验性路由专家 TP 下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。完整流程与校验哈希见 [deepseek41](docs/models/deepseek41_zh-cn.md) |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731（284B MoE） | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)；每种量化一个子目录（`UD-Q8_K_XL/`、`UD-IQ4_XS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。仅文本 |
 | GLM 5.x | GLM-5.2（744B-A40B MoE，内嵌 NextN MTP） | [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF)；每种量化一个子目录（`UD-Q4_K_XL/`、`UD-IQ2_XXS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。**仅文本**——再往下两行的 GLM-5.3-Flash 才是支持图像的那个；中间那行的 GLM-5.3 同样仅文本。这些 GGUF 已带有 `--spec` 所需的 NextN 块——与 Qwen 3.6 不同，不存在需要挑选的独立 MTP 仓库 |
@@ -43,9 +44,9 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Qwen-Image-2.1 | LoRA 插件（可选） | [`config/lora/`](config/lora/) 中的十四个 Qwen-Image-2.1 插件，用 `--lora` 加载；每个插件在首次使用时以固定修订版本与 SHA-256 从 Hugging Face 下载其 `.safetensors`，保存到模型根目录下的 `qwen-image-2.1/loras/`（Fun-Acc 还会下载它转交的 `pdd_config.json`）。包括步数蒸馏适配器（Viggle Turbo、Pruna 8/5 步、阿里巴巴 PAI Fun-Acc 4 步）以及风格 / 编辑 LoRA；其中数个仅限非商业用途。见 [USAGE_zh-cn.md](USAGE_zh-cn.md#qwen-image-21-lora-插件) |
 | LTX 2.5 Distilled | 视频 + 48 kHz 立体声音频 | [`config/ltx-2.5-distilled.json`](config/ltx-2.5-distilled.json) 从无访问限制的 [unsloth/LTX-2.5-GGUF](https://huggingface.co/unsloth/LTX-2.5-GGUF) 固定五个文件（43.08 GB）：`distilled/` 下的 UD-Q4_K_XL 去噪器、专用 Gemma 4 BF16 编码器 / 投影、卷积视频 VAE、2 倍潜变量放大器与音频 VAE。无需账号或 token。TensorAgent 的实验性档位为 48 GB；默认预览为 1024×1024×17、24 fps，使用 8+3 步两阶段 ancestral Euler。可选 Ingredients IC-LoRA 与扩散视频解码器仍需官方访问权限。见 [LTX 2.5](docs/models/ltx-2.5_zh-cn.md)。 |
 | EmbeddingGemma 2 | 文本 / 代码及可选媒体嵌入 | [`config/embeddinggemma2.json`](config/embeddinggemma2.json) 将 Q8_0 文本模型固定到 Unsloth 修订 `031f0d4b35536f69ab3509d4893c923264fcf253`；同一版本的可选 `mmproj-Q8_0.gguf` 提供图像 / 音频 / 视频输入。用 `--embeddings` 承载；输出 768 维（MRL：512/256/128），默认输入窗口 8192 token。已实现六个后端，不支持 Vulkan。命令与覆盖范围见[嵌入指南](docs/embeddings_zh-cn.md)。 |
-| MiniMax-H3 音视频生成 | 去噪器（`--model` GGUF） | **两个独立的 checkpoint，不是开关**——加载哪一个决定了它接受什么条件输入。[unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)：`minimax_h3_fl2va_pruned-Q4_K.gguf`（10.64 GiB）用于文生视频 / 图生视频 / 首尾帧，`minimax_h3_ref2va_pruned-Q4_K.gguf`（10.60 GiB）用于身份与外观参考。另有 Q8_0（19.97 GiB）到 Q2_K（6.26 GiB）。H3 是 CFG 蒸馏模型：**CFG 必须为 1.0**（默认值）；默认 20 步，下面可选的 Turbo 插件把 FL2VA 检查点蒸馏为 8 或 4 步。这些 GGUF **完全没有元数据**，TensorSharp 靠张量表识别它们，并从文件名读出分区——重命名或重新量化时请保留 `fl2va` / `ref2va`。两个 checkpoint 共用下面三个网络，所以事后再加另一个只需下它自己的约 10.6 GiB。TensorAgent 的桌面目录（32 GB 档位）会自己下载整套带哈希校验的文件（含分词器），分为 `minimax-h3-fl2va-q4k` 与 `minimax-h3-ref2va-q4k` 两个条目；后安装的那个直接链接已有的 24.0 GB 共用文件而不重新下载，只下载自己的去噪器。见 [minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#在-tensoragent-mac-应用里) |
+| MiniMax-H3 音视频生成 | 去噪器（`--model` GGUF） | **两个独立的 checkpoint，不是开关**——加载哪一个决定了它接受什么条件输入。[unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)：`minimax_h3_fl2va_pruned-Q4_K.gguf`（10.64 GiB）用于文生视频 / 图生视频 / 首尾帧，`minimax_h3_ref2va_pruned-Q4_K.gguf`（10.60 GiB）用于身份与外观参考。另有 Q8_0（19.97 GiB）到 Q2_K（6.26 GiB）。H3 是 CFG 蒸馏模型：**CFG 必须为 1.0**（默认值）；默认 20 步，下面可选的 Turbo 插件把 FL2VA 检查点蒸馏为 8 或 4 步。这些 GGUF **完全没有元数据**，TensorSharp 靠张量表识别它们，并从文件名读出分区——重命名或重新量化时请保留 `fl2va` / `ref2va`。两个 checkpoint 共用下面三个网络，所以事后再加另一个只需下它自己的约 10.6 GiB。TensorAgent 的桌面目录（32 GB 档位）会通过单个 `minimax-h3-fl2va-q4k` 条目下载两种带哈希校验的去噪器及 24.0 GB 共用文件（含分词器）。Video Studio 可在两种条件模式间切换，无需重新加载共用模型。见 [minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#在-tensoragent-mac-应用里) |
 | MiniMax-H3 音视频生成 | Qwen3-VL-32B 文本编码器（必需） | 同仓库：`qwen3vl_32b_minimax_h3-Q4_K_M.gguf`（16.97 GiB），或 `-Q2_K_M.gguf`（12.20 GiB）以搭配最小的那几个去噪器。截断到 50 层并去掉最后的 norm，去噪开始前即从显存释放。**它不含分词器**——还需要下一行那三个文件 |
-| MiniMax-H3 音视频生成 | `vocab.json` + `merges.txt` + `tokenizer_config.json`（必需） | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor) 的 `processor/`（三个合计 4.46 MB）——编码器 GGUF 缺的那对 Qwen2 字节级 BPE 文件，外加 `tokenizer_config.json`：只有它定义了 `<\|vision_start\|>`、`<\|image_pad\|>` 和 `<\|vision_end\|>`。文生视频与参考全是录音的请求不需要它；缺了它，带关键帧、或参考中含照片或视频片段的请求会在视觉塔运行前被拒绝（以前图片会被放到提示词的错误位置上、悄悄被忽略）。这也是配置文件唯一无法替你自动下载的东西（自动下载只能补齐“是参数”的条目，而分词器不是），不过 TensorAgent 的目录会自己下载这三个文件。放在编码器旁边，或用 `TS_VIDEO_TOKENIZER` 指向存放它们的目录 |
+| MiniMax-H3 音视频生成 | `vocab.json` + `merges.txt` + `tokenizer_config.json`（必需） | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor) 的 `processor/`（三个合计 4.46 MB）——编码器 GGUF 缺的那对 Qwen2 字节级 BPE 文件，外加 `tokenizer_config.json`：只有它定义了 `<\|vision_start\|>`、`<\|image_pad\|>` 和 `<\|vision_end\|>`。文生视频与参考全是录音的请求不需要它；缺了它，带关键帧、或参考中含照片或视频片段的请求会在视觉塔运行前被拒绝（以前图片会被放到提示词的错误位置上、悄悄被忽略）。随附的 `minimax-h3-fl2va.json` 配置会在首次运行时自动下载这三个文件；手动安装时将它们放在编码器旁边，或用 `TS_VIDEO_TOKENIZER` 指向存放它们的目录 |
 | MiniMax-H3 音视频生成 | 视频 VAE（必需） | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae) 里的 `minimax_h3_video_vae_fp16.safetensors`（5.21 GB）。空间 16 倍 / 时间 4 倍，解码器是纯 Transformer。放在去噪器旁或用 `--video-vae` 指定 |
 | MiniMax-H3 音视频生成 | 音频 VAE（可选） | 同一目录下的 `minimax_h3_audio_vae_fp32.safetensors`（0.61 GB）。把联合生成的音频 latent 解码成 32 kHz 立体声，作为旁挂 `.wav` 写在视频边上。**不下载也照样出视频**，只是没有声音。用 `--audio-vae` 指定 |
 | MiniMax-H3 音视频生成 | Turbo LoRA 插件（可选，仅 FL2VA） | [`config/lora/`](config/lora/) 中的两个步数蒸馏插件，用 `--lora` 加载，来自 [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/a29e57d195f80ead07c89f89e55ecf2911e893c5)，固定修订版本 `a29e57d195f80ead07c89f89e55ecf2911e893c5`（Apache-2.0），各 1,383,677,808 字节（1.38 GB），首次使用时下载到模型根目录下的 `minimax-h3/loras/`。`minimax-h3-fl2v-turbo-8step.json`：`minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors`，SHA-256 `9b0efe3613b43a84e30febaa43af27432ea9d0711eac7bba904b2556b175f6d4`，8 步。`minimax-h3-fl2v-turbo-4step.json`：`minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors`，SHA-256 `c3d4a2cf618efea71b9e21a4baaa12d412f1eb6c2b6f86efacaf0ebb6814b689`，4 步，配方为推断所得。各自把步数、flow shift、采样器与 CFG 锁定为其配方；Ref2VA 两个都拒绝。见 [minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#turbo-插件) |
@@ -186,6 +187,35 @@ GLM 系列都会在构建模型之前被拒绝），而且会在每个 rank 上�
 已验证的配置，并且在它之下加载器会放弃 draft——`blk.78` 借用的主干 LM head 是按列切分的——
 转为普通解码。GLM-5.2 与 GLM-5.3-Flash 的下载方式相同，仓库见上表。详见
 [glm](docs/models/glm_zh-cn.md#glm-53glm-dsa)。
+
+**Muse Spark**（816B-A42B MoE，文本 + 图像、思维链、ATEM 工具；`ggml_cuda` / `ggml_vulkan` 上使用原生整模型执行器）：
+
+```bash
+# UD-IQ3_XXS 是 8 个分片、317 GiB。实测机器有十张 46 GB A40，全部专家都放在显存中，
+# 每张 GPU 约 36 GiB。
+hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF --include "UD-IQ3_XXS/*" --local-dir models/muse-spark
+hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF mmproj-Q8_0.gguf --local-dir models/muse-spark
+
+# 按层切分，长提示更快。生成更快的张量并行模式：把 --layer-split 10 换成 --tp 10（仅 ggml_cuda）。
+MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+    --model models/muse-spark/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00001-of-00008.gguf \
+    --backend ggml_cuda --layer-split 10 --port 5000
+```
+
+`--layer-split N` 或 `--tp N` 按你的 GPU 数设置（最多 16 张；`--tp` 还要求所有 GPU 型号相同）。
+`TS_MUSE_SPARK_PLAN_SLOTS=5` 为四个并发请求加共享前缀检查点预留空间。实测运行还设置了
+`TS_CODE_EXEC=0`，传了 `--no-webui --no-skills --no-multi-agent`，且没有加载投影器；需要图像
+输入时，加上 `--mmproj models/muse-spark/mmproj-Q8_0.gguf` 与
+`TS_MUSE_SPARK_DEV0_RESERVE_MB=3072`，后者在 GPU 0 上为图像编码器留出余量。GPU 较少时，按层
+切分配合 `TS_MUSE_SPARK_CPU_MOE=auto` 让尽可能多的专家栈留在 GPU 上，其余放到主机内存；如果
+既没有它，也没有 `--n-cpu-moe N`，放不下的 checkpoint 会被拒绝加载，错误信息会指明该选项。
+[当前对比](docs/perf/muse-spark-vs-llama-cpp.md)没有测量 CPU 卸载。
+`--tp N` 让全部专家留在 GPU 上。`TS_MUSE_SPARK_NATIVE=0` 会选回较早的逐算子路径，
+`ggml_vulkan` 上的 `--tp N` 也走这条路径。无权重投机解码用 `--spec --spec-type ngram`；原生
+`--tp` 路径不使用投机解码。该配置下与 llama.cpp 的对比见
+[性能数据](docs/benchmarks_zh-cn.md#十块-a40-上的-muse-spark-816b)；全部选项见
+[模型卡片](docs/models/muse-spark_zh-cn.md#选项)。
 
 **Gemma 4**（文本 + 图像/视频/音频、思维链、工具、可选 MTP）：
 
@@ -331,7 +361,7 @@ dotnet run --project TensorSharp.Cli -c Release -- \
 
 **MiniMax-H3 音视频生成**（提示词 + 可选关键帧或参考 → H.264 MP4，**外加原生 32 kHz 立体声音频，在同一个打包 latent 里一起生成**）：
 
-这里有四个网络协同工作，所以最短路径是现成的配置文件——它把四个都写好了，缺什么下什么（首次运行约 35.5 GB）：
+这里有五个模型文件协同工作，所以最短路径是现成的配置文件——它会下载两个去噪器和三个共享网络（首次运行约 46 GB）：
 
 ```bash
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json
@@ -339,15 +369,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
 ```
 
-`config/minimax-h3-ref2va.json` 是另一个 checkpoint：最多九个身份与外观参考——静态图、片段、音轨——
-用于一个全新的镜头，而不是必须被复现的帧。FL2VA 与 Ref2VA 是**两个独立的 checkpoint，不是一个开关**，
-向其中一个索要另一个的条件输入会直接报错，并在错误信息里点名你真正需要的那个文件。两份配置只有去噪器
-不同（那边约 35.4 GB），下面三个网络是共用的，所以第二份配置只会下它自己的 DiT。参见
+单个配置会同时下载 FL2VA 与 Ref2VA 两个独立的 checkpoint；它们不是一个开关，而是分别服务关键帧与身份参考。
+最多九个身份与外观参考——静态图、片段、音轨——用于一个全新的镜头，而不是必须被复现的帧。
+向不匹配的分区索要条件输入会直接报错。参见
 [config/README.md](config/README.md#video-generation-with-sound-minimax-h3)。文件会落到
 `TENSORSHARP_MODELS` 指向的位置，或仓库根目录下的 `models/`（已被 Git 忽略）。
 
-分词器无论走哪条路都不会自动下载：文本编码器的 GGUF 不含分词器，而自动下载只能补齐“是参数”的条目。
-三个文件都放在编码器旁边；`tokenizer_config.json` 是唯一定义视觉标记的那个，缺了它文生视频照样能跑，
+配置会自动下载分词器：文本编码器的 GGUF 不含分词器，但配置将三个文件作为伴随下载放在编码器旁边。
+`tokenizer_config.json` 是唯一定义视觉标记的那个，缺了它文生视频照样能跑，
 但带关键帧、或参考中含照片或视频片段的请求会被拒绝：
 
 ```bash

@@ -86,8 +86,7 @@ Windows/Linux 上带 Vulkan 驱动的 AMD、Intel 或 NVIDIA GPU 使用 `ggml_vu
 - 只有一个调度序列时，调度器的单序列路径会选择线性 `Forward()` 路径，
   从而进入融合整模型 decode，而不是通用批处理逐算子路径。
 
-实测与路由说明见[引擎对比报告](../engine_comparison_report.md)、
-[E4B prefill 性能记录](../perf/gemma4-prefill-cuda-graph-design.md)与
+实现与路由说明见[E4B prefill 工程记录](../perf/gemma4-prefill-cuda-graph-design.md)与
 [N=1 调度器文档](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
 
 多模态 CLI 单次推理（文本提示词通过 `--input` 从文件读取；只给 `--image` 而不给

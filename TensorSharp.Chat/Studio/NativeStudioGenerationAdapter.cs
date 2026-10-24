@@ -28,18 +28,25 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
     private readonly Func<CancellationToken, Task> _prepare;
     private readonly TensorSharp.Runtime.Scheduling.ComputeGate _compute;
     private readonly Func<bool, IReadOnlyList<LoraSpec>> _videoLoras;
+    private readonly Action<Ltx25Model> _ensureLtxIngredients;
     /// <param name="videoLoras">The LoRA plug-ins each clip runs with, for a host that chooses them per clip (the
     /// TensorAgent app); null leaves the loaded model's own (the server's <c>--lora</c>). It is called with false for a
     /// capability or validation query, which must have no side effects, and with true once for the clip that runs.</param>
     public NativeStudioGenerationAdapter(ModelService models, WebUiChatService chat, Func<CancellationToken, Task> prepare = null, TensorSharp.Runtime.Scheduling.ComputeGate compute = null,
-        Func<bool, IReadOnlyList<LoraSpec>> videoLoras = null)
-    { _models = models; _chat = chat; _prepare = prepare; _compute = compute; _videoLoras = videoLoras; }
+        Func<bool, IReadOnlyList<LoraSpec>> videoLoras = null, Action<Ltx25Model> ensureLtxIngredients = null)
+    { _models = models; _chat = chat; _prepare = prepare; _compute = compute; _videoLoras = videoLoras; _ensureLtxIngredients = ensureLtxIngredients; }
 
     public Task<IReadOnlyList<StudioModelCapability>> GetCapabilitiesAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (_models.Model is not IVideoGenerationModel video)
             return Task.FromResult<IReadOnlyList<StudioModelCapability>>(Array.Empty<StudioModelCapability>());
+        string? ingredientsError = null;
+        if (video is Ltx25Model ltx && _ensureLtxIngredients != null)
+        {
+            try { _ensureLtxIngredients(ltx); }
+            catch (Exception e) when (e is not OperationCanceledException) { ingredientsError = e.Message; }
+        }
         // The contract the next clip would sample with: the host's plug-in choice, read from the plug-in configs alone,
         // else the model's own. A choice the model would refuse leaves nothing to offer, so it is the unavailable reason.
         VideoSamplingContract contract;
@@ -50,7 +57,10 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             refused.Available = false; refused.UnavailableReason = e.Message;
             return Task.FromResult<IReadOnlyList<StudioModelCapability>>(new[] { refused });
         }
-        return Task.FromResult<IReadOnlyList<StudioModelCapability>>(new[] { CreateCapability(video, _models.LoadedModelName, _chat.VideoDefaults, contract) });
+        StudioModelCapability capability = CreateCapability(video, _models.LoadedModelName, _chat.VideoDefaults, contract);
+        if (ingredientsError != null && video is Ltx25Model)
+            capability.UnavailableModes[StudioGenerationModes.Reference] = ingredientsError;
+        return Task.FromResult<IReadOnlyList<StudioModelCapability>>(new[] { capability });
     }
 
     /// <summary>The sampling contract <paramref name="specs"/> bind <paramref name="video"/> to, read from the plug-in
@@ -97,7 +107,9 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
                 }
                 if (ltx.SupportsReferenceConditioning) capability.ReferenceMinFrames = Ltx25ReferenceConditioning.MinimumFrames;
                 else capability.UnavailableModes[StudioGenerationModes.Reference] = "LTX identity/appearance references need the Ingredients IC-LoRA " +
-                    "(loras/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors beside the checkpoint, or TS_LTX25_INGREDIENTS_LORA). Install it and reload the model.";
+                    "(loras/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors beside the checkpoint, or TS_LTX25_INGREDIENTS_LORA). Install it and refresh Video Studio capabilities; the adapter attaches to the loaded model.";
+                capability.ReferenceVideos = ltx.SupportsReferenceConditioning;
+                capability.MaxReferenceVideos = ltx.SupportsReferenceConditioning ? 1 : 0;
                 // The pipeline composes a frame-0 guide with the Ingredients sheet as upstream ICLoraPipeline does, but Studio
                 // does not offer it: the publisher trained Ingredients with first_frame_conditioning_p 0.0, and in validation
                 // (768x448x121, MLX) every take that started on the frame cut to the reference sheet at its second frame.
@@ -110,29 +122,33 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             case MiniMaxH3Model h3:
                 capability.SpatialMultiple = 32; capability.TemporalMultiple = 17; capability.TemporalOffset = 5;
                 capability.DefaultWidth = 640; capability.DefaultHeight = 384;
-                capability.ImageConditioning = h3.Partition != MiniMaxH3Partition.Reference;
+                bool hasFl2va = h3.SupportsPartition(MiniMaxH3Partition.FirstLastFrame);
+                bool hasRef2va = h3.SupportsPartition(MiniMaxH3Partition.Reference);
+                capability.ImageConditioning = hasFl2va;
+                capability.LastFrameConditioning = hasFl2va;
+                capability.IdentityReferences = hasRef2va;
+                capability.MaxReferences = hasRef2va ? MiniMaxH3Geometry.MaxReferences : 0;
+                capability.ReferenceVideos = hasRef2va;
+                capability.MaxReferenceVideos = hasRef2va ? 1 : 0;
                 capability.FixedFps = 24; capability.DefaultCfgScale = 1; capability.FixedCfgScale = 1;
                 capability.DefaultSteps = MiniMaxH3Scheduler.DefaultSteps;
                 // MiniMax's README (and the vllm-omni / sglang recipes) give 4-15 s at 24 fps; the default stays a short preview.
                 capability.RecommendedMinSeconds = 4; capability.RecommendedMaxSeconds = 15;
-                // FL2VA and Ref2VA are separate checkpoint files, not settings.
-                if (h3.Partition == MiniMaxH3Partition.Reference)
+                // Older one-checkpoint installations remain usable, with the other mode
+                // shown as unavailable until the complete catalog entry is installed.
+                if (!hasFl2va)
                 {
                     const string keyframes = "MiniMax-H3 first- or last-frame conditioning needs the FL2VA checkpoint (minimax_h3_fl2va_pruned-*.gguf); " +
-                        "the loaded Ref2VA checkpoint treats images as identity references. Load the FL2VA file to pin frames.";
+                        "download the complete MiniMax-H3 model entry to enable first/last-frame mode.";
                     capability.UnavailableModes[StudioGenerationModes.ImageToVideo] = keyframes;
                     capability.UnavailableModes[StudioGenerationModes.FirstLastFrame] = keyframes;
                 }
-                else capability.UnavailableModes[StudioGenerationModes.Reference] = "MiniMax-H3 identity/appearance references need the Ref2VA checkpoint " +
-                    "(minimax_h3_ref2va_pruned-*.gguf); the loaded FL2VA checkpoint pins frames. Load the Ref2VA file to use references.";
+                if (!hasRef2va) capability.UnavailableModes[StudioGenerationModes.Reference] = "MiniMax-H3 identity/appearance references need the Ref2VA checkpoint " +
+                    "(minimax_h3_ref2va_pruned-*.gguf); download the complete MiniMax-H3 model entry to enable reference mode.";
                 // MiniMax's own pipeline, stable-diffusion.cpp and vllm-omni all refuse keyframes with references in one request.
-                capability.ReferencesWithFirstFrameUnavailableReason = h3.Partition == MiniMaxH3Partition.Reference
-                    ? "MiniMax-H3 Ref2VA keeps a character from reference photos but cannot pin a first frame, and the FL2VA checkpoint, which pins " +
-                      "frames, takes no references; MiniMax's pipeline, stable-diffusion.cpp and vllm-omni refuse both in one request. Continue from the " +
-                      "frame on FL2VA, or remove the frame here for a new shot that keeps the character (it starts a new framing, so the join is a cut)."
-                    : "MiniMax-H3 FL2VA starts on a frame but takes no reference photos, and the Ref2VA checkpoint, which keeps a character, pins no " +
-                      "frames; MiniMax's pipeline, stable-diffusion.cpp and vllm-omni refuse both in one request. Continue from the frame alone (it already " +
-                      "shows the character), or load Ref2VA for a take that keeps the character without starting exactly on the frame.";
+                capability.ReferencesWithFirstFrameUnavailableReason = hasFl2va && hasRef2va
+                    ? "MiniMax-H3 uses separate denoisers for first/last frames and reference photos, and cannot combine them in one take. Switch between frame mode and reference mode here; Studio keeps the loaded model and shared components in place."
+                    : "MiniMax-H3 uses separate denoisers for first/last frames and reference photos, and cannot combine them in one take. Continue on the frame, or remove it for a new reference take.";
                 break;
             case WanVideoModel wan:
                 capability.SpatialMultiple = wan.Variant == WanVariant.TI2V ? 32 : 16;
@@ -179,7 +195,7 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             // i2v/fl2v keep the first frame's framing, so its canvas comes from that image by MiniMax's 768p
             // recipe, exactly as chat sizes it. A host that pins both sides keeps that size for every mode, as chat
             // does; a one-sided pin squares here (above) while chat derives the other side from the photo.
-            if (h3Model.Partition != MiniMaxH3Partition.Reference && defaults.CanvasPolicy == VideoCanvasPolicy.ModelRecipe
+            if (h3Model.SupportsPartition(MiniMaxH3Partition.FirstLastFrame) && defaults.CanvasPolicy == VideoCanvasPolicy.ModelRecipe
                 && defaults.Width <= 0 && defaults.Height <= 0)
             {
                 capability.ImageCanvasModes = [StudioGenerationModes.ImageToVideo, StudioGenerationModes.FirstLastFrame];
@@ -269,10 +285,13 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             throw new StudioException("unsupported_conditioning", "The loaded checkpoint does not support the requested conditioning or audio output.");
         if (request.CfgScale == 1 && !string.IsNullOrWhiteSpace(request.NegativePrompt))
             throw new StudioException("unsupported_negative_prompt", "Negative prompts do not run at CFG 1. Clear the negative prompt rather than silently ignoring it.");
-        if (request.TemporalConditions.Count > 0 && !capability.TemporalGuidance || request.ReferenceAssetIds.Count > 0 && !capability.IdentityReferences)
-            throw new StudioException("unsupported_conditioning", "The loaded checkpoint does not support these temporal guides or identity references.");
-        if (request.TemporalConditions.Count + request.ReferenceAssetIds.Count > Math.Max(0, capability.MaxReferences))
-            throw new StudioException("invalid_conditioning", $"This model accepts at most {capability.MaxReferences} guides/references.");
+        if (request.TemporalConditions.Count > 0 && !capability.TemporalGuidance ||
+            request.ReferenceAssetIds.Count > 0 && !capability.IdentityReferences ||
+            request.ReferenceVideoAssetIds.Count > 0 && !capability.ReferenceVideos)
+            throw new StudioException("unsupported_conditioning", "The loaded checkpoint does not support these temporal guides or identity-reference media.");
+        if (request.TemporalConditions.Count + request.ReferenceAssetIds.Count > Math.Max(0, capability.MaxReferences) ||
+            request.ReferenceVideoAssetIds.Count > Math.Max(0, capability.MaxReferenceVideos))
+            throw new StudioException("invalid_conditioning", $"This model accepts at most {capability.MaxReferences} image guides/references and {capability.MaxReferenceVideos} video references.");
         foreach (var guide in request.TemporalConditions)
             if (guide.FrameIndex < -1 || guide.FrameIndex >= request.FrameCount || !float.IsFinite(guide.Strength) || guide.Strength is < 0 or > 1)
                 throw new StudioException("invalid_conditioning", "Temporal guide position or strength is invalid.");
@@ -282,7 +301,10 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             if (_models.Model is Ltx25Model ltx)
                 _ = Ltx25GenerationSettings.Resolve(Parameters(request, conditioningAssets, null, cancellationToken), ltx.SupportsReferenceConditioning);
             if (_models.Model is MiniMaxH3Model h3)
-                _ = MiniMaxH3ModeResolver.Resolve(Parameters(request, conditioningAssets, null, cancellationToken), h3.Partition);
+            {
+                VideoGenerationParams parameters = Parameters(request, conditioningAssets, null, cancellationToken);
+                _ = MiniMaxH3ModeResolver.Resolve(parameters, h3.PartitionFor(parameters));
+            }
             // So is a plug-in's recipe, which holds Studio to the request rules it holds chat to.
             if (_models.Model is MiniMaxH3Model plugged)
                 (_videoLoras == null ? plugged.SamplingRecipe : MiniMaxH3LoraConfig.RecipeFor(_videoLoras(false), plugged.Partition))
@@ -340,8 +362,14 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
         // provenance, so it names the files and the schedule the clip actually sampled.
         var loras = _videoLoras?.Invoke(true);
         var plugins = (loras ?? (expectedModel as ILoraPluginHost)?.LoraSpecs ?? Array.Empty<LoraSpec>()).Select(PluginWeights).ToList();
+        MiniMaxH3Partition? h3Partition = null;
+        if (expectedModel is MiniMaxH3Model selectedH3)
+            h3Partition = selectedH3.PartitionFor(Parameters(request, conditioningAssets, null, cancellationToken));
         var h3Recipe = expectedModel is MiniMaxH3Model turbo
-            ? loras == null ? turbo.SamplingRecipe : MiniMaxH3LoraConfig.RecipeFor(loras, turbo.Partition) : null;
+            ? h3Partition == turbo.Partition
+                ? loras == null ? turbo.SamplingRecipe : MiniMaxH3LoraConfig.RecipeFor(loras, turbo.Partition)
+                : null
+            : null;
         string recipeId = (expectedModel is MiniMaxH3Model ? h3Recipe?.ToContract() : PlannedContract(expectedModel, loras))?.Id
             ?? VideoSamplingContract.NativeId;
         using var interrupted = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -356,7 +384,19 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             string checksum = await Sha256Async(source, progress, 0, "Computing the installed checkpoint SHA-256 once for generation provenance.", cancellationToken).ConfigureAwait(false);
             identity += "; sha256=" + checksum + "; bytes=" + source.Length.ToString(CultureInfo.InvariantCulture);
             if (expectedModel is MiniMaxH3Model h3)
-                identity += "; checkpoint=" + (h3.Partition == MiniMaxH3Partition.Reference ? "ref2va" : "fl2va");
+            {
+                string partitionName = h3Partition == MiniMaxH3Partition.Reference ? "ref2va" : "fl2va";
+                identity += "; checkpoint=" + partitionName;
+                string selectedDenoiserPath = h3.DenoiserPathFor(h3Partition!.Value);
+                if (!string.Equals(Path.GetFullPath(selectedDenoiserPath), Path.GetFullPath(expectedPath), StringComparison.Ordinal))
+                {
+                    var selectedDenoiser = new FileInfo(selectedDenoiserPath);
+                    string selectedHash = await Sha256Async(selectedDenoiser, progress, .03,
+                        "Computing the selected MiniMax-H3 denoiser SHA-256 once for generation provenance.", cancellationToken).ConfigureAwait(false);
+                    identity += "; active_denoiser=" + selectedDenoiser.Name + "; active_denoiser_sha256=" + selectedHash
+                        + "; active_denoiser_bytes=" + selectedDenoiser.Length.ToString(CultureInfo.InvariantCulture);
+                }
+            }
             // Each plug-in's adapter file is hashed like the checkpoint: before the clip when it is on disk, after it when
             // the run fetched it (a plug-in config names its download).
             var pluginHashes = new string[plugins.Count];
@@ -480,6 +520,7 @@ public sealed class NativeStudioGenerationAdapter : IStudioGenerationAdapter
             // Studio's mode names are the native mode names for every family that reads one; Wan infers from the image.
             Mode = mode,
             ReferenceImagePaths = r.ReferenceAssetIds.Select(id => Resolve(assets, id)).ToList(),
+            ReferenceVideoPaths = r.ReferenceVideoAssetIds.Select(id => Resolve(assets, id)).ToList(),
             ImageConditions = guides,
             GenerateAudio = r.GenerateAudio ?? true, CancellationToken = ct,
             // Every video pipeline follows a finished step with a progress report, which carries the new count.

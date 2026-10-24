@@ -24,10 +24,20 @@ public sealed class StudioChainConditioningTests
     static Ltx25Model Ltx(bool ingredients)
     {
         var model = (Ltx25Model)RuntimeHelpers.GetUninitializedObject(typeof(Ltx25Model));
-        return ingredients ? WithProperty(model, "ReferenceLoraPath", "/models/ltx25/loras/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors") : model;
+        if (ingredients)
+            typeof(Ltx25Model).GetField("_referenceLoraPath", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(model, "/models/ltx25/loras/ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors");
+        return model;
     }
-    static MiniMaxH3Model H3(MiniMaxH3Partition partition) =>
-        WithProperty((MiniMaxH3Model)RuntimeHelpers.GetUninitializedObject(typeof(MiniMaxH3Model)), nameof(MiniMaxH3Model.Partition), partition);
+    static MiniMaxH3Model H3(MiniMaxH3Partition partition)
+    {
+        var model = WithProperty((MiniMaxH3Model)RuntimeHelpers.GetUninitializedObject(typeof(MiniMaxH3Model)), nameof(MiniMaxH3Model.Partition), partition);
+        typeof(MiniMaxH3Model).GetField("_firstLastDitPath", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(model, partition == MiniMaxH3Partition.FirstLastFrame ? "metadata-only-fl2va.gguf" : null);
+        typeof(MiniMaxH3Model).GetField("_referenceDitPath", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(model, partition == MiniMaxH3Partition.Reference ? "metadata-only-ref2va.gguf" : null);
+        return model;
+    }
     static WanVideoModel Wan() => WithProperty(WithProperty((WanVideoModel)RuntimeHelpers.GetUninitializedObject(typeof(WanVideoModel)),
         nameof(WanVideoModel.Variant), WanVariant.TI2V), nameof(WanVideoModel.InputChannels), 48);
 
@@ -161,7 +171,7 @@ public sealed class StudioChainConditioningTests
         Assert.Null(bare.ReferenceDefaultWidth);
         foreach (var (model, why) in new (IVideoGenerationModel, string)[]
         {
-            (H3(MiniMaxH3Partition.FirstLastFrame), "stable-diffusion.cpp"), (H3(MiniMaxH3Partition.Reference), "stable-diffusion.cpp"), (Wan(), "identity-reference"),
+            (H3(MiniMaxH3Partition.FirstLastFrame), "separate denoisers"), (H3(MiniMaxH3Partition.Reference), "separate denoisers"), (Wan(), "identity-reference"),
         })
         {
             var capability = NativeStudioGenerationAdapter.CreateCapability(model, "model", new());

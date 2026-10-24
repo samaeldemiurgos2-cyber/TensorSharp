@@ -30,6 +30,10 @@
     <EmbeddedResource Include="Fixtures/Knowledge/*.pdf" />
     <EmbeddedResource Include="Fixtures/Knowledge/manifest.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/chat_template.jinja" />
+    <EmbeddedResource Include="Fixtures/MuseSpark/chat_template.jinja" />
+    <EmbeddedResource Include="Fixtures/MuseSpark/unsloth_chat_template.jinja" />
+    <EmbeddedResource Include="Fixtures/MuseSpark/jinja_reference.json" />
+    <EmbeddedResource Include="Fixtures/MuseSpark/llama_jinja_matched_reference.json" />
     <EmbeddedResource Include="Fixtures/NemotronAudio/reference.json" />
     <EmbeddedResource Include="Fixtures/NemotronAudio/reference128.json" />
     <EmbeddedResource Include="Fixtures/NemotronAudio/frontend_reference.json" />

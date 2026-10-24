@@ -82,7 +82,7 @@ OpenAI / Ollama 响应附加 `knowledge_sources`、`knowledge_citation_repairs`�
 | Agent Skills | 技能目录：首先是二进制文件旁的 `skills` 目录（通过 `POST /api/skills` 上传的技能安装在此处；最先扫描，因此同名时其中的技能优先），然后是 `--skills-dir`（默认为从工作目录向上直到 Git 根目录的每个已存在的 `.agents/skills`，由近及远），在 `/v1/skills` 与 `/api/skills` 列出，也可通过 `POST /api/skills` 以 `.zip` 安装。所有聊天端点都可用 `"skills": [...]` 按请求选中。对同时支持工具声明与输出解析的模型族（包括 Qwen 3.8 Flash Next，`qwen4exp`），模型自己的技能调用在服务端内部应答，因此客户端拿到完整回复；不支持完整工具闭环的模型族则以内联方式获得选中技能说明。`skills_run` 只有在服务启动时传入 `--skills-allow-exec` 才可用。 |
 | Agent 式代码执行 | `--code-exec` 会为支持工具调用的模型族加入进程内执行的 `shell`、`read_file`、`write_file` 与 `apply_patch`。Web UI 每个聊天会话保留一个工作区；每个 OpenAI/Ollama HTTP 请求在内部轮次间使用私有工作区，响应结束后由服务删除。联网与安装软件包是相互独立且默认关闭的权限。 |
 | 子智能体 | 在 `/v1/chat/completions`、`/v1/responses`、`/api/chat/ollama` 与 Web UI `/api/chat` 上，对能渲染工具声明且有工具解析器的模型族（Mistral 3、Hunyuan Dense 与 DiffusionGemma 除外）默认开启。模型可以调用 `spawn_agent`、`wait_agent`、`send_input`、`close_agent` 与 `list_agents`；子智能体由服务端在进程内用同一个已加载模型运行；`explorer` 与 `reviewer` 子智能体只读，`worker` 只有在服务启动时传入 `--agents-allow-worker-tools` 时才获得父级的可写工具。`--no-multi-agent` 为整个服务关闭委派，`"multi_agent": false` 为单个请求关闭。见[子智能体](#子智能体multi_agent)。 |
-| 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`，`/v1/chat/completions` 在解码时用 JSON 语法约束它们；`response_format`（`json_object` / `json_schema`）不能与 `tools` 同时使用；只有声明了推理结束位置的模型家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、GLM-5.3-Flash、Gemma 4、Nemotron-H、Muse-Glimmer）允许与 `think` 同时使用 |
+| 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`，`/v1/chat/completions` 在解码时用 JSON 语法约束它们；`response_format`（`json_object` / `json_schema`）不能与 `tools` 同时使用；只有声明了推理结束位置的模型家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、GLM-5.3-Flash、Gemma 4、Nemotron-H、Muse-Glimmer、Muse Spark）允许与 `think` 同时使用 |
 
 > **网络安全：**服务监听 `0.0.0.0:5000`，没有 API Key 身份验证或内置 TLS。
 > 只应在可信网络中使用，或在前方部署带身份验证与 TLS 的反向代理。
@@ -419,7 +419,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 
 ### 聊天 + 思维链 / 推理模式
 
-支持思维链的架构（例如包括 Qwen 3.8 Flash Next 在内的 Qwen 3.5 / 3.6 / 3.8 系列、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer、DeepSeek V4 / V4.1 与 GLM 5.x）可接受 `"think": true`，并将思考过程与可见回答分开返回：
+支持思维链的架构（例如包括 Qwen 3.8 Flash Next 在内的 Qwen 3.5 / 3.6 / 3.8 系列、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer、Muse Spark、DeepSeek V4 / V4.1 与 GLM 5.x）可接受 `"think": true`，并将思考过程与可见回答分开返回：
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -1838,7 +1838,7 @@ print()
 
 注意事项：
 
-- `response_format`（`json_object` 或 `json_schema`）不能与 `tools` 同时使用（HTTP `400`）。只有协议声明了推理结束位置、使 JSON 语法能在该处启用的家族才允许与 `"think": true` 同时使用：GPT-OSS（`final<|message|>`）、DeepSeek V4.1、Qwen 3.8 Flash Next 与 GLM-5.3-Flash（`</think>`）、Gemma 4（`<channel|>`）、Nemotron-H（`</think>`）和 Muse-Glimmer（`to=user<|message|>`）。其他家族对该组合返回 HTTP `400`。
+- `response_format`（`json_object` 或 `json_schema`）不能与 `tools` 同时使用（HTTP `400`）。只有协议声明了推理结束位置、使 JSON 语法能在该处启用的家族才允许与 `"think": true` 同时使用：GPT-OSS（`final<|message|>`）、DeepSeek V4.1、Qwen 3.8 Flash Next 与 GLM-5.3-Flash（`</think>`）、Gemma 4（`<channel|>`）、Nemotron-H（`</think>`），以及 Muse-Glimmer 与 Muse Spark（`to=user<|message|>`）。其他家族对该组合返回 HTTP `400`。
 - `/v1/chat/completions` 上的 `json_object` / `json_schema` 请求在**JSON 语法**约束下解码（语法依据分词器构建，`json_schema` 还依据 schema），会破坏对象的 token 无法被采样，爱闲聊的模型也无法在对象前输出散文。对上述家族，`think: true` 请求要等推理块结束后才启用语法。无法为某个 schema 构建语法时（仅限未开启 `think` 的请求；上述家族的 `think: true` 请求会直接失败），服务端回退到另一种约束：只把**首个采样 token** 限制为以 `{` 开头的候选。`/v1/responses` 的 `text.format` 请求只依靠 prompt 指令与校验。
 - 流式 `json_object` 请求会逐 token 流式返回 JSON 对象（自动剥离 Markdown 代码围栏和多余标签），因此首 token 时延（TTFT）反映的是 prefill 延迟。流式 `json_schema`（strict）请求仍会先在服务端缓存并按 schema 归一化，再以单个 chunk 发出。非流式请求始终归一化。
 - 非法 schema 返回 HTTP `400`；非流式 / `json_schema` 输出未能通过校验则返回 HTTP `422`（已经开始的 `json_object` 流无法再更改状态码）。

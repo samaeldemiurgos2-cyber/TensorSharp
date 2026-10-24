@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_attention_alloc.h"
+#include "ggml_ops_moe_stream_memory.h"
 #include "bonsai_quant.h"
 #include "ggml_ops_graph_optimize.h"
 
@@ -1754,6 +1755,41 @@ namespace tsg
         return alloc_graph_in_gallocr_slot(graph, g_moe_stream_gallocr_slots, "moe-stream-gallocr");
     }
 
+    bool plan_moe_stream_memory(ggml_cgraph* graph, MoeStreamMemoryPlan& plan)
+    {
+        plan = {};
+        if (g_backend == nullptr || graph == nullptr) return false;
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)
+        {
+            plan.reason = "no-accelerator";
+            return false;
+        }
+        auto& slot = g_moe_stream_gallocr_slots[::tsg::g_active_rank];
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        ggml_gallocr_t measure = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+        if (measure == nullptr) return false;
+        // A fresh measuring allocator is essential: reserve_n_size frees the
+        // allocator's old buffer, and must not touch the reusable live buffer.
+        ggml_gallocr_reserve_n_size(measure, graph, nullptr, nullptr, &plan.required);
+        ggml_gallocr_free(measure);
+        if (slot.backend == g_backend && slot.gallocr != nullptr)
+            plan.reusable = ggml_gallocr_get_buffer_size(slot.gallocr, 0);
+        std::size_t total = 0;
+        ggml_backend_dev_memory(dev, &plan.free, &total);
+        if (total == 0)
+        {
+            plan.reason = "memory-query-unavailable";
+            return false;
+        }
+        // The measured graph includes complete expert stacks even when only
+        // selected experts will be uploaded. ggml releases the old allocation
+        // before growing it, so only the growth must fit currently free VRAM.
+        const bool fits = moe_stream_memory_fits(plan.required, plan.free, plan.reusable);
+        plan.reason = fits ? "fits" : "insufficient-headroom";
+        return fits;
+    }
+
     bool alloc_graph_in_gallocr_slot(ggml_cgraph* graph, ReuseGallocrSlot* slots, const char* log_tag)
     {
         if (g_backend == nullptr || graph == nullptr || slots == nullptr)
@@ -3297,11 +3333,13 @@ TSG_EXPORT void TSGgml_Shutdown()
     // CUDA driver is still alive; leaving them to thread_local destructors
     // aborts the process on exit ("CUDA error: driver shutting down").
     free_prefill_attn_sessions();
+    free_paged_attn_sessions();
     // MoE CPU offload keeps a persistent ggml CPU backend (and its worker thread
     // pool) for the host-side expert matmuls. It is independent of g_backend, so
     // it has to be released explicitly or the threads outlive the shutdown.
     tsg::moe_ffn_host_release();
     tsg::bonsai_clear_backend();
+    tsg::free_spark_float32_backends();
 
     for (int r = 0; r < ranks; ++r)
     {
@@ -3360,6 +3398,12 @@ TSG_EXPORT int TSGgml_RecreateBackend()
     // buffer, releases the caches that hold MTLBuffer wrappers, and frees the backend
     // in the order the Metal device's deleter asserts on.
     TSGgml_Shutdown();
+
+    // Teardown collapses the device group to one rank. ScopedRank cleanup restores
+    // this thread's former selection, which may now name a removed rank. Recreate
+    // the single backend in slot zero before a later model rebuilds its group.
+    // The caller has already unloaded its model and stopped its rank workers.
+    tsg::g_active_rank = 0;
 
     {
         std::lock_guard<std::mutex> guard(tsg::g_backend_init_mutex);
@@ -3728,6 +3772,32 @@ TSG_EXPORT int64_t TSGgml_DeviceCopyCacheResidentBytes()
             total += static_cast<std::int64_t>(kv.second.buffer_size);
     }
     return total;
+}
+
+// Read-only current-rank probe. In particular, do NOT call the cacheable binder:
+// probing an absent entry must not allocate a new, uninitialised device copy.
+// Presence does not itself prove upload completion. The caller must invoke this
+// only after the uploading operation has completed successfully.
+TSG_EXPORT int TSGgml_HasResidentDeviceCopy(void* key, int64_t raw_bytes)
+{
+    if (key == nullptr || raw_bytes <= 0 || g_backend == nullptr)
+        return 0;
+    const auto bytes = static_cast<std::uint64_t>(raw_bytes);
+    auto matches = [bytes](const CachedHostBuffer& entry) {
+        return entry.mode == CachedBufferMode::DeviceCopy && entry.bytes == bytes &&
+            entry.buffer != nullptr && ggml_backend_buffer_get_base(entry.buffer) != nullptr;
+    };
+    {
+        std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+        auto it = g_preloaded_buffer_cache.find(key);
+        if (it != g_preloaded_buffer_cache.end() && matches(it->second)) return 1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        auto it = g_host_buffer_cache.find(key);
+        if (it != g_host_buffer_cache.end() && matches(it->second)) return 1;
+    }
+    return 0;
 }
 
 // Diagnostic: the active backend device's memory accounting. On Metal `total`
