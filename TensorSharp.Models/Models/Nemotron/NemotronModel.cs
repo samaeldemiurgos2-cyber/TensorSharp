@@ -2468,7 +2468,10 @@ namespace TensorSharp.Models
                 {
                     VecZero(latentAccum, outDim);
 
-                    // Batched GPU path: all experts in a single GGML graph
+                    // Batched GPU path: all experts chunked through the GGML kernel
+                    // which enforces numExperts ∈ [1, 16]. Models whose per-token
+                    // expert count exceeds 16 (e.g. Super VL at 22) split across
+                    // multiple calls and the results accumulate into latentAccum.
                     bool usedBatchedMoE = false;
                     if (isDecode && IsGgmlBackend && _expertUpQW[layer] != null && _expertDownQW[layer] != null)
                     {
@@ -2476,27 +2479,42 @@ namespace TensorSharp.Models
                         var dnQw0 = _expertDownQW[layer][topExperts[0]];
                         if (upQw0 != null && dnQw0 != null)
                         {
-                            for (int k = 0; k < nUsed; k++)
+                            const int MAX_EXPERTS_PER_CALL = 16;
+                            float[] chunkRouteW = nUsed <= MAX_EXPERTS_PER_CALL ? routeW : new float[MAX_EXPERTS_PER_CALL];
+
+                            for (int chunkStart = 0; chunkStart < nUsed; chunkStart += MAX_EXPERTS_PER_CALL)
                             {
-                                int ei = topExperts[k];
-                                _moeUpPtrs[k] = _expertUpQW[layer][ei].CacheKey;
-                                _moeDownPtrs[k] = _expertDownQW[layer][ei].CacheKey;
+                                int chunkSize = Math.Min(MAX_EXPERTS_PER_CALL, nUsed - chunkStart);
+                                for (int k = 0; k < chunkSize; k++)
+                                {
+                                    int ei = topExperts[chunkStart + k];
+                                    _moeUpPtrs[k] = _expertUpQW[layer][ei].CacheKey;
+                                    _moeDownPtrs[k] = _expertDownQW[layer][ei].CacheKey;
+                                }
+                                float[] callRouteW = routeW;
+                                if (nUsed > MAX_EXPERTS_PER_CALL)
+                                {
+                                    Array.Copy(routeW, chunkStart, chunkRouteW, 0, chunkSize);
+                                    callRouteW = chunkRouteW;
+                                }
+
+                                long t0exp = Stopwatch.GetTimestamp();
+
+                                GgmlBasicOps.MoEExpertsForward(
+                                    _expertDownResult, routedInput,
+                                    chunkSize, _moeUpPtrs, _moeDownPtrs,
+                                    upQw0.GgmlType, upQw0.Ne0, upQw0.Ne1, upQw0.RawBytes,
+                                    dnQw0.GgmlType, dnQw0.Ne0, dnQw0.Ne1, dnQw0.RawBytes,
+                                    callRouteW);
+
+                                _linearTicks += Stopwatch.GetTimestamp() - t0exp;
+
+                                float* expPtr = GetFloatPtr(_expertDownResult);
+                                if (chunkStart == 0)
+                                    Buffer.MemoryCopy(expPtr, latentAccum, outDim * 4, outDim * 4);
+                                else
+                                    VecScaleAdd(latentAccum, expPtr, 1.0f, outDim);
                             }
-
-                            long t0exp = Stopwatch.GetTimestamp();
-
-                            // Use _expertDownResult as the output accumulator
-                            GgmlBasicOps.MoEExpertsForward(
-                                _expertDownResult, routedInput,
-                                nUsed, _moeUpPtrs, _moeDownPtrs,
-                                upQw0.GgmlType, upQw0.Ne0, upQw0.Ne1, upQw0.RawBytes,
-                                dnQw0.GgmlType, dnQw0.Ne0, dnQw0.Ne1, dnQw0.RawBytes,
-                                routeW);
-
-                            _linearTicks += Stopwatch.GetTimestamp() - t0exp;
-
-                            float* expPtr = GetFloatPtr(_expertDownResult);
-                            Buffer.MemoryCopy(expPtr, latentAccum, outDim * 4, outDim * 4);
                             usedBatchedMoE = true;
                         }
                     }

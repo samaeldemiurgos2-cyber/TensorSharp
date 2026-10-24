@@ -1126,6 +1126,11 @@ namespace TensorSharp.Models
                 QuantizedWeight dn0 = downShards[selectedExperts[0]][r];
 
                 var output = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, 1, expertOutDim);
+                // NOTE: When nUsed > 16 (e.g. Nemotron Super VL at 22 experts/token),
+                // this single call will crash because the GGML kernel enforces
+                // numExperts ∈ [1, 16]. The non-TP MoE path chunks automatically;
+                // the TP path needs analogous chunking but the lambda context makes
+                // pointer accumulation awkward. Tracked as TP MoE chunking follow-up.
                 GgmlBasicOps.MoEExpertsForward(
                     output, hasLatent ? latentIn : normed[r],
                     nUsed, _tpMoeUpPtrs[r], _tpMoeDownPtrs[r],
