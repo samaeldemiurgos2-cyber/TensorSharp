@@ -94,7 +94,7 @@ objects are untouched (their `CacheKey`/device buffers are independent of the di
 legacy `ffn_latent_in/out` path and the new `ffn_latent_down/up` checkpoint both serve the same downstream
 code.
 
-### G2 -- Per-expert NVFP4 scale2 (`<base>.scale`) -- **IMPLEMENTED**
+### G2 -- Per-expert NVFP4 scale2 (`<base>.scale`) -- **IMPLEMENTED, then fixed twice**
 
 Routed/non-shared experts carry a **per-expert** sidecar in addition to the NVFP4 blocks:
 - `ffn_*_exps.weight` [.., 512] NVFP4(40) -- self-contained per-block scale (36-byte/64-elem block
@@ -106,12 +106,30 @@ Routed/non-shared experts carry a **per-expert** sidecar in addition to the NVFP
 `AttachSidecarWeightScales` only attaches a **1-element** `.scale` (covering the shared experts' scalar
 `.scale[1]`); the routed experts' vector `.scale[512]` stays in `_weights` with `Scale = 1.0f` on the views.
 
-**Fix (in tree):** `NemotronModel.InitExpertScales()` reads `ffn_*_exps.scale` and folds one per-expert
-multiplier `downScale * upScale^2` into the routing weight, in both `MoEForward` and
-`TryMoEPrefillBatchedByExpert`. The square is required because llama.cpp applies `up_exps_s` inside the up
-matmul -- *before* the ReLU^2 non-linearity (`ReLU^2(scale*x) = scale^2 * ReLU^2(x)` for the positive scale2
-values) -- while `down_exps_s` lands after. Experts without sidecars (IQ-quantized, e.g. Bolt) are a no-op.
-Still needs DGX-Spark (Blackwell) logit validation, since NVFP4 only runs there.
+**Fix (in tree):** `NemotronModel.InitExpertScales()` reads `ffn_*_exps.scale` and applies the per-expert
+multipliers in both `MoEForward` and `TryMoEPrefillBatchedByExpert`. Experts without sidecars
+(IQ-quantized, e.g. Bolt) are a no-op.
+
+**Validated on the DGX Spark, and the first implementation was wrong.** It originally folded a single
+multiplier `downScale * upScale^2` into the *routing weight*. That is algebraically correct --
+`ReLU^2(us*x) = us^2 * ReLU^2(x)` for positive scale2 -- but numerically fatal: it defers the up
+correction until *after* the squaring, so the kernel squares an `up_out` still `1/us` too large. At
+NVFP4 `us ~ 1e-5` that overflows to `+Inf`, and the Inf met a `~1e-15` route weight to produce NaN.
+Super VL aborted warmup with "non-finite router logits" at its first MoE layer.
+
+Now (`6be5296e`, `a0941ceb`) the scales are kept **separate**: `us` is applied to the up projection
+immediately before `ReluSquaredInPlace`, and only `ds` is folded into the routing weight (a single
+multiply on correctly-magnituded values, which is safe). The batched GGML kernel gained an optional
+trailing `up_scales` array so it can apply `us` between the up matmul and the ReLU.
+
+**Separately**, the fused residual-add path dropped the *per-tensor* 1-element scale entirely
+(`b3aba946`): `TryLinearAddInto` -> `FusedMatMulQuantAdd` takes no scale argument, so
+`ssm_out.weight` on all 40 Mamba2 layers was added to the residual unscaled. `LinearForward` and
+`LinearForwardInto` both apply `qw.Scale`, so only the fused decode path was wrong -- which is why the
+native and CPU Mamba2 paths produced *identical* garbage and kernel-level debugging was a dead end.
+Bolt's symptom was fluent text for 3-4 tokens, then collapse. Gate every fused quant fast path on
+`qw.Scale == 1.0f` (the Qwen3.5 pattern); note two MoE call sites `throw` on fallback rather than
+degrading, so `CanMoEDecodeResidualAdd` needs the same gate.
 
 ### G6 -- Per-block MoE config ("Puzzle"/Bolt) -- **IMPLEMENTED**
 
@@ -136,20 +154,44 @@ parallelism is rejected with a clear error** for now (the TP MoE paths are not p
 Note: Bolt's experts are `IQ2_XXS` (type 16), so G2 (NVFP4 per-expert scale2) does **not** apply to Bolt --
 it only affects the 120B NVFP4 file.
 
-### G3 -- 512 experts / top-22 -- **verified already covered**
+### G3 -- 512 experts / top-22 -- **was NOT covered; fixed**
 
 `expert_count=512`, `expert_used_count=22`. The stacked-expert storage, per-expert view creation,
 `SelectTopKInPlace` (delegates to `TensorComputePrimitives`, no pool-size limit), and the per-block
-config infrastructure already support 512 experts. Routing buffers are correctly sized
-(`_moeProbs`[512], `_moeTopExperts`[22]). The outstanding verification is CPU-offload memory for
-512 NVFP4 experts per MoE layer (~2.8 GB/layer) -- `--n-cpu-moe` should be validated on the DGX Spark.
+config infrastructure do support 512 experts, and routing buffers are correctly sized
+(`_moeProbs`[512], `_moeTopExperts`[22]).
 
-### G4 -- BF16 non-expert weights -- **verified already covered**
+**But this analysis missed the GGML kernel limit.** `GgmlNative.MoEExpertsForward` (native
+`TSGgml_MoEExpertsForwardF32`) rejects `numExperts` outside **[1, 16]**, so top-22 aborted on the first
+MoE forward with `MoE: num_experts must be 1..16`. The sibling SwiGLU variant allows 1..32. Fixed in
+`57a20f89` by splitting wider routing into chunks of <=16 and accumulating with `VecScaleAdd`; models
+at or below 16 take a single chunk and are unchanged. The tensor-parallel equivalent got the same
+treatment in `69201abb`.
+
+Lesson for the next shape review: "the managed routing data structures support N" is not the same as
+"every native kernel on the path supports N". Check the kernel's own argument validation.
+
+The outstanding verification is still CPU-offload memory for 512 NVFP4 experts per MoE layer
+(~2.8 GB/layer) -- `--n-cpu-moe` has not been validated.
+
+### G4 -- BF16 non-expert weights -- **verified already covered (confirmed on Spark)**
 
 `ssm_in/ssm_out/attn_*/ffn_latent_*` are BF16 (type 30). BF16 is explicitly listed in
 `CanStoreDirectCudaCompressedWeight`, `ManagedQuantizedOps.SupportsCpuQuantizedStorage`, and the
 `ManagedQuantGemm.Float` cheap-convert path. The Nemotron DSpark drafter already exercises BF16
 attention weights in production. No gap.
+
+**Confirmed empirically, and worth stating because the opposite looks plausible.** Super VL's Mamba2
+`ssm_in/ssm_out` are BF16 and its NaN appeared right after a Mamba2 layer, which makes BF16 an
+attractive suspect. It is not the cause. `addmm_quant_f32_impl` passes the type straight to
+`ggml_new_tensor_2d` with **no** block-quant guard, and BF16 `mul_mat` works; the in-tree comment in
+`ModelBase.DFlash.cs` claiming the AddmmQuant family "silently returns a zeroed output" for F16/BF16
+is drafter-specific and stale, not a general constraint.
+
+Do **not** "fix" this by dequantizing BF16 to F32 at load. That grew Super VL from ~73 GB to ~85 GB of
+weights and OOM-killed it on a 121 GB Spark during prefill warmup. Run models at the quantization they
+ship in -- these GGUFs are sized deliberately for the platform. If a dtype genuinely is unsupported,
+fix it in TensorSharp-owned native code rather than inflating the footprint.
 
 ### G5 -- Vision -- **already supported**
 
@@ -162,15 +204,84 @@ matches the existing code exactly. No additional work needed.
 
 ## 5. Summary
 
-All gaps are addressed. The text path has G1 (latent naming), G2 (NVFP4 scale2), and G6 (per-block MoE)
-implemented. BF16 and 512-expert routing are already covered by existing infrastructure. Vision is
-already supported by the existing `NemotronVisionEncoder`. The remaining verification items (NVFP4
-scale2 correctness, CPU-offload under 512 experts, and end-to-end vision) must be validated on the
-DGX Spark since NVFP4 requires Blackwell and the models are too large for the local 5090.
+**Validated on a DGX Spark (GB10) on 2026-10-24/25. Both models now produce correct output.** The
+original gap analysis was directionally right but declared three things covered that were not, and all
+three were real bugs. "Loads and reports the right shapes" turned out to be weak evidence: both models
+loaded cleanly, printed correct layer/expert counts, and then produced garbage or NaN.
 
-## 6. Verification strategy
+What was actually broken:
 
-No local GPU can hold these (79GB NVFP4, needs Blackwell; Bolt needs >46GB). The user will test on a
-DGX Spark. Text-only load should be validated first by a **no-run metadata/weight-inspection pass**
-(load model -> dump layer types, expert counts, per-layer tensor names -> assert against the header),
-then a short-context token-generate check on the DGX Spark.
+| Gap | Claimed | Actual | Fix |
+|---|---|---|---|
+| G2 per-tensor scale2 | implemented | fused residual-add dropped it entirely | `b3aba946` |
+| G2 per-expert scale2 | implemented | folded past ReLU^2, overflowed to Inf/NaN | `6be5296e`, `a0941ceb` |
+| G3 top-22 | "verified already covered" | GGML kernel rejects >16 experts | `57a20f89`, `69201abb` |
+| G4 BF16 | "no gap" | **correct as written** | none needed |
+
+G4 is the one claim that held up, and it is worth trusting: BF16 works natively through AddmmQuant.
+
+## 6. Verification results (DGX Spark, GB10, aarch64, CUDA 13.0)
+
+Both models, `--temperature 0`, native quantization, no weight expansion:
+
+- **Bolt 74B** on `ggml_cuda` and on `cuda`: correct answers, `finishReason=eos`. Byte-identical
+  output across the pre- and post-merge trees.
+- **Super VL 120B** on `ggml_cuda`: `"The capital of France is Paris."` and a correct multi-step
+  reasoning answer, both `finishReason=eos`. 72 GB of weights loads and runs in the 121 GB pool.
+
+Symptoms before the fixes, for anyone who hits something similar: Bolt was fluent for 3-4 tokens then
+collapsed into `>>(>>(` and file-extension soup; Super VL aborted warmup with "non-finite router
+logits" at MoE layer 3. A per-layer probe located it -- `after L0 (Mamba2): finite absmax=0.85`,
+`after L1 (MoE): NON-FINITE` -- which is what separated the MoE scale bug from the Mamba2 one.
+
+**Benchmarking on this host:** end-to-end model timing is useless for kernel-level work. Two runs of
+the *identical binary* gave Attention = 63553 ms and 81341 ms, a 28% swing wider than the spread
+across four different code paths. Use `benchmarks/FlashAttnBench` (median of N, isolated kernel, plus
+a CPU-reference `maxErr`). Note the profiler's "Attention" bucket also accumulates Mamba2 time
+(`_attnTicks` is incremented inside `Mamba2Forward` and `TryMamba2NativeDecode`), so on this hybrid
+model that label is mostly Mamba2 -- which is why an attention-kernel win is invisible end-to-end.
+
+**Backend choice:** prefer `ggml_cuda` for Nemotron. Bolt decoded at ~8.8 tok/s there versus 0.7 tok/s
+on the direct `cuda` backend, whose attention is the bottleneck. The direct backend's matmuls are ~11x
+faster, so it is worth optimizing, but Mamba2 -- not attention -- is where its time goes.
+
+**A `model load refused ... CUDA device has 5486 MiB free of 124546 MiB` is memory pressure, not a
+platform limit.** Leftover `dotnet` runs and Ollama hold the unified pool. Clear them and retry; check
+holders with `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv`.
+
+### Building on a Spark
+
+The supported path is `eng/Dockerfile.gb10` (see `DEVELOPMENT.md`), which pins CUDA 13.0.2, compiles
+`compute_121` PTX for the direct CUDA backend, and **disables Vulkan**. Committing `.cu` source is
+therefore how a kernel reaches Spark users: `SelectCudaPtxContent` swaps locally compiled PTX in
+whenever nvcc is present, so the committed baseline is not on their path.
+
+Two traps if you build on the host instead of in the container:
+
+- The GGML native build fails in the **Vulkan** target, because
+  `ExternalProjects/vulkan-toolchain/shaderc-linux/bin/glslc` is an **x86-64 ELF** on an aarch64 host.
+  The kernel returns ENOEXEC and `sh` parses the binary as a script, giving the misleading
+  `glslc: 1: Syntax error: "(" unexpected`. Build with
+  `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=false bash TensorSharp.GGML.Native/build-linux.sh`. The
+  `curl: (22) ... 404` alongside it is that toolchain fetch failing, not upstream flakiness.
+- Do not then run `dotnet build` without a skip flag: the csproj re-invokes `build-linux.sh`, where the
+  same 404 is fatal (`exited with code -1` -> MSB3073). Use `-p:TensorSharpSkipGgmlNative=true`;
+  `CopyGgmlNativeBinary` has no skip condition, so it still copies the fresh `.so`.
+
+The committed PTX baseline targets `compute_61`, and **nvcc 13 dropped `compute_61`** (it lists
+`compute_75`..`compute_121`), so the baseline cannot be refreshed on a Spark. Any newly added kernel
+must therefore be resolved with `GetOptionalFunction`, not `GetFunction`: the latter calls
+`ThrowOnError` and handles are resolved eagerly in the `CudaKernels` constructor, so a missing symbol
+would take the whole direct-CUDA backend down on no-nvcc builds. Gate the feature on the handle being
+non-zero and fall back.
+
+### Still unverified
+
+- **Tensor parallelism.** `69201abb` is compile-verified only; a single GB10 cannot execute any TP
+  path. Expert-parallel MoE throws `NotSupportedException` for up-scaled experts rather than routing
+  garbage, because `MoEFFNPrefill` has no per-expert scale hook and building EP shards removes the
+  per-expert weights the fallback needs.
+- **Vision (G5)** -- unchanged, still unexercised end-to-end.
+- **CPU offload** with 512 NVFP4 experts per layer (`--n-cpu-moe`).
+- The new group-16/head_dim-128 flash prefill kernel is restricted to `windowSize == 0`; it implements
+  sliding windows but only full attention has been run.
