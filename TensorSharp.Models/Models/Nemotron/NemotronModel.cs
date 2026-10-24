@@ -22,6 +22,7 @@ using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.GGML;
 using TensorSharp.MLX;
+using TensorSharp.Cuda;
 
 namespace TensorSharp.Models
 {
@@ -2184,6 +2185,30 @@ namespace TensorSharp.Models
                         if (!exact) { kSrc.Dispose(); vSrc.Dispose(); }
                     }
                 }
+            }
+
+            // Direct CUDA backend: the general GQA prefill kernel reads the live
+            // [numKVHeads, kvStride, headDim] cache in place and broadcasts the KV
+            // heads internally. The materialized path below instead allocates a
+            // [numHeads, rows, kvLen] F32 score tensor and expands K/V into
+            // groupSize copies (16x for Nemotron's 32 Q heads over 2 KV heads),
+            // which is why attention dominates this backend's profile. Declines
+            // cleanly on kvLen > 8192, an unsupported cache dtype, or a
+            // non-contiguous tensor, so the fallback below still covers those.
+            if (_backend == BackendType.Cuda && numHeads % numKVHeads == 0
+                && !MaterializedPrefillAttentionForTest)
+            {
+                var fused = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
+                if (CudaFusedOps.TryGqaPrefillAttention(
+                        fused, qHeads, kCache, vCache,
+                        numHeads, numKVHeads, headDim,
+                        seqLen, totalSeqLen, startPos, 0, scale,
+                        kvStride: checked((int)kCache.Sizes[1])))
+                {
+                    return fused;
+                }
+
+                fused.Dispose();
             }
 
             int groupSize = numHeads / numKVHeads;
