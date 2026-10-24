@@ -199,6 +199,7 @@ namespace TensorSharp.Models
         // Pre-allocated buffers for batched MoE P/Invoke call
         private IntPtr[] _moeUpPtrs;
         private IntPtr[] _moeDownPtrs;
+        private float[] _moeUpScales;
 
         // Pre-allocated tensors for expert matmul reuse (avoids per-expert allocation)
         private Tensor _expertUpResult;
@@ -1115,6 +1116,7 @@ namespace TensorSharp.Models
 
             _moeUpPtrs = new IntPtr[_numExpertsUsed];
             _moeDownPtrs = new IntPtr[_numExpertsUsed];
+            _moeUpScales = new float[_numExpertsUsed];
 
             int maxLatent = 0;
             for (int l = 0; l < Config.NumLayers; l++)
@@ -2510,12 +2512,12 @@ namespace TensorSharp.Models
                     // expert count exceeds 16 (e.g. Super VL at 22) split across
                     // multiple calls and the results accumulate into latentAccum.
                     bool usedBatchedMoE = false;
-                    // The batched kernel applies ReLU^2 to the raw quantized up
-                    // projection and only scales the accumulated result, so it
-                    // cannot apply a per-expert NVFP4 up scale before the
-                    // squaring. Fall through to the per-expert path when one is
-                    // needed — deferring it overflows to +Inf (see InitExpertScales).
-                    if (isDecode && IsGgmlBackend && !HasExpertUpScale(layer)
+                    // The kernel squares the raw quantized up projection, so a
+                    // per-expert NVFP4 up scale has to be applied inside the graph,
+                    // before the squaring. It rides along in _moeUpScales; the down
+                    // scale needs no hook because it is a single post-matmul multiply
+                    // already folded into routeW above (see InitExpertScales).
+                    if (isDecode && IsGgmlBackend
                         && _expertUpQW[layer] != null && _expertDownQW[layer] != null)
                     {
                         var upQw0 = _expertUpQW[layer][topExperts[0]];
@@ -2523,7 +2525,12 @@ namespace TensorSharp.Models
                         if (upQw0 != null && dnQw0 != null)
                         {
                             const int MAX_EXPERTS_PER_CALL = 16;
-                            float[] chunkRouteW = nUsed <= MAX_EXPERTS_PER_CALL ? routeW : new float[MAX_EXPERTS_PER_CALL];
+                            bool chunked = nUsed > MAX_EXPERTS_PER_CALL;
+                            float[] chunkRouteW = chunked ? new float[MAX_EXPERTS_PER_CALL] : routeW;
+                            float[] layerUpScale = _layerExpertUpScale != null
+                                && layer < _layerExpertUpScale.Length
+                                ? _layerExpertUpScale[layer] : null;
+                            float[] callUpScales = layerUpScale != null ? _moeUpScales : null;
 
                             for (int chunkStart = 0; chunkStart < nUsed; chunkStart += MAX_EXPERTS_PER_CALL)
                             {
@@ -2533,9 +2540,11 @@ namespace TensorSharp.Models
                                     int ei = topExperts[chunkStart + k];
                                     _moeUpPtrs[k] = _expertUpQW[layer][ei].CacheKey;
                                     _moeDownPtrs[k] = _expertDownQW[layer][ei].CacheKey;
+                                    if (layerUpScale != null)
+                                        _moeUpScales[k] = layerUpScale[ei];
                                 }
                                 float[] callRouteW = routeW;
-                                if (nUsed > MAX_EXPERTS_PER_CALL)
+                                if (chunked)
                                 {
                                     Array.Copy(routeW, chunkStart, chunkRouteW, 0, chunkSize);
                                     callRouteW = chunkRouteW;
@@ -2548,7 +2557,7 @@ namespace TensorSharp.Models
                                     chunkSize, _moeUpPtrs, _moeDownPtrs,
                                     upQw0.GgmlType, upQw0.Ne0, upQw0.Ne1, upQw0.RawBytes,
                                     dnQw0.GgmlType, dnQw0.Ne0, dnQw0.Ne1, dnQw0.RawBytes,
-                                    callRouteW);
+                                    callRouteW, callUpScales);
 
                                 _linearTicks += Stopwatch.GetTimestamp() - t0exp;
 

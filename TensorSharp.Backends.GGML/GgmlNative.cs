@@ -2013,7 +2013,8 @@ internal enum GgmlIndexReductionOp
             long downNe0,
             long downNe1,
             long downRawBytesEach,
-            float[] routeWeights);
+            float[] routeWeights,
+            float[] upScales);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -5226,13 +5227,13 @@ internal enum GgmlIndexReductionOp
             int numExperts, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
             int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
             int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
-            float[] routeWeights)
+            float[] routeWeights, float[] upScales = null)
         {
             CheckResult(TSGgml_MoEExpertsForwardF32(result, input, numExperts,
                 upDataPtrs, downDataPtrs,
                 upGgmlType, upNe0, upNe1, upRawBytesEach,
                 downGgmlType, downNe0, downNe1, downRawBytesEach,
-                routeWeights), "moe_experts_forward");
+                routeWeights, upScales), "moe_experts_forward");
         }
 
         public static void MoEExpertsSwiGLUForward(GgmlTensorView2D result, GgmlTensorView2D input,
