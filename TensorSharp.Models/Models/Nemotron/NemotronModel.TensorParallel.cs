@@ -864,6 +864,7 @@ namespace TensorSharp.Models
 
                             Tensor upOut = TpNemotronExpertLinear(batchInput, upKey, r, count);
                             batchInput.Dispose();
+                            ApplyExpertUpScale(upOut, layer, e);   // before the squaring, or NVFP4 scale2 overflows
                             ReluSquaredInPlace(upOut);   // Nemotron MoE uses ReLU^2, not SiLU.
                             Tensor downOut = TpNemotronExpertLinear(upOut, downKey, r, count);
                             upOut.Dispose();
@@ -1091,6 +1092,13 @@ namespace TensorSharp.Models
             int tp = TpDegree;
             int nUsed = _numExpertsUsed;
 
+            // The kernel squares the raw quantized up projection and only scales the
+            // accumulated result, so it cannot apply a per-expert NVFP4 up scale
+            // before the squaring. Defer to the per-expert fallback, which can
+            // (see ApplyExpertUpScale / InitExpertScales for the overflow this avoids).
+            if (HasExpertUpScale(layer))
+                return null;
+
             // Validate and collect every shard pointer BEFORE allocating anything,
             // so a bail-out cannot leak a partially built result set.
             for (int r = 0; r < tp; r++)
@@ -1113,6 +1121,12 @@ namespace TensorSharp.Models
             var routeWeights = new float[nUsed];
             Array.Copy(routeWeightsAll, routeWeights, nUsed);
 
+            // The GGML MoE kernel rejects numExperts outside [1, 16]; models routing
+            // more than that per token (Nemotron Super VL: 22) are split across calls
+            // with the partial results accumulated, mirroring the non-TP decode path.
+            const int MAX_EXPERTS_PER_CALL = 16;
+            bool needsChunking = nUsed > MAX_EXPERTS_PER_CALL;
+
             var results = new Tensor[tp];
             // Fan the ranks out instead of walking them: GGML ops submit AND
             // synchronize inside one call, so a sequential rank loop runs GPU 0 to
@@ -1126,17 +1140,48 @@ namespace TensorSharp.Models
                 QuantizedWeight dn0 = downShards[selectedExperts[0]][r];
 
                 var output = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, 1, expertOutDim);
-                // NOTE: When nUsed > 16 (e.g. Nemotron Super VL at 22 experts/token),
-                // this single call will crash because the GGML kernel enforces
-                // numExperts ∈ [1, 16]. The non-TP MoE path chunks automatically;
-                // the TP path needs analogous chunking but the lambda context makes
-                // pointer accumulation awkward. Tracked as TP MoE chunking follow-up.
-                GgmlBasicOps.MoEExpertsForward(
-                    output, hasLatent ? latentIn : normed[r],
-                    nUsed, _tpMoeUpPtrs[r], _tpMoeDownPtrs[r],
-                    up0.GgmlType, up0.Ne0, up0.Ne1, up0.RawBytes,
-                    dn0.GgmlType, dn0.Ne0, dn0.Ne1, dn0.RawBytes,
-                    routeWeights);
+                Tensor chunkOut = needsChunking
+                    ? new Tensor(_tpGroup.GetAllocator(r), DType.Float32, 1, expertOutDim)
+                    : null;
+                float[] chunkRouteW = needsChunking ? new float[MAX_EXPERTS_PER_CALL] : routeWeights;
+
+                try
+                {
+                    for (int chunkStart = 0; chunkStart < nUsed; chunkStart += MAX_EXPERTS_PER_CALL)
+                    {
+                        int chunkSize = Math.Min(MAX_EXPERTS_PER_CALL, nUsed - chunkStart);
+
+                        // The kernel reads the first chunkSize entries of each pointer
+                        // array, so shift this chunk's shards into position. Safe to
+                        // mutate: the collection loop above repopulates both arrays in
+                        // full on every call, and each rank owns its own arrays.
+                        if (chunkStart > 0)
+                        {
+                            Array.Copy(_tpMoeUpPtrs[r], chunkStart, _tpMoeUpPtrs[r], 0, chunkSize);
+                            Array.Copy(_tpMoeDownPtrs[r], chunkStart, _tpMoeDownPtrs[r], 0, chunkSize);
+                            Array.Copy(routeWeights, chunkStart, chunkRouteW, 0, chunkSize);
+                        }
+
+                        GgmlBasicOps.MoEExpertsForward(
+                            chunkStart == 0 ? output : chunkOut,
+                            hasLatent ? latentIn : normed[r],
+                            chunkSize, _tpMoeUpPtrs[r], _tpMoeDownPtrs[r],
+                            up0.GgmlType, up0.Ne0, up0.Ne1, up0.RawBytes,
+                            dn0.GgmlType, dn0.Ne0, dn0.Ne1, dn0.RawBytes,
+                            chunkStart == 0 ? routeWeights : chunkRouteW);
+
+                        if (chunkStart > 0)
+                            Ops.Add(output, output, chunkOut);
+                    }
+                }
+                catch
+                {
+                    output.Dispose();
+                    chunkOut?.Dispose();
+                    throw;
+                }
+
+                chunkOut?.Dispose();
                 results[r] = output;
             });
 
