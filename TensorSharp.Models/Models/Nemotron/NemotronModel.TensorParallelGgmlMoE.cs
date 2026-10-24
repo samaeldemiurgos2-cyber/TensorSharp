@@ -280,6 +280,23 @@ namespace TensorSharp.Models
         {
             if (!UsesExpertParallelMoE)
                 return null;
+
+            // MoEFFNPrefill applies ReLU^2 inside the kernel and takes no per-expert
+            // scale array, so an NVFP4 up scale cannot be applied before the squaring -
+            // deferring it overflows to +Inf and then NaN (see InitExpertScales). The
+            // per-expert fallback that could apply it is unavailable here, because
+            // building EP shards removes the per-expert weights. Refuse loudly rather
+            // than route garbage.
+            if (HasExpertUpScale(layer))
+            {
+                throw new NotSupportedException(
+                    $"Nemotron expert-parallel MoE cannot serve layer {layer}: its experts carry NVFP4 " +
+                    "scale2 sidecars whose up-projection scale must be applied before the ReLU^2 activation, " +
+                    "and MoEFFNPrefill has no per-expert pre-activation scale hook. Run without expert-parallel " +
+                    "MoE (the per-expert tensor-parallel path applies the scale correctly), or use a GGUF whose " +
+                    "expert scales are folded into the quantized blocks.");
+            }
+
             var upShards = _tpStackedUp[layer];
             var downShards = _tpStackedDown[layer];
             if (upShards == null || downShards == null)

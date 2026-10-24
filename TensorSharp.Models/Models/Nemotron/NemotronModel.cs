@@ -118,6 +118,7 @@ namespace TensorSharp.Models
         // the up/down matmuls, i.e. up before and down after the non-linearity).
         // Null entry = no sidecar (e.g. IQ-quantized experts, which are self-scaling).
         private float[][] _layerExpertScale;
+        private float[][] _layerExpertUpScale;
 
         // Pre-allocated decode buffers for Mamba2
         private float[] _mamba2ConvOutBuf;
@@ -198,6 +199,7 @@ namespace TensorSharp.Models
         // Pre-allocated buffers for batched MoE P/Invoke call
         private IntPtr[] _moeUpPtrs;
         private IntPtr[] _moeDownPtrs;
+        private float[] _moeUpScales;
 
         // Pre-allocated tensors for expert matmul reuse (avoids per-expert allocation)
         private Tensor _expertUpResult;
@@ -863,6 +865,7 @@ namespace TensorSharp.Models
                 return;
 
             _layerExpertScale = new float[Config.NumLayers][];
+            _layerExpertUpScale = new float[Config.NumLayers][];
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_layerTypes[l] != LayerType.FFN)
@@ -876,17 +879,22 @@ namespace TensorSharp.Models
                 if (upScale == null && downScale == null)
                 {
                     _layerExpertScale[l] = null!;
+                    _layerExpertUpScale[l] = null!;
                     continue;
                 }
 
-                var combined = new float[ne];
+                // The up scale has to be applied BEFORE the ReLU^2 non-linearity and the
+                // down scale after the down matmul. Folding both into the routing weight
+                // (ds * us * us) is algebraically equivalent but numerically unsafe: it
+                // leaves up_out too large by 1/us, and squaring that overflows to +Inf
+                // for NVFP4 experts whose scale2 is ~1e-5. Observed on Nemotron Super VL,
+                // where the resulting Inf met a ~1e-15 route weight and produced NaN by
+                // MoE layer 1. Keep them separate so each is applied at its own stage.
+                var down = new float[ne];
                 for (int e = 0; e < ne; e++)
-                {
-                    float us = upScale != null ? upScale[e] : 1.0f;
-                    float ds = downScale != null ? downScale[e] : 1.0f;
-                    combined[e] = ds * us * us;
-                }
-                _layerExpertScale[l] = combined;
+                    down[e] = downScale != null ? downScale[e] : 1.0f;
+                _layerExpertScale[l] = down;
+                _layerExpertUpScale[l] = upScale;
             }
         }
 
@@ -896,6 +904,30 @@ namespace TensorSharp.Models
                 return null;
             return tensor.GetElementsAsFloat(expectedLength);
         }
+
+        /// <summary>
+        /// Applies an expert's NVFP4 up-projection scale2 BEFORE the ReLU^2
+        /// non-linearity. This cannot be deferred into the routing weight:
+        /// squaring an up_out that is still 1/us too large overflows to +Inf
+        /// when scale2 is ~1e-5, and the Inf then propagates as NaN.
+        /// </summary>
+        private void ApplyExpertUpScale(Tensor up, int layer, int expertIdx)
+        {
+            if (up == null || _layerExpertUpScale == null || layer >= _layerExpertUpScale.Length)
+                return;
+            float[] s = _layerExpertUpScale[layer];
+            if (s == null || (uint)expertIdx >= (uint)s.Length)
+                return;
+            float us = s[expertIdx];
+            if (us != 1.0f)
+                Ops.Mul(up, up, us);
+        }
+
+        /// <summary>True when any expert on this layer needs a pre-activation up scale.</summary>
+        private bool HasExpertUpScale(int layer)
+            => _layerExpertUpScale != null
+               && layer < _layerExpertUpScale.Length
+               && _layerExpertUpScale[layer] != null;
 
         private unsafe void InitLayerInfo()
         {
@@ -1084,6 +1116,7 @@ namespace TensorSharp.Models
 
             _moeUpPtrs = new IntPtr[_numExpertsUsed];
             _moeDownPtrs = new IntPtr[_numExpertsUsed];
+            _moeUpScales = new float[_numExpertsUsed];
 
             int maxLatent = 0;
             for (int l = 0; l < Config.NumLayers; l++)
@@ -1689,6 +1722,11 @@ namespace TensorSharp.Models
                 && residual.Sizes[0] == input.Sizes[0]
                 && input.Sizes[0] == 1
                 && _quantWeights.TryGetValue(weightName, out var qw)
+                // FusedMatMulQuantAdd takes no scale, so a weight carrying an
+                // NVFP4 scale2 sidecar would be added to the residual unscaled.
+                // Bail out and let the caller use the scale-aware LinearForward
+                // chain instead.
+                && qw.Scale == 1.0f
                 && input.Sizes[1] == qw.Ne0
                 && residual.Sizes[1] == qw.Ne1;
         }
@@ -1842,6 +1880,7 @@ namespace TensorSharp.Models
                         hidden = FFNBlock(hidden, layer, seqLen, isDecode);
                         break;
                 }
+
                 if (_backend == BackendType.Mlx && (layer + 1) % evalEveryN == 0
                     && layer + 1 != Config.NumLayers && hidden != null)
                 {
@@ -2468,35 +2507,66 @@ namespace TensorSharp.Models
                 {
                     VecZero(latentAccum, outDim);
 
-                    // Batched GPU path: all experts in a single GGML graph
+                    // Batched GPU path: all experts chunked through the GGML kernel
+                    // which enforces numExperts ∈ [1, 16]. Models whose per-token
+                    // expert count exceeds 16 (e.g. Super VL at 22) split across
+                    // multiple calls and the results accumulate into latentAccum.
                     bool usedBatchedMoE = false;
-                    if (isDecode && IsGgmlBackend && _expertUpQW[layer] != null && _expertDownQW[layer] != null)
+                    // The kernel squares the raw quantized up projection, so a
+                    // per-expert NVFP4 up scale has to be applied inside the graph,
+                    // before the squaring. It rides along in _moeUpScales; the down
+                    // scale needs no hook because it is a single post-matmul multiply
+                    // already folded into routeW above (see InitExpertScales).
+                    if (isDecode && IsGgmlBackend
+                        && _expertUpQW[layer] != null && _expertDownQW[layer] != null)
                     {
                         var upQw0 = _expertUpQW[layer][topExperts[0]];
                         var dnQw0 = _expertDownQW[layer][topExperts[0]];
                         if (upQw0 != null && dnQw0 != null)
                         {
-                            for (int k = 0; k < nUsed; k++)
+                            const int MAX_EXPERTS_PER_CALL = 16;
+                            bool chunked = nUsed > MAX_EXPERTS_PER_CALL;
+                            float[] chunkRouteW = chunked ? new float[MAX_EXPERTS_PER_CALL] : routeW;
+                            float[] layerUpScale = _layerExpertUpScale != null
+                                && layer < _layerExpertUpScale.Length
+                                ? _layerExpertUpScale[layer] : null;
+                            float[] callUpScales = layerUpScale != null ? _moeUpScales : null;
+
+                            for (int chunkStart = 0; chunkStart < nUsed; chunkStart += MAX_EXPERTS_PER_CALL)
                             {
-                                int ei = topExperts[k];
-                                _moeUpPtrs[k] = _expertUpQW[layer][ei].CacheKey;
-                                _moeDownPtrs[k] = _expertDownQW[layer][ei].CacheKey;
+                                int chunkSize = Math.Min(MAX_EXPERTS_PER_CALL, nUsed - chunkStart);
+                                for (int k = 0; k < chunkSize; k++)
+                                {
+                                    int ei = topExperts[chunkStart + k];
+                                    _moeUpPtrs[k] = _expertUpQW[layer][ei].CacheKey;
+                                    _moeDownPtrs[k] = _expertDownQW[layer][ei].CacheKey;
+                                    if (layerUpScale != null)
+                                        _moeUpScales[k] = layerUpScale[ei];
+                                }
+                                float[] callRouteW = routeW;
+                                if (chunked)
+                                {
+                                    Array.Copy(routeW, chunkStart, chunkRouteW, 0, chunkSize);
+                                    callRouteW = chunkRouteW;
+                                }
+
+                                long t0exp = Stopwatch.GetTimestamp();
+
+                                GgmlBasicOps.MoEExpertsForward(
+                                    _expertDownResult, routedInput,
+                                    chunkSize, _moeUpPtrs, _moeDownPtrs,
+                                    upQw0.GgmlType, upQw0.Ne0, upQw0.Ne1, upQw0.RawBytes,
+                                    dnQw0.GgmlType, dnQw0.Ne0, dnQw0.Ne1, dnQw0.RawBytes,
+                                    callRouteW, callUpScales);
+
+                                _linearTicks += Stopwatch.GetTimestamp() - t0exp;
+
+                                float* expPtr = GetFloatPtr(_expertDownResult);
+                                if (chunkStart == 0)
+                                    Buffer.MemoryCopy(expPtr, latentAccum, outDim * 4, outDim * 4);
+                                else
+                                    VecScaleAdd(latentAccum, expPtr, 1.0f, outDim);
                             }
-
-                            long t0exp = Stopwatch.GetTimestamp();
-
-                            // Use _expertDownResult as the output accumulator
-                            GgmlBasicOps.MoEExpertsForward(
-                                _expertDownResult, routedInput,
-                                nUsed, _moeUpPtrs, _moeDownPtrs,
-                                upQw0.GgmlType, upQw0.Ne0, upQw0.Ne1, upQw0.RawBytes,
-                                dnQw0.GgmlType, dnQw0.Ne0, dnQw0.Ne1, dnQw0.RawBytes,
-                                routeW);
-
-                            _linearTicks += Stopwatch.GetTimestamp() - t0exp;
-
-                            float* expPtr = GetFloatPtr(_expertDownResult);
-                            Buffer.MemoryCopy(expPtr, latentAccum, outDim * 4, outDim * 4);
                             usedBatchedMoE = true;
                         }
                     }
@@ -2522,6 +2592,7 @@ namespace TensorSharp.Models
                             int expertIdx = topExperts[k];
 
                             Tensor up = LinearForward(routedInput, _expertUpKeys[layer][expertIdx]);
+                            ApplyExpertUpScale(up, layer, expertIdx);
                             ReluSquaredInPlace(up);
                             Tensor expertOut = LinearForward(up, _expertDownKeys[layer][expertIdx]);
                             up.Dispose();
@@ -2673,6 +2744,7 @@ namespace TensorSharp.Models
             {
                 if (_latentAccumTensor == null
                     || !_quantWeights.TryGetValue(prefix + "ffn_latent_out.weight", out var latentOutQw)
+                    || latentOutQw.Scale != 1.0f
                     || _latentAccumTensor.DimensionCount != 2
                     || _latentAccumTensor.Sizes[0] != 1
                     || _latentAccumTensor.Sizes[1] != latentOutQw.Ne0
@@ -2686,6 +2758,8 @@ namespace TensorSharp.Models
             {
                 if (!_quantWeights.TryGetValue(prefix + "ffn_up_shexp.weight", out var sharedUpQw)
                     || !_quantWeights.TryGetValue(prefix + "ffn_down_shexp.weight", out var sharedDownQw)
+                    || sharedUpQw.Scale != 1.0f
+                    || sharedDownQw.Scale != 1.0f
                     || sharedUpQw.Ne1 != sharedDownQw.Ne0
                     || sharedDownQw.Ne1 != Config.HiddenSize)
                 {
@@ -2781,6 +2855,7 @@ namespace TensorSharp.Models
                     if (up == null)
                         return false;
 
+                    ApplyExpertUpScale(up, layer, expert);
                     ReluSquaredInPlace(up);
                     InvalidateTensorDeviceCache(up);
 
