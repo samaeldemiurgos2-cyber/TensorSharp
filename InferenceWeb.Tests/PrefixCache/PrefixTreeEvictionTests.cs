@@ -386,7 +386,7 @@ public class PrefixTreeEvictionTests
         Assert.True(locked.EnforceCaps(EvictionTier.PublicTop));
         // Option caps from RAM for HostKv.
         PrefixTree ram = new(new PrefixTreeOptions { Capabilities = Tk.Caps(), BlockSize = B, HostRamBytes = 4000 });
-        Assert.Equal(1000, ram.OptionCaps.HostKv);
+        Assert.Equal(2000, ram.OptionCaps.HostKv);
     }
 
     [Fact]

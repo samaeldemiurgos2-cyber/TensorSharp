@@ -240,6 +240,22 @@ namespace TensorSharp.Models
             // round-tripping dispatches per block. Falls back to the per-block
             // loop on any failure. CPU-allocator path keeps the per-block loop.
             bool wholeEncoderDone = false;
+            if (deepStack == null && _useNativeAttention && !s_traceEnabled)
+            {
+                Tensor mergedProjection = TryWholeEncoderMerged(blockOrdered, numPatches, headDim, halfDim,
+                    ropeCache.CosTable, ropeCache.SinTable);
+                if (mergedProjection != null)
+                {
+                    blockOrdered.Dispose();
+                    double tickMs = 1000.0 / Stopwatch.Frequency;
+                    Console.WriteLine($"  Vision encode: {(Stopwatch.GetTimestamp() - encodeStart) * tickMs:F0} ms total " +
+                        $"(patchEmbed {patchEmbedTicks * tickMs:F0} ms, blocks+merger " +
+                        $"{(Stopwatch.GetTimestamp() - blocksStart) * tickMs:F0} ms), " +
+                        $"{numPatches} patches -> {mergedProjection.Sizes[0]} tokens");
+                    DumpProjection(mergedProjection);
+                    return mergedProjection;
+                }
+            }
             if (deepStack == null && _useNativeAttention)
             {
                 wholeEncoderDone = TryWholeEncoderFused(blockOrdered, numPatches, headDim, halfDim,
@@ -329,7 +345,28 @@ namespace TensorSharp.Models
                 $"proj {projTicks * msPerTick:F0} ms), " +
                 $"{numPatches} patches -> {mergedPatches} tokens");
 
+            DumpProjection(projected);
             return projected;
+        }
+
+        // Validation aid: TS_QWEN_VISION_DUMP=<dir> writes each image's projected
+        // embeddings as an int32 element count followed by float32 values, the format
+        // eng/validation/compare-vision-embeddings.py reads.
+        private static readonly string s_projectionDumpDir = Environment.GetEnvironmentVariable("TS_QWEN_VISION_DUMP");
+        private static int s_projectionDumpIndex;
+
+        private static void DumpProjection(Tensor projected)
+        {
+            if (string.IsNullOrEmpty(s_projectionDumpDir))
+                return;
+            int count = checked((int)projected.ElementCount());
+            float[] values = projected.GetElementsAsFloat(count);
+            System.IO.Directory.CreateDirectory(s_projectionDumpDir);
+            string path = System.IO.Path.Combine(s_projectionDumpDir,
+                $"vision-{System.Threading.Interlocked.Increment(ref s_projectionDumpIndex):D3}.f32");
+            using var stream = System.IO.File.Create(path);
+            stream.Write(BitConverter.GetBytes(count));
+            stream.Write(System.Runtime.InteropServices.MemoryMarshal.AsBytes(values.AsSpan()));
         }
 
         /// <summary>
@@ -377,7 +414,7 @@ namespace TensorSharp.Models
             // Build im2col matrix [numPatches, rowStride] in parallel.
             int[] blockOrder = GetOrCreateBlockOrder(gridH, gridW);
             var im2col = new Tensor(_allocator, DType.Float32, numPatches, rowStride);
-            using (var staging = new HostStaging(im2col, _cudaDirect))
+            using (var staging = new HostStaging(im2col, _cudaDirect, _patchStaging))
             {
                 float* im2colPtr = staging.Ptr;
 
@@ -455,20 +492,42 @@ namespace TensorSharp.Models
         /// pinned array and pushing it with a single bulk CopyToStorage skips it.
         /// On host-resident allocators the tensor's own buffer is used directly.
         /// </summary>
+        /// <summary>A pinned staging buffer kept across encodes (they serialize).</summary>
+        private sealed class StagingBuffer
+        {
+            public float[] Data;
+        }
+
+        private readonly StagingBuffer _patchStaging = new();
+
         private sealed unsafe class HostStaging : IDisposable
         {
             private readonly Tensor _tensor;
             private readonly float[] _buffer;
+            private readonly bool _direct;
             private System.Runtime.InteropServices.GCHandle _handle;
 
             public float* Ptr { get; }
 
-            public HostStaging(Tensor tensor, bool stageOnHost)
+            /// <param name="reuse">For a CUDA tensor: a pinned buffer kept across calls, filled and
+            /// then copied straight to the tensor's device memory. A fresh 25 MB array and the
+            /// storage's fresh host mirror per screenshot cost page faults and a second copy.</param>
+            public HostStaging(Tensor tensor, bool stageOnHost, StagingBuffer reuse = null)
             {
                 _tensor = tensor;
                 if (!stageOnHost)
                 {
                     Ptr = TensorComputePrimitives.GetFloatPointer(tensor);
+                    return;
+                }
+                if (reuse != null && tensor.Storage is TensorSharp.Cuda.CudaStorage)
+                {
+                    if (reuse.Data == null || reuse.Data.Length < tensor.ElementCount())
+                        reuse.Data = GC.AllocateUninitializedArray<float>(checked((int)tensor.ElementCount()), pinned: true);
+                    _buffer = reuse.Data;
+                    _direct = true;
+                    fixed (float* p = _buffer)
+                        Ptr = p;   // a pinned-heap array never moves
                     return;
                 }
 
@@ -482,9 +541,13 @@ namespace TensorSharp.Models
             {
                 if (_buffer == null)
                     return;
-
-                _tensor.Storage.CopyToStorage(_tensor.StorageOffset, _handle.AddrOfPinnedObject(),
-                    _tensor.ElementCount() * sizeof(float));
+                long bytes = _tensor.ElementCount() * sizeof(float);
+                if (_direct)
+                {
+                    ((TensorSharp.Cuda.CudaStorage)_tensor.Storage).CopyToDevice(_tensor.StorageOffset, (IntPtr)Ptr, bytes);
+                    return;
+                }
+                _tensor.Storage.CopyToStorage(_tensor.StorageOffset, _handle.AddrOfPinnedObject(), bytes);
                 _handle.Free();
             }
         }
@@ -647,7 +710,138 @@ namespace TensorSharp.Models
         private bool TryWholeEncoderFused(Tensor hidden, int numPatches, int headDim, int halfDim,
             float[] cosTable, float[] sinTable, int firstBlock = 0, int blockCount = -1)
         {
-            int n = blockCount < 0 ? _blockCount : blockCount;
+            if (!TryCollectBlockWeights(firstBlock, blockCount < 0 ? _blockCount : blockCount, out var w))
+                return false;
+            // Fuse all blocks while gallocr reuses their activation storage. On
+            // CUDA the default native attention uses bounded F32 score tiles
+            // and ordered writes into one output; CPU/Metal use upstream flash.
+            // TS_QWEN_VISION_F32=1 selects the owned streaming F32 CUDA kernel
+            // for 72-wide heads. Both CUDA paths avoid a full quadratic score
+            // allocation, but the ~1.6 GB of resident encoder weights and the
+            // language model's resident buffers can still cause WDDM paging.
+            float attnScale = 1f / MathF.Sqrt(headDim);
+            try
+            {
+                bool ok = GgmlBasicOps.Qwen35VisionEncoder(hidden, _eps, attnScale,
+                    numPatches, _numHeads, headDim, halfDim, cosTable, sinTable,
+                    w.Ln1W, w.Ln1B, w.QkvW, w.QkvB, w.OutW, w.OutB, w.Ln2W, w.Ln2B, w.UpW, w.UpB, w.DownW, w.DownB,
+                    geluErf: UseFusedVision21);
+                if (ok)
+                    _hostModel?.YieldGpuComputeLock();
+                return ok;
+            }
+            // A stop from the yield (the model is being unloaded) is not a kernel failure:
+            // falling back to the unfused path would keep encoding on a retiring model.
+            catch (Exception e) when (e is not OperationCanceledException and not ModelUnloadedException)
+            {
+                if (!_wholeEncoderFusedWarned)
+                {
+                    _wholeEncoderFusedWarned = true;
+                    Console.Error.WriteLine(
+                        $"[qwen35-vision] whole-encoder fused graph failed ({e.Message}); " +
+                        "falling back to the per-block encoder (5-15x slower image prefill). Reported once.");
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// The whole encoder and the post-LN spatial merger as one graph, returning the
+        /// projected [merged, out] rows; null when a weight is missing or the native path
+        /// declines, leaving <paramref name="hidden"/> untouched for the unmerged path.
+        /// The separate merger ran post-LN, a contiguous copy and two linears as host-
+        /// dispatched ops (~55 ms of a ~245 ms 4032-patch encode on CUDA).
+        /// </summary>
+        private Tensor TryWholeEncoderMerged(Tensor hidden, int numPatches, int headDim, int halfDim,
+            float[] cosTable, float[] sinTable)
+        {
+            if (s_mergedEncoderDisabled || _mergedEncoderFailed || !TryCollectBlockWeights(0, _blockCount, out var w)
+                || !_weights.TryGetValue("v.post_ln.weight", out var postW) || !_weights.TryGetValue("v.post_ln.bias", out var postB)
+                || !_weights.TryGetValue("mm.0.weight", out var fc1W) || !_weights.TryGetValue("mm.0.bias", out var fc1B)
+                || !_weights.TryGetValue("mm.2.weight", out var fc2W) || !_weights.TryGetValue("mm.2.bias", out var fc2B))
+                return null;
+            int unit = _spatialMergeSize * _spatialMergeSize;
+            if (numPatches % unit != 0)
+                return null;
+            if (UseF16Linears)
+            {
+                w = w with
+                {
+                    QkvW = Array.ConvertAll(w.QkvW, F16Linear), OutW = Array.ConvertAll(w.OutW, F16Linear),
+                    UpW = Array.ConvertAll(w.UpW, F16Linear), DownW = Array.ConvertAll(w.DownW, F16Linear),
+                };
+                fc1W = F16Linear(fc1W);
+                fc2W = F16Linear(fc2W);
+            }
+            var projected = new Tensor(_allocator, DType.Float32, numPatches / unit, (int)fc2W.Sizes[0]);
+            bool ok = false;
+            try
+            {
+                ok = GgmlBasicOps.Qwen35VisionEncoderMerged(hidden, projected, _eps, 1f / MathF.Sqrt(headDim),
+                    numPatches, _numHeads, headDim, halfDim, cosTable, sinTable,
+                    w.Ln1W, w.Ln1B, w.QkvW, w.QkvB, w.OutW, w.OutB, w.Ln2W, w.Ln2B, w.UpW, w.UpB, w.DownW, w.DownB,
+                    UseFusedVision21, postW, postB, fc1W, fc1B, fc2W, fc2B, unit,
+                    // ApplyVisionMergerGelu: erf when configured, or on the Qwen-Image tower.
+                    _mergerGeluErf || _qwenImage21);
+                if (!ok && !_mergedEncoderFailed)
+                {
+                    _mergedEncoderFailed = true;
+                    Console.Error.WriteLine("[qwen35-vision] merged encoder graph declined (" +
+                        GgmlBasicOps.LastNativeError("no diagnostic") + "); using the separate merger. Reported once.");
+                }
+                if (ok)
+                    _hostModel?.YieldGpuComputeLock();
+                return ok ? projected : null;
+            }
+            finally
+            {
+                if (!ok) projected.Dispose();
+            }
+        }
+
+        private static readonly bool s_mergedEncoderDisabled =
+            Environment.GetEnvironmentVariable("TS_QWEN_VISION_MERGED") == "0";
+
+        // Opt-in F16 copies of the linear weights for the merged CUDA graph (tensor-core
+        // GEMMs with F32 accumulation, half the resident weight memory; attention, norms
+        // and biases stay F32). Measured on a 4032-patch screenshot: no faster - the
+        // explicit F32 attention dominates - and relative L2 0.0021-0.0031 against F32,
+        // at the 0.003 compare-vision-embeddings gate. TS_QWEN_VISION_F16=1 enables.
+        private bool UseF16Linears => _allocator is TensorSharp.GGML.GgmlAllocator ggml
+            && ggml.Context.BackendType == TensorSharp.GGML.GgmlBackendType.Cuda
+            && Environment.GetEnvironmentVariable("TS_QWEN_VISION_F16") == "1";
+
+        private readonly Dictionary<Tensor, Tensor> _f16Linears = new();
+
+        private unsafe Tensor F16Linear(Tensor weight)
+        {
+            if (_f16Linears.TryGetValue(weight, out var cached))
+                return cached;
+            var half = new Tensor(_allocator, DType.Float16, weight.Sizes);
+            long count = weight.ElementCount();
+            float* src = GetFloatPtr(weight);
+            ushort* dst = (ushort*)TensorComputePrimitives.GetStoragePointer(half);
+            long s = (long)src, d = (long)dst;
+            System.Threading.Tasks.Parallel.For(0L, (count + 65535) / 65536, block =>
+            {
+                long start = block * 65536, end = Math.Min(count, start + 65536);
+                for (long i = start; i < end; i++)
+                    ((ushort*)d)[i] = BitConverter.HalfToUInt16Bits((System.Half)((float*)s)[i]);
+            });
+            if (_f16Linears.Count == 0)
+                Console.WriteLine("[qwen35-vision] merged encoder uses F16 linear weights (TS_QWEN_VISION_F16=1).");
+            _f16Linears[weight] = half;
+            return half;
+        }
+        private bool _mergedEncoderFailed;
+
+        private readonly record struct BlockWeights(
+            Tensor[] Ln1W, Tensor[] Ln1B, Tensor[] QkvW, Tensor[] QkvB, Tensor[] OutW, Tensor[] OutB,
+            Tensor[] Ln2W, Tensor[] Ln2B, Tensor[] UpW, Tensor[] UpB, Tensor[] DownW, Tensor[] DownB);
+
+        private bool TryCollectBlockWeights(int firstBlock, int n, out BlockWeights weights)
+        {
+            weights = default;
             var ln1W = new Tensor[n]; var ln1B = new Tensor[n];
             var qkvW = new Tensor[n]; var qkvB = new Tensor[n];
             var outW = new Tensor[n]; var outB = new Tensor[n];
@@ -672,39 +866,8 @@ namespace TensorSharp.Models
                     !_weights.TryGetValue($"{p}.ffn_down.bias", out downB[i]))
                     return false;
             }
-
-            // Fuse all blocks while gallocr reuses their activation storage. On
-            // CUDA the default native attention uses bounded F32 score tiles
-            // and ordered writes into one output; CPU/Metal use upstream flash.
-            // TS_QWEN_VISION_F32=1 selects the owned streaming F32 CUDA kernel
-            // for 72-wide heads. Both CUDA paths avoid a full quadratic score
-            // allocation, but the ~1.6 GB of resident encoder weights and the
-            // language model's resident buffers can still cause WDDM paging.
-
-            float attnScale = 1f / MathF.Sqrt(headDim);
-            try
-            {
-                bool ok = GgmlBasicOps.Qwen35VisionEncoder(hidden, _eps, attnScale,
-                    numPatches, _numHeads, headDim, halfDim, cosTable, sinTable,
-                    ln1W, ln1B, qkvW, qkvB, outW, outB, ln2W, ln2B, upW, upB, downW, downB,
-                    geluErf: UseFusedVision21);
-                if (ok)
-                    _hostModel?.YieldGpuComputeLock();
-                return ok;
-            }
-            // A stop from the yield (the model is being unloaded) is not a kernel failure:
-            // falling back to the unfused path would keep encoding on a retiring model.
-            catch (Exception e) when (e is not OperationCanceledException and not ModelUnloadedException)
-            {
-                if (!_wholeEncoderFusedWarned)
-                {
-                    _wholeEncoderFusedWarned = true;
-                    Console.Error.WriteLine(
-                        $"[qwen35-vision] whole-encoder fused graph failed ({e.Message}); " +
-                        "falling back to the per-block encoder (5-15x slower image prefill). Reported once.");
-                }
-                return false;
-            }
+            weights = new BlockWeights(ln1W, ln1B, qkvW, qkvB, outW, outB, ln2W, ln2B, upW, upB, downW, downB);
+            return true;
         }
 
         private Tensor EncoderBlock(Tensor hidden, int blockIdx, int numPatches, int headDim,

@@ -75,6 +75,9 @@ enum tsg_dsv4_fused_kind : int32_t
     // blocks, i3 index precision, f0 kq scale. The CPU backend runs the
     // node's own callback; CUDA runs desc.cuda_compute.
     TSG_MSA_ATTENTION           = 27,
+    // TSG_ATTN_VISION_F32 on tensor cores: F16 Q/K/V operands, F32 scores,
+    // softmax and output. Same inputs and output layout.
+    TSG_ATTN_VISION_MMA         = 28,
 };
 
 #define TSG_DSV4_FUSED_MAGIC 0x5453445356344655ull  // "TSDSV4FU"

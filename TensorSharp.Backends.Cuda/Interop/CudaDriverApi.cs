@@ -28,6 +28,9 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName)]
         public static partial int cuDeviceGetAttribute(out int value, int attribute, int device);
 
+        [LibraryImport(LibName)]
+        public static partial int cuCtxGetDevice(out int device);
+
         [LibraryImport(LibName, EntryPoint = "cuCtxCreate_v2")]
         public static partial int cuCtxCreate(out IntPtr ctx, uint flags, int device);
 
@@ -85,6 +88,9 @@ namespace TensorSharp.Cuda.Interop
 
         [LibraryImport(LibName, EntryPoint = "cuMemsetD8Async")]
         public static partial int cuMemsetD8Async(IntPtr dstDevice, byte value, UIntPtr count, IntPtr stream);
+
+        [LibraryImport(LibName, EntryPoint = "cuMemsetD32Async")]
+        public static partial int cuMemsetD32Async(IntPtr dstDevice, uint value, UIntPtr count, IntPtr stream);
 
         [LibraryImport(LibName)]
         public static partial int cuModuleLoadData(out IntPtr module, IntPtr image);
@@ -166,6 +172,10 @@ namespace TensorSharp.Cuda.Interop
 
         [LibraryImport(LibName)]
         public static partial int cuEventSynchronize(IntPtr hEvent);
+
+        /// <summary>0 when the event's work completed, CUDA_ERROR_NOT_READY (600) while it runs.</summary>
+        [LibraryImport(LibName)]
+        public static partial int cuEventQuery(IntPtr hEvent);
 
         [LibraryImport(LibName)]
         public static partial int cuEventElapsedTime(out float pMilliseconds, IntPtr hStart, IntPtr hEnd);

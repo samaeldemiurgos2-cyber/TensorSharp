@@ -96,6 +96,13 @@ namespace TensorSharp.Models.Architecture
         /// whole-layer placement. LayerSplit architectures support it inherently.</summary>
         public bool SupportsLayerSplit { get; init; }
 
+        /// <summary>The executor loads and runs only its node's whole layers and
+        /// exchanges every required stage boundary tensor through ILayerSplitGroup.</summary>
+        public bool SupportsDistributedLayerSplit { get; init; }
+
+        public IReadOnlyList<BackendType> DistributedLayerSplitBackends { get; init; } =
+            new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan };
+
         /// <summary>Optional native partial-TP mode, for an otherwise layer-split
         /// executor. True only when its explicit native settings enable real sharding
         /// for the requested degree and backend.</summary>
@@ -105,6 +112,11 @@ namespace TensorSharp.Models.Architecture
         /// collectives. Only applies to TensorParallel architectures; native
         /// executors that own local ranks must set this to false.</summary>
         public bool SupportsDistributedTensorParallel { get; init; } = true;
+
+        /// <summary>Optional backend restriction for cross-node collectives.
+        /// Checked before the host creates GPU ranks or connects to peers;
+        /// null permits the shared distributed GPU backends.</summary>
+        public IReadOnlyList<BackendType> DistributedTensorParallelBackends { get; init; }
 
         /// <summary>Backends implementing this architecture's whole-layer placement.</summary>
         public IReadOnlyList<BackendType> LayerSplitBackends { get; init; } =

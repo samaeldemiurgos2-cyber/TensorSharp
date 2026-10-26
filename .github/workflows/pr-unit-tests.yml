@@ -68,6 +68,9 @@ jobs:
           TMPDIR="$PWD/.gb10-container-check" python3 eng/tests/gb10-container.py
           rmdir .gb10-container-check
 
+      - name: Check the CUDA redist installer (local fixtures, no download)
+        run: python3 -m unittest eng/tests/test_install_cuda_redist.py
+
       - name: Run environment-independent tests
         run: >
           dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

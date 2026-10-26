@@ -16,27 +16,27 @@ if [[ "${BUILDPLATFORM}" != "linux/arm64" || "${TARGETPLATFORM}" != "linux/arm64
 fi
 CHECK_GB10_PLATFORM
 
-# CUDA 13.0.2 compiler/runtime components, without profilers, NCCL or unused math libraries.
+# CUDA 13.4.3 compiler/runtime components, without profilers, NCCL or unused math libraries.
 ADD --checksum=sha256:6ea7d2737648936820e85677177957a0f6521b840d98eb0bbae0a4f003fa7249 \
     https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb /tmp/cuda-keyring.deb
 RUN dpkg -i /tmp/cuda-keyring.deb \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build \
-        cuda-nvcc-13-0=13.0.88-1 libnvvm-13-0=13.0.88-1 \
-        cuda-crt-13-0=13.0.88-1 libnvptxcompiler-13-0=13.0.88-1 \
-        cuda-cudart-13-0=13.0.96-1 cuda-cudart-dev-13-0=13.0.96-1 \
-        cuda-driver-dev-13-0=13.0.96-1 cuda-cccl-13-0=13.0.85-1 \
-        cuda-culibos-dev-13-0=13.0.85-1 cuda-cuobjdump-13-0=13.0.85-1 \
-        cuda-toolkit-13-0-config-common=13.0.96-1 cuda-toolkit-13-config-common=13.0.96-1 \
-        cuda-toolkit-config-common=13.0.96-1 \
-        libcublas-13-0=13.1.0.3-1 libcublas-dev-13-0=13.1.0.3-1 \
-    && rm /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcublas_static.a \
-        /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcublasLt_static.a /tmp/cuda-keyring.deb \
+        cuda-nvcc-13-4=13.4.92-1 libnvvm-13-4=13.4.92-1 \
+        cuda-crt-13-4=13.4.92-1 libnvptxcompiler-13-4=13.4.92-1 \
+        cuda-cudart-13-4=13.4.92-1 cuda-cudart-dev-13-4=13.4.92-1 \
+        cuda-driver-dev-13-4=13.4.92-1 cccl-13-4=13.3.4.3.1-1 \
+        cuda-culibos-dev-13-4=13.4.92-1 cuda-cuobjdump-13-4=13.4.92-1 \
+        cuda-toolkit-13-4-config-common=13.4.92-1 cuda-toolkit-13-config-common=13.4.92-1 \
+        cuda-toolkit-config-common=13.4.92-1 \
+        libcublas-13-4=13.8.0.4-1 libcublas-dev-13-4=13.8.0.4-1 \
+    && rm /usr/local/cuda-13.4/targets/sbsa-linux/lib/libcublas_static.a \
+        /usr/local/cuda-13.4/targets/sbsa-linux/lib/libcublasLt_static.a /tmp/cuda-keyring.deb \
     && rm -rf /var/lib/apt/lists/*
 
-ENV CUDA_HOME=/usr/local/cuda-13.0 \
-    PATH=/usr/local/cuda-13.0/bin:${PATH}
+ENV CUDA_HOME=/usr/local/cuda-13.4 \
+    PATH=/usr/local/cuda-13.4/bin:${PATH}
 RUN <<'CHECK_GB10_CUDA'
 cuda_version="$(nvcc --version)"
 if [[ "${cuda_version}" != *"release 13."* ]]; then
@@ -87,6 +87,7 @@ RUN : "${SOURCE_REVISION:?Pass --build-arg SOURCE_REVISION with the checkout rev
 FROM build AS development
 RUN dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipGgmlNative=true \
     && test -s TensorSharp.Backends.Cuda/obj/cuda_ptx/ptx/tensorsharp_kernels.ptx \
+    && test -s TensorSharp.Backends.Cuda/obj/cuda_ptx/ptx/tensorsharp_kernels.fatbin \
     && test -s TensorSharp.Backends.Cuda/obj/cuda_ptx/ptx/tensorsharp_dsv4_kernels.ptx
 
 CMD ["bash"]

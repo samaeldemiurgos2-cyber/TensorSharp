@@ -116,7 +116,50 @@ public class ContinuousBatchSchedulerTests
     }
 
     [Fact]
-    public void Scheduler_PrefillOnlyContention_UsesWholeTokenBudgetFairly()
+    public void Scheduler_PrefillOnlyContention_FirstComeFirstServedUsesWholeBudget()
+    {
+        // With no decode in flight the oldest prompt takes the whole budget, so it
+        // finishes (and starts streaming) first instead of every prompt of a burst
+        // finishing together at the end; leftover budget flows to the next prompt.
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 32,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 8,
+            SoloPrefillChunkSize = 32,
+            NumBlocks = 32,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = false,
+            DecodeQuantumTokens = 1,
+            PrefillOnlyFirstComeFirstServed = true,
+        };
+        var pool = NewPool(cfg.NumBlocks);
+        var sched = new ContinuousBatchScheduler(cfg, pool, NullLogger.Instance);
+        var first = NewSequence("prefill-a", promptLen: 64, maxNew: 4);
+        var second = NewSequence("prefill-b", promptLen: 64, maxNew: 4);
+        var shortOne = NewSequence("prefill-c", promptLen: 12, maxNew: 4);
+        sched.Submit(first);
+        sched.Submit(second);
+
+        var step = sched.Schedule();
+        Assert.Single(step.ScheduledWork);
+        Assert.Same(first, step.ScheduledWork[0].Sequence);
+        Assert.Equal(cfg.MaxNumBatchedTokens, step.ScheduledWork[0].NumScheduledTokens);
+
+        // A prompt shorter than the budget leaves the rest to the next one.
+        var cfg2 = cfg;
+        var sched2 = new ContinuousBatchScheduler(cfg2, NewPool(cfg2.NumBlocks), NullLogger.Instance);
+        sched2.Submit(shortOne);
+        var tail = NewSequence("prefill-d", promptLen: 64, maxNew: 4);
+        sched2.Submit(tail);
+        var mixed = sched2.Schedule();
+        Assert.Equal(2, mixed.ScheduledWork.Count);
+        Assert.Equal(12, mixed.ScheduledWork[0].NumScheduledTokens);
+        Assert.Equal(cfg.MaxNumBatchedTokens, mixed.ScheduledWork.Sum(work => work.NumScheduledTokens));
+    }
+
+    [Fact]
+    public void Scheduler_PrefillOnlyContention_EvenSplitUsesWholeTokenBudgetFairly()
     {
         // Two long prompts are the shape produced by parallel research/document
         // requests before either reaches its first tool call.  A fixed 8-token
@@ -227,6 +270,100 @@ public class ContinuousBatchSchedulerTests
         Assert.Same(earlierLongPrefill, mixed.ScheduledWork[1].Sequence);
         Assert.True(mixed.ScheduledWork[1].IsPrefill);
         Assert.Equal(cfg.MaxPrefillChunkSize, mixed.ScheduledWork[1].NumScheduledTokens);
+    }
+
+    [Fact]
+    public void Scheduler_MixedStepPrefillBudget_RunsATinyRemainderNow()
+    {
+        // A prompt 4 tokens past the mixed budget finishes in this step rather than taking a step
+        // (a whole forward pass) of its own for those 4 tokens; one 40 past it is cut at the budget.
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 512,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 256,
+            SoloPrefillChunkSize = 512,
+            NumBlocks = 64,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = false,
+            DecodeQuantumTokens = 1,
+            MixedStepPrefillBudget = 128,
+        };
+        foreach (var (extra, expected) in new[] { (4, 132), (40, 128) })
+        {
+            var sched = new ContinuousBatchScheduler(cfg, NewPool(cfg.NumBlocks), NullLogger.Instance);
+            var decoder = NewSequence("decoding-" + extra, promptLen: 4, maxNew: 32);
+            sched.Submit(decoder);
+            var opening = sched.Schedule();
+            foreach (var work in opening.ScheduledWork)
+                work.Sequence.AdvanceComputedTokens(work.NumScheduledTokens);
+            var prompt = NewSequence("prefill-" + extra, promptLen: 128 + extra, maxNew: 4);
+            sched.Submit(prompt);
+            var step = sched.Schedule();
+            Assert.Contains(step.ScheduledWork, work => ReferenceEquals(work.Sequence, decoder) && !work.IsPrefill);
+            var chunk = Assert.Single(step.ScheduledWork, work => work.IsPrefill);
+            Assert.Equal(expected, chunk.NumScheduledTokens);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Scheduler_MixedStepPrefillBudget_BoundsAllPromptsBesideDecodes(bool firstComeFirstServed)
+    {
+        // Every decoding sequence waits for the whole step, so the mixed budget bounds the
+        // prompt tokens of ALL prefilling sequences together. First-come-first-served keeps it
+        // on the prompt it served; otherwise it rotates to the next prompt.
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 32,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 8,
+            SoloPrefillChunkSize = 32,
+            NumBlocks = 64,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = false,
+            DecodeQuantumTokens = 1,
+            MixedStepPrefillBudget = 8,
+            MixedStepPrefillFirstComeFirstServed = firstComeFirstServed,
+        };
+        var sched = new ContinuousBatchScheduler(cfg, NewPool(cfg.NumBlocks), NullLogger.Instance);
+        var decoder = NewSequence("decoding", promptLen: 4, maxNew: 32);
+        var first = NewSequence("prefill-a", promptLen: 64, maxNew: 4);
+        var second = NewSequence("prefill-b", promptLen: 64, maxNew: 4);
+        sched.Submit(decoder);
+        sched.Submit(first);
+        sched.Submit(second);
+
+        void Advance(SchedulerOutput step)
+        {
+            foreach (var work in step.ScheduledWork)
+            {
+                if (!work.IsPrefill)
+                    work.Sequence.AppendOutputToken(1);
+                work.Sequence.AdvanceComputedTokens(work.NumScheduledTokens);
+            }
+        }
+
+        // Nothing decodes yet: the prompts share the whole budget as before.
+        var opening = sched.Schedule();
+        Assert.Equal(3, opening.ScheduledWork.Count);
+        Advance(opening);
+
+        var served = new List<string>();
+        for (int round = 0; round < 2; round++)
+        {
+            var step = sched.Schedule();
+            Assert.Contains(step.ScheduledWork, work => ReferenceEquals(work.Sequence, decoder) && !work.IsPrefill);
+            var prompt = Assert.Single(step.ScheduledWork, work => work.IsPrefill);
+            Assert.Equal(cfg.MixedStepPrefillBudget, prompt.NumScheduledTokens);
+            served.Add(prompt.Sequence.RequestId);
+            Advance(step);
+        }
+        if (firstComeFirstServed)
+            Assert.Equal(served[0], served[1]);
+        else
+            Assert.NotEqual(served[0], served[1]);
     }
 
     [Fact]

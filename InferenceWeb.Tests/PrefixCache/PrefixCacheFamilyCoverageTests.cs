@@ -88,8 +88,8 @@ public sealed class PrefixCacheFamilyCoverageTests
         }
         Assert.Equal(
             new[] { "DeepSeek41Model", "DeepSeek4Model", "Gemma4Model", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
-                    "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerModel", "MuseSparkModel", "NemotronModel", "Qwen35Model",
-                    "Qwen4ExpCudaModel", "Qwen4ExpModel" },
+                    "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerModel", "MuseSparkModel", "NemotronModel", "Qwen35CudaModel",
+                    "Qwen35Model", "Qwen4ExpCudaModel", "Qwen4ExpModel" },
             engineServed.Select(t => t.Name).ToArray());
     }
 

@@ -183,6 +183,133 @@ public sealed class CudaPtxBuildSettingsTests
         finally { Directory.Delete(directory, recursive: true); }
     }
 
+    [Theory]
+    [InlineData("Cuda compilation tools, release 13.4, V13.4.92", null, "compute_75")]
+    [InlineData("Cuda compilation tools, release 12.8, V12.8.93", null, "compute_61")]
+    [InlineData("Cuda compilation tools, release 13.4, V13.4.92", "compute_90", "compute_90")]
+    public async Task FallbackArchitectureFollowsTheToolkitMajorVersion(string versionLine, string? pinned, string expected)
+    {
+        string directory = NewDirectory();
+        try
+        {
+            string tools = FakeVersionNvcc(directory, versionLine);
+            var properties = new Dictionary<string, string> { ["CudaArch"] = "compute_86" };
+            if (pinned != null) properties["CudaArchFallback"] = pinned;
+            var result = await RunTarget("DetectCudaPtxBuildSettings", properties,
+                new() { ["PATH"] = tools + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH") },
+                "_CudaArchFallback,_NvccMajor");
+            Assert.True(result.ExitCode == 0, result.Output + result.Error);
+            using var json = JsonDocument.Parse(result.Output);
+            Assert.Equal(expected, json.RootElement.GetProperty("Properties").GetProperty("_CudaArchFallback").GetString());
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    [Fact]
+    public async Task RefreshWithACuda13ToolkitFailsBeforeCompiling()
+    {
+        string directory = NewDirectory();
+        try
+        {
+            string tools = FakeVersionNvcc(directory, "Cuda compilation tools, release 13.4, V13.4.92");
+            var result = await RunTarget("ResolveCudaPtxBuildSettings", new() { ["TensorSharpUpdateCommittedPtx"] = "true" },
+                new() { ["PATH"] = tools + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH") });
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("needs a CUDA 12 nvcc", result.Output + result.Error);
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    [Theory]
+    [InlineData("compute_120", "", "true", "-gencode arch=compute_120a,code=sm_120a -gencode arch=compute_120,code=compute_120")]
+    [InlineData("sm_86", "", "true", "-gencode arch=compute_86,code=sm_86 -gencode arch=compute_86,code=compute_86")]
+    [InlineData("compute_75", "75,86,120", "true",
+        "-gencode arch=compute_75,code=sm_75 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_120a,code=sm_120a -gencode arch=compute_75,code=compute_75")]
+    [InlineData("compute_120", "", "false", "")]
+    public async Task FatbinCarriesSassForTheTargetsPlusThePtx(string arch, string sassList, string emit, string expected)
+    {
+        // A list reaches MSBuild from the environment: its command line splits -p values on ',' and ';'.
+        var environment = sassList.Length > 0 ? new Dictionary<string, string> { ["CudaFatbinArchitectures"] = sassList } : null;
+        var result = await RunTarget("ResolveCudaPtxArchitecture", new() { ["CudaArch"] = arch, ["CudaEmitFatbin"] = emit },
+            environment, "_CudaFatbinGencode,_CudaBuildSettingsKey");
+        Assert.True(result.ExitCode == 0, result.Output + result.Error);
+        using var json = JsonDocument.Parse(result.Output);
+        var actual = json.RootElement.GetProperty("Properties");
+        Assert.Equal(expected, actual.GetProperty("_CudaFatbinGencode").GetString());
+        Assert.Equal(expected.Length > 0, actual.GetProperty("_CudaBuildSettingsKey").GetString()!.Contains("_fatbin"));
+    }
+
+    [Fact]
+    public async Task TheCommittedBaselineRefreshBuildsNoFatbin()
+    {
+        var result = await RunTarget("ResolveCudaPtxArchitecture", new() { ["TensorSharpUpdateCommittedPtx"] = "true" },
+            getProperties: "_CudaFatbinGencode,_ResolvedCudaArch");
+        Assert.True(result.ExitCode == 0, result.Output + result.Error);
+        using var json = JsonDocument.Parse(result.Output);
+        Assert.Equal("", json.RootElement.GetProperty("Properties").GetProperty("_CudaFatbinGencode").GetString());
+    }
+
+    [Fact]
+    public async Task FatbinAndItsPtxHashAreCopiedBesideThePtx()
+    {
+        string directory = NewDirectory();
+        string input = Path.Combine(directory, "intermediate"), output = Path.Combine(directory, "output");
+        Directory.CreateDirectory(input);
+        foreach (string name in new[] { "probe.ptx", "probe.fatbin", "probe.fatbin.sha256" })
+            File.WriteAllText(Path.Combine(input, name), name);
+        try
+        {
+            var result = await RunTarget("CopyCudaPtxToOutput", new()
+            {
+                ["_NvccExitCode"] = "0", ["_CudaFatbinGencode"] = "-gencode arch=compute_120,code=sm_120",
+                ["PtxOutputDir"] = input, ["OutDir"] = output,
+            });
+            Assert.True(result.ExitCode == 0, result.Output + result.Error);
+            foreach (string name in new[] { "probe.ptx", "probe.fatbin", "probe.fatbin.sha256" })
+                Assert.True(File.Exists(Path.Combine(output, "cuda_kernels", name)), name);
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    [Fact]
+    public void ModuleLoaderPrefersOnlyTheFatbinBuiltFromThisPtx()
+    {
+        string directory = NewDirectory();
+        try
+        {
+            string ptx = Path.Combine(directory, "probe.ptx");
+            byte[] ptxBytes = "//\n.version 9.4\n.target sm_120\n"u8.ToArray();
+            File.WriteAllBytes(ptx, ptxBytes);
+            byte[] image = { 0x50, 0xed, 0x55, 0xba, 1, 2, 3 };
+            File.WriteAllBytes(Path.ChangeExtension(ptx, ".fatbin"), image);
+            Assert.Null(TensorSharp.Cuda.CudaModule.TryReadMatchingFatbin(ptx, ptxBytes));   // no sidecar
+
+            string sidecar = Path.ChangeExtension(ptx, ".fatbin") + ".sha256";
+            File.WriteAllText(sidecar, Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(ptxBytes)).ToLowerInvariant() + "\n");
+            Assert.Equal(image, TensorSharp.Cuda.CudaModule.TryReadMatchingFatbin(ptx, ptxBytes));
+
+            byte[] newerPtx = "//\n.version 9.4\n.target sm_120\n// edited\n"u8.ToArray();
+            Assert.Null(TensorSharp.Cuda.CudaModule.TryReadMatchingFatbin(ptx, newerPtx));   // stale fatbin
+            Assert.Null(TensorSharp.Cuda.CudaModule.TryReadMatchingFatbin(Path.ChangeExtension(ptx, ".bin"), ptxBytes));
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    private static string FakeVersionNvcc(string directory, string versionLine)
+    {
+        string tools = Path.Combine(directory, "tools");
+        Directory.CreateDirectory(tools);
+        string stub = Path.Combine(tools, OperatingSystem.IsWindows() ? "nvcc.cmd" : "nvcc");
+        if (OperatingSystem.IsWindows())
+            File.WriteAllText(stub, "@echo off\r\nif \"%~1\"==\"--version\" (echo " + versionLine + "& exit /b 0)\r\nexit /b 1\r\n");
+        else
+        {
+            File.WriteAllText(stub, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '" + versionLine + "'; exit 0; fi\nexit 1\n");
+            File.SetUnixFileMode(stub, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        return tools;
+    }
+
     private static string NewDirectory()
     {
         string directory = Path.Combine(RepositoryRoot(), "artifacts", "tests", "CudaPtxBuildSettings", Guid.NewGuid().ToString("N"));
@@ -201,7 +328,8 @@ public sealed class CudaPtxBuildSettingsTests
     // projects. Architecture probes need no toolchain; the compilation probe
     // uses a fake nvcc and isolated fixture paths, never repository PTX.
     private static async Task<(int ExitCode, string Output, string Error)> RunTarget(
-        string target, Dictionary<string, string> properties, Dictionary<string, string>? environment = null)
+        string target, Dictionary<string, string> properties, Dictionary<string, string>? environment = null,
+        string getProperties = "_ResolvedCudaArch,_CudaBuildSettingsKey")
     {
         string root = RepositoryRoot();
         string? host = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
@@ -211,12 +339,13 @@ public sealed class CudaPtxBuildSettingsTests
             UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardOutput = true, RedirectStandardError = true,
         };
-        foreach (string name in new[] { "CudaArch", "CudaArchFallback", "TensorSharpUpdateCommittedPtx", "TENSORSHARP_CUDA_ARCH" })
+        foreach (string name in new[] { "CudaArch", "CudaArchFallback", "TensorSharpUpdateCommittedPtx", "TENSORSHARP_CUDA_ARCH",
+                     "CudaEmitFatbin", "CudaFatbinArchitectures" })
             start.Environment.Remove(name);
         if (environment != null)
             foreach ((string name, string value) in environment) start.Environment[name] = value;
         foreach (string argument in new[] { "msbuild", Path.Combine(root, "TensorSharp.Backends.Cuda", "TensorSharp.Backends.Cuda.csproj"),
-            "-nologo", "-verbosity:quiet", "-target:" + target, "-getProperty:_ResolvedCudaArch,_CudaBuildSettingsKey" })
+            "-nologo", "-verbosity:quiet", "-target:" + target, "-getProperty:" + getProperties })
             start.ArgumentList.Add(argument);
         foreach ((string name, string value) in properties) start.ArgumentList.Add("-property:" + name + "=" + value);
         using var process = Process.Start(start)!;

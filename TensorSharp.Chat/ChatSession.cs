@@ -103,7 +103,14 @@ namespace TensorSharp.Server
         internal string ResolveCacheScope(string inheritedScope)
         {
             if (SharedAcrossConversations)
-                return inheritedScope ?? HashScope("lineage|" + Guid.NewGuid().ToString("N"));
+            {
+                var isolation = TensorSharp.Runtime.Scheduling.ExecutionOptions.FromEnvironment().PrefixCacheIsolation;
+                if (isolation == TensorSharp.Runtime.Scheduling.PrefixCache.IsolationMode.Shared)
+                    return HashScope("trusted-shared|" + Id);
+                if (isolation == TensorSharp.Runtime.Scheduling.PrefixCache.IsolationMode.Lineage && inheritedScope != null)
+                    return inheritedScope;
+                return HashScope("lineage|" + Guid.NewGuid().ToString("N"));
+            }
             int epoch;
             string conversation;
             lock (HistoryLock)

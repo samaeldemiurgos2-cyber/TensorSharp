@@ -41,7 +41,11 @@ for entry in cli:TensorSharp.Cli server:TensorSharp.Server.Host; do
         ptx="TensorSharp.Backends.Cuda/obj/cuda_ptx/ptx/$(basename "${kernel%.cu}").ptx"
         grep -Eq '^\.target[[:space:]]+sm_121([[:space:],]|$)' "$ptx" \
             || { echo "Missing or non-GB10 PTX: $ptx" >&2; exit 1; }
-        cp "$ptx" "$publish/cuda_kernels/"
+        # The sm_121 SASS loads on any CUDA 13 driver; the CUDA 13.4 PTX beside it
+        # only JIT-compiles on a 13.4 or newer driver (DGX OS ships R580, CUDA 13.0).
+        fatbin="${ptx%.ptx}.fatbin"
+        [[ -s "$fatbin" && -s "$fatbin.sha256" ]] || { echo "Missing GB10 fatbin: $fatbin" >&2; exit 1; }
+        cp "$ptx" "$fatbin" "$fatbin.sha256" "$publish/cuda_kernels/"
     done
     for library in libOpenCvSharpExtern.so libx264.so.164 Magick.Native-Q8-arm64.dll.so; do
         [[ -s "$publish/$library" ]] || { echo "Required ARM64 media library missing: $library" >&2; exit 1; }
@@ -52,8 +56,8 @@ for entry in cli:TensorSharp.Cli server:TensorSharp.Server.Host; do
     mkdir -p "$publish/licenses"
     cp LICENSE "$publish/licenses/TensorSharp-LICENSE.txt"
     cp ExternalProjects/ggml/LICENSE "$publish/licenses/GGML-LICENSE.txt"
-    cp /usr/share/doc/cuda-cudart-13-0/copyright "$publish/licenses/NVIDIA-cudart.txt"
-    cp /usr/share/doc/libcublas-13-0/copyright "$publish/licenses/NVIDIA-cuBLAS.txt"
+    cp /usr/share/doc/cuda-cudart-13-4/copyright "$publish/licenses/NVIDIA-cudart.txt"
+    cp /usr/share/doc/libcublas-13-4/copyright "$publish/licenses/NVIDIA-cuBLAS.txt"
     cp "$NUGET_ROOT"/magick.net-q8-anycpu/*/Notice.txt "$publish/licenses/Magick.NET-NOTICE.txt"
     cp "$NUGET_ROOT"/oneware.opencvsharp4.runtime.ubuntu.24.04-arm64/*/*.nuspec "$publish/licenses/OpenCV-runtime.nuspec"
     cp /usr/share/common-licenses/Apache-2.0 /usr/share/common-licenses/GPL-2 \
@@ -61,8 +65,8 @@ for entry in cli:TensorSharp.Cli server:TensorSharp.Server.Host; do
     cat > "$publish/README-GB10.txt" <<EOF
 TensorSharp $VERSION - Linux ARM64, NVIDIA GB10, CUDA 13
 Run ./$project --help from this directory, or use its absolute path.
-No .NET SDK or CUDA toolkit installation is required. An NVIDIA driver
-compatible with CUDA 13.0.2 is required for GPU execution.
+No .NET SDK or CUDA toolkit installation is required. Built with CUDA 13.4.3;
+any NVIDIA driver of the CUDA 13 family (R580 or newer) runs it.
 Ubuntu 24.04 OS packages: ca-certificates libgomp1 libgssapi-krb5-2 libicu74
 libssl3t64 libstdc++6 zlib1g.
 NCCL, Vulkan and optional cuDNN acceleration are disabled in this build.

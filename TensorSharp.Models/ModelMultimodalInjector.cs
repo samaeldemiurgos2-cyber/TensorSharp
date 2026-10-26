@@ -61,15 +61,31 @@ namespace TensorSharp.Models
         // The embedding cache is keyed by media CONTENT (MediaContentId), so an API
         // client resending the same base64 image each turn encodes it once. It is bounded
         // by bytes and evicted least-recently-used; an entry a prepared prompt still
-        // references is never evicted. TS_MM_EMBEDDING_CACHE_MB (default 512).
-        private static readonly long EmbeddingCacheBudgetBytes = ResolveEmbeddingCacheBudgetBytes();
+        // references is never evicted. TS_MM_EMBEDDING_CACHE_MB overrides the default,
+        // which scales with host memory (see ResolveEmbeddingCacheBudgetBytes).
+        private static readonly long EmbeddingCacheBudgetBytes = ResolveEmbeddingCacheBudgetBytes(
+            Environment.GetEnvironmentVariable("TS_MM_EMBEDDING_CACHE_MB"),
+            GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
         private long _embeddingCacheBytes;
         private long _embeddingUseClock;
 
-        private static long ResolveEmbeddingCacheBudgetBytes()
+        private const long MinEmbeddingCacheBudgetBytes = 512L << 20;
+        private const long MaxEmbeddingCacheBudgetBytes = 4L << 30;
+
+        /// <summary>
+        /// Every image a prompt carries is looked up here, including those its reused
+        /// KV prefix already covers. Concurrent agents that resend a window of
+        /// screenshots each turn cycle through the cache, and once their combined
+        /// windows exceed it, least-recently-used eviction misses on every image: four
+        /// lanes of seven 1008-token Qwen screenshots (20.6 MB each) overran the old
+        /// fixed 512 MB and re-encoded all 28 every turn. The default is 1/64 of host
+        /// memory within [512 MB, 4 GB].
+        /// </summary>
+        internal static long ResolveEmbeddingCacheBudgetBytes(string setting, long availableMemoryBytes)
         {
-            string raw = Environment.GetEnvironmentVariable("TS_MM_EMBEDDING_CACHE_MB");
-            return long.TryParse(raw, out long mb) && mb > 0 ? mb * 1024L * 1024L : 512L * 1024L * 1024L;
+            if (long.TryParse(setting, out long mb) && mb > 0)
+                return mb * 1024L * 1024L;
+            return Math.Clamp(availableMemoryBytes / 64, MinEmbeddingCacheBudgetBytes, MaxEmbeddingCacheBudgetBytes);
         }
         private List<PreparedEmbeddingSpan> _preparedVisionEmbeddings =>
             _preparation.Value?.Vision ?? GetOrCreateBucket(_visionByRequest, "");

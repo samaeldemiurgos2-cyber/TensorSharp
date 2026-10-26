@@ -760,6 +760,9 @@ namespace TensorSharp.Cuda
         /// false when the head dim has no specialized kernel, so callers fall back
         /// to <see cref="TryScaledDotProductAttention"/>.
         /// </summary>
+        // TS_VISION_ATTN_MMA=0 keeps the scalar F32 kernels (A/B of the tensor-core path).
+        private static readonly bool s_visionAttentionScalar = Environment.GetEnvironmentVariable("TS_VISION_ATTN_MMA") == "0";
+
         public static bool TryVisionAttention(Tensor result, Tensor query, Tensor key, Tensor value,
             int numHeads, int seq, int headDim, float scale)
         {
@@ -776,15 +779,40 @@ namespace TensorSharp.Cuda
             }
 
             CudaAllocator allocator = resultStorage.AllocatorImpl;
-            if (!TryGetKernels(allocator, out CudaKernels kernels) || !kernels.HasVisionAttentionF32(headDim))
+            if (!TryGetKernels(allocator, out CudaKernels kernels)
+                || !(kernels.HasVisionAttentionMma(headDim) || kernels.HasVisionAttentionF32(headDim)))
                 return false;
 
             queryStorage.EnsureDeviceCurrent();
             keyStorage.EnsureDeviceCurrent();
             valueStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
-            kernels.LaunchVisionAttentionF32(queryPtr, keyPtr, valuePtr, resultPtr,
-                numHeads, seq, headDim, scale, allocator.Stream.Handle);
+            IntPtr stream = allocator.Stream.Handle;
+            if (kernels.HasVisionAttentionMma(headDim) && !s_visionAttentionScalar)
+            {
+                // Tensor cores: q/k/v once to padded f16 [heads, seq, dp] (stream-ordered pool memory,
+                // returned once the work that reads it is queued), then the FlashAttention-2 kernel.
+                int dp = CudaKernels.VisionAttentionPaddedDim(headDim);
+                long bytes = (long)numHeads * seq * dp * 2;
+                IntPtr q16 = allocator.RentDeviceMemory(bytes, out long qBytes);
+                IntPtr k16 = allocator.RentDeviceMemory(bytes, out long kBytes);
+                IntPtr v16 = allocator.RentDeviceMemory(bytes, out long vBytes);
+                try
+                {
+                    kernels.LaunchVisionPadF16(queryPtr, seq, numHeads, headDim, dp, q16, stream);
+                    kernels.LaunchVisionPadF16(keyPtr, seq, numHeads, headDim, dp, k16, stream);
+                    kernels.LaunchVisionPadF16(valuePtr, seq, numHeads, headDim, dp, v16, stream);
+                    kernels.LaunchVisionAttentionMma(q16, k16, v16, resultPtr, numHeads, seq, headDim, scale, stream);
+                }
+                finally
+                {
+                    allocator.ReturnDeviceMemory(q16, qBytes);
+                    allocator.ReturnDeviceMemory(k16, kBytes);
+                    allocator.ReturnDeviceMemory(v16, vBytes);
+                }
+            }
+            else
+                kernels.LaunchVisionAttentionF32(queryPtr, keyPtr, valuePtr, resultPtr, numHeads, seq, headDim, scale, stream);
             resultStorage.MarkDeviceModified();
             return true;
         }

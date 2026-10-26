@@ -1,0 +1,2435 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// ---------------------------------------------------------------------------
+// Qwen3.5 / Qwen3.8 dense (qwen35) kernels for the direct-CUDA backend.
+//
+// The checkpoints this engine serves store every projection as NVFP4 (ggml block_nvfp4: 64
+// values in 36 bytes - four UE4M3 scales, one per 16 values, then 32 bytes of E2M1 codes;
+// within a 16-value sub-block the low nibbles are values 0-7 and the high nibbles 8-15) with
+// a per-tensor F32 scale applied to the product.
+//
+// The engine keeps each matrix as two planes instead of 36-byte blocks: codes [rows][k/2]
+// (ggml's nibble order within every 16 values kept) and UE4M3 scales [rows][k/16]. Same bytes,
+// but every 64-value code run is 16-byte aligned, which the cp.async and vector loads need.
+//
+//   * ts_q35_repack_nvfp4: ggml block_nvfp4 rows -> the two planes (once, at load).
+//   * ts_q35_quantize_q81_f32: F32 activation rows -> int8 rows plus one F32 scale per 32
+//     values (q8_1 without the interleaving, so a 16-value slice is one aligned 16-byte load).
+//   * ts_q35_gemv_nvfp4_<n>: y[n rows] = alpha * x[n rows] W^T for n <= 8 activation rows, dp4a
+//     against the quantized activations. This is the integer path ggml-cuda's mmvq takes for
+//     NVFP4 (same E2M1 table, same UE4M3 decode, same q8_1 rounding).
+//   * ts_q35_quantize_nvfp4_f32: F32 activation rows -> NVFP4 planes plus a per-row F32 scale,
+//     ggml-cuda's quantize_mmq_nvfp4 numerics (row scale amax / (6 * 448), the sub-block scale
+//     searched over five UE4M3 codes for the least squared error).
+//   * ts_q35_gemm_w4a4_<bn>: y = alpha * rowScale * (x W^T) for more activation rows, on the
+//     block-scaled FP4 tensor cores (mma kind::mxf4nvf4, sm_120a): weight codes go from shared
+//     memory to the MMA by ldmatrix with no per-value decode. ggml-cuda's mmq runs the same
+//     product; this one has no stream-k fixup pass (split-K merges in the tile's last CTA, in
+//     a fixed order).
+// ---------------------------------------------------------------------------
+
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_fp4.h>
+#include <stdint.h>
+
+#define TS_Q35_NVFP4_BLOCK 64
+#define TS_Q35_NVFP4_BLOCK_BYTES 36
+
+__device__ __forceinline__ float ts_q35_warp_sum(float v)
+{
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_xor_sync(0xffffffff, v, off, 32);
+    return v;
+}
+
+__device__ __forceinline__ float ts_q35_warp_max(float v)
+{
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, off, 32));
+    return v;
+}
+
+__device__ __forceinline__ float ts_q35_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+__device__ __forceinline__ float ts_q35_silu(float x) { return x / (1.0f + expf(-x)); }
+__device__ __forceinline__ float ts_q35_softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
+
+__device__ __forceinline__ int ts_q35_dp4a(int a, int b, int c)
+{
+#if __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, c);
+#else
+    const int8_t* a8 = (const int8_t*)&a;
+    const int8_t* b8 = (const int8_t*)&b;
+    return c + a8[0] * b8[0] + a8[1] * b8[1] + a8[2] * b8[2] + a8[3] * b8[3];
+#endif
+}
+
+// UE4M3 block scale as ggml-cuda decodes it: the NaN codes read as zero, and the value is
+// halved because the E2M1 table below is doubled to stay integral.
+__device__ __forceinline__ float ts_q35_ue4m3(uint32_t x)
+{
+    x &= 0xFF;
+    if (x == 0x7F || x == 0xFF)
+        return 0.0f;
+    const uint32_t e = (x >> 3) & 0xF, m = x & 7;
+    // Subnormal: m * 2^-9; normal: (1 + m/8) * 2^(e-7). Both exact in F32.
+    const float v = e == 0 ? (float)m * (1.0f / 512.0f) : __uint_as_float(((e + 120) << 23) | (m << 20));
+    return 0.5f * v;
+}
+
+// Eight 4-bit E2M1 codes (one int, low nibble first) -> two ints of int8 values (2x the E2M1
+// value): .x holds the low nibbles of the four bytes, .y the high nibbles. The table
+// {0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12} lives in four registers; byte_perm picks the
+// positive or negative half per code by its sign bit.
+__device__ __forceinline__ int2 ts_q35_e2m1x8(int q)
+{
+    const uint32_t t0 = 0x03020100u, t1 = 0x0C080604u, t2 = 0xFDFEFF00u, t3 = 0xF4F8FAFCu;
+    const uint32_t q4 = (uint32_t)q;
+    const uint32_t select = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+    uint32_t tmp[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+        const uint32_t shift = 16 * i;
+        const uint32_t lo = __byte_perm(t0, t1, q4 >> shift);
+        const uint32_t hi = __byte_perm(t2, t3, q4 >> shift);
+        tmp[i] = __byte_perm(lo, hi, select >> shift);
+    }
+    // tmp holds the values in nibble order (lo0, hi0, lo1, hi1, ...); split them.
+    return make_int2((int)__byte_perm(tmp[0], tmp[1], 0x6420), (int)__byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+// ---------------------------------------------------------------------------
+// Activation quantization: one warp per 32-value block of a row. scale = max|x| / 127,
+// q = round(x / scale) - ggml's quantize_q8_1 (the block sum it also stores is unused by
+// NVFP4's dot). xq: [rows, k] int8, xd: [rows, k / 32] F32.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_q35_quantize_q81_f32(
+    const float* __restrict__ x, int8_t* __restrict__ xq, float* __restrict__ xd, int k, int rows)
+{
+    const int blocks = k >> 5;
+    const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= (long long)blocks * rows)
+        return;
+    const long long row = warp / blocks;
+    const int b = (int)(warp % blocks);
+    const float v = x[row * k + b * 32 + lane];
+    const float amax = ts_q35_warp_max(fabsf(v));
+    const float d = amax / 127.0f;
+    const int q = amax == 0.0f ? 0 : __float2int_rn(v / d);
+    xq[row * k + b * 32 + lane] = (int8_t)q;
+    if (lane == 0)
+        xd[row * blocks + b] = d;
+}
+
+// ---------------------------------------------------------------------------
+// ggml block_nvfp4 rows -> code plane [rows][k/2] and scale plane [rows][k/16]. One thread
+// per 64-value block; the 36-byte blocks are 4-byte aligned. parts > 1: source row rowBase + r of
+// part `part` lands at plane row (row / 8) * 8 * parts + part * 8 + row % 8 (groups of 8 rows of
+// each part interleaved, as the fused gate|up projection is stored); otherwise at row r.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_q35_repack_nvfp4(
+    const uint8_t* __restrict__ src, long long srcRowBytes, uint8_t* __restrict__ codes,
+    uint8_t* __restrict__ scales, int rows, int k, int rowBase, int parts, int part)
+{
+    const int perRow = k / TS_Q35_NVFP4_BLOCK;
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= (long long)rows * perRow)
+        return;
+    const long long rs = i / perRow;
+    const int b = (int)(i % perRow);
+    const long long row = rowBase + rs;
+    const long long r = parts > 1 ? row / 8 * 8 * parts + part * 8 + row % 8 : rs;
+    const uint32_t* w = (const uint32_t*)(src + rs * srcRowBytes + (long long)b * TS_Q35_NVFP4_BLOCK_BYTES);
+    *(uint32_t*)(scales + r * (k / 16) + (long long)b * 4) = w[0];
+    uint4* dst = (uint4*)(codes + r * (k / 2) + (long long)b * 32);
+    dst[0] = make_uint4(w[1], w[2], w[3], w[4]);
+    dst[1] = make_uint4(w[5], w[6], w[7], w[8]);
+}
+
+// ---------------------------------------------------------------------------
+// NVFP4 GEMV for N <= 8 activation rows. A warp owns R consecutive weight rows; lane l reads
+// blocks l, l + 32, ... of each (36 contiguous bytes, so the warp's loads cover contiguous
+// spans) and every activation slice it loads serves all R rows: past a few activation rows the
+// kernel is bound by those loads, not by the weight stream.
+// y[n, r] = alpha * sum_k W[r, k] x[n, k].
+// ---------------------------------------------------------------------------
+template <int N, int R>
+__device__ __forceinline__ void ts_q35_gemv_nvfp4(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales, int outDim, int k,
+    const int8_t* __restrict__ xq, const float* __restrict__ xd, float alpha, float* __restrict__ y)
+{
+    const int warpsPerBlock = blockDim.x >> 5;
+    const int r0 = (blockIdx.x * warpsPerBlock + (threadIdx.x >> 5)) * R;
+    const int lane = threadIdx.x & 31;
+    if (r0 >= outDim)
+        return;
+    const int nblocks = k / TS_Q35_NVFP4_BLOCK;
+    const int scalesPerRow = k >> 5;
+
+    float acc[N][R];
+#pragma unroll
+    for (int n = 0; n < N; ++n)
+#pragma unroll
+        for (int j = 0; j < R; ++j)
+            acc[n][j] = 0.0f;
+
+    for (int b = lane; b < nblocks; b += 32)
+    {
+        uint32_t dw[R], qs[R][8];
+#pragma unroll
+        for (int j = 0; j < R; ++j)
+        {
+            // Rows past the end repeat the last row; their results are dropped.
+            const long long r = min(r0 + j, outDim - 1);
+            const uint4* c = (const uint4*)(codes + r * (k / 2) + (long long)b * 32);
+            const uint4 c0 = c[0], c1 = c[1];
+            qs[j][0] = c0.x; qs[j][1] = c0.y; qs[j][2] = c0.z; qs[j][3] = c0.w;
+            qs[j][4] = c1.x; qs[j][5] = c1.y; qs[j][6] = c1.z; qs[j][7] = c1.w;
+            dw[j] = *(const uint32_t*)(scales + r * (k / 16) + (long long)b * 4);
+        }
+#pragma unroll
+        for (int s = 0; s < 4; ++s)
+        {
+            const int kk = b * TS_Q35_NVFP4_BLOCK + s * 16;
+            const int sb = kk >> 5;
+            int2 v0[R], v1[R];
+            float ds[R];
+#pragma unroll
+            for (int j = 0; j < R; ++j)
+            {
+                ds[j] = ts_q35_ue4m3(dw[j] >> (8 * s));
+                v0[j] = ts_q35_e2m1x8((int)qs[j][2 * s]);       // values 0-3 | 8-11
+                v1[j] = ts_q35_e2m1x8((int)qs[j][2 * s + 1]);   // values 4-7 | 12-15
+            }
+#pragma unroll
+            for (int n = 0; n < N; ++n)
+            {
+                const int4 a = *(const int4*)(xq + (long long)n * k + kk);
+                const float xs = xd[(long long)n * scalesPerRow + sb];
+#pragma unroll
+                for (int j = 0; j < R; ++j)
+                {
+                    int sumi = ts_q35_dp4a(v0[j].x, a.x, 0);
+                    sumi = ts_q35_dp4a(v1[j].x, a.y, sumi);
+                    sumi = ts_q35_dp4a(v0[j].y, a.z, sumi);
+                    sumi = ts_q35_dp4a(v1[j].y, a.w, sumi);
+                    acc[n][j] += ds[j] * xs * (float)sumi;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < N; ++n)
+#pragma unroll
+        for (int j = 0; j < R; ++j)
+        {
+            const float v = ts_q35_warp_sum(acc[n][j]);
+            if (lane == 0 && r0 + j < outDim)
+                y[(long long)n * outDim + r0 + j] = alpha * v;
+        }
+}
+
+// Rows per warp by activation rows: one row keeps the most warps in flight while the weight
+// stream is the only cost; more activation rows amortize their loads over more weight rows.
+#define TS_Q35_GEMV(N, R) \
+    extern "C" __global__ void ts_q35_gemv_nvfp4_##N( \
+        const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales, int outDim, int k, \
+        const int8_t* __restrict__ xq, const float* __restrict__ xd, float alpha, float* __restrict__ y) \
+    { ts_q35_gemv_nvfp4<N, R>(codes, scales, outDim, k, xq, xd, alpha, y); }
+
+#ifndef TS_Q35_GEMV_ROWS
+#define TS_Q35_GEMV_ROWS(N) ((N) <= 1 ? 1 : (N) <= 3 ? 2 : 4)
+#endif
+TS_Q35_GEMV(1, TS_Q35_GEMV_ROWS(1))
+TS_Q35_GEMV(2, TS_Q35_GEMV_ROWS(2))
+TS_Q35_GEMV(3, TS_Q35_GEMV_ROWS(3))
+TS_Q35_GEMV(4, TS_Q35_GEMV_ROWS(4))
+TS_Q35_GEMV(5, TS_Q35_GEMV_ROWS(5))
+TS_Q35_GEMV(6, TS_Q35_GEMV_ROWS(6))
+TS_Q35_GEMV(7, TS_Q35_GEMV_ROWS(7))
+TS_Q35_GEMV(8, TS_Q35_GEMV_ROWS(8))
+
+/// Weight rows one warp of ts_q35_gemv_nvfp4_<n> owns (the launcher sizes its grid by it).
+extern "C" __global__ void ts_q35_gemv_rows_per_warp(int* out)
+{
+#pragma unroll
+    for (int n = 1; n <= 8; ++n)
+        out[n] = TS_Q35_GEMV_ROWS(n);
+}
+
+// ---------------------------------------------------------------------------
+// Activation rows -> NVFP4 planes + per-row scale, ggml-cuda's quantize_mmq_nvfp4 numerics.
+// Codes [rows][k/2], scales [rows][k/16], rowScale [rows].
+// The packed nibble order is the weights': within 16 values, byte j holds value j (low) and
+// value j + 8 (high), so the tensor-core product pairs every activation with its weight.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint8_t ts_q35_fp32_to_e4m3(float x)
+{
+    if (!(x > 0.0f))
+        return 0;
+    return (uint8_t)__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+}
+
+__device__ __forceinline__ float ts_q35_nvfp4_error(const float* v, float invRow, float invScale, float scale)
+{
+    // Squared error of the 16 values coded at this scale (dequantized at 2 * scale, the
+    // E2M1 value times the UE4M3 value).
+    float err = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; i += 4)
+    {
+        const __nv_fp4x4_e2m1 q(make_float4(v[i] * invRow * invScale, v[i + 1] * invRow * invScale,
+                                            v[i + 2] * invRow * invScale, v[i + 3] * invRow * invScale));
+        const float4 d = static_cast<float4>(q);
+        const float e0 = fabsf(v[i] * invRow) - fabsf(d.x) * 2.0f * scale;
+        const float e1 = fabsf(v[i + 1] * invRow) - fabsf(d.y) * 2.0f * scale;
+        const float e2 = fabsf(v[i + 2] * invRow) - fabsf(d.z) * 2.0f * scale;
+        const float e3 = fabsf(v[i + 3] * invRow) - fabsf(d.w) * 2.0f * scale;
+        err = fmaf(e0, e0, err);
+        err = fmaf(e1, e1, err);
+        err = fmaf(e2, e2, err);
+        err = fmaf(e3, e3, err);
+    }
+    return err;
+}
+
+__device__ __forceinline__ uint32_t ts_q35_fp4x4(float a, float b, float c, float d)
+{
+    const __nv_fp4x4_e2m1 q(make_float4(a, b, c, d));
+    return (uint32_t)(*reinterpret_cast<const uint16_t*>(&q));
+}
+
+// The 16 values of sub-block sb, coded at the scale the five-code search finds best.
+__device__ __forceinline__ void ts_q35_quantize_sub16(const float* v, float invRow, uint8_t* codes, uint8_t* scales, long long row,
+    int k, int sb)
+{
+    float amaxSub = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        amaxSub = fmaxf(amaxSub, fabsf(v[i] * invRow));
+    const int first = ts_q35_fp32_to_e4m3(amaxSub / 6.0f);
+    int code = first;
+    float scale = ts_q35_ue4m3(code);
+    float best = ts_q35_nvfp4_error(v, invRow, scale > 0.0f ? 0.5f / scale : 0.0f, scale);
+    const int offsets[4] = { -1, 1, -2, 2 };
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+    {
+        const int c = first + offsets[t];
+        if (c < 0 || c > 0x7e)
+            continue;
+        const float sc = ts_q35_ue4m3(c);
+        const float err = ts_q35_nvfp4_error(v, invRow, sc > 0.0f ? 0.5f / sc : 0.0f, sc);
+        if (err < best)
+        {
+            best = err;
+            code = c;
+            scale = sc;
+        }
+    }
+    const float s = invRow * (scale > 0.0f ? 0.5f / scale : 0.0f);
+    const uint32_t q0 = ts_q35_fp4x4(v[0] * s, v[8] * s, v[1] * s, v[9] * s)
+        | (ts_q35_fp4x4(v[2] * s, v[10] * s, v[3] * s, v[11] * s) << 16);
+    const uint32_t q1 = ts_q35_fp4x4(v[4] * s, v[12] * s, v[5] * s, v[13] * s)
+        | (ts_q35_fp4x4(v[6] * s, v[14] * s, v[7] * s, v[15] * s) << 16);
+    *(uint2*)(codes + row * (k / 2) + sb * 8) = make_uint2(q0, q1);
+    scales[row * (k / 16) + sb] = (uint8_t)code;
+}
+
+__device__ __forceinline__ float ts_q35_block_reduce(float v, float* partial, bool isMax)
+{
+    v = isMax ? ts_q35_warp_max(v) : ts_q35_warp_sum(v);
+    if ((threadIdx.x & 31) == 0)
+        partial[threadIdx.x >> 5] = v;
+    __syncthreads();
+    if (threadIdx.x < 32)
+    {
+        float t = threadIdx.x < (blockDim.x >> 5) ? partial[threadIdx.x] : 0.0f;
+        t = isMax ? ts_q35_warp_max(t) : ts_q35_warp_sum(t);
+        if (threadIdx.x == 0)
+            partial[0] = t;
+    }
+    __syncthreads();
+    const float r = partial[0];
+    __syncthreads();
+    return r;
+}
+
+// The row reaches shared memory once, through one of three prologues, and is quantized from there:
+//   MODE 0: x itself [rows][k];
+//   MODE 1: silu(gate) * up of a fused gate|up row [rows][2k] (the down projection's input);
+//   MODE 2: x += delta (written back; delta may be null), then rmsnorm(x) * w with eps - the
+//           pre-norm and the next projection's quantization in one pass, the normed row never
+//           stored (the same per-thread sums and reductions as ts_q35_add_rmsnorm_f32 at 512
+//           threads, so the values match it exactly).
+// One block per row, k floats of dynamic shared memory.
+template <int MODE>
+__device__ __forceinline__ void ts_q35_quantize_row(
+    float* __restrict__ x, const float* __restrict__ aux, const float* __restrict__ w, float eps,
+    uint8_t* __restrict__ codes, uint8_t* __restrict__ scales, float* __restrict__ rowScale, int k)
+{
+    extern __shared__ float act[];
+    __shared__ float partial[32];
+    const long long row = blockIdx.x;
+    float amax = 0.0f;
+    if (MODE == 2)
+    {
+        float* xr = x + row * k;
+        float ss = 0.0f;
+        for (int i = threadIdx.x; i < k; i += blockDim.x)
+        {
+            float v = xr[i];
+            if (aux != nullptr)
+            {
+                v += aux[row * k + i];
+                xr[i] = v;
+            }
+            act[i] = v;
+            ss += v * v;
+        }
+        ss = ts_q35_block_reduce(ss, partial, false);
+        const float scale = rsqrtf(ss / (float)k + eps);
+        for (int i = threadIdx.x; i < k; i += blockDim.x)
+        {
+            const float v = act[i] * scale * w[i];
+            act[i] = v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+    }
+    else
+    {
+        const float* xr = x + row * (MODE == 1 ? 2LL * k : k);
+        for (int i = threadIdx.x * 4; i < k; i += blockDim.x * 4)
+        {
+            float4 v = *(const float4*)(xr + i);
+            if (MODE == 1)
+            {
+                const float4 u = *(const float4*)(xr + k + i);
+                v = make_float4(ts_q35_silu(v.x) * u.x, ts_q35_silu(v.y) * u.y, ts_q35_silu(v.z) * u.z, ts_q35_silu(v.w) * u.w);
+            }
+            *(float4*)(act + i) = v;
+            amax = fmaxf(fmaxf(amax, fabsf(v.x)), fmaxf(fmaxf(fabsf(v.y), fabsf(v.z)), fabsf(v.w)));
+        }
+    }
+    amax = ts_q35_block_reduce(amax, partial, true);
+    const float rs = amax / (6.0f * 448.0f);
+    const float invRow = rs > 0.0f ? 1.0f / rs : 0.0f;
+    if (threadIdx.x == 0)
+        rowScale[row] = rs;
+    for (int sb = threadIdx.x; sb < k / 16; sb += blockDim.x)
+    {
+        float v[16];
+#pragma unroll
+        for (int i = 0; i < 16; i += 4)
+        {
+            const float4 t = *(const float4*)(act + sb * 16 + i);
+            v[i] = t.x; v[i + 1] = t.y; v[i + 2] = t.z; v[i + 3] = t.w;
+        }
+        ts_q35_quantize_sub16(v, invRow, codes, scales, row, k, sb);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(512) ts_q35_quantize_nvfp4_f32(
+    const float* __restrict__ x, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales,
+    float* __restrict__ rowScale, int k)
+{
+    ts_q35_quantize_row<0>(const_cast<float*>(x), nullptr, nullptr, 0.0f, codes, scales, rowScale, k);
+}
+
+extern "C" __global__ void __launch_bounds__(512) ts_q35_quantize_swiglu_nvfp4_f32(
+    const float* __restrict__ gu, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales,
+    float* __restrict__ rowScale, int k)
+{
+    ts_q35_quantize_row<1>(const_cast<float*>(gu), nullptr, nullptr, 0.0f, codes, scales, rowScale, k);
+}
+
+extern "C" __global__ void __launch_bounds__(512) ts_q35_add_rmsnorm_nvfp4_f32(
+    float* __restrict__ x, const float* __restrict__ delta, const float* __restrict__ w, float eps,
+    uint8_t* __restrict__ codes, uint8_t* __restrict__ scales, float* __restrict__ rowScale, int k)
+{
+    ts_q35_quantize_row<2>(x, delta, w, eps, codes, scales, rowScale, k);
+}
+
+// ---------------------------------------------------------------------------
+// W4A4 GEMM on the block-scaled FP4 tensor cores.
+//
+// A CTA owns 128 weight rows x BN activation rows and streams K through a cp.async ring of
+// 256-value stages: per stage 128 x 128 code bytes and 128 x 16 scale bytes of weights, BN x
+// 144 bytes of activations. Eight warps split the tile WM x WN; each MMA step is m16n8k64
+// (16 weight rows x 8 activation rows x 64 K values) with one UE4M3 scale per 16 K values on
+// both sides. Code rows are padded to 144 bytes so ldmatrix and the B fragment loads hit 32
+// distinct banks.
+//
+// Split-K (gridDim.z > 1) writes F32 partials and the tile's last CTA to finish sums them in
+// split order, then resets its counter for the next launch: deterministic, and no separate
+// fixup kernel.
+// ---------------------------------------------------------------------------
+#if defined(__CUDA_ARCH__) && (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL))
+#define TS_Q35_FP4_MMA 1
+#endif
+
+#define TS_Q35_BM 128
+#define TS_Q35_BK 256
+#define TS_Q35_CROW (TS_Q35_BK / 2 + 16)
+#define TS_Q35_SROW (TS_Q35_BK / 16)
+
+__device__ __forceinline__ uint32_t ts_q35_smem_u32(const void* p)
+{
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void ts_q35_cp16(void* dst, const void* src, bool valid)
+{
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(ts_q35_smem_u32(dst)), "l"(src), "r"(valid ? 16 : 0));
+}
+
+__device__ __forceinline__ void ts_q35_cp_commit()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int N>
+__device__ __forceinline__ void ts_q35_cp_wait()
+{
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+__device__ __forceinline__ void ts_q35_ldsm_x4(uint32_t (&r)[4], const void* p)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(ts_q35_smem_u32(p)));
+}
+
+__device__ __forceinline__ void ts_q35_mma_fp4(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
+                                               uint32_t sa, uint32_t sb)
+{
+#ifdef TS_Q35_FP4_MMA
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, %10, {0, 0}, %11, {0, 0};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sa), "r"(sb));
+#else
+    __trap();
+#endif
+}
+
+template <int BN, int WM, int WN, int STAGES, int BK = TS_Q35_BK>
+struct TsQ35GemmSmem
+{
+    static constexpr int CROW = BK / 2 + 16, SROW = BK / 16;
+    uint8_t ac[STAGES][TS_Q35_BM * CROW];
+    uint8_t as[STAGES][TS_Q35_BM * SROW];
+    uint8_t bc[STAGES][BN * CROW];
+    uint8_t bs[STAGES][BN * SROW];
+};
+
+__device__ __forceinline__ void ts_q35_cp8(void* dst, const void* src, bool valid)
+{
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n"
+                 :: "r"(ts_q35_smem_u32(dst)), "l"(src), "r"(valid ? 8 : 0));
+}
+
+template <int BN, int WM, int WN, int STAGES, int BK = TS_Q35_BK, bool COLS_FAST = false, bool SWIGLU = false>
+__device__ __forceinline__ void ts_q35_gemm_w4a4(
+    const uint8_t* __restrict__ wCodes, const uint8_t* __restrict__ wScales, int outDim, int k,
+    const uint8_t* __restrict__ xCodes, const uint8_t* __restrict__ xScales, const float* __restrict__ rowScale,
+    int m, float alpha, float* __restrict__ y, float* __restrict__ partial, int* __restrict__ counters)
+{
+    static_assert(WM * WN == 8, "eight warps");
+    constexpr int WROWS = TS_Q35_BM / WM, WCOLS = BN / WN;
+    constexpr int MT = WROWS / 16, NT = WCOLS / 8;
+    extern __shared__ __align__(16) uint8_t smemRaw[];
+    using Smem = TsQ35GemmSmem<BN, WM, WN, STAGES, BK>;
+    constexpr int CROW = Smem::CROW, SROW = Smem::SROW, CHUNKS = BK / 32;
+    auto& sm = *reinterpret_cast<Smem*>(smemRaw);
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp % WM, wn = warp / WM;
+    // COLS_FAST: activation tiles vary fastest across the grid, so the CTAs in flight share
+    // weight tiles in L2 (otherwise a weight matrix larger than L2 streams from memory once per
+    // activation tile): +8% at 2048 rows, -2% at 128 or fewer.
+    const int row0 = (COLS_FAST ? blockIdx.y : blockIdx.x) * TS_Q35_BM, col0 = (COLS_FAST ? blockIdx.x : blockIdx.y) * BN;
+    const int splits = gridDim.z;
+    const int stagesTotal = k / BK;
+    const int perSplit = (stagesTotal + splits - 1) / splits;
+    const int sBegin = blockIdx.z * perSplit;
+    const int sEnd = min(stagesTotal, sBegin + perSplit);
+    const int nStages = max(0, sEnd - sBegin);
+    const long long wRowBytes = k / 2, wScaleBytes = k / 16;
+
+    auto load = [&](int slot, int stage) {
+        const long long kc = (long long)stage * (BK / 2), ks = (long long)stage * SROW;
+        for (int i = tid; i < TS_Q35_BM * CHUNKS; i += 256)
+        {
+            const int r = i / CHUNKS, c = i % CHUNKS;
+            const int gr = row0 + r;
+            const bool ok = gr < outDim;
+            ts_q35_cp16(sm.ac[slot] + r * CROW + c * 16, wCodes + (ok ? gr : 0) * wRowBytes + kc + c * 16, ok);
+        }
+        for (int r = tid; r < TS_Q35_BM; r += 256)
+        {
+            const int gr = row0 + r;
+            const bool ok = gr < outDim;
+            if (SROW == 16)
+                ts_q35_cp16(sm.as[slot] + r * SROW, wScales + (ok ? gr : 0) * wScaleBytes + ks, ok);
+            else
+                ts_q35_cp8(sm.as[slot] + r * SROW, wScales + (ok ? gr : 0) * wScaleBytes + ks, ok);
+        }
+        for (int i = tid; i < BN * CHUNKS; i += 256)
+        {
+            const int r = i / CHUNKS, c = i % CHUNKS;
+            const int gr = col0 + r;
+            const bool ok = gr < m;
+            ts_q35_cp16(sm.bc[slot] + r * CROW + c * 16, xCodes + (ok ? gr : 0) * wRowBytes + kc + c * 16, ok);
+        }
+        for (int r = tid; r < BN; r += 256)
+        {
+            const int gr = col0 + r;
+            const bool ok = gr < m;
+            if (SROW == 16)
+                ts_q35_cp16(sm.bs[slot] + r * SROW, xScales + (ok ? gr : 0) * wScaleBytes + ks, ok);
+            else
+                ts_q35_cp8(sm.bs[slot] + r * SROW, xScales + (ok ? gr : 0) * wScaleBytes + ks, ok);
+        }
+    };
+
+    float acc[MT][NT][4];
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+            acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.0f;
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s)
+    {
+        if (s < nStages)
+            load(s, sBegin + s);
+        ts_q35_cp_commit();
+    }
+    const int g = lane >> 2, q = lane & 3;
+    for (int it = 0; it < nStages; ++it)
+    {
+        ts_q35_cp_wait<STAGES - 2>();
+        __syncthreads();
+        // The slot this fills was consumed last iteration, which every warp has finished.
+        const int next = it + STAGES - 1;
+        if (next < nStages)
+            load(next % STAGES, sBegin + next);
+        ts_q35_cp_commit();
+        const int slot = it % STAGES;
+        const uint8_t* ac = sm.ac[slot];
+        const uint8_t* as = sm.as[slot];
+        const uint8_t* bc = sm.bc[slot];
+        const uint8_t* bs = sm.bs[slot];
+#pragma unroll
+        for (int kstep = 0; kstep < BK / 64; ++kstep)
+        {
+            uint32_t a[MT][4], sa[MT];
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+            {
+                const int r = wm * WROWS + i * 16;
+                ts_q35_ldsm_x4(a[i], ac + (r + (lane & 15)) * CROW + kstep * 32 + (lane >> 4) * 16);
+                sa[i] = *(const uint32_t*)(as + (r + g + (lane & 1) * 8) * SROW + kstep * 4);
+            }
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+            {
+                const int c = wn * WCOLS + j * 8 + g;
+                const uint8_t* bp = bc + c * CROW + kstep * 32 + q * 4;
+                const uint32_t b0 = *(const uint32_t*)bp, b1 = *(const uint32_t*)(bp + 16);
+                const uint32_t sb = *(const uint32_t*)(bs + c * SROW + kstep * 4);
+#pragma unroll
+                for (int i = 0; i < MT; ++i)
+                    ts_q35_mma_fp4(acc[i][j], a[i], b0, b1, sa[i], sb);
+            }
+        }
+    }
+    ts_q35_cp_wait<0>();
+
+    // Epilogue: D rows are weight rows (g, g + 8), columns activation rows (2q, 2q + 1).
+    auto element = [&](int i, int j, int e, int& r, int& c) {
+        r = row0 + wm * WROWS + i * 16 + g + (e >= 2 ? 8 : 0);
+        c = col0 + wn * WCOLS + j * 8 + q * 2 + (e & 1);
+    };
+    if (SWIGLU)
+    {
+        // Interleaved gate|up rows: an m16 tile's rows g (gate) and g + 8 (up) are the same FFN
+        // column, so each thread holds both halves of its outputs: y [m][outDim / 2] =
+        // silu(gate) * up, each half rounded as the plain epilogue stores it (no split-K).
+        const int ff = outDim / 2;
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int e = 0; e < 2; ++e)
+                {
+                    int r, c;
+                    element(i, j, e, r, c);
+                    if (r >= outDim || c >= m)
+                        continue;
+                    const float gate = acc[i][j][e] * rowScale[c] * alpha, up = acc[i][j][e + 2] * rowScale[c] * alpha;
+                    y[(long long)c * ff + r / 16 * 8 + r % 16] = ts_q35_silu(gate) * up;
+                }
+        return;
+    }
+    if (splits == 1)
+    {
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                {
+                    int r, c;
+                    element(i, j, e, r, c);
+                    if (r < outDim && c < m)
+                        y[(long long)c * outDim + r] = acc[i][j][e] * rowScale[c] * alpha;
+                }
+        return;
+    }
+    float* mine = partial + (long long)blockIdx.z * m * outDim;
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                int r, c;
+                element(i, j, e, r, c);
+                if (r < outDim && c < m)
+                    mine[(long long)c * outDim + r] = acc[i][j][e];
+            }
+    __threadfence();
+    __syncthreads();
+    __shared__ int last;
+    const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+    if (tid == 0)
+        last = atomicAdd(counters + tile, 1) == splits - 1;
+    __syncthreads();
+    if (!last)
+        return;
+    __threadfence();
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                int r, c;
+                element(i, j, e, r, c);
+                if (r >= outDim || c >= m)
+                    continue;
+                float sum = 0.0f;
+                for (int z = 0; z < splits; ++z)
+                    sum += __ldcg(partial + ((long long)z * m + c) * outDim + r);
+                y[(long long)c * outDim + r] = sum * rowScale[c] * alpha;
+            }
+    if (tid == 0)
+        counters[tile] = 0;
+}
+
+#define TS_Q35_GEMM(NAME, BN, WM, WN, STAGES, COLS_FAST, SWIGLU) \
+    extern "C" __global__ __launch_bounds__(256) void NAME( \
+        const uint8_t* __restrict__ wCodes, const uint8_t* __restrict__ wScales, int outDim, int k, \
+        const uint8_t* __restrict__ xCodes, const uint8_t* __restrict__ xScales, const float* __restrict__ rowScale, \
+        int m, float alpha, float* __restrict__ y, float* __restrict__ partial, int* __restrict__ counters) \
+    { ts_q35_gemm_w4a4<BN, WM, WN, STAGES, TS_Q35_BK, COLS_FAST, SWIGLU>(wCodes, wScales, outDim, k, xCodes, xScales, rowScale, m, \
+        alpha, y, partial, counters); }
+
+// grid (weight tiles, activation tiles, splits); the 128-row kernels take (activation tiles, weight tiles, splits).
+// _swiglu: the fused gate|up projection with SwiGLU in the epilogue (y is the FFN activation).
+TS_Q35_GEMM(ts_q35_gemm_w4a4_32, 32, 8, 1, 3, false, false)
+TS_Q35_GEMM(ts_q35_gemm_w4a4_64, 64, 4, 2, 3, false, false)
+TS_Q35_GEMM(ts_q35_gemm_w4a4_128, 128, 4, 2, 2, true, false)
+TS_Q35_GEMM(ts_q35_gemm_w4a4_32_swiglu, 32, 8, 1, 3, false, true)
+TS_Q35_GEMM(ts_q35_gemm_w4a4_64_swiglu, 64, 4, 2, 3, false, true)
+TS_Q35_GEMM(ts_q35_gemm_w4a4_128_swiglu, 128, 4, 2, 2, true, true)
+
+/// Dynamic shared memory of ts_q35_gemm_w4a4_<bn>, by bn (32, 64, 128).
+extern "C" __global__ void ts_q35_gemm_smem_bytes(int* out)
+{
+    out[0] = (int)sizeof(TsQ35GemmSmem<32, 8, 1, 3>);
+    out[1] = (int)sizeof(TsQ35GemmSmem<64, 4, 2, 3>);
+    out[2] = (int)sizeof(TsQ35GemmSmem<128, 4, 2, 2>);
+}
+
+// ===========================================================================
+// Layer kernels. Activations are F32 rows [tokens][width]. A launch covers nSeq sequences of
+// rowsPerSeq consecutive rows each (one sequence's prompt chunk: nSeq = 1; a batched decode or
+// verify step: one window per sequence), each sequence bringing its own caches and states
+// through device arrays of pointers.
+// ===========================================================================
+
+#define TS_Q35_HD 256          // attention head width
+#define TS_Q35_GDN_HD 128      // Gated DeltaNet head width (keys and values)
+// Attention caches live in blocks of this many tokens, shared between slots (a checkpoint and the
+// sequence it came from hold the same blocks): per attention layer, K then V, each
+// [nKv][TS_Q35_KV_BLOCK][272 B] (a head's keys contiguous). A sequence's blocks are found through
+// its row of the block table.
+#define TS_Q35_KV_BLOCK 256
+#define TS_Q35_ROPE_DIMS 64    // rotated dims per attention head (NEOX pairs (i, i + 32))
+// One 256-value q8_0 row: the 256 int8 codes, then the 8 F16 block scales (block j = values
+// 32j..32j+31, value = d_j * code). ggml's q8_0 numerics in a layout whose codes are 16-byte
+// aligned, so they feed cp.async, ldmatrix and int8 mma directly.
+#define TS_Q35_Q8_ROW 272
+#define TS_Q35_Q8_SCALES 256   // byte offset of the scales within a row
+
+// ---------------------------------------------------------------------------
+// Token embedding from a Q4_0 table: one block per token, rows [tokens][width].
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_q35_embed_q4_0(
+    const uint8_t* __restrict__ table, long long rowBytes, const int* __restrict__ tokens,
+    float* __restrict__ out, int width)
+{
+    const int t = blockIdx.x;
+    const uint8_t* row = table + (long long)tokens[t] * rowBytes;
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+    {
+        const uint8_t* blk = row + (i >> 5) * 18;
+        const float d = __half2float(*(const half*)blk);
+        const int j = i & 31;
+        const int q = j < 16 ? (blk[2 + j] & 0xF) : (blk[2 + j - 16] >> 4);
+        out[(long long)t * width + i] = (float)(q - 8) * d;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// x += delta (when delta is not null), then y = rmsnorm(x) * w. One block per row.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_q35_add_rmsnorm_f32(
+    float* __restrict__ x, const float* __restrict__ delta, const float* __restrict__ w,
+    float* __restrict__ y, int width, float eps)
+{
+    __shared__ float partial[32];
+    const long long row = blockIdx.x;
+    float* xr = x + row * width;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+    {
+        float v = xr[i];
+        if (delta != nullptr)
+        {
+            v += delta[row * width + i];
+            xr[i] = v;
+        }
+        ss += v * v;
+    }
+    ss = ts_q35_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0)
+        partial[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32)
+    {
+        float v = threadIdx.x < (blockDim.x >> 5) ? partial[threadIdx.x] : 0.0f;
+        v = ts_q35_warp_sum(v);
+        if (threadIdx.x == 0)
+            partial[0] = v;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(partial[0] / (float)width + eps);
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+        y[row * width + i] = xr[i] * scale * w[i];
+}
+
+// ---------------------------------------------------------------------------
+// Attention front end. qkv rows are [Q|gate per head (nHead x 2 x 256) | K (nKv x 256) |
+// V (nKv x 256)]. One warp per (row, unit): units 0..nHead-1 are query heads, then nKv key heads,
+// then nKv value heads. Lane l holds dims l + 32j, so the NEOX pair (i, i + 32) of the rotated
+// first 64 dims is lane-local, and q8_0 block j (dims 32j..32j+31) is one value per lane.
+// Q (normed, roped) and the raw gate go to q/gate [rows][nHead][256]; K (normed, roped) and V
+// are quantized to q8_0 into the sequence's cache blocks at cacheRow (see TS_Q35_KV_BLOCK).
+// ropePos holds the four M-RoPE position components [4][ropeStride]; sections are (t, h, w) pair
+// counts, interleaved t, h, w, t, h, w, ... over the 32 rotated pairs (ggml IMROPE).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_q35_attn_prep_f32(
+    const float* __restrict__ qkv, int rows, int rowsPerSeq, int nHead, int nKv,
+    const float* __restrict__ qNorm, const float* __restrict__ kNorm, float eps,
+    const int* __restrict__ ropePos, int ropeStride, int sectT, int sectH, int sectW, float ropeBase,
+    const int* __restrict__ cacheRow, uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
+    float* __restrict__ q, float* __restrict__ gate)
+{
+    const int units = nHead + 2 * nKv;
+    const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= (long long)rows * units)
+        return;
+    const int row = (int)(warp / units), unit = (int)(warp % units);
+    const int seq = row / rowsPerSeq;
+    const long long rowWidth = (long long)nHead * 2 * TS_Q35_HD + 2LL * nKv * TS_Q35_HD;
+    const float* src;
+    if (unit < nHead)
+        src = qkv + row * rowWidth + (long long)unit * 2 * TS_Q35_HD;
+    else if (unit < nHead + nKv)
+        src = qkv + row * rowWidth + (long long)nHead * 2 * TS_Q35_HD + (long long)(unit - nHead) * TS_Q35_HD;
+    else   // V follows the nKv key heads
+        src = qkv + row * rowWidth + (long long)nHead * 2 * TS_Q35_HD + (long long)(unit - nHead) * TS_Q35_HD;
+
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        v[j] = src[lane + 32 * j];
+
+    if (unit < nHead + nKv)
+    {
+        // Per-head RMS norm, then rotary on dims [0, 64): pair (lane, lane + 32) is v[0], v[1].
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            ss += v[j] * v[j];
+        ss = ts_q35_warp_sum(ss);
+        const float scale = rsqrtf(ss / (float)TS_Q35_HD + eps);
+        const float* nw = unit < nHead ? qNorm : kNorm;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            v[j] = v[j] * scale * nw[lane + 32 * j];
+        const int pair = lane;   // 0..31
+        int comp;
+        if (pair % 3 == 1 && pair < 3 * sectH) comp = 1;
+        else if (pair % 3 == 2 && pair < 3 * sectW) comp = 2;
+        else if (pair % 3 == 0 && pair < 3 * sectT) comp = 0;
+        else comp = 3;
+        const float p = (float)ropePos[(long long)comp * ropeStride + row];
+        const float theta = p * powf(ropeBase, -2.0f * (float)pair / (float)TS_Q35_ROPE_DIMS);
+        float sn, cs;
+        sincosf(theta, &sn, &cs);
+        const float x0 = v[0], x1 = v[1];
+        v[0] = x0 * cs - x1 * sn;
+        v[1] = x0 * sn + x1 * cs;
+    }
+    if (unit < nHead)
+    {
+        float* qd = q + ((long long)row * nHead + unit) * TS_Q35_HD;
+        float* gd = gate + ((long long)row * nHead + unit) * TS_Q35_HD;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+        {
+            qd[lane + 32 * j] = v[j];
+            gd[lane + 32 * j] = src[TS_Q35_HD + lane + 32 * j];
+        }
+        return;
+    }
+    const bool isK = unit < nHead + nKv;
+    const int head = isK ? unit - nHead : unit - nHead - nKv;
+    const int cr = cacheRow[row];
+    uint8_t* cache = blockTable[(long long)seq * maxBlocks + cr / TS_Q35_KV_BLOCK] + (isK ? kOff : vOff)
+                   + ((long long)head * TS_Q35_KV_BLOCK + cr % TS_Q35_KV_BLOCK) * TS_Q35_Q8_ROW;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+    {
+        // ggml quantize_row_q8_0: d = amax / 127, q = round(x / d).
+        const float amax = ts_q35_warp_max(fabsf(v[j]));
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        cache[32 * j + lane] = (uint8_t)(int8_t)(int)roundf(v[j] * id);
+        if (lane == 0)
+            *(half*)(cache + TS_Q35_Q8_SCALES + 2 * j) = __float2half(d);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// out = attn * sigmoid(gate), elementwise over [rows][nHead * 256].
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_q35_gate_mul_f32(float* __restrict__ attn, const float* __restrict__ gate, long long n)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        attn[i] *= ts_q35_sigmoid(gate[i]);
+}
+
+// ---------------------------------------------------------------------------
+// SwiGLU over the fused gate|up projection: out[r][i] = silu(gu[r][i]) * gu[r][ff + i].
+// ---------------------------------------------------------------------------
+// gu rows [gate | up] (interleaved = 0), or groups of 8 gate then 8 up values (interleaved = 1,
+// the target's gate|up planes, see ts_q35_repack_nvfp4).
+extern "C" __global__ void ts_q35_swiglu_f32(const float* __restrict__ gu, float* __restrict__ out, int ff, int interleaved)
+{
+    // grid (column blocks, rows)
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ff)
+        return;
+    const long long r = blockIdx.y;
+    const float* row = gu + r * 2 * ff;
+    const int gi = interleaved ? c / 8 * 16 + c % 8 : c, ui = interleaved ? gi + 8 : ff + c;
+    out[r * ff + c] = ts_q35_silu(row[gi]) * row[ui];
+}
+
+// ---------------------------------------------------------------------------
+// Gated DeltaNet front end over the packed in-projection rows [qkv (convDim) | z (vDim) |
+// beta (hv) | alpha (hv)]. ts_q35_gdn_conv_f32: one thread per (row, channel) runs the causal
+// convolution (kernel dConv; the state [dConv - 1][convDim] holds the inputs before this window,
+// oldest first) with SiLU; rawOut, when set, keeps the window's unconvolved inputs [rows][convDim]
+// for a later state commit. ts_q35_gdn_conv_state_f32 then moves the state past the window.
+// ts_q35_gdn_prep_f32: one warp per (row, head) L2-normalizes q and k in place (ggml:
+// rms_norm(x, eps / n) / sqrt(n)) and computes beta = sigmoid(b) and g = softplus(alpha +
+// dtBias) * ssmA (a log decay). The convolved q | k | v land in qkvOut [rows][convDim].
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_q35_gdn_conv_f32(
+    const float* __restrict__ packed, int packedWidth, int rowsPerSeq, int convDim, int dConv,
+    const float* __restrict__ convW, float* const* __restrict__ convStates, float* __restrict__ qkvOut,
+    float* __restrict__ rawOut)
+{
+    // One thread per (row, channel); grid (channel blocks, rows, sequences).
+    const int seq = blockIdx.z, t = blockIdx.y;
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= convDim)
+        return;
+    const float* state = convStates[seq];   // [dConv - 1][convDim], oldest first
+    const long long base = (long long)seq * rowsPerSeq;
+    const float* wk = convW + (long long)ch * dConv;
+    float acc = 0.0f;
+    for (int j = 0; j < dConv; ++j)
+    {
+        const int src = t - (dConv - 1) + j;   // row of the input tap j reads
+        const float x = src >= 0 ? packed[(base + src) * packedWidth + ch] : state[(long long)(dConv - 1 + src) * convDim + ch];
+        acc += x * wk[j];
+    }
+    qkvOut[(base + t) * convDim + ch] = ts_q35_silu(acc);
+    if (rawOut != nullptr)
+        rawOut[(base + t) * convDim + ch] = packed[(base + t) * packedWidth + ch];
+}
+
+// The convolution state after the first count[seq] (null: all rowsPerSeq) rows of a window:
+// the last dConv - 1 inputs, from those rows and, when there are fewer, the old state (read
+// ahead of every write: entry i takes old entry i + rows, so ascending i never reads what it
+// already replaced). The rows sit at src [seq * rowsPerSeq + t][srcWidth]; grid (channel
+// blocks, sequences, layers), layer z reading src + z * layerStride and the state
+// convStates[z * ptrStride + seq] (null: no recurrent layer there).
+extern "C" __global__ void ts_q35_gdn_conv_state_f32(
+    const float* __restrict__ src, int srcWidth, long long layerStride, int rowsPerSeq, const int* __restrict__ count,
+    int convDim, int dConv, float* const* __restrict__ convStates, int ptrStride)
+{
+    const int seq = blockIdx.y, layer = blockIdx.z;
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    float* state = convStates[(long long)layer * ptrStride + seq];
+    if (ch >= convDim || state == nullptr)
+        return;
+    const int rows = count != nullptr ? count[seq] : rowsPerSeq;
+    const float* in = src + layer * layerStride + (long long)seq * rowsPerSeq * srcWidth;
+    for (int i = 0; i < dConv - 1; ++i)
+    {
+        const int r = rows - (dConv - 1) + i;
+        state[(long long)i * convDim + ch] = r >= 0
+            ? in[(long long)r * srcWidth + ch]
+            : state[(long long)(dConv - 1 + r) * convDim + ch];
+    }
+}
+
+// count (null: every row real): sequence s's rows past count[s] are padding (rowsPerSeq rows per
+// sequence) and get beta = 0 and g = 0, which leaves the delta rule's state exactly as it was.
+extern "C" __global__ void ts_q35_gdn_prep_f32(
+    float* __restrict__ qkv, const float* __restrict__ packed, int packedWidth, int rows,
+    int hk, int hv, int convDim, int vDim, const float* __restrict__ dtBias, const float* __restrict__ ssmA,
+    float eps, float* __restrict__ g, float* __restrict__ beta, const int* __restrict__ count, int rowsPerSeq)
+{
+    const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int units = 2 * hk + hv;
+    if (warp >= (long long)rows * units)
+        return;
+    const long long row = warp / units;
+    const int unit = (int)(warp % units);
+    if (unit < 2 * hk)
+    {
+        float* p = qkv + row * convDim + (long long)unit * TS_Q35_GDN_HD;
+        float v[4], ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            v[j] = p[lane + 32 * j];
+            ss += v[j] * v[j];
+        }
+        ss = ts_q35_warp_sum(ss);
+        const float n = (float)TS_Q35_GDN_HD;
+        const float scale = rsqrtf(ss / n + eps / n) / sqrtf(n);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            p[lane + 32 * j] = v[j] * scale;
+        return;
+    }
+    const int h = unit - 2 * hk;
+    if (lane == 0)
+    {
+        const float* pr = packed + row * packedWidth + convDim + vDim;
+        const bool pad = count != nullptr && row % rowsPerSeq >= count[row / rowsPerSeq];
+        beta[row * hv + h] = pad ? 0.0f : ts_q35_sigmoid(pr[h]);
+        g[row * hv + h] = pad ? 0.0f : ts_q35_softplus(pr[hv + h] + dtBias[h]) * ssmA[h];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The gated delta rule, token by token (ggml-cuda's gated_delta_net_cuda arithmetic). State per
+// (sequence, v-head) is [128 cols][128 rows] with M[col][i] = S[i][col]; value head h reads key
+// head h % hk. Block: 4 warps x 4 columns per warp (8 lanes per column, 16 rows per lane), grid
+// (hv, nSeq, 128 / 16). out [rows][hv][128] scaled by 1/sqrt(128).
+//   ts_q35_gdn_scan_f32:        rowsPerSeq rows per sequence, outputs and the advanced state.
+//   ts_q35_gdn_scan_verify_f32: outputs only; the state stays as it was (a speculative window).
+//   ts_q35_gdn_replay_f32:      the state only, advanced over the first kept[seq] rows of a
+//                               verified window - every recurrent layer in one launch: grid z is
+//                               layer * 8 + column block, the layer's inputs at
+//                               layer * qkvStride / gStride and its state states[layer * ptrStride + seq].
+// ---------------------------------------------------------------------------
+template <bool OUT, bool STATE>
+__device__ __forceinline__ void ts_q35_gdn_scan(
+    const float* __restrict__ qkv, int convDim, int hk, int hv, int rowsPerSeq, int rows,
+    const float* __restrict__ g, const float* __restrict__ beta, float* __restrict__ states, float* __restrict__ out, int colBlock)
+{
+    constexpr int S = TS_Q35_GDN_HD, COLS = 4, LANES = 32 / COLS, PER = S / LANES;
+    const int h = blockIdx.x, seq = blockIdx.y;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int colInWarp = lane / LANES, laneInCol = lane % LANES;
+    const int col = (colBlock * (blockDim.x >> 5) + warp) * COLS + colInWarp;
+    const int kh = h % hk;
+    float* M = states + ((long long)h * S + col) * S;
+    float s[PER];
+#pragma unroll
+    for (int r = 0; r < PER; ++r)
+        s[r] = M[r * LANES + laneInCol];
+    const float scale = rsqrtf((float)S);
+    for (int t = 0; t < rows; ++t)
+    {
+        const long long row = (long long)seq * rowsPerSeq + t;
+        const float* qt = qkv + row * convDim + (long long)kh * S;
+        const float* kt = qkv + row * convDim + (long long)(hk + kh) * S;
+        const float vt = qkv[row * convDim + 2LL * hk * S + (long long)h * S + col];
+        const float gv = expf(g[row * hv + h]);
+        const float bv = beta[row * hv + h];
+        float kr[PER], kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < PER; ++r)
+        {
+            kr[r] = kt[r * LANES + laneInCol];
+            kv += s[r] * kr[r];
+        }
+#pragma unroll
+        for (int off = LANES / 2; off > 0; off >>= 1)
+            kv += __shfl_xor_sync(0xffffffff, kv, off, 32);
+        const float delta = (vt - gv * kv) * bv;
+#pragma unroll
+        for (int r = 0; r < PER; ++r)
+            s[r] = gv * s[r] + kr[r] * delta;
+        if (OUT)
+        {
+            float o = 0.0f;
+#pragma unroll
+            for (int r = 0; r < PER; ++r)
+                o += s[r] * qt[r * LANES + laneInCol];
+#pragma unroll
+            for (int off = LANES / 2; off > 0; off >>= 1)
+                o += __shfl_xor_sync(0xffffffff, o, off, 32);
+            if (laneInCol == 0)
+                out[(row * hv + h) * S + col] = o * scale;
+        }
+    }
+    if (STATE)
+    {
+#pragma unroll
+        for (int r = 0; r < PER; ++r)
+            M[r * LANES + laneInCol] = s[r];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) ts_q35_gdn_scan_f32(
+    const float* __restrict__ qkv, int convDim, int hk, int hv, int rowsPerSeq,
+    const float* __restrict__ g, const float* __restrict__ beta,
+    float* const* __restrict__ states, float* __restrict__ out)
+{
+    ts_q35_gdn_scan<true, true>(qkv, convDim, hk, hv, rowsPerSeq, rowsPerSeq, g, beta, states[blockIdx.y], out, blockIdx.z);
+}
+
+extern "C" __global__ void __launch_bounds__(128) ts_q35_gdn_scan_verify_f32(
+    const float* __restrict__ qkv, int convDim, int hk, int hv, int rowsPerSeq,
+    const float* __restrict__ g, const float* __restrict__ beta,
+    float* const* __restrict__ states, float* __restrict__ out)
+{
+    ts_q35_gdn_scan<true, false>(qkv, convDim, hk, hv, rowsPerSeq, rowsPerSeq, g, beta, states[blockIdx.y], out, blockIdx.z);
+}
+
+extern "C" __global__ void __launch_bounds__(128) ts_q35_gdn_replay_f32(
+    const float* __restrict__ qkv, long long qkvStride, int convDim, int hk, int hv, int rowsPerSeq, const int* __restrict__ kept,
+    const float* __restrict__ g, const float* __restrict__ beta, long long gStride,
+    float* const* __restrict__ states, int ptrStride)
+{
+    constexpr int BLOCKS = TS_Q35_GDN_HD / 16;
+    const int layer = blockIdx.z / BLOCKS;
+    float* state = states[(long long)layer * ptrStride + blockIdx.y];
+    if (state == nullptr)
+        return;
+    ts_q35_gdn_scan<false, true>(qkv + layer * qkvStride, convDim, hk, hv, rowsPerSeq, kept[blockIdx.y],
+        g + layer * gStride, beta + layer * gStride, state, nullptr, blockIdx.z % BLOCKS);
+}
+
+// ---------------------------------------------------------------------------
+// The same rule over chunks of C = 16 tokens (prefill). With G_t the chunk's cumulative log
+// decay through token t and S0 the incoming state [128 k][V], the token loop unrolls to
+//   U = (I + A)^-1 D,   A[t][s] = beta_t e^(G_t - G_s) k_t.k_s (s < t),
+//                       D[t]    = beta_t (v_t - e^G_t S0^T k_t)
+//   o_t = e^G_t S0^T q_t + sum_{s <= t} e^(G_t - G_s) (q_t.k_s) U[s]
+//   S   = e^G_last S0 + K^T (U * e^(G_last - G_s))
+// (the WY form ggml-cuda's gated-delta-net-mma.cu evaluates). Every product runs on BF16 tensor
+// cores with each operand split into a BF16 value and its BF16 residual (lo*hi + hi*lo + hi*hi,
+// about 16 mantissa bits); the state stays F32 in registers across chunks. One block of 8 warps
+// owns one (sequence, v-head, 32-column value slice): grid (hv * 4, nSeq). Warp w keeps state
+// rows 16w..16w+15. Operands sit in shared memory with the contraction index innermost, rows
+// padded to 68 or 12 words so the fragment loads are conflict-free.
+// ---------------------------------------------------------------------------
+#define TS_Q35_GDN_C 16                     // tokens per chunk
+#define TS_Q35_GDN_V 32                     // value columns per block
+#define TS_Q35_GDN_KS (TS_Q35_GDN_HD + 8)   // BF16 row stride of the 128-wide operands
+#define TS_Q35_GDN_CS (TS_Q35_GDN_C + 8)    // BF16 row stride of the 16-wide operands
+
+struct TsQ35GdnChunk
+{
+    // [hi | lo][rows][stride]
+    __nv_bfloat16 q[2][TS_Q35_GDN_C][TS_Q35_GDN_KS];   // queries, scaled by 1/sqrt(128)
+    __nv_bfloat16 k[2][TS_Q35_GDN_C][TS_Q35_GDN_KS];
+    union
+    {
+        __nv_bfloat16 s[2][TS_Q35_GDN_V][TS_Q35_GDN_KS];   // S0 as [v][k]
+        struct
+        {
+            __nv_bfloat16 u[2][TS_Q35_GDN_V][TS_Q35_GDN_CS];   // U as [v][t]
+            __nv_bfloat16 w[2][TS_Q35_GDN_V][TS_Q35_GDN_CS];   // U * e^(G_last - G_t)
+        } uw;
+    };
+    __nv_bfloat16 p[2][TS_Q35_GDN_C][TS_Q35_GDN_CS];     // e^(G_t - G_s) q_t.k_s, s <= t
+    __nv_bfloat16 inv[2][TS_Q35_GDN_C][TS_Q35_GDN_CS];   // (I + A)^-1
+    __nv_bfloat16 d[2][TS_Q35_GDN_V][TS_Q35_GDN_CS];     // D as [v][t]
+    float lower[TS_Q35_GDN_C][TS_Q35_GDN_C];              // A
+    float prefix[TS_Q35_GDN_C], beta[TS_Q35_GDN_C];
+};
+
+// A BF16 value and its residual, written to plane 0 and plane `PLANE` elements later.
+template <int PLANE>
+__device__ __forceinline__ void ts_q35_put_split(__nv_bfloat16* m, int i, float x)
+{
+    const __nv_bfloat16 h = __float2bfloat16(x);
+    m[i] = h;
+    m[PLANE + i] = __float2bfloat16(x - __bfloat162float(h));
+}
+
+__device__ __forceinline__ uint32_t ts_q35_split_bf16x2(float x0, float x1, uint32_t& lo)
+{
+    const __nv_bfloat162 h = __floats2bfloat162_rn(x0, x1);
+    const float2 r = __bfloat1622float2(h);
+    const __nv_bfloat162 l = __floats2bfloat162_rn(x0 - r.x, x1 - r.y);
+    lo = *reinterpret_cast<const uint32_t*>(&l);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+__device__ __forceinline__ uint32_t ts_q35_ld32(const __nv_bfloat16* p) { return *reinterpret_cast<const uint32_t*>(p); }
+
+__device__ __forceinline__ void ts_q35_mma_bf16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
+}
+
+// c (16 x 8) += A B^T over K: A [16][K] and B [8][K] row-major BF16 (strides sa, sb) whose
+// residual planes sit aPlane / bPlane elements later.
+template <int K>
+__device__ __forceinline__ void ts_q35_mma3(float (&c)[4], const __nv_bfloat16* a, int sa, int aPlane,
+                                            const __nv_bfloat16* b, int sb, int bPlane)
+{
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+#pragma unroll
+    for (int k = 0; k < K; k += 16)
+    {
+        const __nv_bfloat16* pa = a + g * sa + k + 2 * t;
+        const __nv_bfloat16* pb = b + g * sb + k + 2 * t;
+        const uint32_t ah[4] = { ts_q35_ld32(pa), ts_q35_ld32(pa + 8 * sa), ts_q35_ld32(pa + 8), ts_q35_ld32(pa + 8 * sa + 8) };
+        const uint32_t al[4] = { ts_q35_ld32(pa + aPlane), ts_q35_ld32(pa + aPlane + 8 * sa), ts_q35_ld32(pa + aPlane + 8),
+                                 ts_q35_ld32(pa + aPlane + 8 * sa + 8) };
+        const uint32_t bh0 = ts_q35_ld32(pb), bh1 = ts_q35_ld32(pb + 8);
+        const uint32_t bl0 = ts_q35_ld32(pb + bPlane), bl1 = ts_q35_ld32(pb + bPlane + 8);
+        ts_q35_mma_bf16(c, al, bh0, bh1);
+        ts_q35_mma_bf16(c, ah, bl0, bl1);
+        ts_q35_mma_bf16(c, ah, bh0, bh1);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) ts_q35_gdn_chunk_f32(
+    const float* __restrict__ qkv, int convDim, int hk, int hv, int rowsPerSeq,
+    const float* __restrict__ g, const float* __restrict__ beta,
+    float* const* __restrict__ states, float* __restrict__ out)
+{
+    constexpr int S = TS_Q35_GDN_HD, C = TS_Q35_GDN_C, V = TS_Q35_GDN_V, KS = TS_Q35_GDN_KS, CS = TS_Q35_GDN_CS;
+    constexpr int QP = C * KS, SP = V * KS, CP = C * CS, VP = V * CS;   // residual plane offsets
+    __shared__ __align__(16) TsQ35GdnChunk sm;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, gq = lane >> 2, tq = lane & 3;
+    const int h = blockIdx.x / (S / V), v0 = (blockIdx.x % (S / V)) * V, seq = blockIdx.y, kh = h % hk;
+    const long long rowBase = (long long)seq * rowsPerSeq;
+    float* M = states[seq] + (long long)h * S * S;   // M[col][i] = S[i][col]
+
+    // st[j]: this warp's 16 state rows x value columns 8j..8j+7 (mma accumulator layout:
+    // element e is row gq + 8 (e >> 1), column 2 tq + (e & 1)).
+    const int d0 = warp * 16;
+    float st[V / 8][4];
+#pragma unroll
+    for (int j = 0; j < V / 8; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            st[j][e] = M[(long long)(v0 + 8 * j + 2 * tq + (e & 1)) * S + d0 + gq + 8 * (e >> 1)];
+
+    // Thread tid stages 8 dims of one token's q and k; the next chunk's are loaded while this one runs.
+    const int ldT = tid >> 4, ldD = (tid & 15) * 8;
+    float4 qn[2], kn[2];
+    auto loadQk = [&](int t0)
+    {
+        qn[0] = qn[1] = kn[0] = kn[1] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (t0 + ldT < rowsPerSeq)
+        {
+            const float* row = qkv + (rowBase + t0 + ldT) * convDim;
+            qn[0] = *(const float4*)(row + kh * S + ldD);
+            qn[1] = *(const float4*)(row + kh * S + ldD + 4);
+            kn[0] = *(const float4*)(row + (hk + kh) * S + ldD);
+            kn[1] = *(const float4*)(row + (hk + kh) * S + ldD + 4);
+        }
+    };
+    loadQk(0);
+    const float qScale = rsqrtf((float)S);
+    for (int t0 = 0; t0 < rowsPerSeq; t0 += C)
+    {
+        const int valid = min(C, rowsPerSeq - t0);
+        {
+            const float qv[8] = { qn[0].x, qn[0].y, qn[0].z, qn[0].w, qn[1].x, qn[1].y, qn[1].z, qn[1].w };
+            const float kv[8] = { kn[0].x, kn[0].y, kn[0].z, kn[0].w, kn[1].x, kn[1].y, kn[1].z, kn[1].w };
+            uint32_t qh[4], ql[4], kh2[4], kl[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+            {
+                qh[i] = ts_q35_split_bf16x2(qv[2 * i] * qScale, qv[2 * i + 1] * qScale, ql[i]);
+                kh2[i] = ts_q35_split_bf16x2(kv[2 * i], kv[2 * i + 1], kl[i]);
+            }
+            *(uint4*)&sm.q[0][ldT][ldD] = make_uint4(qh[0], qh[1], qh[2], qh[3]);
+            *(uint4*)&sm.q[1][ldT][ldD] = make_uint4(ql[0], ql[1], ql[2], ql[3]);
+            *(uint4*)&sm.k[0][ldT][ldD] = make_uint4(kh2[0], kh2[1], kh2[2], kh2[3]);
+            *(uint4*)&sm.k[1][ldT][ldD] = make_uint4(kl[0], kl[1], kl[2], kl[3]);
+        }
+        if (warp == 0)
+        {
+            // Inclusive prefix of the log decays; tokens past the window decay by e^0.
+            float gv = lane < valid ? g[(rowBase + t0 + lane) * hv + h] : 0.0f;
+#pragma unroll
+            for (int off = 1; off < C; off <<= 1)
+            {
+                const float x = __shfl_up_sync(0xffffffff, gv, off, 32);
+                if (lane >= off)
+                    gv += x;
+            }
+            if (lane < C)
+            {
+                sm.prefix[lane] = gv;
+                sm.beta[lane] = lane < valid ? beta[(rowBase + t0 + lane) * hv + h] : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < V / 8; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                ts_q35_put_split<SP>(&sm.s[0][0][0], (8 * j + 2 * tq + (e & 1)) * KS + d0 + gq + 8 * (e >> 1), st[j][e]);
+        __syncthreads();
+        if (t0 + C < rowsPerSeq)
+            loadQk(t0 + C);
+
+        // Warps 0-3: e^G_t (Q S0) for value columns 8w..8w+7, kept for the output.
+        // Warps 4-7: D for columns 8(w-4).., then one tile of A (w = 4, 5) or of P (w = 6, 7).
+        float base[4];
+        if (warp < 4)
+        {
+            float c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            ts_q35_mma3<S>(c, &sm.q[0][0][0], KS, QP, &sm.s[0][8 * warp][0], KS, SP);
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                base[e] = expf(sm.prefix[gq + 8 * (e >> 1)]) * c[e];
+        }
+        else
+        {
+            const int j = warp - 4;
+            float c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            ts_q35_mma3<S>(c, &sm.k[0][0][0], KS, QP, &sm.s[0][8 * j][0], KS, SP);
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const int t = gq + 8 * (e >> 1), v = 8 * j + 2 * tq + (e & 1);
+                const float vt = t < valid ? qkv[(rowBase + t0 + t) * convDim + 2LL * hk * S + (long long)h * S + v0 + v] : 0.0f;
+                ts_q35_put_split<VP>(&sm.d[0][0][0], v * CS + t, sm.beta[t] * (vt - expf(sm.prefix[t]) * c[e]));
+            }
+            const bool gram = j < 2;
+            const int s0 = (j & 1) * 8;
+            float x[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            ts_q35_mma3<S>(x, gram ? &sm.k[0][0][0] : &sm.q[0][0][0], KS, QP, &sm.k[0][s0][0], KS, QP);
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const int t = gq + 8 * (e >> 1), s = s0 + 2 * tq + (e & 1);
+                const float decay = s <= t ? expf(sm.prefix[t] - sm.prefix[s]) : 0.0f;
+                if (gram)
+                    sm.lower[t][s] = s < t ? sm.beta[t] * decay * x[e] : 0.0f;
+                else
+                    ts_q35_put_split<CP>(&sm.p[0][0][0], t * CS + s, decay * x[e]);
+            }
+        }
+        __syncthreads();
+
+        // (I + A)^-1 is unit lower-triangular: warp w forward-substitutes rows w and w + 8, lane = column.
+        for (int row = warp; row < C; row += 8)
+        {
+            float x = lane == row ? 1.0f : lane < row ? -sm.lower[row][lane] : 0.0f;
+            for (int pivot = row - 1; pivot > 0; --pivot)
+            {
+                const float xp = __shfl_sync(0xffffffff, x, pivot, 32);
+                if (lane < pivot)
+                    x -= xp * sm.lower[pivot][lane];
+            }
+            if (lane < C)
+                ts_q35_put_split<CP>(&sm.inv[0][0][0], row * CS + lane, x);
+        }
+        __syncthreads();
+
+        // U = (I + A)^-1 D, and U decayed to the chunk's end (S0 is consumed: U and W reuse it).
+        const float gLast = sm.prefix[C - 1];
+        if (warp >= 4)
+        {
+            const int j = warp - 4;
+            float c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            ts_q35_mma3<C>(c, &sm.inv[0][0][0], CS, CP, &sm.d[0][8 * j][0], CS, VP);
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const int t = gq + 8 * (e >> 1), v = 8 * j + 2 * tq + (e & 1);
+                ts_q35_put_split<VP>(&sm.uw.u[0][0][0], v * CS + t, c[e]);
+                ts_q35_put_split<VP>(&sm.uw.w[0][0][0], v * CS + t, c[e] * expf(gLast - sm.prefix[t]));
+            }
+        }
+        __syncthreads();
+
+        if (warp < 4)
+        {
+            ts_q35_mma3<C>(base, &sm.p[0][0][0], CS, CP, &sm.uw.u[0][8 * warp][0], CS, VP);
+#pragma unroll
+            for (int half = 0; half < 2; ++half)
+            {
+                const int t = gq + 8 * half;
+                if (t < valid)
+                    *(float2*)&out[((rowBase + t0 + t) * hv + h) * S + v0 + 8 * warp + 2 * tq] =
+                        make_float2(base[2 * half], base[2 * half + 1]);
+            }
+        }
+        // S = e^G_last S0 + K^T W: the A operand is K transposed, gathered from sm.k pairwise.
+        {
+            const unsigned short* kr = reinterpret_cast<const unsigned short*>(&sm.k[0][0][0]);
+            auto pair = [&](int plane, int t, int d)
+            {
+                const unsigned short* p = kr + plane * QP + t * KS + d;
+                return (uint32_t)p[0] | ((uint32_t)p[KS] << 16);
+            };
+            uint32_t ah[4], al[4];
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+            {
+                const int t = 2 * tq + 8 * (r >> 1), d = d0 + gq + 8 * (r & 1);
+                ah[r] = pair(0, t, d);
+                al[r] = pair(1, t, d);
+            }
+            const float decay = expf(gLast);
+#pragma unroll
+            for (int j = 0; j < V / 8; ++j)
+            {
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    st[j][e] *= decay;
+                const __nv_bfloat16* pb = &sm.uw.w[0][8 * j + gq][2 * tq];
+                const uint32_t bh0 = ts_q35_ld32(pb), bh1 = ts_q35_ld32(pb + 8);
+                const uint32_t bl0 = ts_q35_ld32(pb + VP), bl1 = ts_q35_ld32(pb + VP + 8);
+                ts_q35_mma_bf16(st[j], al, bh0, bh1);
+                ts_q35_mma_bf16(st[j], ah, bl0, bl1);
+                ts_q35_mma_bf16(st[j], ah, bh0, bh1);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < V / 8; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            M[(long long)(v0 + 8 * j + 2 * tq + (e & 1)) * S + d0 + gq + 8 * (e >> 1)] = st[j][e];
+}
+
+// ---------------------------------------------------------------------------
+// Gated RMS norm of the delta-rule output: y = rmsnorm(o_head) * ssmNorm * silu(z), one warp per
+// (row, v-head); z is the packed projection's z slice.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_q35_gdn_out_f32(
+    const float* __restrict__ o, const float* __restrict__ packed, int packedWidth, int convDim, int rows, int hv,
+    const float* __restrict__ ssmNorm, float eps, float* __restrict__ y)
+{
+    const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= (long long)rows * hv)
+        return;
+    const long long row = warp / hv;
+    const int h = (int)(warp % hv);
+    const float* src = o + (row * hv + h) * TS_Q35_GDN_HD;
+    float v[4], ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        v[j] = src[lane + 32 * j];
+        ss += v[j] * v[j];
+    }
+    ss = ts_q35_warp_sum(ss);
+    const float scale = rsqrtf(ss / (float)TS_Q35_GDN_HD + eps);
+    const float* z = packed + row * packedWidth + convDim + (long long)h * TS_Q35_GDN_HD;
+    float* dst = y + (row * hv + h) * TS_Q35_GDN_HD;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        const int i = lane + 32 * j;
+        dst[i] = v[j] * scale * ssmNorm[i] * ts_q35_silu(z[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Causal attention over the q8_0 caches, GQA. One block of 4 warps owns one KV head and up to
+// 64 query rows of a sequence, row r being (token r / G, query head kvHead * G + r % G); row
+// r attends keys [0, keyEnd[token]). Key tiles of 32 are dequantized once into F16 shared
+// memory (d * q, rounded to F16 as ggml's q8_0 -> F16 conversion does) and served to every
+// warp; Q is rounded to F16, scores and the online softmax stay F32, P is rounded to F16 for
+// the value product, accumulation F32 (mma.m16n8k16).
+//   SPLIT = false: blockIdx.x is the 64-row tile; the block sweeps every key its rows see and
+//   writes out = softmax(QK^T * scale) V * sigmoid(gate).
+//   SPLIT = true (decode / verify, at most 64 rows per sequence and KV head): blockIdx.x is a
+//   key range of `chunk` keys; the block writes unnormalized partials (acc[256], ln-domain max,
+//   sum) that ts_q35_attn_combine_f32 merges in split order.
+// ---------------------------------------------------------------------------
+#define TS_Q35_ATTN_KT 32
+#define TS_Q35_ATTN_ROW (TS_Q35_HD + 8)   // F16 tile row stride: 528 bytes, bank-spread
+
+__device__ __forceinline__ void ts_q35_mma_f16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ uint32_t ts_q35_pack_h2(float lo, float hi)
+{
+    const half2 v = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+
+__device__ __forceinline__ void ts_q35_ldsm_x2_t(uint32_t& b0, uint32_t& b1, const half* row)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b0), "=r"(b1) : "r"(ts_q35_smem_u32(row)));
+#else
+    b0 = b1 = 0;
+    __trap();
+#endif
+}
+
+// 32 keys x 256 values of one head from a q8_0 cache into F16 rows; keys past `limit` are zero
+// (finite, so their masked probabilities times V stay zero).
+__device__ __forceinline__ void ts_q35_dequant_tile(const uint8_t* __restrict__ head, long long keyStride, int firstKey, int limit, half* tile)
+{
+    for (int i = threadIdx.x; i < TS_Q35_ATTN_KT * 8; i += blockDim.x)
+    {
+        const int key = i >> 3, b = i & 7;
+        half* dst = tile + key * TS_Q35_ATTN_ROW + b * 32;
+        if (firstKey + key >= limit)
+        {
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                *(uint4*)(dst + 8 * j) = make_uint4(0, 0, 0, 0);
+            continue;
+        }
+        const uint8_t* row = head + (long long)(firstKey + key) * keyStride;
+        const float d = __half2float(*(const half*)(row + TS_Q35_Q8_SCALES + 2 * b));
+        const uint4* codes = (const uint4*)(row + b * 32);
+#pragma unroll
+        for (int c = 0; c < 2; ++c)
+        {
+            const uint4 w = codes[c];
+            const uint32_t words[4] = { w.x, w.y, w.z, w.w };
+#pragma unroll
+            for (int p = 0; p < 2; ++p)
+            {
+                uint32_t h[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                {
+                    const uint32_t x = words[p * 2 + e / 2] >> (16 * (e & 1));
+                    h[e] = ts_q35_pack_h2((float)(int8_t)(x & 0xFF) * d, (float)(int8_t)((x >> 8) & 0xFF) * d);
+                }
+                *(uint4*)(dst + 16 * c + 8 * p) = make_uint4(h[0], h[1], h[2], h[3]);
+            }
+        }
+    }
+}
+
+template <bool SPLIT>
+__device__ __forceinline__ void ts_q35_attention(
+    const float* __restrict__ q, const float* __restrict__ gate, const int* __restrict__ keyEnd,
+    uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
+    int rowsPerSeq, int nHead, int nKv, float scale, int chunk, int splits,
+    float* __restrict__ partial, float* __restrict__ out)
+{
+    __shared__ __align__(16) half ks[TS_Q35_ATTN_KT * TS_Q35_ATTN_ROW];
+    __shared__ __align__(16) half vs[TS_Q35_ATTN_KT * TS_Q35_ATTN_ROW];
+    const int kvh = blockIdx.y, seq = blockIdx.z;
+    const int G = nHead / nKv;
+    const int R = rowsPerSeq * G;
+    // 16 query rows per warp: a block takes blockDim / 2 rows (prefill: 8 warps, so every key
+    // tile it dequantizes serves 128 rows).
+    const int blockRows = blockDim.x >> 1;
+    const int rowBase = SPLIT ? 0 : blockIdx.x * blockRows;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, qd = lane & 3;
+    const int* ends = keyEnd + (long long)seq * rowsPerSeq;
+
+    // Keys the block's rows see: up to the last token's end.
+    const int lastRow = min(rowBase + blockRows, R) - 1;
+    int kHi = ends[lastRow / G];
+    int kLo = 0;
+    if (SPLIT)
+    {
+        kLo = blockIdx.x * chunk;
+        kHi = min(kHi, kLo + chunk);
+    }
+    // Cache blocks hold this head's TS_Q35_KV_BLOCK keys contiguously, and a 32-key tile never
+    // leaves its block.
+    const long long keyStride = TS_Q35_Q8_ROW;
+    uint8_t* const* blocks = blockTable + (long long)seq * maxBlocks;
+
+    // This warp's rows: r0 = rowBase + warp * 16 + g, r1 = r0 + 8.
+    const int r0 = rowBase + warp * 16 + g, r1 = r0 + 8;
+    const bool live0 = r0 < R, live1 = r1 < R;
+    const int end0 = live0 ? ends[r0 / G] : 0, end1 = live1 ? ends[r1 / G] : 0;
+    auto qptr = [&](int r) {
+        const int t = r / G, h = kvh * G + r % G;
+        return q + (((long long)seq * rowsPerSeq + t) * nHead + h) * TS_Q35_HD;
+    };
+    const bool warpLive = rowBase + warp * 16 < R;
+
+    uint32_t qa[16][4];
+    {
+        const float* q0 = live0 ? qptr(r0) : nullptr;
+        const float* q1 = live1 ? qptr(r1) : nullptr;
+#pragma unroll
+        for (int kk = 0; kk < 16; ++kk)
+        {
+            const int c = kk * 16 + qd * 2;
+            qa[kk][0] = q0 ? ts_q35_pack_h2(q0[c], q0[c + 1]) : 0u;
+            qa[kk][1] = q1 ? ts_q35_pack_h2(q1[c], q1[c + 1]) : 0u;
+            qa[kk][2] = q0 ? ts_q35_pack_h2(q0[c + 8], q0[c + 9]) : 0u;
+            qa[kk][3] = q1 ? ts_q35_pack_h2(q1[c + 8], q1[c + 9]) : 0u;
+        }
+    }
+    float acc[32][4];
+#pragma unroll
+    for (int n = 0; n < 32; ++n)
+        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    const float log2Scale = scale * 1.4426950408889634f;
+
+    for (int first = kLo; first < kHi; first += TS_Q35_ATTN_KT)
+    {
+        __syncthreads();
+        const uint8_t* tileBase = blocks[first / TS_Q35_KV_BLOCK]
+                                + ((long long)kvh * TS_Q35_KV_BLOCK + first % TS_Q35_KV_BLOCK) * TS_Q35_Q8_ROW;
+        ts_q35_dequant_tile(tileBase + kOff, keyStride, 0, kHi - first, ks);
+        ts_q35_dequant_tile(tileBase + vOff, keyStride, 0, kHi - first, vs);
+        __syncthreads();
+        if (!warpLive)
+            continue;
+        float s[4][4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
+            const half* kb = ks + (j * 8 + g) * TS_Q35_ATTN_ROW + qd * 2;
+#pragma unroll
+            for (int kk = 0; kk < 16; ++kk)
+                ts_q35_mma_f16(s[j], qa[kk], *(const uint32_t*)(kb + kk * 16), *(const uint32_t*)(kb + kk * 16 + 8));
+        }
+        float t0 = m0, t1 = m1;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            const int key = first + j * 8 + qd * 2;
+            s[j][0] = key < end0 ? s[j][0] * log2Scale : -INFINITY;
+            s[j][1] = key + 1 < end0 ? s[j][1] * log2Scale : -INFINITY;
+            s[j][2] = key < end1 ? s[j][2] * log2Scale : -INFINITY;
+            s[j][3] = key + 1 < end1 ? s[j][3] * log2Scale : -INFINITY;
+            t0 = fmaxf(t0, fmaxf(s[j][0], s[j][1]));
+            t1 = fmaxf(t1, fmaxf(s[j][2], s[j][3]));
+        }
+#pragma unroll
+        for (int off = 1; off < 4; off <<= 1)
+        {
+            t0 = fmaxf(t0, __shfl_xor_sync(0xffffffff, t0, off));
+            t1 = fmaxf(t1, __shfl_xor_sync(0xffffffff, t1, off));
+        }
+        // A row may see no key of this tile (causal tail, split range): keep its state.
+        const float c0 = t0 == -INFINITY ? 1.0f : exp2f(m0 - t0);
+        const float c1 = t1 == -INFINITY ? 1.0f : exp2f(m1 - t1);
+        m0 = t0;
+        m1 = t1;
+        l0 *= c0;
+        l1 *= c1;
+#pragma unroll
+        for (int n = 0; n < 32; ++n)
+        {
+            acc[n][0] *= c0; acc[n][1] *= c0;
+            acc[n][2] *= c1; acc[n][3] *= c1;
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            s[j][0] = t0 == -INFINITY ? 0.0f : exp2f(s[j][0] - t0);
+            s[j][1] = t0 == -INFINITY ? 0.0f : exp2f(s[j][1] - t0);
+            s[j][2] = t1 == -INFINITY ? 0.0f : exp2f(s[j][2] - t1);
+            s[j][3] = t1 == -INFINITY ? 0.0f : exp2f(s[j][3] - t1);
+            l0 += s[j][0] + s[j][1];
+            l1 += s[j][2] + s[j][3];
+        }
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk)
+        {
+            const uint32_t pa[4] = {
+                ts_q35_pack_h2(s[2 * kk][0], s[2 * kk][1]), ts_q35_pack_h2(s[2 * kk][2], s[2 * kk][3]),
+                ts_q35_pack_h2(s[2 * kk + 1][0], s[2 * kk + 1][1]), ts_q35_pack_h2(s[2 * kk + 1][2], s[2 * kk + 1][3]) };
+            const half* vrow = vs + (kk * 16 + (lane & 15)) * TS_Q35_ATTN_ROW;
+#pragma unroll
+            for (int n = 0; n < 32; ++n)
+            {
+                uint32_t b0, b1;
+                ts_q35_ldsm_x2_t(b0, b1, vrow + n * 8);
+                ts_q35_mma_f16(acc[n], pa, b0, b1);
+            }
+        }
+    }
+    if (!warpLive)
+        return;
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1)
+    {
+        l0 += __shfl_xor_sync(0xffffffff, l0, off);
+        l1 += __shfl_xor_sync(0xffffffff, l1, off);
+    }
+#pragma unroll
+    for (int half_ = 0; half_ < 2; ++half_)
+    {
+        const int r = half_ ? r1 : r0;
+        if (r >= R)
+            continue;
+        const int t = r / G, h = kvh * G + r % G;
+        const long long base = ((long long)seq * rowsPerSeq + t) * nHead + h;
+        if (SPLIT)
+        {
+            float* p = partial + (base * splits + blockIdx.x) * (TS_Q35_HD + 2);
+#pragma unroll
+            for (int n = 0; n < 32; ++n)
+            {
+                const int x = n * 8 + qd * 2;
+                p[x] = acc[n][half_ * 2];
+                p[x + 1] = acc[n][half_ * 2 + 1];
+            }
+            if (qd == 0)
+            {
+                const float m = half_ ? m1 : m0;
+                p[TS_Q35_HD] = m == -INFINITY ? -INFINITY : m * 0.6931471805599453f;   // log2 -> ln domain
+                p[TS_Q35_HD + 1] = half_ ? l1 : l0;
+            }
+        }
+        else
+        {
+            const float l = half_ ? l1 : l0;
+            const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+            float* o = out + base * TS_Q35_HD;
+            const float* gt = gate + base * TS_Q35_HD;
+#pragma unroll
+            for (int n = 0; n < 32; ++n)
+            {
+                const int x = n * 8 + qd * 2;
+                o[x] = acc[n][half_ * 2] * inv * ts_q35_sigmoid(gt[x]);
+                o[x + 1] = acc[n][half_ * 2 + 1] * inv * ts_q35_sigmoid(gt[x + 1]);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) ts_q35_attn_q8_f32(
+    const float* __restrict__ q, const float* __restrict__ gate, const int* __restrict__ keyEnd,
+    uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
+    int rowsPerSeq, int nHead, int nKv, float scale, float* __restrict__ out)
+{
+    ts_q35_attention<false>(q, gate, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, 0, 1, nullptr, out);
+}
+
+extern "C" __global__ void __launch_bounds__(128) ts_q35_attn_q8_split_f32(
+    const float* __restrict__ q, const int* __restrict__ keyEnd,
+    uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
+    int rowsPerSeq, int nHead, int nKv, float scale, int chunk, float* __restrict__ partial)
+{
+    ts_q35_attention<true>(q, nullptr, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, chunk,
+                           gridDim.x, partial, nullptr);
+}
+
+// Merge the split partials of every (row, head) in split order and apply the gate:
+// out = (sum_s acc_s e^(m_s - M)) / (sum_s l_s e^(m_s - M)) * sigmoid(gate). One block per
+// (row, head), 256 threads (one per value).
+extern "C" __global__ void ts_q35_attn_combine_f32(
+    const float* __restrict__ partial, const float* __restrict__ gate, int splits, float* __restrict__ out)
+{
+    const long long base = blockIdx.x;
+    const float* p = partial + base * splits * (TS_Q35_HD + 2);
+    float mx = -INFINITY;
+    for (int s = 0; s < splits; ++s)
+        mx = fmaxf(mx, p[s * (TS_Q35_HD + 2) + TS_Q35_HD]);
+    float num = 0.0f, den = 0.0f;
+    const int x = threadIdx.x;
+    for (int s = 0; s < splits; ++s)
+    {
+        const float* ps = p + s * (TS_Q35_HD + 2);
+        const float w = mx == -INFINITY ? 0.0f : expf(ps[TS_Q35_HD] - mx);
+        num = fmaf(ps[x], w, num);
+        den = fmaf(ps[TS_Q35_HD + 1], w, den);
+    }
+    out[base * TS_Q35_HD + x] = (den > 0.0f ? num / den : 0.0f) * ts_q35_sigmoid(gate[base * TS_Q35_HD + x]);
+}
+
+// ---------------------------------------------------------------------------
+// Prefill attention: the rows, grid and output of ts_q35_attn_q8_f32, about 1.7 times as fast. K
+// and V tiles stream through a two-stage cp.async pipeline of raw cache rows and are dequantized
+// to F16 in shared memory (the values ts_q35_dequant_tile gives). The mma accumulate in F16, which
+// runs at twice the rate of F32 accumulation on sm_120, over short runs only: each 16-value step
+// of QK^T (Q pre-scaled to log2 units) is rounded once and summed in F32, and PV over one 32-key
+// tile (probabilities at most 1) is rounded twice before it joins the F32 accumulators. Against
+// exact q8_0 attention on Qwen3.8's shape (eng/validation/tsg-q35-attn-bench.cu) its error is
+// that of ts_q35_attn_q8_f32.
+// ---------------------------------------------------------------------------
+#define TS_Q35_AI_KT 32
+#define TS_Q35_AI_TILE (TS_Q35_AI_KT * TS_Q35_Q8_ROW)   // bytes of one head's 32 cache rows
+#define TS_Q35_AI_ROWS 128                              // query rows per block (8 warps)
+#define TS_Q35_AH_CHAIN 1                               // QK k-steps per F16 accumulation run
+
+// m16n8k16 with F16 accumulation (twice the rate of F32 accumulation on sm_120).
+__device__ __forceinline__ void ts_q35_mma_f16h(uint32_t (&c)[2], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ void ts_q35_ldsm_x4_t(uint32_t (&r)[4], const void* p)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(ts_q35_smem_u32(p)));
+#else
+    r[0] = r[1] = r[2] = r[3] = 0;
+    __trap();
+#endif
+}
+
+// Four int8 codes times an F16 scale as two half2, each value the F16 rounding of code * d (as
+// ts_q35_dequant_tile computes it): 1024 + (code + 128) is exact in F16, so subtracting 1152
+// restores the code exactly before the one rounding multiply.
+__device__ __forceinline__ void ts_q35_i8x4_to_h2(uint32_t codes, half2 d, half2& lo, half2& hi)
+{
+    const uint32_t u = codes ^ 0x80808080u;
+    const uint32_t a = __byte_perm(u, 0x64646464u, 0x7170), b = __byte_perm(u, 0x64646464u, 0x7372);
+    const half2 bias = __float2half2_rn(1152.0f);
+    lo = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&a), bias), d);
+    hi = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&b), bias), d);
+}
+
+struct TsQ35AttnPrefill
+{
+    uint8_t raw[2][2][TS_Q35_AI_TILE];                // [stage][K, V] cache rows as stored
+    half k[TS_Q35_AI_KT * TS_Q35_ATTN_ROW];           // this tile's K in F16
+    half v[TS_Q35_AI_KT * TS_Q35_ATTN_ROW];           // this tile's V in F16
+};
+
+__device__ __forceinline__ void ts_q35_tile_to_h(const uint8_t* raw, half* dst, int tid)
+{
+    const int key = tid & 31, b = tid >> 5;
+    const uint8_t* row = raw + key * TS_Q35_Q8_ROW;
+    const half2 d = __half2half2(*(const half*)(row + TS_Q35_Q8_SCALES + 2 * b));
+    const uint4* codes = (const uint4*)(row + b * 32);
+    uint4* out = (uint4*)(dst + key * TS_Q35_ATTN_ROW + b * 32);
+#pragma unroll
+    for (int c = 0; c < 2; ++c)
+    {
+        const uint4 w = codes[c];
+        half2 h[8];
+        ts_q35_i8x4_to_h2(w.x, d, h[0], h[1]);
+        ts_q35_i8x4_to_h2(w.y, d, h[2], h[3]);
+        ts_q35_i8x4_to_h2(w.z, d, h[4], h[5]);
+        ts_q35_i8x4_to_h2(w.w, d, h[6], h[7]);
+        out[2 * c] = *reinterpret_cast<const uint4*>(&h[0]);
+        out[2 * c + 1] = *reinterpret_cast<const uint4*>(&h[4]);
+    }
+}
+
+// splits > 1 (a grid too small to fill the device): block x = (row tile, key split); each split
+// takes a 32-key-aligned share of its rows' keys and writes unnormalized partials (acc, ln-domain
+// max, sum) that ts_q35_attn_combine_f32 merges.
+extern "C" __global__ void __launch_bounds__(256) ts_q35_attn_prefill_f32(
+    const float* __restrict__ q, const float* __restrict__ gate, const int* __restrict__ keyEnd,
+    uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
+    int rowsPerSeq, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out)
+{
+    extern __shared__ __align__(16) uint8_t ts_q35_attn_smem[];
+    TsQ35AttnPrefill& sm = *reinterpret_cast<TsQ35AttnPrefill*>(ts_q35_attn_smem);
+    const int kvh = blockIdx.y, seq = blockIdx.z;
+    const int G = nHead / nKv;
+    const int R = rowsPerSeq * G;
+    const int split = blockIdx.x % splits;
+    const int rowBase = (blockIdx.x / splits) * TS_Q35_AI_ROWS;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, qd = lane & 3;
+    const int* ends = keyEnd + (long long)seq * rowsPerSeq;
+    const int kAll = ends[(min(rowBase + TS_Q35_AI_ROWS, R) - 1) / G];
+    const int share = ((kAll + splits - 1) / splits + TS_Q35_AI_KT - 1) / TS_Q35_AI_KT * TS_Q35_AI_KT;
+    const int kLo = min(kAll, split * share), kHi = min(kAll, kLo + share);
+    uint8_t* const* blocks = blockTable + (long long)seq * maxBlocks;
+
+    const int r0 = rowBase + warp * 16 + g, r1 = r0 + 8;
+    const bool live0 = r0 < R, live1 = r1 < R;
+    const int end0 = live0 ? ends[r0 / G] : 0, end1 = live1 ? ends[r1 / G] : 0;
+    const bool warpLive = rowBase + warp * 16 < R;
+
+    auto load = [&](int st, int first) {
+        const long long at = ((long long)kvh * TS_Q35_KV_BLOCK + first % TS_Q35_KV_BLOCK) * TS_Q35_Q8_ROW;
+        const uint8_t* base = blocks[first / TS_Q35_KV_BLOCK] + at;
+        for (int i = tid; i < 2 * TS_Q35_AI_TILE / 16; i += blockDim.x)
+        {
+            const int isV = i >= TS_Q35_AI_TILE / 16, c = isV ? i - TS_Q35_AI_TILE / 16 : i;
+            const bool ok = first + c / (TS_Q35_Q8_ROW / 16) < kHi;
+            ts_q35_cp16(sm.raw[st][isV] + c * 16, base + (isV ? vOff : kOff) + (ok ? c * 16 : 0), ok);
+        }
+    };
+    if (kHi > kLo)
+        load(0, kLo);
+    ts_q35_cp_commit();
+
+    const float log2Scale = scale * 1.4426950408889634f;
+    uint32_t qa[16][4];
+    {
+        const int t0 = r0 / G, t1 = r1 / G;
+        const float* q0 = live0 ? q + (((long long)seq * rowsPerSeq + t0) * nHead + kvh * G + r0 % G) * TS_Q35_HD : nullptr;
+        const float* q1 = live1 ? q + (((long long)seq * rowsPerSeq + t1) * nHead + kvh * G + r1 % G) * TS_Q35_HD : nullptr;
+#pragma unroll
+        for (int kk = 0; kk < 16; ++kk)
+        {
+            const int c = kk * 16 + qd * 2;
+            qa[kk][0] = q0 ? ts_q35_pack_h2(q0[c] * log2Scale, q0[c + 1] * log2Scale) : 0u;
+            qa[kk][1] = q1 ? ts_q35_pack_h2(q1[c] * log2Scale, q1[c + 1] * log2Scale) : 0u;
+            qa[kk][2] = q0 ? ts_q35_pack_h2(q0[c + 8] * log2Scale, q0[c + 9] * log2Scale) : 0u;
+            qa[kk][3] = q1 ? ts_q35_pack_h2(q1[c + 8] * log2Scale, q1[c + 9] * log2Scale) : 0u;
+        }
+    }
+
+    float acc[32][4];
+#pragma unroll
+    for (int n = 0; n < 32; ++n)
+        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+
+    for (int first = kLo, t = 0; first < kHi; first += TS_Q35_AI_KT, ++t)
+    {
+        const int st = t & 1;
+        ts_q35_cp_wait<0>();
+        __syncthreads();   // this tile landed; every warp is done with the previous one
+        if (first + TS_Q35_AI_KT < kHi)
+            load(st ^ 1, first + TS_Q35_AI_KT);
+        ts_q35_cp_commit();
+        ts_q35_tile_to_h(sm.raw[st][0], sm.k, tid);
+        ts_q35_tile_to_h(sm.raw[st][1], sm.v, tid);
+        __syncthreads();   // this tile's K and V are in F16
+        if (!warpLive)
+            continue;
+
+        float s[4][4];
+        {
+            // B fragments of 2 n-tiles x 1 k-step per ldmatrix.x4 (rows = keys).
+            const half* kb = sm.k + ((lane & 7) + ((lane >> 4) << 3)) * TS_Q35_ATTN_ROW + ((lane >> 3) & 1) * 8;
+#pragma unroll
+            for (int np = 0; np < 2; ++np)
+            {
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    s[2 * np][e] = s[2 * np + 1][e] = 0.0f;
+#pragma unroll
+                for (int ch = 0; ch < 16 / TS_Q35_AH_CHAIN; ++ch)
+                {
+                    uint32_t h0[2] = { 0u, 0u }, h1[2] = { 0u, 0u };
+#pragma unroll
+                    for (int i = 0; i < TS_Q35_AH_CHAIN; ++i)
+                    {
+                        const int kk = ch * TS_Q35_AH_CHAIN + i;
+                        uint32_t b[4];
+                        ts_q35_ldsm_x4(b, kb + np * 16 * TS_Q35_ATTN_ROW + kk * 16);
+                        ts_q35_mma_f16h(h0, qa[kk], b[0], b[1]);
+                        ts_q35_mma_f16h(h1, qa[kk], b[2], b[3]);
+                    }
+                    const float2 a0 = __half22float2(*reinterpret_cast<const half2*>(&h0[0]));
+                    const float2 a1 = __half22float2(*reinterpret_cast<const half2*>(&h0[1]));
+                    const float2 c0 = __half22float2(*reinterpret_cast<const half2*>(&h1[0]));
+                    const float2 c1 = __half22float2(*reinterpret_cast<const half2*>(&h1[1]));
+                    s[2 * np][0] += a0.x; s[2 * np][1] += a0.y; s[2 * np][2] += a1.x; s[2 * np][3] += a1.y;
+                    s[2 * np + 1][0] += c0.x; s[2 * np + 1][1] += c0.y; s[2 * np + 1][2] += c1.x; s[2 * np + 1][3] += c1.y;
+                }
+            }
+        }
+
+        float t0 = m0, t1 = m1;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            const int key = first + j * 8 + qd * 2;
+            s[j][0] = key < end0 ? s[j][0] : -INFINITY;
+            s[j][1] = key + 1 < end0 ? s[j][1] : -INFINITY;
+            s[j][2] = key < end1 ? s[j][2] : -INFINITY;
+            s[j][3] = key + 1 < end1 ? s[j][3] : -INFINITY;
+            t0 = fmaxf(t0, fmaxf(s[j][0], s[j][1]));
+            t1 = fmaxf(t1, fmaxf(s[j][2], s[j][3]));
+        }
+#pragma unroll
+        for (int off = 1; off < 4; off <<= 1)
+        {
+            t0 = fmaxf(t0, __shfl_xor_sync(0xffffffff, t0, off));
+            t1 = fmaxf(t1, __shfl_xor_sync(0xffffffff, t1, off));
+        }
+        const float c0 = t0 == -INFINITY ? 1.0f : exp2f(m0 - t0);
+        const float c1 = t1 == -INFINITY ? 1.0f : exp2f(m1 - t1);
+        m0 = t0;
+        m1 = t1;
+        l0 *= c0;
+        l1 *= c1;
+        if (!__all_sync(0xffffffff, c0 == 1.0f && c1 == 1.0f))
+        {
+#pragma unroll
+            for (int n = 0; n < 32; ++n)
+            {
+                acc[n][0] *= c0; acc[n][1] *= c0;
+                acc[n][2] *= c1; acc[n][3] *= c1;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            s[j][0] = t0 == -INFINITY ? 0.0f : exp2f(s[j][0] - t0);
+            s[j][1] = t0 == -INFINITY ? 0.0f : exp2f(s[j][1] - t0);
+            s[j][2] = t1 == -INFINITY ? 0.0f : exp2f(s[j][2] - t1);
+            s[j][3] = t1 == -INFINITY ? 0.0f : exp2f(s[j][3] - t1);
+            l0 += s[j][0] + s[j][1];
+            l1 += s[j][2] + s[j][3];
+        }
+        uint32_t pa[2][4];
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk)
+        {
+            pa[kk][0] = ts_q35_pack_h2(s[2 * kk][0], s[2 * kk][1]);
+            pa[kk][1] = ts_q35_pack_h2(s[2 * kk][2], s[2 * kk][3]);
+            pa[kk][2] = ts_q35_pack_h2(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+            pa[kk][3] = ts_q35_pack_h2(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+        }
+        const half* vrow = sm.v + ((lane & 7) + (((lane >> 3) & 1) << 3)) * TS_Q35_ATTN_ROW + ((lane >> 4) << 3);
+#pragma unroll
+        for (int dn = 0; dn < 16; ++dn)
+        {
+            uint32_t h0[2] = { 0u, 0u }, h1[2] = { 0u, 0u };
+#pragma unroll
+            for (int kk = 0; kk < 2; ++kk)
+            {
+                uint32_t b[4];
+                ts_q35_ldsm_x4_t(b, vrow + kk * 16 * TS_Q35_ATTN_ROW + dn * 16);
+                ts_q35_mma_f16h(h0, pa[kk], b[0], b[1]);
+                ts_q35_mma_f16h(h1, pa[kk], b[2], b[3]);
+            }
+            const float2 a0 = __half22float2(*reinterpret_cast<const half2*>(&h0[0]));
+            const float2 a1 = __half22float2(*reinterpret_cast<const half2*>(&h0[1]));
+            const float2 b0 = __half22float2(*reinterpret_cast<const half2*>(&h1[0]));
+            const float2 b1 = __half22float2(*reinterpret_cast<const half2*>(&h1[1]));
+            acc[2 * dn][0] += a0.x; acc[2 * dn][1] += a0.y; acc[2 * dn][2] += a1.x; acc[2 * dn][3] += a1.y;
+            acc[2 * dn + 1][0] += b0.x; acc[2 * dn + 1][1] += b0.y; acc[2 * dn + 1][2] += b1.x; acc[2 * dn + 1][3] += b1.y;
+        }
+    }
+    ts_q35_cp_wait<0>();
+    if (!warpLive)
+        return;
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1)
+    {
+        l0 += __shfl_xor_sync(0xffffffff, l0, off);
+        l1 += __shfl_xor_sync(0xffffffff, l1, off);
+    }
+#pragma unroll
+    for (int half_ = 0; half_ < 2; ++half_)
+    {
+        const int r = half_ ? r1 : r0;
+        if (r >= R)
+            continue;
+        const int t = r / G, h = kvh * G + r % G;
+        const long long base = ((long long)seq * rowsPerSeq + t) * nHead + h;
+        const float l = half_ ? l1 : l0;
+        if (splits > 1)
+        {
+            float* p = partial + (base * splits + split) * (TS_Q35_HD + 2);
+#pragma unroll
+            for (int n = 0; n < 32; ++n)
+            {
+                const int x = n * 8 + qd * 2;
+                p[x] = acc[n][half_ * 2];
+                p[x + 1] = acc[n][half_ * 2 + 1];
+            }
+            if (qd == 0)
+            {
+                const float m = half_ ? m1 : m0;
+                p[TS_Q35_HD] = m == -INFINITY ? -INFINITY : m * 0.6931471805599453f;   // log2 -> ln domain
+                p[TS_Q35_HD + 1] = l;
+            }
+            continue;
+        }
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        float* o = out + base * TS_Q35_HD;
+        const float* gt = gate + base * TS_Q35_HD;
+#pragma unroll
+        for (int n = 0; n < 32; ++n)
+        {
+            const int x = n * 8 + qd * 2;
+            o[x] = acc[n][half_ * 2] * inv * ts_q35_sigmoid(gt[x]);
+            o[x + 1] = acc[n][half_ * 2 + 1] * inv * ts_q35_sigmoid(gt[x + 1]);
+        }
+    }
+}
+
+
+// Dynamic shared memory of ts_q35_attn_prefill_f32, for the host.
+extern "C" __global__ void ts_q35_attn_smem_bytes(int* out)
+{
+    out[0] = (int)sizeof(TsQ35AttnPrefill);
+}
+
+// ---------------------------------------------------------------------------
+// LM head: Q6_K weights x q8_1 activations for one row (more: ts_q35_gemm_q6k below). Q6_K superblock (256 values, 210
+// bytes): ql[128] | qh[64] | scales int8[16] | half d; value 128h + 32m + l (h < 2, m < 4,
+// l < 32) is (ql nibble | 2 qh bits) - 32 with scale index 8h + 2m + l / 16. One warp per output
+// row; lane j takes 128-value halves j, j + 32, ... Four consecutive values are one dp4a.
+// ---------------------------------------------------------------------------
+template <int N>
+__device__ __forceinline__ void ts_q35_gemv_q6k(
+    const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k,
+    const int8_t* __restrict__ xq, const float* __restrict__ xd, float* __restrict__ y)
+{
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (r >= outDim)
+        return;
+    const uint8_t* row = w + (long long)r * rowBytes;
+    const int halves = k / 128;
+    float acc[N];
+#pragma unroll
+    for (int n = 0; n < N; ++n)
+        acc[n] = 0.0f;
+    for (int u = lane; u < halves; u += 32)
+    {
+        const int sbIdx = u >> 1, h = u & 1;
+        const uint8_t* sb = row + (long long)sbIdx * 210;
+        const uint8_t* ql = sb + 64 * h;
+        const uint8_t* qh = sb + 128 + 32 * h;
+        const int8_t* sc = (const int8_t*)(sb + 192) + 8 * h;
+        const float d = __half2float(*(const half*)(sb + 208));
+        const int v0 = sbIdx * 256 + 128 * h;   // first value of this half
+#pragma unroll
+        for (int l0 = 0; l0 < 32; l0 += 4)
+        {
+            const uint32_t a = *(const uint16_t*)(ql + l0) | ((uint32_t)*(const uint16_t*)(ql + l0 + 2) << 16);
+            const uint32_t b = *(const uint16_t*)(ql + 32 + l0) | ((uint32_t)*(const uint16_t*)(ql + 32 + l0 + 2) << 16);
+            const uint32_t c = *(const uint16_t*)(qh + l0) | ((uint32_t)*(const uint16_t*)(qh + l0 + 2) << 16);
+            int wq[4];
+            wq[0] = (int)__vsubss4((a & 0x0F0F0F0Fu) | ((c & 0x03030303u) << 4), 0x20202020);
+            wq[1] = (int)__vsubss4((b & 0x0F0F0F0Fu) | (((c >> 2) & 0x03030303u) << 4), 0x20202020);
+            wq[2] = (int)__vsubss4(((a >> 4) & 0x0F0F0F0Fu) | (((c >> 4) & 0x03030303u) << 4), 0x20202020);
+            wq[3] = (int)__vsubss4(((b >> 4) & 0x0F0F0F0Fu) | (((c >> 6) & 0x03030303u) << 4), 0x20202020);
+#pragma unroll
+            for (int m = 0; m < 4; ++m)
+            {
+                const int v = v0 + 32 * m + l0;
+                const float ws = d * (float)sc[2 * m + l0 / 16];
+#pragma unroll
+                for (int n = 0; n < N; ++n)
+                {
+                    const int xi = *(const int*)(xq + (long long)n * k + v);
+                    acc[n] += ws * xd[(long long)n * (k >> 5) + (v >> 5)] * (float)ts_q35_dp4a(wq[m], xi, 0);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < N; ++n)
+    {
+        const float v = ts_q35_warp_sum(acc[n]);
+        if (lane == 0)
+            y[(long long)n * outDim + r] = v;
+    }
+}
+
+#define TS_Q35_GEMV_Q6K(N) \
+    extern "C" __global__ void ts_q35_gemv_q6k_##N( \
+        const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k, \
+        const int8_t* __restrict__ xq, const float* __restrict__ xd, float* __restrict__ y) \
+    { ts_q35_gemv_q6k<N>(w, rowBytes, outDim, k, xq, xd, y); }
+TS_Q35_GEMV_Q6K(1)
+
+// ---------------------------------------------------------------------------
+// LM head over many rows (a verify window): Q6_K weights x q8_1 activations on the int8 tensor
+// cores. One mma.m16n8k16.s8 per 16-value Q6_K sub-block, its exact integer sum scaled by the
+// sub-block's weight scale (d * sc) and the activation's 32-value scale and accumulated in F32 -
+// the GEMV's integer products, summed in a different order. Block: 4 warps x 16 weight rows
+// against NT * 8 activation rows; per 256-value superblock the activations and each warp's
+// decoded weight rows (int8, value - 32) are staged in shared memory, rows padded to 68 words so
+// the fragment loads are conflict-free. Grid (row tiles, K splits): with more than one split
+// every block adds its share atomically into a zeroed y.
+// ---------------------------------------------------------------------------
+#define TS_Q35_Q6K_ROW (256 + 16)
+
+__device__ __forceinline__ void ts_q35_mma_s8(int (&c)[4], int a0, int a1, int b0)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(0), "r"(0), "r"(0), "r"(0));
+#else
+    __trap();
+#endif
+}
+
+template <int NT>
+__device__ __forceinline__ void ts_q35_gemm_q6k(
+    const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k,
+    const int8_t* __restrict__ xq, const float* __restrict__ xd, int n, float* __restrict__ y)
+{
+    constexpr int NA = NT * 8;
+    __shared__ __align__(16) int8_t xs[NA][TS_Q35_Q6K_ROW];
+    __shared__ float xds[NA][8];
+    __shared__ __align__(16) int8_t ws[4][16][TS_Q35_Q6K_ROW];
+    __shared__ float wsc[4][16][16];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int row0 = blockIdx.x * 64 + warp * 16;
+    const int nsb = k / 256, per = (nsb + gridDim.y - 1) / gridDim.y;
+    const int sb0 = blockIdx.y * per, sb1 = min(nsb, sb0 + per);
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            acc[j][e] = 0.0f;
+    for (int sb = sb0; sb < sb1; ++sb)
+    {
+        __syncthreads();
+        // Activations: NA rows x 256 int8 (16 bytes per thread-step) and their 8 scales.
+        for (int i = tid; i < NA * 16; i += blockDim.x)
+        {
+            const int r = i >> 4, c = (i & 15) * 16;
+            *(int4*)&xs[r][c] = r < n ? *(const int4*)(xq + (long long)r * k + sb * 256 + c) : make_int4(0, 0, 0, 0);
+        }
+        for (int i = tid; i < NA * 8; i += blockDim.x)
+        {
+            const int r = i >> 3;
+            xds[r][i & 7] = r < n ? xd[(long long)r * (k >> 5) + sb * 8 + (i & 7)] : 0.0f;
+        }
+        // This warp's 16 weight rows: lane takes (row, half, 4-value group) items, 16 values each.
+        for (int item = lane; item < 16 * 2 * 8; item += 32)
+        {
+            const int r = item >> 4, h = (item >> 3) & 1, l0 = (item & 7) * 4;
+            const int gr = row0 + r;
+            uint32_t q[4] = { 0, 0, 0, 0 };
+            if (gr < outDim)
+            {
+                const uint8_t* blk = w + (long long)gr * rowBytes + (long long)sb * 210;
+                const uint8_t* ql = blk + 64 * h;
+                const uint8_t* qh = blk + 128 + 32 * h;
+                const uint32_t a = *(const uint16_t*)(ql + l0) | ((uint32_t)*(const uint16_t*)(ql + l0 + 2) << 16);
+                const uint32_t b = *(const uint16_t*)(ql + 32 + l0) | ((uint32_t)*(const uint16_t*)(ql + 32 + l0 + 2) << 16);
+                const uint32_t c = *(const uint16_t*)(qh + l0) | ((uint32_t)*(const uint16_t*)(qh + l0 + 2) << 16);
+                q[0] = __vsubss4((a & 0x0F0F0F0Fu) | ((c & 0x03030303u) << 4), 0x20202020);
+                q[1] = __vsubss4((b & 0x0F0F0F0Fu) | (((c >> 2) & 0x03030303u) << 4), 0x20202020);
+                q[2] = __vsubss4(((a >> 4) & 0x0F0F0F0Fu) | (((c >> 4) & 0x03030303u) << 4), 0x20202020);
+                q[3] = __vsubss4(((b >> 4) & 0x0F0F0F0Fu) | (((c >> 6) & 0x03030303u) << 4), 0x20202020);
+                if (l0 == 0)
+                {
+                    const float d = __half2float(*(const half*)(blk + 208));
+                    const int8_t* sc = (const int8_t*)(blk + 192) + 8 * h;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        wsc[warp][r][8 * h + j] = d * (float)sc[j];
+                }
+            }
+            else if (l0 == 0)
+            {
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    wsc[warp][r][8 * h + j] = 0.0f;
+            }
+#pragma unroll
+            for (int m = 0; m < 4; ++m)
+                *(uint32_t*)&ws[warp][r][128 * h + 32 * m + l0] = q[m];
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int j = 0; j < 16; ++j)   // 16-value sub-blocks
+        {
+            const int a0 = *(const int*)&ws[warp][g][16 * j + 4 * t];
+            const int a1 = *(const int*)&ws[warp][g + 8][16 * j + 4 * t];
+            const float s0 = wsc[warp][g][j], s1 = wsc[warp][g + 8][j];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+            {
+                int c[4];
+                ts_q35_mma_s8(c, a0, a1, *(const int*)&xs[8 * nt + g][16 * j + 4 * t]);
+                const float x0 = xds[8 * nt + 2 * t][j >> 1], x1 = xds[8 * nt + 2 * t + 1][j >> 1];
+                acc[nt][0] += (float)c[0] * s0 * x0;
+                acc[nt][1] += (float)c[1] * s0 * x1;
+                acc[nt][2] += (float)c[2] * s1 * x0;
+                acc[nt][3] += (float)c[3] * s1 * x1;
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const int r = row0 + g + 8 * (e >> 1), col = 8 * nt + 2 * t + (e & 1);
+            if (r < outDim && col < n)
+            {
+                if (gridDim.y > 1)
+                    atomicAdd(y + (long long)col * outDim + r, acc[nt][e]);
+                else
+                    y[(long long)col * outDim + r] = acc[nt][e];
+            }
+        }
+}
+
+#define TS_Q35_GEMM_Q6K(NT) \
+    extern "C" __global__ void __launch_bounds__(128) ts_q35_gemm_q6k_##NT( \
+        const uint8_t* __restrict__ w, long long rowBytes, int outDim, int k, \
+        const int8_t* __restrict__ xq, const float* __restrict__ xd, int n, float* __restrict__ y) \
+    { ts_q35_gemm_q6k<NT>(w, rowBytes, outDim, k, xq, xd, n, y); }
+TS_Q35_GEMM_Q6K(1)
+TS_Q35_GEMM_Q6K(2)
+TS_Q35_GEMM_Q6K(4)
+TS_Q35_GEMM_Q6K(8)
+
+// dst[r] = src[idx[r]] for rows of `width` floats; one block per row.
+extern "C" __global__ void ts_q35_rows_by_index_f32(
+    const float* __restrict__ src, int width, const int* __restrict__ idx, float* __restrict__ dst)
+{
+    const float* in = src + (long long)idx[blockIdx.x] * width;
+    float* o = dst + (long long)blockIdx.x * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+        o[i] = in[i];
+}
+
+// dst[row][0, width) = src[row][0, width), rows of their own strides (floats); one block per row.
+extern "C" __global__ void ts_q35_copy_rows_f32(
+    const float* __restrict__ src, long long srcStride, float* __restrict__ dst, long long dstStride, int width)
+{
+    const float* in = src + blockIdx.x * srcStride;
+    float* o = dst + blockIdx.x * dstStride;
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+        o[i] = in[i];
+}
+
+// ---------------------------------------------------------------------------
+// Row argmax (first index of the maximum, as ggml's argmax): one 1024-thread block per row.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_q35_argmax_f32(const float* __restrict__ x, int n, int* __restrict__ out)
+{
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const float* row = x + (long long)blockIdx.x * n;
+    float best = -INFINITY;
+    int idx = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    {
+        const float v = row[i];
+        if (v > best || (v == best && i < idx))
+        {
+            best = v;
+            idx = i;
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+    {
+        const float ov = __shfl_xor_sync(0xffffffff, best, off);
+        const int oi = __shfl_xor_sync(0xffffffff, idx, off);
+        if (ov > best || (ov == best && oi < idx))
+        {
+            best = ov;
+            idx = oi;
+        }
+    }
+    if ((threadIdx.x & 31) == 0)
+    {
+        bv[threadIdx.x >> 5] = best;
+        bi[threadIdx.x >> 5] = idx;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32)
+    {
+        const int warps = blockDim.x >> 5;
+        best = threadIdx.x < warps ? bv[threadIdx.x] : -INFINITY;
+        idx = threadIdx.x < warps ? bi[threadIdx.x] : 0x7fffffff;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            const float ov = __shfl_xor_sync(0xffffffff, best, off);
+            const int oi = __shfl_xor_sync(0xffffffff, idx, off);
+            if (ov > best || (ov == best && oi < idx))
+            {
+                best = ov;
+                idx = oi;
+            }
+        }
+        if (threadIdx.x == 0)
+            out[blockIdx.x] = idx;
+    }
+}
+
+#include "tensorsharp_q35_dflash.cuh"

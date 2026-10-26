@@ -1,5 +1,6 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
+#include "ggml_ops_cuda_launch_policy.h"
 #include "ggml_ops_internal.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -817,6 +818,7 @@ std::unique_ptr<encoder> load(const char * path, const char * backend_name, int 
                 e->cpu_attention_scratch = std::make_unique<cpu_attention_workspace>(e->cpu_blas.get());
         }
     } else {
+        require(tsg::configure_cuda_launch_policy(), "cannot configure the CUDA launch policy");
         int matched = 0;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             auto dev = ggml_backend_dev_get(i);

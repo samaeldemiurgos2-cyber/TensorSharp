@@ -151,12 +151,15 @@ public sealed class MuseSparkHostPoolTests
         Assert.Equal(0, pool.Stats.SystemFreeFailures);
     }
 
-    private sealed class Pool : IDisposable
+    internal sealed class Pool : IDisposable
     {
         private readonly Type _type = typeof(GgmlContext).Assembly.GetType("TensorSharp.GGML.GgmlMemoryPool", true)!;
         private readonly object _pool;
         private readonly ConcurrentDictionary<IntPtr, long> _owned = new();
-        internal Pool(GgmlBackendType backend) => _pool = Activator.CreateInstance(_type, backend)!;
+        // The count-bounded policy under test; byte-budgeted retention has its own tests.
+        internal Pool(GgmlBackendType backend, long retainBudgetBytes = 0) => _pool = Activator.CreateInstance(_type,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null,
+            new object[] { backend, null!, retainBudgetBytes }, null)!;
         private object Call(string name, params object[] arguments)
         {
             try { return _type.GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!.Invoke(_pool, arguments)!; }
@@ -168,6 +171,14 @@ public sealed class MuseSparkHostPoolTests
         internal IntPtr Allocate(long bytes)
         {
             IntPtr pointer = (IntPtr)Call("Allocate", bytes);
+            Assert.True(_owned.TryAdd(pointer, bytes));
+            return pointer;
+        }
+        internal IntPtr AllocateReportingZero(long bytes, out bool zeroed)
+        {
+            var arguments = new object[] { bytes, false };
+            IntPtr pointer = (IntPtr)Call("AllocateReportingZero", arguments);
+            zeroed = (bool)arguments[1];
             Assert.True(_owned.TryAdd(pointer, bytes));
             return pointer;
         }

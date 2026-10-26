@@ -232,6 +232,9 @@ namespace TensorSharp.Runtime.Speculative
         // captured by a forward of this execution (see SeedCommitted).
         private bool _carryValid = true;
 
+        // Always known when the model keeps it (ISpeculativeTarget.SpecCarryOnDevice).
+        private bool CarryValid => _carryValid || _model.SpecCarryOnDevice;
+
         /// <summary>Reset speculative state and statistics. Does NOT touch the model's KV cache.</summary>
         public void Reset()
         {
@@ -252,7 +255,7 @@ namespace TensorSharp.Runtime.Speculative
         /// positioned there. Returns a caller-owned copy of the last-position
         /// logits.
         /// </summary>
-        public float[] PrefillStep(int[] chunk, int startPos)
+        public float[] PrefillStep(int[] chunk, int startPos, int promptEnd = -1)
         {
             if (chunk == null || chunk.Length == 0)
                 throw new ArgumentException("Chunk must not be empty.", nameof(chunk));
@@ -269,6 +272,18 @@ namespace TensorSharp.Runtime.Speculative
                 // The trunk keeps the drafter in sync itself and only hands
                 // back the last row's hidden state.
                 _trunk.Forward(chunk, _pendingH, _stepLogits, allLogitsRows: false);
+            }
+            else if (promptEnd > 0 && _speculator.PrefillContextRows < int.MaxValue
+                && (long)startPos + n <= (long)promptEnd - _speculator.PrefillContextRows)
+            {
+                // Every row of this chunk is older than the drafter's context at the
+                // end of the prompt, so later rows overwrite whatever it would write.
+                // Keep only the last row's hidden state: the next chunk's carry-in.
+                // A null-row commit reports the gap.
+                EnsureChunkBuffers(1);
+                _trunk.Forward(chunk, _lastRowH, _stepLogits, allLogitsRows: false);
+                _speculator.Commit(chunk, null, startPos);
+                Array.Copy(_lastRowH, 0, _pendingH, 0, _hidden);
             }
             else
             {
@@ -343,13 +358,13 @@ namespace TensorSharp.Runtime.Speculative
                     Stats.ParkedSteps++;
             }
 
-            kMax = Math.Min(kMax, MaxDraftTokens);
+            kMax = Math.Min(kMax, Math.Min(MaxDraftTokens, _model.SpecSoloMaxDraftTokens));
             // Verify needs position + K + 1 trunk slots; drafting writes drafter
             // rows up to position + K.
             kMax = Math.Min(kMax, _model.MaxContextLength - position - 2);
             // No carried hidden state yet (armed over a plain prefill): this step
             // runs plain and captures it.
-            if (!_carryValid)
+            if (!CarryValid)
                 kMax = 0;
 
             _draftTokens.Clear();
@@ -385,7 +400,7 @@ namespace TensorSharp.Runtime.Speculative
                 // A seeded start has no carry for this token: hand the speculator the
                 // token with no hidden row (a head that starts mid-sequence accepts
                 // that, by contract) rather than a row of zeros dressed as one.
-                bool carryKnown = _carryValid;
+                bool carryKnown = CarryValid;
                 // While the GOVERNOR has parked a learned head that can resume after
                 // a gap, the hidden state is not needed - nothing will draft from it
                 // until the park ends - so the step takes the model's own decode when
@@ -553,6 +568,132 @@ namespace TensorSharp.Runtime.Speculative
                 NextLogits = nextLogits,
                 UsedSpeculation = true,
             };
+        }
+
+        /// <summary>
+        /// Batched step, first half: draft for this sequence ahead of a verify that
+        /// serves several sequences at once (<see cref="IBatchedSpeculativeTarget"/>).
+        /// The caller binds this sequence's drafter state first. Returns the number of
+        /// drafts in <paramref name="draftsOut"/>; 0 (no carry yet, no room) means the
+        /// sequence rides the verify with its anchor alone. The cost governor is not
+        /// consulted: beside other sequences a window costs a few columns of a shared
+        /// sweep, and the plain alternative is a step of the same sweep.
+        /// </summary>
+        public int ProposeForBatch(int lastToken, int position, int kMax, List<int> draftsOut,
+            Action<float[], IReadOnlyList<int>>? adjustDraftLogits = null)
+        {
+            ArgumentNullException.ThrowIfNull(draftsOut);
+            draftsOut.Clear();
+            kMax = Math.Min(kMax, MaxDraftTokens);
+            kMax = Math.Min(kMax, _model.MaxContextLength - position - 2);
+            if (!CarryValid || kMax <= 0)
+                return 0;
+            long t0 = Stopwatch.GetTimestamp();
+            _speculator.Propose(
+                new DraftContext
+                {
+                    LastToken = lastToken,
+                    Position = position,
+                    MaxTokens = kMax,
+                    CarryHidden = _pendingH,
+                    AdjustLogits = adjustDraftLogits,
+                },
+                draftsOut);
+            if (draftsOut.Count > kMax)
+                throw new InvalidOperationException(
+                    $"The {_speculator.Name} speculator proposed {draftsOut.Count} tokens "
+                    + $"for a verification window limited to {kMax} drafts.");
+            Stats.DraftTicks += Stopwatch.GetTimestamp() - t0;
+            return draftsOut.Count;
+        }
+
+        /// <summary>True when this execution's drafts can come from a block drafted for
+        /// several sequences in one pass (<see cref="IBatchedSpeculativeTarget.TryDraftBatch"/>).</summary>
+        public bool SupportsBatchDraft => NeedsHidden && _speculator is BlockDraftSpeculator;
+
+        /// <summary>
+        /// Batched step, first half when drafting for several sequences in one pass:
+        /// whether this sequence drafts at all this step and, if so, its carried
+        /// feature row and draft cap. The same gates as <see cref="ProposeForBatch"/>.
+        /// </summary>
+        public bool TryPrepareBatchDraft(int position, int kMax, [NotNullWhen(true)] out float[]? carry, out int maxTokens)
+        {
+            carry = null;
+            maxTokens = Math.Min(Math.Min(kMax, MaxDraftTokens), _model.MaxContextLength - position - 2);
+            if (!SupportsBatchDraft || !CarryValid || maxTokens <= 0)
+                return false;
+            carry = _pendingH;
+            return true;
+        }
+
+        /// <summary>Apply the drafter's gate to a block drafted for this sequence by a
+        /// multi-sequence pass. Returns the number of drafts in
+        /// <paramref name="draftsOut"/>.</summary>
+        public int AcceptBatchDraft(int[] blockTokens, float[] blockConf, int maxTokens, List<int> draftsOut, long draftTicks)
+        {
+            ArgumentNullException.ThrowIfNull(draftsOut);
+            draftsOut.Clear();
+            Stats.DraftTicks += draftTicks;
+            if (_speculator is not BlockDraftSpeculator block)
+                return 0;
+            return block.SelectDrafts(blockTokens, blockConf, Math.Min(blockTokens.Length, blockConf.Length), maxTokens, draftsOut);
+        }
+
+        /// <summary>
+        /// Batched step, second half: the trunk verified [<paramref name="lastToken"/>,
+        /// drafts] at <paramref name="position"/> and kept the anchor plus
+        /// <paramref name="accepted"/> drafts. Hands the kept tokens to the speculator
+        /// with their trunk taps (<paramref name="rowFeatures"/> from
+        /// <paramref name="rowOffset"/>, one SpecFeatureSize row per verify row) and
+        /// carries the last kept row into the next draft. The caller binds this
+        /// sequence's drafter state first and has already advanced the trunk.
+        /// </summary>
+        public void CommitBatch(int lastToken, int position, IReadOnlyList<int> drafts, int accepted,
+            float[]? rowFeatures, long rowOffset, long verifyTicks)
+        {
+            ArgumentNullException.ThrowIfNull(drafts);
+            if (accepted < 0 || accepted > drafts.Count)
+                throw new ArgumentOutOfRangeException(nameof(accepted));
+            int k = drafts.Count;
+            if (k > 0)
+            {
+                Stats.VerifySteps++;
+                Stats.TokensDrafted += k;
+                Stats.TokensAccepted += accepted;
+                if (accepted < k)
+                    Stats.RollbackSteps++;
+                Stats.VerifyTicks += verifyTicks;
+                _plainRun = 0;
+            }
+            else
+            {
+                Stats.PlainSteps++;
+                Stats.PlainTicks += verifyTicks;
+            }
+
+            int[] keep = new int[accepted + 1];
+            keep[0] = lastToken;
+            for (int i = 0; i < accepted; i++)
+                keep[i + 1] = drafts[i];
+            long tCatch0 = Stopwatch.GetTimestamp();
+            if (!NeedsHidden || rowFeatures == null)
+            {
+                _speculator.Commit(keep, null, position);
+                _carryValid = !NeedsHidden;
+            }
+            else
+            {
+                // Row k pairs token k with the taps of the token before it: the carried
+                // row for the anchor, then the verify rows of the kept prefix.
+                bool carryKnown = CarryValid;
+                Array.Copy(_pendingH, 0, _catchUpH, 0, _hidden);
+                if (accepted > 0)
+                    Array.Copy(rowFeatures, rowOffset, _catchUpH, _hidden, (long)accepted * _hidden);
+                _speculator.Commit(keep, carryKnown ? _catchUpH : null, position);
+                Array.Copy(rowFeatures, rowOffset + (long)accepted * _hidden, _pendingH, 0, _hidden);
+                _carryValid = true;
+            }
+            Stats.CatchUpTicks += Stopwatch.GetTimestamp() - tCatch0;
         }
 
         public void Dispose() => _speculator.Dispose();

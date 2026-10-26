@@ -105,6 +105,29 @@ namespace TensorSharp.GGML
                 throw new InvalidOperationException($"Fill only supports Float32, Float16, Q8_0 and Q4_0 GGML tensors (got {result.ElementType}).");
 
             float* buffer = (float*)GetBufferStart(result);
+            // Recurrent-state resets fill tens of millions of contiguous floats per
+            // request; the strided iterator below costs hundreds of milliseconds there.
+            if (IsContiguousView(result))
+            {
+                long remaining = result.ElementCount();
+                if (value == 0f)
+                {
+                    HostMemory.Clear(buffer, remaining * sizeof(float));
+                    return;
+                }
+                float* cursor = buffer;
+                while (remaining > 0)
+                {
+                    int slice = (int)Math.Min(remaining, int.MaxValue);
+                    var span = new Span<float>(cursor, slice);
+                    if (value == 0f) span.Clear();
+                    else span.Fill(value);
+                    cursor += slice;
+                    remaining -= slice;
+                }
+                return;
+            }
+
             TensorIterState iter = new TensorIterState(buffer, result.DimensionCount, result.SizesMemory, result.StridesMemory);
 
             do
@@ -126,6 +149,18 @@ namespace TensorSharp.GGML
                 expected *= t.Sizes[d];
             }
             return expected == t.ElementCount();
+        }
+
+        // Row-major contiguous from the view's first element; a storage offset is allowed.
+        private static bool IsContiguousView(Tensor t)
+        {
+            long expected = 1;
+            for (int d = t.DimensionCount - 1; d >= 0; d--)
+            {
+                if (t.Sizes[d] != 1 && t.Strides[d] != expected) return false;
+                expected *= t.Sizes[d];
+            }
+            return true;
         }
 
         // Detects the common 2D contiguous float32 layout that lets us
@@ -1428,6 +1463,91 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// The whole Qwen3.5-family encoder plus its post-LN spatial merger as one
+        /// graph: writes the projected [merged, out] rows into <paramref name="merged"/>.
+        /// <paramref name="hidden"/> is the encoder input and is not written back.
+        /// </summary>
+        public static unsafe bool Qwen35VisionEncoderMerged(
+            Tensor hidden, Tensor merged, float eps, float attnScale,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            float[] cosTable, float[] sinTable,
+            Tensor[] ln1W, Tensor[] ln1B, Tensor[] qkvW, Tensor[] qkvB,
+            Tensor[] outW, Tensor[] outB, Tensor[] ln2W, Tensor[] ln2B,
+            Tensor[] upW, Tensor[] upB, Tensor[] downW, Tensor[] downB, bool geluErf,
+            Tensor postLnW, Tensor postLnB, Tensor fc1W, Tensor fc1B, Tensor fc2W, Tensor fc2B,
+            int mergeUnit, bool mergerGeluErf)
+        {
+            if (!HasNativeBufferStorage(hidden) || !HasNativeBufferStorage(merged))
+                return false;
+            if (!TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView)
+                || !TryCreateStandardView(merged, out GgmlTensorView2D mergedView))
+                return false;
+            int blockCount = ln1W.Length;
+            if (blockCount == 0)
+                return false;
+            // Linear weights (blocks and merger) are all F32 or all F16; norms and biases stay F32.
+            DType linear = qkvW[0].ElementType;
+            if (linear != DType.Float32 && linear != DType.Float16)
+                return false;
+            foreach (Tensor[] set in new[] { qkvW, outW, upW, downW })
+                foreach (Tensor t in set)
+                    if (t.ElementType != linear || !t.IsContiguous())
+                        return false;
+            foreach (Tensor t in new[] { postLnW, postLnB, fc1B, fc2B })
+                if (t == null || t.ElementType != DType.Float32 || !t.IsContiguous())
+                    return false;
+            foreach (Tensor t in new[] { fc1W, fc2W })
+                if (t == null || t.ElementType != linear || !t.IsContiguous())
+                    return false;
+            int linearBytes = linear == DType.Float16 ? 2 : sizeof(float);
+
+            IntPtr[] Ptrs(Tensor[] ws)
+            {
+                var a = new IntPtr[blockCount];
+                for (int i = 0; i < blockCount; i++)
+                    a[i] = GetBufferStart(ws[i]);
+                return a;
+            }
+
+            var args = new GgmlNative.VisionMergerArgs
+            {
+                StructBytes = Marshal.SizeOf<GgmlNative.VisionMergerArgs>(),
+                MergeUnit = mergeUnit,
+                GeluErf = mergerGeluErf ? 1 : 0,
+                LnDim = (int)postLnW.ElementCount(),
+                PostLnW = GetBufferStart(postLnW),
+                PostLnB = GetBufferStart(postLnB),
+                Fc1W = GetBufferStart(fc1W),
+                Fc1B = GetBufferStart(fc1B),
+                Fc1Ne0 = (int)fc1W.Sizes[fc1W.DimensionCount - 1],
+                Fc1Ne1 = (int)fc1W.Sizes[0],
+                Fc2W = GetBufferStart(fc2W),
+                Fc2B = GetBufferStart(fc2B),
+                Fc2Ne0 = (int)fc2W.Sizes[fc2W.DimensionCount - 1],
+                Fc2Ne1 = (int)fc2W.Sizes[0],
+            };
+            fixed (float* cosPtr = cosTable, sinPtr = sinTable)
+            {
+                return GgmlNative.Qwen35VisionEncoderMerged(hiddenView, mergedView, args,
+                    blockCount, eps, attnScale, numPatches, numHeads, headDim, halfDim,
+                    (IntPtr)cosPtr, (IntPtr)sinPtr,
+                    Ptrs(ln1W), Ptrs(ln1B), Ptrs(qkvW), Ptrs(qkvB),
+                    Ptrs(outW), Ptrs(outB), Ptrs(ln2W), Ptrs(ln2B),
+                    Ptrs(upW), Ptrs(upB), Ptrs(downW), Ptrs(downB),
+                    (int)ln1W[0].ElementCount(),
+                    (int)qkvW[0].Sizes[qkvW[0].DimensionCount - 1], (int)qkvW[0].Sizes[0],
+                    qkvW[0].ElementCount() * linearBytes, (int)qkvB[0].ElementCount(),
+                    (int)outW[0].Sizes[outW[0].DimensionCount - 1], (int)outW[0].Sizes[0],
+                    outW[0].ElementCount() * linearBytes, (int)outB[0].ElementCount(),
+                    (int)upW[0].Sizes[upW[0].DimensionCount - 1], (int)upW[0].Sizes[0],
+                    upW[0].ElementCount() * linearBytes, (int)upB[0].ElementCount(),
+                    (int)downW[0].Sizes[downW[0].DimensionCount - 1], (int)downW[0].Sizes[0],
+                    downW[0].ElementCount() * linearBytes, (int)downB[0].ElementCount(), geluErf,
+                    linear == DType.Float16 ? 1 : 0);
+            }
+        }
+
+        /// <summary>
         /// Fused Gemma-4 SigLIP vision block: the whole EncoderBlock (RMSNorm + QKV +
         /// per-head QK/V RMSNorm + 2D split RoPE + SDPA + out proj + sandwich post-norm
         /// + residual, then RMSNorm + gated QuickGELU MLP + sandwich post-norm +
@@ -1775,10 +1895,24 @@ namespace TensorSharp.GGML
         /// <summary>True if the active GGML backend device is an integrated GPU (unified-memory iGPU).</summary>
         public static bool IsActiveDeviceIntegrated() => GgmlNative.IsActiveDeviceIntegrated();
         public static void SyncHostBuffer(IntPtr ptr, long byteCount) => GgmlNative.SyncHostBuffer(ptr, byteCount);
+        public static void PrefaultHostSpans(IntPtr[] ptrs, long[] lengths) => GgmlNative.PrefaultHostSpans(ptrs, lengths);
         public static void SyncHostBufferRanges(IntPtr ptr, ReadOnlySpan<long> offsets, ReadOnlySpan<long> lengths)
             => GgmlNative.SyncHostBufferRanges(ptr, offsets, lengths);
+        public static int SyncIdleHostBufferRanges(IntPtr ptr, ReadOnlySpan<long> offsets, ReadOnlySpan<long> lengths)
+            => GgmlNative.SyncIdleHostBufferRanges(ptr, offsets, lengths);
+        public static int DownloadDeviceCopyRanges(IntPtr srcKey, IntPtr dst,
+            ReadOnlySpan<long> srcOffsets, ReadOnlySpan<long> dstOffsets, ReadOnlySpan<long> lengths)
+            => GgmlNative.DownloadDeviceCopyRanges(srcKey, dst, srcOffsets, dstOffsets, lengths);
         public static void UploadHostBufferRanges(IntPtr ptr, ReadOnlySpan<long> offsets, ReadOnlySpan<long> lengths)
             => GgmlNative.UploadHostBufferRanges(ptr, offsets, lengths);
+        public static bool CopyDeviceCopyRanges(IntPtr srcKey, long srcBytes, IntPtr dstKey, long dstBytes,
+            ReadOnlySpan<long> srcOffsets, ReadOnlySpan<long> dstOffsets, ReadOnlySpan<long> lengths, bool zeroDestination)
+            => GgmlNative.CopyDeviceCopyRanges(srcKey, srcBytes, dstKey, dstBytes, srcOffsets, dstOffsets, lengths, zeroDestination);
+        public static bool UploadToDeviceCopyRanges(IntPtr srcHost, long srcBytes, IntPtr dstKey, long dstBytes,
+            ReadOnlySpan<long> srcOffsets, ReadOnlySpan<long> dstOffsets, ReadOnlySpan<long> lengths, bool zeroDestination)
+            => GgmlNative.UploadToDeviceCopyRanges(srcHost, srcBytes, dstKey, dstBytes, srcOffsets, dstOffsets, lengths, zeroDestination);
+        public static bool EnsureDeviceCopyFromHost(IntPtr key, long bytes) => GgmlNative.EnsureDeviceCopyFromHost(key, bytes);
+        public static long CachedBufferBytes(IntPtr key) => GgmlNative.CachedBufferBytes(key);
         public static void SetAsyncCompute(bool enabled) => GgmlNative.SetAsyncCompute(enabled);
         public static bool GetAsyncCompute() => GgmlNative.GetAsyncCompute();
 
@@ -1813,13 +1947,33 @@ namespace TensorSharp.GGML
             IntPtr encNormData,
             IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
             IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
-            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype)
+            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype, float[] scales = null)
             => GgmlNative.DFlashInject(featRows, featureSize, nRows, ringRowsIdx, positions,
                 numLayers, hiddenSize, headDim, numKvHeads, ringRows,
                 eps, ropeBase, ropeFreqScale, fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
                 kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
-                kNormArr, ringKArr, ringVArr, ringDtype);
+                kNormArr, ringKArr, ringVArr, ringDtype, scales);
+
+        /// <summary>DFlash PASS A+B for several rings in one GGML graph (CUDA).</summary>
+        public static bool DFlashInjectBatched(
+            int nLanes, int maxRows, int totalRows,
+            float[] featRows, int featureSize,
+            int[] gather, long[] ringRowsIdx, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale,
+            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
+            IntPtr encNormData,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype, float[] scales = null)
+            => GgmlNative.DFlashInjectBatched(nLanes, maxRows, totalRows, featRows, featureSize,
+                gather, ringRowsIdx, positions,
+                numLayers, hiddenSize, headDim, numKvHeads, ringRows,
+                eps, ropeBase, ropeFreqScale, fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                kNormArr, ringKArr, ringVArr, ringDtype, scales);
 
         /// <summary>DFlash PASS C in one GGML graph: the block draft, then either the
         /// borrowed LM head + softmax + on-device top-1 (plain DFlash) or the DFlash2
@@ -1855,7 +2009,7 @@ namespace TensorSharp.GGML
             IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
             IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
             IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
-            float[] selScoresOut, int[] selCandOut)
+            float[] selScoresOut, int[] selCandOut, float[] scales = null)
             => GgmlNative.DFlashDraftBlock(blockIds, blockLen, positions,
                 numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows,
                 eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow,
@@ -1882,7 +2036,47 @@ namespace TensorSharp.GGML
                 selHiddenData, selHiddenType, selHiddenNe0, selHiddenNe1, selHiddenBytes,
                 selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes,
                 selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes,
-                selScoresOut, selCandOut);
+                selScoresOut, selCandOut, scales);
+
+        /// <summary>DFlash PASS C for several sequences in one graph; see
+        /// <see cref="GgmlNative.DFlashDraftBlockBatched"/>.</summary>
+        public static bool DFlashDraftBlockBatched(
+            int nLanes, int[] blockIds, int blockLen, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale, float kqScale,
+            int[] ringSlotPos, int slidingWindow,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
+            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
+            IntPtr outNormData,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocabSize, int[] idsOut, float[] confOut,
+            
+            
+            int convTaps, int convGroupSize, int convNumGroups,
+            IntPtr[] attnConvBaseArr,
+            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
+            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
+            IntPtr[] ffnConvBaseArr,
+            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
+            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
+            
+            
+            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
+            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
+            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
+            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
+            float[] selScoresOut, int[] selCandOut, float[] scales)
+            => GgmlNative.DFlashDraftBlockBatched(nLanes, blockIds, blockLen, positions, numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows, eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow, attnNormArr, qArr, qTypeArr, qNe0Arr, qNe1Arr, qBytesArr, kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr, vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr, qNormArr, kNormArr, oArr, oTypeArr, oNe0Arr, oNe1Arr, oBytesArr, ffnNormArr, gateArr, gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr, upArr, upTypeArr, upNe0Arr, upNe1Arr, upBytesArr, downArr, downTypeArr, downNe0Arr, downNe1Arr, downBytesArr, ringKArr, ringVArr, ringDtype, outNormData, tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, vocabSize, idsOut, confOut, convTaps, convGroupSize, convNumGroups, attnConvBaseArr, attnConvProjArr, attnConvProjTypeArr, attnConvProjNe0Arr, attnConvProjNe1Arr, attnConvProjBytesArr, ffnConvBaseArr, ffnConvProjArr, ffnConvProjTypeArr, ffnConvProjNe0Arr, ffnConvProjNe1Arr, ffnConvProjBytesArr, selRank, selTopK, selLogitScale, selLogitSoftcap, selHiddenData, selHiddenType, selHiddenNe0, selHiddenNe1, selHiddenBytes, selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes, selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes, selScoresOut, selCandOut, scales);
 
         /// <summary>Drop the persistent DFlash graphs.</summary>
         public static void DFlashResetCaches() => GgmlNative.DFlashResetCaches();
@@ -2433,6 +2627,36 @@ namespace TensorSharp.GGML
             return status == 1;
         }
 
+        /// <summary>Qwen3.5/3.8 batched speculative verify; see
+        /// <see cref="GgmlNative.Qwen35BatchedVerify"/>.</summary>
+        public static int Qwen35BatchedVerify(
+            Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs, int nTok,
+            int[] tokenIds, int[] positions, int[] ropePositions,
+            IntPtr[] kCaches, IntPtr[] vCaches, IntPtr[] convStates, IntPtr[] deltaStates,
+            int[] cacheSizes,
+            int numHeads, int numKvHeads, int headDim, int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm,
+            IntPtr tokenEmbd, int tokenEmbdType, long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
+            int[] captureLayers, float[] captureData, int[] sampled)
+            => GgmlNative.Qwen35BatchedVerify(layers, numLayers, nSeqs, nTok, tokenIds, positions, ropePositions,
+                kCaches, vCaches, convStates, deltaStates, cacheSizes,
+                numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads, eps, ropeBase, ropeFreqScale,
+                vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm,
+                tokenEmbd, tokenEmbdType, tokenEmbdNe0, tokenEmbdNe1, tokenEmbdBytes,
+                captureLayers, captureData, sampled);
+
+        public static int Qwen35BatchedVerifyCommit(int[] accepted) => GgmlNative.Qwen35BatchedVerifyCommit(accepted);
+
+        public static void Qwen35BatchedVerifyReset() => GgmlNative.Qwen35BatchedVerifyReset();
+
+        /// <summary>True when qwen35 batched decode binds the holders' own resident caches.</summary>
+        public static bool Qwen35ArenaUsesHolderBuffers() => GgmlNative.Qwen35ArenaUsesHolderBuffers();
+
         /// <summary>Drop the qwen35 arena batched-decode pool (flushes dirty
         /// slots to host first). Call on model teardown.</summary>
         public static void Qwen35ArenaResetBatchedDecodeCache() => GgmlNative.Qwen35ArenaResetBatchedDecodeCache();
@@ -2664,6 +2888,36 @@ namespace TensorSharp.GGML
             int numRecurrentLayers, long ownerId = 0)
             => GgmlNative.Qwen35DrainDeviceState(
                 convOut, deltaOut, numRecurrentLayers, ownerId);
+
+        /// <summary>Copy the live device recurrent state to host buffers, leaving it
+        /// live (see TSGgml_Qwen35ReadLiveStateOwned).</summary>
+        public static bool Qwen35ReadLiveState(IntPtr[] convOut, IntPtr[] deltaOut,
+            int numRecurrentLayers, long ownerId = 0)
+            => GgmlNative.Qwen35ReadLiveState(convOut, deltaOut, numRecurrentLayers, ownerId);
+
+        /// <summary>Zero the live device recurrent state
+        /// (see TSGgml_Qwen35ZeroLiveStateOwned).</summary>
+        public static bool Qwen35ZeroLiveState(IntPtr sig, int numRecurrentLayers,
+            long convBytes, long deltaBytes, long ownerId)
+            => GgmlNative.Qwen35ZeroLiveState(sig, numRecurrentLayers, convBytes, deltaBytes, ownerId);
+
+        /// <summary>Forget the live device recurrent state
+        /// (see TSGgml_Qwen35DiscardLiveStateOwned).</summary>
+        public static void Qwen35DiscardLiveState(long ownerId)
+            => GgmlNative.Qwen35DiscardLiveState(ownerId);
+
+        /// <summary>Move the live device recurrent state into a sequence's device copies
+        /// (see TSGgml_Qwen35ExportLiveStateOwned).</summary>
+        public static bool Qwen35ExportLiveState(IntPtr[] convKeys, IntPtr[] deltaKeys,
+            int numRecurrentLayers, long ownerId)
+            => GgmlNative.Qwen35ExportLiveState(convKeys, deltaKeys, numRecurrentLayers, ownerId);
+
+        /// <summary>Seed the live device recurrent state from a sequence's device copies
+        /// (see TSGgml_Qwen35ImportLiveStateOwned).</summary>
+        public static bool Qwen35ImportLiveState(IntPtr sig, IntPtr[] convKeys, IntPtr[] deltaKeys,
+            int numRecurrentLayers, long convBytes, long deltaBytes, long ownerId)
+            => GgmlNative.Qwen35ImportLiveState(
+                sig, convKeys, deltaKeys, numRecurrentLayers, convBytes, deltaBytes, ownerId);
 
         /// <summary>Pull one per-token recurrent-state snapshot out of the verify that
         /// just ran (see TSGgml_Qwen35FetchStateSnapshotOwned).</summary>

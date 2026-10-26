@@ -2,6 +2,8 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Runtime;
 
@@ -15,8 +17,12 @@ namespace TensorSharp.Models
             Id = "deepseek41",
             DisplayName = "DeepSeek V4.1 Flash",
             Aliases = new[] { "deepseek41" },
-            MultiGpu = MultiGpuMode.LayerSplit,
-            MultiGpuLimitation = "DeepSeek V4.1 (deepseek41) uses a single-process native executor with layer placement and optional routed-MoE tensor parallelism; full attention tensor parallelism and distributed groups are not implemented.",
+            MultiGpu = MultiGpuMode.TensorParallel,
+            DistributedTensorParallelBackends = new[] { BackendType.GgmlCuda },
+            SupportsLayerSplit = true,
+            SupportsDistributedLayerSplit = true,
+            DistributedLayerSplitBackends = new[] { BackendType.GgmlCuda },
+            MultiGpuLimitation = "DeepSeek V4.1 uses native routed-MoE tensor parallelism; attention and shared experts retain local layer placement.",
             SupportsNativeTensorParallel = (degree, backend) => backend == BackendType.GgmlCuda &&
                 degree is >= 2 and <= 8,
             DescribeMultiGpuPlacement = DescribePlacement,
@@ -59,10 +65,9 @@ namespace TensorSharp.Models
             // here, before the checkpoint is opened, instead of loading with F16
             // caches while reporting the requested dtype (which is what happened).
             DeepSeek4Architecture.RefuseBlockQuantizedKvCache("DeepSeek V4.1 Flash", v41: true);
-            if (tpGroup != null)
-                throw new NotSupportedException(
-                    "DeepSeek V4.1 uses a single-process native executor and does not support distributed tensor-parallel groups. " +
-                    "Start without --tp-node-id/--tp-peers.");
+            ValidateTensorParallelGroup(backend, tpDegree, tpGroup);
+            if (tpGroup?.NodeCount > 1 && !string.IsNullOrWhiteSpace(draftModelPath))
+                throw new NotSupportedException("Distributed DeepSeek V4.1 tensor parallelism does not mirror DSpark operations; omit --draft-model.");
             if (!string.IsNullOrWhiteSpace(draftModelPath) &&
                 backend != BackendType.GgmlCuda && backend != BackendType.GgmlCpu)
                 throw new NotSupportedException(
@@ -177,6 +182,61 @@ namespace TensorSharp.Models
             return tpDegree > 1 ? tpDegree : 0;
         }
 
+        internal static void ValidateTensorParallelGroup(BackendType backend, int tpDegree, ITensorParallelGroup group)
+        {
+            ResolveTensorParallelRanks(tpDegree);
+            if (group == null) return;
+            if (group is ILayerSplitGroup layer)
+            {
+                if (backend != BackendType.GgmlCuda || tpDegree != 1 || layer.NodeCount < 2 ||
+                    layer.Degree is < 1 or > 8 || layer.NodeId < 0 || layer.NodeId >= layer.NodeCount)
+                    throw new NotSupportedException("DeepSeek distributed layer split requires ggml_cuda, --tp 1 and 1..8 GPUs per node.");
+                return;
+            }
+            if (backend != BackendType.GgmlCuda)
+                throw new NotSupportedException("DeepSeek V4.1 distributed tensor parallelism requires --backend ggml_cuda.");
+            if (group.NodeCount < 2 || group is not INestedTensorParallelGroup)
+                throw new NotSupportedException("DeepSeek V4.1 distributed TP requires the existing nested group and its cross-node AllReduce transport.");
+            if (group.Degree != tpDegree || group.Degree is < 1 or > 8 ||
+                group.GlobalDegree <= group.Degree || group.GlobalDegree > 16 ||
+                group.GlobalRankOffset < 0 || group.GlobalRankOffset > group.GlobalDegree - group.Degree ||
+                group.GlobalDegree != (long)group.NodeCount * group.Degree || group.GlobalRankOffset % group.Degree != 0)
+                throw new ArgumentException("DeepSeek V4.1 TP requires matching local --tp (1..8), 2..16 global ranks, and a complete contiguous global rank interval per node.");
+        }
+
+        // Agree before opening native weight buffers: differing ubatches,
+        // offload layers or YOCO schedules otherwise enter incompatible
+        // collectives. Bit votes are exact F32 integers even across 16 nodes;
+        // summing a digest as ordinary float values could hide a mismatch.
+        internal static void ValidateDistributedExecutionConfig(ITensorParallelGroup group, string configuration)
+        {
+            if (group == null || group.NodeCount <= 1) return;
+            if (group is not INestedTensorParallelGroup nested)
+                throw new NotSupportedException("Distributed DeepSeek V4.1 needs the existing cross-node AllReduce transport.");
+            byte[] digest = SHA256.HashData(Encoding.UTF8.GetBytes(configuration));
+            var votes = new float[digest.Length * 8];
+            for (int bit = 0; bit < votes.Length; ++bit)
+                votes[bit] = (digest[bit / 8] >> (bit % 8)) & 1;
+            nested.CrossNodeAllReduce(votes, votes.Length);
+            for (int bit = 0; bit < votes.Length; ++bit)
+                if (votes[bit] != (((digest[bit / 8] >> (bit % 8)) & 1) * group.NodeCount))
+                    throw new InvalidOperationException("DeepSeek V4.1 distributed nodes have different model metadata or execution settings. Use the same checkpoint, context, prefill width, CPU-MoE count and YOCO policy on every node.");
+        }
+
+        internal static string DistributedNumericalOptions()
+        {
+            var options = new StringBuilder();
+            foreach (string name in new[]
+            {
+                "TS_DSV4_FUSED", "TS_DSV4_FA", "TS_DSV4_GATHER",
+                "TS_DSV41_SPARSE_FA", "TS_DSV41_COMPACT_RAW_GATHER",
+                "TS_DSV41_ENGRAM_DEVICE", "TS_DSV41_KV_MIRRORS", "TS_DSV41_REWIND_CHECKPOINT",
+            })
+                options.Append('|').Append(name).Append('=')
+                    .Append(Environment.GetEnvironmentVariable(name) ?? "<default>");
+            return options.ToString();
+        }
+
         internal static void ValidateDsparkArchitecture(string architecture)
         {
             if (!string.Equals(architecture, "deepseek41-dspark", StringComparison.Ordinal))
@@ -210,6 +270,6 @@ namespace TensorSharp.Models
             => $"  Multi-GPU: DeepSeek V4.1 routed-MoE tensor parallelism across {ranks} GPUs: " +
                "gate/up/down expert dimensions are sharded, with exact F32 activation/output gathers. " +
                "Attention and shared experts retain layer placement; CPU-offloaded layers retain whole CPU experts. " +
-               "Full attention tensor parallelism and distributed groups are not supported.";
+               "Distributed groups use the same shards and the existing cross-node F32 collective transport.";
     }
 }

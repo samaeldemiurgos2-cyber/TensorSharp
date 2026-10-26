@@ -1096,7 +1096,7 @@ static enum ggml_status tsg_dsv4_backend_graph_compute(ggml_backend_t backend, g
             tsg_matmul_q8_cuda_compute(node, c->cuda_backend);
         else if (d->kind == TSG_ATTN_F32_PARTIAL || d->kind == TSG_ATTN_F32_FINISH ||
                  d->kind == TSG_ATTN_F32_SOFTMAX || d->kind == TSG_ATTN_MASK_COMPACT ||
-                 d->kind == TSG_ATTN_VISION_F32)
+                 d->kind == TSG_ATTN_VISION_F32 || d->kind == TSG_ATTN_VISION_MMA)
             tsg_attention_cuda_compute(node, c->cuda_backend);
         else if (d->kind == TSG_DSV41_TP_MOE)
         {

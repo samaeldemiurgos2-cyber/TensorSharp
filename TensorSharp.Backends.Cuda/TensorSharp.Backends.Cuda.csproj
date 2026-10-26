@@ -28,7 +28,14 @@
     <CudaArchResolverSh>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'resolve-cuda-arch.sh'))</CudaArchResolverSh>
     <CudaArch Condition="'$(CudaArch)' == '' And '$(TENSORSHARP_CUDA_ARCH)' != ''">$(TENSORSHARP_CUDA_ARCH)</CudaArch>
     <CudaArch Condition="'$(CudaArch)' == ''">auto</CudaArch>
-    <CudaArchFallback Condition="'$(CudaArchFallback)' == ''">compute_61</CudaArchFallback>
+    <!-- CudaArchFallback (the target when no GPU is detected) defaults by toolkit:
+         compute_61 for CUDA 12, compute_75 for CUDA 13+, which dropped the
+         pre-Turing targets. Set it to pin one. -->
+    <!-- Besides PTX, nvcc builds a .fatbin per kernel file: SASS for the resolved
+         architecture (or for every CudaFatbinArchitectures entry, e.g. "75,86,89,90,120")
+         plus that PTX. A driver older than the toolkit can load the SASS - CUDA
+         minor-version compatibility - but cannot JIT the toolkit's newer PTX. -->
+    <CudaEmitFatbin Condition="'$(CudaEmitFatbin)' == ''">true</CudaEmitFatbin>
     <CudaNvccOptimizationFlags Condition="'$(CudaNvccOptimizationFlags)' == ''">-O3 --extra-device-vectorization</CudaNvccOptimizationFlags>
     <CudaEnableFastMath Condition="'$(CudaEnableFastMath)' == ''">false</CudaEnableFastMath>
     <CudaFastMathFlag Condition="'$(CudaEnableFastMath)' == 'true' Or '$(CudaEnableFastMath)' == 'True'">--use_fast_math</CudaFastMathFlag>
@@ -51,17 +58,24 @@
   </ItemGroup>
 
   <Target Name="DetectCudaPtxBuildSettings">
-    <Exec Command="nvcc --version" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
+    <Exec Command="nvcc --version" IgnoreExitCode="true" ConsoleToMSBuild="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ExitCode" PropertyName="_NvccExitCode" />
+      <Output TaskParameter="ConsoleOutput" PropertyName="_NvccVersionText" />
     </Exec>
+    <PropertyGroup>
+      <_NvccMajor>$([System.Text.RegularExpressions.Regex]::Match('$(_NvccVersionText)', 'release (\d+)\.').Groups[1].Value)</_NvccMajor>
+      <_CudaArchFallback Condition="'$(CudaArchFallback)' != ''">$(CudaArchFallback)</_CudaArchFallback>
+      <_CudaArchFallback Condition="'$(_CudaArchFallback)' == '' And '$(_NvccMajor)' != '' And $(_NvccMajor) &gt;= 13">compute_75</_CudaArchFallback>
+      <_CudaArchFallback Condition="'$(_CudaArchFallback)' == ''">compute_61</_CudaArchFallback>
+    </PropertyGroup>
     <Exec Condition="'$(_NvccExitCode)' == '0' And '$(TensorSharpUpdateCommittedPtx)' != 'true' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$([MSBuild]::IsOSPlatform(Windows))' == 'true'"
-          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(CudaArchResolverPs1)&quot; -FallbackArch &quot;$(CudaArchFallback)&quot;"
+          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(CudaArchResolverPs1)&quot; -FallbackArch &quot;$(_CudaArchFallback)&quot;"
           ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_DetectedCudaArch" />
       <Output TaskParameter="ExitCode" PropertyName="_DetectCudaArchExitCode" />
     </Exec>
     <Exec Condition="'$(_NvccExitCode)' == '0' And '$(TensorSharpUpdateCommittedPtx)' != 'true' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$([MSBuild]::IsOSPlatform(Windows))' != 'true'"
-          Command="sh &quot;$(CudaArchResolverSh)&quot; &quot;$(CudaArchFallback)&quot;"
+          Command="sh &quot;$(CudaArchResolverSh)&quot; &quot;$(_CudaArchFallback)&quot;"
           ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_DetectedCudaArch" />
       <Output TaskParameter="ExitCode" PropertyName="_DetectCudaArchExitCode" />
@@ -72,19 +86,42 @@
        the portable-baseline policy can also be checked without nvcc or a GPU. -->
   <Target Name="ResolveCudaPtxArchitecture">
     <Error Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(CudaArch)' != 'auto' And '$(CudaArch)' != 'native' And '$(CudaArch)' != 'compute_61' And '$(CudaArch)' != 'sm_61'"
-           Text="The committed CUDA PTX baseline must target compute_61 for machines without nvcc. Use -p:CudaArch=compute_61 (with a toolkit that supports it), or omit TensorSharpUpdateCommittedPtx for a GPU-specific local build. Requested target: $(CudaArch)." />
+           Text="The committed CUDA PTX baseline must target compute_61 for machines without nvcc. Use -p:CudaArch=compute_61 (with a CUDA 12 toolkit; CUDA 13 starts at compute_75), or omit TensorSharpUpdateCommittedPtx for a GPU-specific local build. Requested target: $(CudaArch)." />
     <PropertyGroup>
+      <_CudaArchFallback Condition="'$(_CudaArchFallback)' == ''">$(CudaArchFallback)</_CudaArchFallback>
+      <_CudaArchFallback Condition="'$(_CudaArchFallback)' == ''">compute_61</_CudaArchFallback>
       <_ResolvedCudaArch Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true'">compute_61</_ResolvedCudaArch>
       <_ResolvedCudaArch Condition="'$(TensorSharpUpdateCommittedPtx)' != 'true' And '$(CudaArch)' != 'auto' And '$(CudaArch)' != 'native'">$(CudaArch)</_ResolvedCudaArch>
       <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == '' And '$(_DetectCudaArchExitCode)' == '0' And '$(_DetectedCudaArch)' != ''">$(_DetectedCudaArch.Trim())</_ResolvedCudaArch>
-      <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == ''">$(CudaArchFallback)</_ResolvedCudaArch>
+      <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == ''">$(_CudaArchFallback)</_ResolvedCudaArch>
+      <!-- The committed baseline is PTX only; GPU-specific builds also get a fatbin. -->
+      <_CudaFatbinArch Condition="'$(TensorSharpUpdateCommittedPtx)' != 'true' And '$(CudaEmitFatbin)' == 'true'">$([System.Text.RegularExpressions.Regex]::Match('$(_ResolvedCudaArch)', '^(?:compute|sm)_(\d{2,3})$').Groups[1].Value)</_CudaFatbinArch>
+      <_CudaFatbinSassArchs Condition="'$(_CudaFatbinArch)' != '' And '$(CudaFatbinArchitectures)' != ''">$(CudaFatbinArchitectures.Replace(',', ';').Replace(' ', ''))</_CudaFatbinSassArchs>
+      <_CudaFatbinSassArchs Condition="'$(_CudaFatbinArch)' != '' And '$(_CudaFatbinSassArchs)' == ''">$(_CudaFatbinArch)</_CudaFatbinSassArchs>
+    </PropertyGroup>
+    <ItemGroup>
+      <!-- The comma-to-semicolon Replace above leaves its ';' escaped. -->
+      <_CudaFatbinSass Include="$([MSBuild]::Unescape($(_CudaFatbinSassArchs)))" />
+    </ItemGroup>
+    <PropertyGroup>
+      <!-- Built from the PTX, so every SASS entry must be at or above its target
+           (CI resolves to the compute_75 fallback on GPU-less runners). -->
+      <!-- Blackwell RTX SASS is built for the architecture-specific target (sm_120a / sm_121a):
+           it runs on every device of that family and enables the block-scaled FP4 tensor-core
+           MMA the direct-CUDA Qwen3.5 engine uses (tensorsharp_q35_kernels.cu). -->
+      <_CudaFatbinGencode Condition="'$(_CudaFatbinArch)' != ''">@(_CudaFatbinSass->'-gencode arch=compute_%(Identity),code=sm_%(Identity)', ' ') -gencode arch=compute_$(_CudaFatbinArch),code=compute_$(_CudaFatbinArch)</_CudaFatbinGencode>
+      <_CudaFatbinGencode Condition="'$(_CudaFatbinGencode)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(_CudaFatbinGencode)', 'arch=compute_(12[01]),code=sm_12[01]\b', 'arch=compute_$1a,code=sm_$1a'))</_CudaFatbinGencode>
       <_CudaBuildSettingsKey>$(_ResolvedCudaArch.Replace('compute_', 'compute_').Replace('sm_', 'sm_'))_$(CudaNvccOptimizationFlags.Replace(' ', '_').Replace('-', ''))$(CudaFastMathFlag.Replace(' ', '_').Replace('-', ''))</_CudaBuildSettingsKey>
+      <_CudaFatbinOutputs Condition="'$(_CudaFatbinArch)' != ''">@(CudaKernel->'$(PtxOutputDir)/%(Filename).fatbin')</_CudaFatbinOutputs>
+      <_CudaBuildSettingsKey Condition="'$(_CudaFatbinArch)' != ''">$(_CudaBuildSettingsKey)_fatbin$(_CudaFatbinSassArchs.Replace(';', '-'))</_CudaBuildSettingsKey>
     </PropertyGroup>
   </Target>
 
   <Target Name="ResolveCudaPtxBuildSettings" DependsOnTargets="DetectCudaPtxBuildSettings;ResolveCudaPtxArchitecture">
     <Error Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(_NvccExitCode)' != '0'"
            Text="Refreshing the committed CUDA PTX baseline requires nvcc on PATH and a toolkit that supports compute_61. Omit TensorSharpUpdateCommittedPtx to build with the existing committed kernels." />
+    <Error Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(_NvccMajor)' != '' And $(_NvccMajor) &gt;= 13"
+           Text="Refreshing the committed CUDA PTX baseline needs a CUDA 12 nvcc: the baseline targets compute_61, which CUDA $(_NvccMajor) no longer compiles. Put a CUDA 12 toolkit first on PATH for the refresh." />
     <!-- PTX files share one output directory across architecture settings.
          A prior compute_61 stamp cannot prove that later GPU-specific output
          is portable. Invalidate it for explicit baseline refreshes only. -->
@@ -92,8 +129,9 @@
             Files="$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp" />
     <Message Condition="'$(_NvccExitCode)' == '0' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$(_DetectCudaArchExitCode)' != '' And '$(_DetectCudaArchExitCode)' != '0'"
              Importance="high"
-             Text="WARNING: TensorSharp CUDA architecture detection failed; using $(CudaArchFallback)." />
+             Text="WARNING: TensorSharp CUDA architecture detection failed; using $(_CudaArchFallback)." />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="TensorSharp CUDA build: PTX target is $(_ResolvedCudaArch)" />
+    <Message Condition="'$(_NvccExitCode)' == '0' And '$(_CudaFatbinGencode)' != ''" Importance="high" Text="TensorSharp CUDA build: fatbin SASS for sm_$(_CudaFatbinSassArchs.Replace(';', ', sm_')) plus compute_$(_CudaFatbinArch) PTX" />
   </Target>
 
   <!-- When nvcc is available, replace the committed PTX Content items with the
@@ -112,6 +150,14 @@
       <Content Remove="$(CudaCommittedPtxDir)/*.ptx" />
       <Content Include="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')">
         <Link>cuda_kernels\%(Filename).ptx</Link>
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </Content>
+      <Content Include="@(CudaKernel->'$(PtxOutputDir)/%(Filename).fatbin')" Condition="'$(_CudaFatbinGencode)' != ''">
+        <Link>cuda_kernels\%(Filename).fatbin</Link>
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </Content>
+      <Content Include="@(CudaKernel->'$(PtxOutputDir)/%(Filename).fatbin.sha256')" Condition="'$(_CudaFatbinGencode)' != ''">
+        <Link>cuda_kernels\%(Filename).fatbin.sha256</Link>
         <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       </Content>
     </ItemGroup>
@@ -133,7 +179,7 @@
           BeforeTargets="BeforeBuild"
           DependsOnTargets="ResolveCudaPtxBuildSettings"
           Inputs="@(CudaKernel);@(CudaKernelHeader);$(MSBuildProjectFullPath);$(CudaArchResolverPs1);$(CudaArchResolverSh)"
-          Outputs="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx');$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
+          Outputs="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx');$(_CudaFatbinOutputs);$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
     <Message Condition="'$(_NvccExitCode)' != '0'" Importance="high"
              Text="TensorSharp CUDA build: nvcc not found; using the committed PTX kernels." />
     <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(VCToolsInstallDir)' != ''">
@@ -172,15 +218,31 @@
     <Exec Condition="'$(_NvccExitCode)' == '0'"
           Command="nvcc -ptx -arch=$(_ResolvedCudaArch) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
+    <!-- The fatbin is compiled from the same source and flags as the PTX just written
+         (from source, so architecture-specific targets get their own code paths), and its
+         sidecar records that PTX's SHA-256: CudaModule loads a fatbin only beside the PTX
+         of its own build, so one left behind by an earlier build is never preferred. -->
+    <Exec Condition="'$(_NvccExitCode)' == '0' And '$(_CudaFatbinGencode)' != ''"
+          Command="nvcc -fatbin $(_CudaFatbinGencode) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).fatbin&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          StandardOutputImportance="low" />
+    <GetFileHash Condition="'$(_NvccExitCode)' == '0' And '$(_CudaFatbinGencode)' != ''"
+                 Files="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')" Algorithm="SHA256" HashEncoding="hex">
+      <Output TaskParameter="Items" ItemName="_CompiledPtxHash" />
+    </GetFileHash>
+    <WriteLinesToFile Condition="'$(_NvccExitCode)' == '0' And '$(_CudaFatbinGencode)' != ''"
+                      File="$(PtxOutputDir)/%(_CompiledPtxHash.Filename).fatbin.sha256"
+                      Lines="%(_CompiledPtxHash.FileHash)"
+                      Overwrite="true" />
     <WriteLinesToFile Condition="'$(_NvccExitCode)' == '0'"
                       File="$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp"
-                      Lines="arch=$(_ResolvedCudaArch);flags=$(CudaNvccOptimizationFlags) $(CudaFastMathFlag)"
+                      Lines="arch=$(_ResolvedCudaArch);flags=$(CudaNvccOptimizationFlags) $(CudaFastMathFlag);fatbin=$(_CudaFatbinSassArchs)"
                       Overwrite="true" />
   </Target>
 
   <Target Name="CopyCudaPtxToOutput" AfterTargets="CompileCudaPtx" Condition="'$(_NvccExitCode)' == '0'">
     <ItemGroup>
       <_CompiledPtx Include="$(PtxOutputDir)/*.ptx" />
+      <_CompiledPtx Include="$(PtxOutputDir)/*.fatbin;$(PtxOutputDir)/*.fatbin.sha256" Condition="'$(_CudaFatbinGencode)' != ''" />
     </ItemGroup>
     <MakeDir Directories="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))" Condition="'@(_CompiledPtx)' != ''" />
     <Copy SourceFiles="@(_CompiledPtx)"

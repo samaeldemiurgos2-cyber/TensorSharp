@@ -202,6 +202,9 @@ namespace TensorSharp.Models
         private Tensor[] _dflashRingV;
         private int _dflashRingRows;
 
+        /// <summary>Committed positions the DFlash KV ring keeps; 0 without a drafter.</summary>
+        private protected int DFlashRingRows => _hasDFlash ? _dflashRingRows : 0;
+
         /// <summary>Reused [vocab] scratch for the DSpark Markov chain (one block
         /// row at a time); kept across calls because a draft step allocates none
         /// of the hot buffers.</summary>
@@ -558,6 +561,10 @@ namespace TensorSharp.Models
         /// <see cref="Dispose"/>; only the rings are ours.</summary>
         private protected void DisposeDFlash()
         {
+            _dflashDeferInjects = false;
+            _dflashPendingInjects.Clear();
+            _dflashPendingRowCount = 0;
+            DisposeDFlashRingPool();
             if (_dflashRingK != null)
                 foreach (var t in _dflashRingK) t?.Dispose();
             if (_dflashRingV != null)
@@ -737,7 +744,7 @@ namespace TensorSharp.Models
             // the draft mask then reads as "in the future" and drops, leaving the
             // drafter with no context at all. Injection is always contiguous and
             // forward WITHIN a sequence, so the frontier is exactly startPos + n.
-            _dflashRingFilled = startPos + n;
+            NoteDFlashRingWrite(startPos, n);
 
             for (int il = 0; il < cfg.NumLayers; il++)
             {
@@ -788,6 +795,7 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe int DFlashDraftBlockCore(int anchorToken, int position, int b, int[] draftOut, float[] confOut)
         {
+            FlushDeferredDFlashInjects();
             int fused = TryFusedDFlashDraftBlock(anchorToken, position, b, draftOut, confOut);
             if (fused >= 0)
                 return fused;
@@ -806,9 +814,9 @@ namespace TensorSharp.Models
             }
 
             // llama.cpp's dflash graph feeds build_inp_embd straight in: no
-            // embedding scale, and (unlike some trunks) no weightless RMSNorm over
-            // the embeddings.
-            Tensor inpL = Embedding(ids);
+            // trunk-specific embedding scale, and (unlike some trunks) no
+            // weightless RMSNorm. A weight sidecar remains part of the weight.
+            Tensor inpL = DFlashEmbedding(ids);
 
             for (int il = 0; il < cfg.NumLayers; il++)
             {
@@ -1588,6 +1596,14 @@ namespace TensorSharp.Models
             return sum > 0 ? (float)(Math.Exp(row[index] - max) / sum) : 0f;
         }
 
+        private Tensor DFlashEmbedding(int[] ids)
+        {
+            Tensor rows = Embedding(ids);
+            if (_quantWeights.TryGetValue("token_embd.weight", out var weight) && weight.Scale != 1f)
+                Ops.Mul(rows, rows, weight.Scale);
+            return rows;
+        }
+
         /// <summary>Gathers <paramref name="count"/> rows of a [vocab, rank]
         /// selector codebook into a flat host array. The codebooks are ordinary
         /// quantized tensors, so this is the same row-gather the token embedding
@@ -1608,7 +1624,7 @@ namespace TensorSharp.Models
                 PopulateQuantizedRows(gathered, qw, rows);
                 float* gp = GetFloatPtr(gathered);
                 for (long i = 0; i < (long)count * rank; i++)
-                    result[i] = gp[i];
+                    result[i] = gp[i] * qw.Scale;
                 return result;
             }
 

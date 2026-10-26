@@ -97,7 +97,8 @@ catch (Exception exception)
 }
 finally
 {
-    string nativeName = OperatingSystem.IsWindows() ? "GgmlOps.dll" : "libGgmlOps.dylib";
+    string nativeName = OperatingSystem.IsWindows() ? "GgmlOps.dll"
+        : OperatingSystem.IsMacOS() ? "libGgmlOps.dylib" : "libGgmlOps.so";
     nativePath = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
         .FirstOrDefault(module => Path.GetFileName(module.FileName).Equals(nativeName, StringComparison.OrdinalIgnoreCase))?.FileName;
     Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);

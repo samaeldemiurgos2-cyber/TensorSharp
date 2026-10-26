@@ -60,16 +60,20 @@ namespace TensorSharp.Models
 
             int safeToken = (Config?.VocabSize ?? 0) > 1 ? 1 : 0;
 
-            if (_tpGroup != null && _tpGroup.NodeCount > 1)
+            if (DistributedControlGroup?.NodeCount > 1)
             {
                 Console.WriteLine("  Waiting for all nodes to finish loading...");
-                _tpGroup.Barrier();
+                DistributedControlGroup.Barrier();
             }
 
             Console.WriteLine("  Warming up kernels (decode + prefill)...");
             _inWarmup = true;
             try
             {
+
+            bool prefillWarmupEnabled = !string.Equals(
+                Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP"), "0", StringComparison.Ordinal);
+            AgreeDistributedWarmupSetting(prefillWarmupEnabled ? 1 : 0, "prefill enabled");
 
             long decodeStart = Stopwatch.GetTimestamp();
             Forward(new[] { safeToken });
@@ -87,7 +91,7 @@ namespace TensorSharp.Models
             // so prime it with a longer dummy prompt here. Previously this ran for
             // MLX only. Guarded so a model that dislikes a dummy refill can never
             // block startup; disable entirely via TS_PREFILL_WARMUP=0.
-            if (!string.Equals(Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP"), "0", StringComparison.Ordinal))
+            if (prefillWarmupEnabled)
             {
                 // MLX, Metal, and the managed CPU backend stay conservative (short
                 // prompt); discrete CUDA/Vulkan GGML paths use a longer one to reach
@@ -195,6 +199,8 @@ namespace TensorSharp.Models
                     warmupTokenOverhead,
                     explicitWarmupLength);
 
+                AgreeDistributedWarmupSetting(warmupLength, "prefill token count");
+
                 int[] warmupPrompt = new int[warmupLength];
                 Array.Fill(warmupPrompt, safeToken);
 
@@ -211,7 +217,7 @@ namespace TensorSharp.Models
                 // host serving on a backend that refuses every later graph, and the
                 // first request then died naming its own embedding lookup rather than
                 // the out-of-memory that killed the backend here (issue #226).
-                catch (Exception ex) when (!BackendHasFailed())
+                catch (Exception ex) when (!BackendHasFailed() && DistributedControlGroup?.NodeCount is not > 1)
                 {
                     Console.WriteLine($"  Prefill warmup skipped: {ex.GetType().Name}: {ex.Message}");
                 }
@@ -219,7 +225,7 @@ namespace TensorSharp.Models
                 {
                     // Resetting runs device ops too; on a dead backend it would fail
                     // and replace the exception that says why.
-                    if (!BackendHasFailed())
+                    if (!BackendHasFailed() && _distributedExecutionFailure == null)
                         ResetKVCache();
                 }
 
@@ -255,6 +261,27 @@ namespace TensorSharp.Models
 
         public virtual void WarmUpMultimodalKernels()
         {
+        }
+
+        private void AgreeDistributedWarmupSetting(int value, string setting)
+        {
+            if (DistributedControlGroup?.NodeCount is not > 1 ||
+                DistributedControlGroup is not INestedTensorParallelGroup nested) return;
+            try
+            {
+                // Warmup runs before driver controls, independently on each node.
+                // Compare bits rather than a sum of integer values: different
+                // values can otherwise average to one node's local selection.
+                var votes = new float[32];
+                for (int bit = 0; bit < votes.Length; bit++) votes[bit] = ((uint)value >> bit) & 1;
+                nested.CrossNodeAllReduce(votes, votes.Length);
+                for (int bit = 0; bit < votes.Length; bit++)
+                    if (votes[bit] != (((uint)value >> bit) & 1) * DistributedControlGroup.NodeCount)
+                        throw new InvalidOperationException(
+                            $"Distributed warmup settings differ across nodes ({setting}; local value {value}). " +
+                            "Use the same warmup settings and context limit on every node.");
+            }
+            catch (Exception failure) { AbortDistributedExecution(failure); throw; }
         }
 
         /// <summary>

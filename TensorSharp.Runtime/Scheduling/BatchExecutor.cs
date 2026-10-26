@@ -256,7 +256,9 @@ namespace TensorSharp.Runtime.Scheduling
             // vision/audio encoder, which runs on the request-handling
             // thread). Without this lock a parallel image-bearing request
             // and the engine's worker race the Metal command queue and
-            // ggml_metal_synchronize aborts the process.
+            // ggml_metal_synchronize aborts the process. A request already
+            // waiting for the lock goes first (see GpuLockWaiters).
+            GpuLockWaiters.YieldToWaiters(_model.GpuComputeLock, MaxYieldToPreparation);
             lock (_model.GpuComputeLock)
             {
                 if (RadixCache != null)
@@ -337,11 +339,14 @@ namespace TensorSharp.Runtime.Scheduling
                                 plan.Candidates[i - 1], plan.Candidates[i]);
                         }
                     }
+                    long pathStarted = _stepLog ? Stopwatch.GetTimestamp() : 0;
                     var results = TryExecutePath(plan.Candidates[i], output, options);
                     if (results != null)
                     {
                         if (_cbDebug)
                             TraceStepResults(plan.Candidates[i], output, results);
+                        if (_stepLog)
+                            LogStepTiming(plan.Candidates[i], pathStarted, results);
                         return results;
                     }
                 }
@@ -354,6 +359,39 @@ namespace TensorSharp.Runtime.Scheduling
         }
 
         private long _cbStepIndex;
+
+        // Bound on how long a step waits for a request thread to take the GPU lock
+        // (TS_GPU_LOCK_YIELD_MS; 0 lets the worker take it first, as before).
+        private static readonly TimeSpan MaxYieldToPreparation = TimeSpan.FromMilliseconds(
+            int.TryParse(Environment.GetEnvironmentVariable("TS_GPU_LOCK_YIELD_MS"), out int yieldMs) && yieldMs >= 0 ? yieldMs : 100);
+
+        private static readonly bool _stepLog =
+            string.Equals(Environment.GetEnvironmentVariable("TS_SCHED_STEP_LOG"), "1", StringComparison.Ordinal);
+        private long _stepLogLastEnd;
+
+        /// <summary>TS_SCHED_STEP_LOG=1: one line per step with the idle gap since the
+        /// previous step returned, the time the serving path took, and each sequence's
+        /// prefill/decode share, so a request that waits between its own forwards shows
+        /// where the wall clock went.</summary>
+        private void LogStepTiming(ExecutionPathKind path, long pathStarted, List<SequenceStepResult> results)
+        {
+            long now = Stopwatch.GetTimestamp();
+            double gapMs = _stepLogLastEnd == 0 ? 0 : (pathStarted - _stepLogLastEnd) * 1000.0 / Stopwatch.Frequency;
+            double stepMs = (now - pathStarted) * 1000.0 / Stopwatch.Frequency;
+            _stepLogLastEnd = now;
+            var sb = new StringBuilder();
+            sb.Append("[step] t=").Append(DateTime.UtcNow.ToString("HH:mm:ss.fff"))
+              .Append(" gap=").Append(gapMs.ToString("F1")).Append(" ms=").Append(stepMs.ToString("F1"))
+              .Append(' ').Append(path);
+            foreach (var r in results)
+            {
+                string id = r.Sequence?.RequestId ?? "?";
+                sb.Append(' ').Append(id.Length > 9 ? id.Substring(id.Length - 4) : id)
+                  .Append(r.IsPrefill ? ":P" : ":D").Append(r.TokensForwarded);
+            }
+            try { Console.Error.WriteLine(sb.ToString()); }
+            catch (Exception) { }
+        }
 
         /// <summary>TS_CB_DEBUG=1 step trace: the path that served the step, every
         /// scheduled sequence (request, prefill/decode, tokens forwarded, computed
@@ -1172,7 +1210,21 @@ namespace TensorSharp.Runtime.Scheduling
                         fused.CanBatchDecode(work.Sequence.RequestId, work.Sequence.NumComputedTokens))
                         decodeWork.Add(work);
                 int dn = decodeWork.Count;
-                if (dn >= 2)
+                // A lone decode beside prefill chunks speculates too. Decoding it one
+                // token per step behind another request's 2048-token chunk (~300 ms a
+                // step) stretched a 41-token reply over seconds; the batched verify of a
+                // single sequence costs about what that plain decode does.
+                bool speculate = dn >= 2 || (dn == 1
+                    && !_pendingRetainedFusedTruncations.ContainsKey(decodeWork[0].Sequence.RequestId));
+                // The step's prompt chunk rides the batched verify when the model can carry it:
+                // one forward for both, so the verify reads no weights of its own.
+                HashSet<string>? mixedHandled = null;
+                ScheduledSequenceWork? mixedWork = speculate ? TryStageMixedPrefill(fused, output, results, ref mixedHandled) : null;
+                long specStarted = Stopwatch.GetTimestamp();
+                bool speculated = speculate && TryRunBatchedSpeculativeSubset(decodeWork, results, ref handledBatched);
+                if (mixedWork != null)
+                    CompleteMixedPrefill(mixedWork, Stopwatch.GetTimestamp() - specStarted, results, ref mixedHandled);
+                if (!speculated && dn >= 2)
                 {
                     var reqIds = new string[dn];
                     var btokens = new int[dn];
@@ -1312,6 +1364,13 @@ namespace TensorSharp.Runtime.Scheduling
                         }
                     }
                 }
+                if (mixedHandled != null)
+                {
+                    handledBatched ??= new HashSet<string>(StringComparer.Ordinal);
+                    handledBatched.UnionWith(mixedHandled);
+                }
+                if (handledBatched != null && handledBatched.Count == n)
+                    return results;
             }
 
             // ---- Batched fused prefill ----
@@ -1352,7 +1411,10 @@ namespace TensorSharp.Runtime.Scheduling
                         var seq = prefillWork[i].Sequence;
                         reqIds[i] = seq.RequestId;
                         starts[i] = seq.NumComputedTokens;
-                        chunks[i] = BuildPrefillChunk(seq, prefillWork[i]);
+                        // No reservation yet: it targets the ACTIVE cache, and the
+                        // per-sequence loop below binds each holder before reserving
+                        // when the model declines the batched prefill.
+                        chunks[i] = PrefillTokens(seq, prefillWork[i]);
                     }
                     var outLogits = new float[pn][];
                     try
@@ -1366,6 +1428,7 @@ namespace TensorSharp.Runtime.Scheduling
                             {
                                 var seq = prefillWork[i].Sequence;
                                 _pendingRetainedFusedTruncations.Remove(seq.RequestId);   // rewound by the model
+                                seq.PrefillReservationTaken = true;   // the batched prefill sized its own holders
                                 seq.LastLogits = outLogits[i];
                                 seq.AdvanceComputedTokens(chunks[i].Length);
                                 MaybeCheckpointSharedPrefix(seq);
@@ -1411,74 +1474,22 @@ namespace TensorSharp.Runtime.Scheduling
                     continue;
                 var seq = work.Sequence;
                 int prevComputed = seq.NumComputedTokens;
+                // A lone holder's decode takes the batched verify when the trunk has one:
+                // it replays only the accepted prefix, so the drafter's whole block costs
+                // about what three drafts do on the solo verify. Tried before binding: the
+                // batched verify reads holders where they are parked.
+                if (!work.IsPrefill && n == 1 && _scheduler.RunningCount == 1
+                    && fused.HasFusedSequenceCache(seq.RequestId)
+                    && !_pendingRetainedFusedTruncations.ContainsKey(seq.RequestId))
+                {
+                    HashSet<string>? soloHandled = null;
+                    if (TryRunBatchedSpeculativeSubset(new List<ScheduledSequenceWork> { work }, results, ref soloHandled))
+                        continue;
+                }
                 try
                 {
-                    bool freshCache = fused.BindSequenceCache(seq.RequestId);
-
-                    if (_pendingRetainedFusedTruncations.Remove(
-                            seq.RequestId,
-                            out int retainedTruncationTarget))
-                    {
-                        if (freshCache)
-                        {
-                            throw new InvalidOperationException(
-                                $"Retained fused cache for {seq.RequestId} was rebound but its holder was not found.");
-                        }
-                        // A retained holder was matched with a trailing rewind
-                        // (FindRetainedFusedMatch). If the model declines it the holder's
-                        // head is still where it was, so decoding would continue from
-                        // positions this turn's prompt does not contain.
-                        if (!_model.TryTruncateKVCache(retainedTruncationTarget))
-                        {
-                            _logger.LogInformation(
-                                "Retained fused cache for {RequestId} could not rewind to {Tokens}; " +
-                                "re-prefilling its prompt from the beginning.",
-                                seq.RequestId, retainedTruncationTarget);
-                            _model.ResetKVCache();
-                            seq.ClearLiveCacheContinuation();
-                            seq.PrefixCheckpointTaken = false;
-                            // The scheduled chunk describes the old suffix. Let
-                            // the next step plan from zero, including any shared
-                            // checkpoint boundary, using the reserved blocks.
-                            results.Add(new SequenceStepResult
-                            {
-                                Sequence = seq,
-                                TokensForwarded = 0,
-                                IsPrefill = true,
-                            });
-                            continue;
-                        }
-                    }
-
-                    // A planned live-cache continuation is only materialized on
-                    // this path when the prior owner's primary cache was adopted
-                    // into this request's own holder above (owner still running
-                    // under the same RequestId). A FRESH holder that still
-                    // carries a continuation claim means the claimed live state
-                    // is gone — its reserved blocks are accounting placeholders
-                    // that were never written, and for snapshot-less models the
-                    // inject below is skipped entirely — so decoding would
-                    // silently run against an empty cache at a non-zero
-                    // position. Drop the claim and re-prefill from position 0.
-                    if (freshCache && seq.UsesLiveCacheContinuation)
-                    {
-                        // The reuse was PROMISED at admission and revoked here;
-                        // without this line the user sees a full re-prefill on a
-                        // turn the scheduler already counted as a cache hit.
-                        _logger.LogInformation(
-                            "Planned live-cache continuation for {RequestId} was revoked before " +
-                            "execution (the claimed live state is gone); re-prefilling the full prompt.",
-                            seq.RequestId);
-                        seq.ClearLiveCacheContinuation();
-                    }
-
-                    // Prefix-cache reuse: a freshly-created cache whose sequence
-                    // was admitted with already-computed (reused) tokens needs
-                    // that prefix injected from the shared paged blocks before
-                    // its first forward. (Injection READS the shared blocks into
-                    // this request's own cache; it never writes them.)
-                    if (freshCache && seq.NumComputedTokens > 0)
-                        InjectPrefixOrRecompute(seq, seq.NumComputedTokens);
+                    if (!BindFusedHolder(fused, seq, results))
+                        continue;
 
                     // A solo decode step on the bound holder may speculate (see
                     // TrySpeculativeFusedDecode); a mixed step keeps every request
@@ -1524,7 +1535,7 @@ namespace TensorSharp.Runtime.Scheduling
                     }
 
                     var swForward = Stopwatch.StartNew();
-                    float[] logits = _model.Forward(inputTokens);
+                    float[] logits = work.IsPrefill ? _model.ForwardPrompt(inputTokens) : _model.Forward(inputTokens);
                     swForward.Stop();
 
                     // Every sequence's forward overwrites the model's shared
@@ -1567,6 +1578,175 @@ namespace TensorSharp.Runtime.Scheduling
                 }
             }
             return results;
+        }
+
+        // TS_SCHED_MIXED_STEP=0 keeps a step's prompt chunk out of its batched verify.
+        private static readonly bool s_mixedStep = Environment.GetEnvironmentVariable("TS_SCHED_MIXED_STEP") != "0";
+
+        /// <summary>
+        /// Stage the step's one prompt chunk to ride its batched verify (see
+        /// <see cref="IMixedStepPrefillTarget"/>), its holder bound and its media queued as the
+        /// per-sequence loop does. Null when the step has no such chunk or the model declines it;
+        /// a sequence whose step ended while binding goes to <paramref name="handled"/>.
+        /// </summary>
+        private ScheduledSequenceWork? TryStageMixedPrefill(IBatchedPagedModel fused, SchedulerOutput output,
+            List<SequenceStepResult> results, ref HashSet<string>? handled)
+        {
+            if (!s_mixedStep || _model is not IMixedStepPrefillTarget target)
+                return null;
+            ScheduledSequenceWork? pick = null;
+            foreach (var work in output.ScheduledWork)
+            {
+                if (!work.IsPrefill)
+                    continue;
+                // Several chunks share their weight reads in the batched prefill instead.
+                if (pick != null)
+                    return null;
+                pick = work;
+            }
+            if (pick == null)
+                return null;
+            var seq = pick.Sequence;
+            int prevComputed = seq.NumComputedTokens;
+            try
+            {
+                if (!BindFusedHolder(fused, seq, results))
+                {
+                    (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
+                    return null;
+                }
+                int[] tokens = BuildPrefillChunk(seq, pick);
+                int position = seq.NumComputedTokens, end = position + tokens.Length;
+                _model.MultimodalInjector?.QueuePromptEmbeddingsForSlice(position, tokens.Length, seq.RequestId);
+                bool whole = end >= seq.PromptTokens.Count || seq.IsPublicCheckpointBoundary(end);
+                return target.StageMixedPrefill(seq.RequestId, tokens, position, whole) ? pick : null;
+            }
+            catch (SequenceSlotUnavailableException ex) when (seq.NumComputedTokens == prevComputed
+                                                               && !fused.HasFusedSequenceCache(seq.RequestId))
+            {
+                _logger.LogDebug("No sequence slot for {RequestId} yet: {Reason}", seq.RequestId, ex.Message);
+                results.Add(new SequenceStepResult { Sequence = seq, SlotUnavailable = true });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Fused per-seq step failed for sequence {RequestId}", seq.RequestId);
+                results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
+                seq.Error = ex;
+            }
+            (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
+            return null;
+        }
+
+        /// <summary>Book the staged chunk the batched verify ran (a prefix of it when the model
+        /// trimmed it to its GEMM tiles); one no verify ran stays for the per-sequence loop.</summary>
+        private void CompleteMixedPrefill(ScheduledSequenceWork work, long elapsedTicks, List<SequenceStepResult> results,
+            ref HashSet<string>? handled)
+        {
+            var seq = work.Sequence;
+            try
+            {
+                bool carried = ((IMixedStepPrefillTarget)_model).TakeMixedPrefill(seq.RequestId, out int ran, out float[]? logits);
+                if (s_batchedSpecLog)
+                    Console.Error.WriteLine($"[mixed-step] {seq.RequestId} @{seq.NumComputedTokens} " +
+                        $"{(carried ? $"ran {ran}/{work.NumScheduledTokens}" : $"not carried ({work.NumScheduledTokens})")}");
+                if (!carried)
+                    return;
+                seq.LastLogits = logits;
+                seq.AdvanceComputedTokens(ran);
+                MaybeCheckpointSharedPrefix(seq);
+                results.Add(new SequenceStepResult
+                {
+                    Sequence = seq,
+                    TokensForwarded = ran,
+                    SampledToken = -1,
+                    IsPrefill = true,
+                    FullBlocksCaptured = 0,
+                    ForwardElapsedTicks = elapsedTicks,
+                });
+            }
+            catch (Exception ex)
+            {
+                // The forward that carried it may have written its cache: fail it rather than rerun it.
+                _logger.LogError(ex, "Mixed-step prefill failed for sequence {RequestId}", seq.RequestId);
+                results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
+                seq.Error = ex;
+            }
+            (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
+        }
+
+        /// <summary>Bind <paramref name="seq"/>'s per-request holder for this step's forward: rewind a
+        /// retained holder matched past the prompt, drop a revoked live-cache claim and inject a
+        /// reused prefix into a fresh holder. False when the step is over for the sequence (a result
+        /// was added).</summary>
+        private bool BindFusedHolder(IBatchedPagedModel fused, SequenceState seq, List<SequenceStepResult> results)
+        {
+            bool freshCache = fused.BindSequenceCache(seq.RequestId);
+
+            if (_pendingRetainedFusedTruncations.Remove(
+                    seq.RequestId,
+                    out int retainedTruncationTarget))
+            {
+                if (freshCache)
+                {
+                    throw new InvalidOperationException(
+                        $"Retained fused cache for {seq.RequestId} was rebound but its holder was not found.");
+                }
+                // A retained holder was matched with a trailing rewind
+                // (FindRetainedFusedMatch). If the model declines it the holder's
+                // head is still where it was, so decoding would continue from
+                // positions this turn's prompt does not contain.
+                if (!_model.TryTruncateKVCache(retainedTruncationTarget))
+                {
+                    _logger.LogInformation(
+                        "Retained fused cache for {RequestId} could not rewind to {Tokens}; " +
+                        "re-prefilling its prompt from the beginning.",
+                        seq.RequestId, retainedTruncationTarget);
+                    _model.ResetKVCache();
+                    seq.ClearLiveCacheContinuation();
+                    seq.PrefixCheckpointTaken = false;
+                    // The scheduled chunk describes the old suffix. Let
+                    // the next step plan from zero, including any shared
+                    // checkpoint boundary, using the reserved blocks.
+                    results.Add(new SequenceStepResult
+                    {
+                        Sequence = seq,
+                        TokensForwarded = 0,
+                        IsPrefill = true,
+                    });
+                    return false;
+                }
+            }
+
+            // A planned live-cache continuation is only materialized on
+            // this path when the prior owner's primary cache was adopted
+            // into this request's own holder above (owner still running
+            // under the same RequestId). A FRESH holder that still
+            // carries a continuation claim means the claimed live state
+            // is gone — its reserved blocks are accounting placeholders
+            // that were never written, and for snapshot-less models the
+            // inject below is skipped entirely — so decoding would
+            // silently run against an empty cache at a non-zero
+            // position. Drop the claim and re-prefill from position 0.
+            if (freshCache && seq.UsesLiveCacheContinuation)
+            {
+                // The reuse was PROMISED at admission and revoked here;
+                // without this line the user sees a full re-prefill on a
+                // turn the scheduler already counted as a cache hit.
+                _logger.LogInformation(
+                    "Planned live-cache continuation for {RequestId} was revoked before " +
+                    "execution (the claimed live state is gone); re-prefilling the full prompt.",
+                    seq.RequestId);
+                seq.ClearLiveCacheContinuation();
+            }
+
+            // Prefix-cache reuse: a freshly-created cache whose sequence
+            // was admitted with already-computed (reused) tokens needs
+            // that prefix injected from the shared paged blocks before
+            // its first forward. (Injection READS the shared blocks into
+            // this request's own cache; it never writes them.)
+            if (freshCache && seq.NumComputedTokens > 0)
+                InjectPrefixOrRecompute(seq, seq.NumComputedTokens);
+            return true;
         }
 
         private List<SequenceStepResult> ExecuteStepPerSequence(SchedulerOutput output)
@@ -1757,7 +1937,7 @@ namespace TensorSharp.Runtime.Scheduling
                     }
 
                     var swForward = Stopwatch.StartNew();
-                    float[] logits = _model.Forward(inputTokens);
+                    float[] logits = work.IsPrefill ? _model.ForwardPrompt(inputTokens) : _model.Forward(inputTokens);
                     swForward.Stop();
 
                     // Forward writes the shared linear cache, not the model's
@@ -2073,6 +2253,7 @@ namespace TensorSharp.Runtime.Scheduling
         private SequenceStepResult ExecuteSpeculativeWorkCore(
             SpecSeqContext context, SequenceState seq, ScheduledSequenceWork work, int prevComputed)
         {
+            (_model as IBatchedSpeculativeTarget)?.BindDraftState(seq.RequestId);
             if (work.IsPrefill)
             {
                 int[] chunk = BuildPrefillChunk(seq, work);
@@ -2080,7 +2261,7 @@ namespace TensorSharp.Runtime.Scheduling
                     _model.MultimodalInjector?.QueuePromptEmbeddingsForSlice(
                         prevComputed, chunk.Length, seq.RequestId);
                 var swPrefill = Stopwatch.StartNew();
-                float[] logits = context.Exec.PrefillStep(chunk, prevComputed);
+                float[] logits = context.Exec.PrefillStep(chunk, prevComputed, seq.PromptTokens.Count);
                 swPrefill.Stop();
                 seq.LastLogits = logits;
                 CompleteSpeculativeStepBookkeeping(seq, chunk.Length);
@@ -2252,6 +2433,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (_fusedSpecCtx.Remove(requestId, out var ctx))
                 ctx.Exec?.Dispose();
             _fusedSpecDeclined.Remove(requestId);
+            (_model as IBatchedSpeculativeTarget)?.ReleaseDraftState(requestId);
         }
 
         /// <summary>
@@ -2282,59 +2464,9 @@ namespace TensorSharp.Runtime.Scheduling
             // The bound holder must agree with the scheduler about the position.
             if (spec.CacheSeqLen != prevComputed)
                 return false;
-
-            if (_fusedSpecCtx.TryGetValue(seq.RequestId, out var ctx) && ctx.NextPosition < prevComputed
-                && ctx.Exec != null && ctx.Exec.CanSeedCommitted)
-            {
-                // The holder advanced plainly while this request shared its steps
-                // with neighbours (or took a plain step after a decline). Resume the
-                // context over those tokens rather than re-arming: a re-arm
-                // re-indexed the whole context and re-ran the probe on every
-                // 1 -> N -> 1 transition, which staggered short requests hit constantly.
-                var gap = new int[prevComputed - ctx.NextPosition];
-                for (int i = 0; i < gap.Length; i++)
-                    gap[i] = seq.TokenAt(ctx.NextPosition + i);
-                ctx.Exec.CatchUp(gap, ctx.NextPosition);
-                ctx.NextPosition = prevComputed;
-                ctx.PendingNextToken = -1;   // the plain path drew and consumed it
-            }
-            if (!_fusedSpecCtx.TryGetValue(seq.RequestId, out ctx) || ctx.NextPosition != prevComputed)
-            {
-                if (ctx != null)
-                {
-                    // Something forwarded past this context (a truncation, a head that
-                    // cannot resume); start over from the holder's tokens.
-                    _fusedSpecCtx.Remove(seq.RequestId);
-                    ctx.Exec?.Dispose();
-                }
-                if (_fusedSpecDeclined.Contains(seq.RequestId))
-                    return false;
-                var speculator = SpeculatorRegistry.Create(spec, Speculation, out string? declineReason);
-                if (speculator == null)
-                {
-                    WarnSpeculationDeclinedOnce(declineReason);
-                    _fusedSpecDeclined.Add(seq.RequestId);
-                    return false;
-                }
-                var exec = new SpeculativeExecution(spec, speculator, trunk: null, SharedGovernor);
-                if (!exec.CanSeedCommitted)
-                {
-                    exec.Dispose();
-                    _fusedSpecDeclined.Add(seq.RequestId);
-                    return false;
-                }
-                var committed = new int[prevComputed];
-                for (int i = 0; i < prevComputed; i++)
-                    committed[i] = seq.TokenAt(i);
-                exec.SeedCommitted(committed);
-                ctx = new SpecSeqContext { Seq = seq, Exec = exec, NextPosition = prevComputed };
-                _fusedSpecCtx[seq.RequestId] = ctx;
-                seq.SpecStats = exec.Stats;
-                _logger.LogInformation(
-                    "Speculative decoding armed for {RequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
-                    + "pMin={PMin}, trunk=fused holder over {Committed} committed tokens)",
-                    seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, prevComputed);
-            }
+            (_model as IBatchedSpeculativeTarget)?.BindDraftState(seq.RequestId);
+            if (!TryGetFusedSpecContext(spec, seq, prevComputed, out SpecSeqContext? ctx))
+                return false;
 
             SpeculativeStepOutcome outcome = RunSpeculativeDecodeStep(
                 ctx, seq, prevComputed, out int sampledToken, out List<int> accepted, out long decodeTicks);
@@ -2360,6 +2492,435 @@ namespace TensorSharp.Runtime.Scheduling
                 FullBlocksCaptured = 0,
                 ForwardElapsedTicks = decodeTicks,
             };
+            return true;
+        }
+
+        private long _batchedSpecSteps;
+
+        /// <summary>Batched speculative steps served (each verifies every decoding
+        /// sequence's window in one trunk forward).</summary>
+        internal long BatchedSpeculativeSteps => _batchedSpecSteps;
+
+        /// <summary>
+        /// One speculative step for SEVERAL decoding sequences on their per-request
+        /// holders: each drafts a window with its own drafter state, the trunk
+        /// verifies every window in one forward (<see cref="IBatchedSpeculativeTarget"/>),
+        /// and each sequence keeps its accepted prefix. Without this, a second request
+        /// in flight dropped every request to one token per step of the batched
+        /// decode while a lone request verified a whole window per step.
+        /// Greedy only. Returns false with nothing consumed when any sequence or the
+        /// trunk declines; the caller then runs the batched decode.
+        /// </summary>
+        private bool TryBatchedSpeculativeDecode(List<ScheduledSequenceWork> decodeWork, List<SequenceStepResult> results)
+        {
+            int n = decodeWork.Count;
+            if (!Speculation.Enabled || n < 1)
+                return false;
+            if (_model is not ISpeculativeTarget spec || _model is not IBatchedSpeculativeTarget batched
+                || !spec.SpeculationProfitable || !spec.SpecTrunkFollowsBoundCache)
+                return false;
+            int window = batched.BatchedSpecWindow(n);
+            if (window < 2)
+                return false;
+            for (int i = 0; i < n; i++)
+            {
+                var seq = decodeWork[i].Sequence;
+                int prev = seq.NumComputedTokens;
+                if (prev <= 0 || !CanSpeculate(seq) || !seq.GetOrCreateSampler().IsPlainGreedyArgmax
+                    || batched.FusedCacheSeqLen(seq.RequestId) != prev)
+                    return false;
+            }
+
+            using var scope = batched.BeginBatchedSpeculation();
+            var ctxs = new SpecSeqContext[n];
+            for (int i = 0; i < n; i++)
+            {
+                var seq = decodeWork[i].Sequence;
+                batched.BindDraftState(seq.RequestId);
+                if (!TryGetFusedSpecContext(spec, seq, seq.NumComputedTokens, out ctxs[i]))
+                    return false;
+            }
+            // Drafts are proposed for the widest window; the verify then takes four rows
+            // when every sequence's confidence-gated draft fits them, the whole window
+            // otherwise. A row still costs its column of every projection and FFN, but
+            // at three or four sequences eight rows cost ~10% more than four, while a
+            // confident block keeps drafts the narrow window would have cut. (An
+            // acceptance average chose the window before drafting and kept it narrow
+            // through runs of long accepted blocks.)
+            int laneBudget = 0;
+            foreach (var ctx in ctxs)
+                laneBudget = Math.Max(laneBudget, ctx.Exec.MaxDraftTokens);
+            window = Math.Min(window, 1 + laneBudget);
+            // Every sequence's window, padding included, must fit its cache without growth.
+            for (int i = 0; i < n; i++)
+                window = Math.Min(window, batched.FusedCacheFreeRows(decodeWork[i].Sequence.RequestId));
+            if (window < 2)
+                return false;
+            var requestIds = new string[n];
+            var positions = new int[n];
+            var anchors = new int[n];
+            var drafts = new List<int>[n];
+            var kMaxes = new int[n];
+            bool stopRepetition = _scheduler.Config.StopRepetition;
+            bool IsStop(int token) => _model.Tokenizer != null && _model.Tokenizer.IsEos(token);
+            // The verify-drawn token when one is pending, else the stash or a sample;
+            // nothing is consumed until the verify has succeeded. A lane whose anchor
+            // ends it (a stop token, or the last token its budget allows) emits it
+            // without a forward: verifying it would compute a row nothing reads.
+            var peeked = new int[n];
+            List<(SequenceState Seq, SpecSeqContext Ctx, int Anchor)>? ending = null;
+            for (int i = 0; i < n; i++)
+            {
+                var seq = decodeWork[i].Sequence;
+                peeked[i] = ctxs[i].PendingNextToken >= 0 ? ctxs[i].PendingNextToken : PeekPendingOrSample(seq);
+                if (IsStop(peeked[i]) || seq.OutputTokens.Count + 1 >= seq.MaxNewTokens)
+                    (ending ??= new()).Add((seq, ctxs[i], peeked[i]));
+            }
+            if (ending != null)
+            {
+                var liveWork = new List<ScheduledSequenceWork>(n);
+                var liveCtxs = new List<SpecSeqContext>(n);
+                var livePeeked = new List<int>(n);
+                for (int i = 0; i < n; i++)
+                    if (!ending.Exists(e => ReferenceEquals(e.Seq, decodeWork[i].Sequence)))
+                    {
+                        liveWork.Add(decodeWork[i]);
+                        liveCtxs.Add(ctxs[i]);
+                        livePeeked.Add(peeked[i]);
+                    }
+                if (liveWork.Count == 0)
+                {
+                    foreach (var (seq, ctx, anchor) in ending)
+                        EmitEndingAnchor(seq, ctx, anchor, results);
+                    return true;
+                }
+                decodeWork = liveWork;
+                ctxs = liveCtxs.ToArray();
+                peeked = livePeeked.ToArray();
+                n = liveWork.Count;
+                requestIds = new string[n];
+                positions = new int[n];
+                anchors = new int[n];
+                drafts = new List<int>[n];
+                kMaxes = new int[n];
+            }
+            long started = Stopwatch.GetTimestamp();
+            for (int i = 0; i < n; i++)
+            {
+                var seq = decodeWork[i].Sequence;
+                int prev = seq.NumComputedTokens;
+                var ctx = ctxs[i];
+                requestIds[i] = seq.RequestId;
+                positions[i] = prev;
+                anchors[i] = peeked[i];
+                // Same window caps as the solo step: the token budget after the anchor,
+                // the blocks the scheduler reserved, no window from a stop token, and
+                // none from a token the repetition guard is about to stop at.
+                int kMax = Math.Min(window - 1, Math.Min(
+                    seq.MaxNewTokens - seq.OutputTokens.Count - 1,
+                    seq.BlockTable.FreeSlotsInCurrentBlocks - 1));
+                if (IsStop(anchors[i]))
+                    kMax = 0;
+                if (kMax > 0 && stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true))
+                {
+                    seq.OutputTokens.Add(anchors[i]);
+                    bool looping = RepetitionGuard.IsLooping(seq.OutputTokens, seq.OutputTokens.Count, out _, out _);
+                    seq.OutputTokens.RemoveAt(seq.OutputTokens.Count - 1);
+                    if (looping)
+                        kMax = 0;
+                }
+                drafts[i] = new List<int>(window);
+                kMaxes[i] = kMax;
+            }
+
+            // Draft every sequence's block in one pass when the drafter can; otherwise
+            // (or if the batched pass declines) one draft per sequence.
+            bool draftedTogether = false;
+            int blockWidth = batched.BatchDraftBlockWidth;
+            if (blockWidth > 0)
+            {
+                var lanes = new List<int>(n);
+                var carries = new List<float[]>(n);
+                var caps = new List<int>(n);
+                for (int i = 0; i < n; i++)
+                    if (ctxs[i].Exec.TryPrepareBatchDraft(positions[i], kMaxes[i], out float[]? carry, out int cap))
+                    {
+                        lanes.Add(i);
+                        carries.Add(carry);
+                        caps.Add(cap);
+                    }
+                if (lanes.Count >= 2)
+                {
+                    int m = lanes.Count;
+                    var laneIds = new string[m];
+                    var laneAnchors = new int[m];
+                    var lanePositions = new int[m];
+                    var blockTokens = new int[m][];
+                    var blockConf = new float[m][];
+                    for (int j = 0; j < m; j++)
+                    {
+                        laneIds[j] = requestIds[lanes[j]];
+                        laneAnchors[j] = anchors[lanes[j]];
+                        lanePositions[j] = positions[lanes[j]];
+                        blockTokens[j] = new int[blockWidth];
+                        blockConf[j] = new float[blockWidth];
+                    }
+                    long tDraft0 = Stopwatch.GetTimestamp();
+                    draftedTogether = batched.TryDraftBatch(laneIds, laneAnchors, carries.ToArray(), lanePositions,
+                        blockTokens, blockConf);
+                    long share = (Stopwatch.GetTimestamp() - tDraft0) / m;
+                    if (draftedTogether)
+                        for (int j = 0; j < m; j++)
+                            ctxs[lanes[j]].Exec.AcceptBatchDraft(blockTokens[j], blockConf[j], caps[j], drafts[lanes[j]], share);
+                }
+            }
+            if (!draftedTogether)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    batched.BindDraftState(requestIds[i]);
+                    ctxs[i].Exec.ProposeForBatch(anchors[i], positions[i], kMaxes[i], drafts[i]);
+                }
+            }
+            int longest = 0;
+            for (int i = 0; i < n; i++)
+                longest = Math.Max(longest, drafts[i].Count);
+            if (window > NarrowBatchedWindow && 1 + longest <= NarrowBatchedWindow)
+                window = NarrowBatchedWindow;
+            var tokens = new int[n * window];
+            for (int i = 0; i < n; i++)
+            {
+                // Pad short windows with the last real token; padded rows are never accepted.
+                int last = anchors[i];
+                for (int t = 0; t < window; t++)
+                {
+                    if (t == 0) tokens[i * window] = anchors[i];
+                    else if (t - 1 < drafts[i].Count) last = tokens[i * window + t] = drafts[i][t - 1];
+                    else tokens[i * window + t] = last;
+                }
+            }
+
+            int feat = spec.SpecFeatureSize;
+            long featNeeded = (long)n * window * feat;
+            if (_batchedSpecFeatures == null || _batchedSpecFeatures.LongLength < featNeeded)
+                _batchedSpecFeatures = new float[featNeeded];
+            var drawn = new int[n * window];
+            long drafted = Stopwatch.GetTimestamp();
+            if (!batched.TryBatchedSpecVerify(requestIds, positions, window, tokens, drawn, _batchedSpecFeatures))
+                return false;
+            long verified = Stopwatch.GetTimestamp();
+            long verifyTicks = verified - started;
+
+            // Accept per sequence exactly as the solo step does: a draft is kept while
+            // it equals its row's draw, and nothing is accepted past a stop.
+            var kept = new int[n];
+            var accepted = new List<int>[n];
+            for (int i = 0; i < n; i++)
+            {
+                var seq = decodeWork[i].Sequence;
+                var ctx = ctxs[i];
+                if (ctx.PendingNextToken >= 0)
+                {
+                    ctx.PendingNextToken = -1;
+                    seq.PendingDeviceToken = null;
+                }
+                else
+                {
+                    TakePendingOrSample(seq);
+                }
+                seq.AppendOutputToken(anchors[i]);
+                bool seqStopRepetition = stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true);
+                bool stopped = IsStop(anchors[i]);
+                var acc = new List<int>();
+                int m = 0;
+                while (!stopped && m < drafts[i].Count && drawn[i * window + m] == drafts[i][m])
+                {
+                    int d = drafts[i][m];
+                    seq.AppendOutputToken(d);
+                    acc.Add(d);
+                    m++;
+                    if (IsStop(d) || (seqStopRepetition
+                            && RepetitionGuard.IsLooping(seq.OutputTokens, seq.OutputTokens.Count, out _, out _)))
+                        stopped = true;
+                }
+                kept[i] = m + 1;
+                accepted[i] = acc;
+            }
+
+            batched.CommitBatchedSpecVerify(requestIds, positions, kept);
+            long committed = Stopwatch.GetTimestamp();
+
+            long ticksPerSequence = (Stopwatch.GetTimestamp() - started) / n;
+            for (int i = 0; i < n; i++)
+            {
+                var seq = decodeWork[i].Sequence;
+                var ctx = ctxs[i];
+                int m = kept[i] - 1;
+                batched.BindDraftState(seq.RequestId);
+                ctx.Exec.CommitBatch(anchors[i], positions[i], drafts[i], m,
+                    _batchedSpecFeatures, (long)i * window * feat, verifyTicks / n);
+                int next = drawn[i * window + m];
+                seq.LastLogits = null;
+                seq.AdvanceComputedTokens(kept[i]);
+                ctx.NextPosition = positions[i] + kept[i];
+                ctx.PendingNextToken = next;
+                PublishDrawnToken(seq, next);
+                if (!seq.FirstTokenAt.HasValue)
+                    seq.FirstTokenAt = DateTime.UtcNow;
+                results.Add(new SequenceStepResult
+                {
+                    Sequence = seq,
+                    TokensForwarded = kept[i],
+                    SampledToken = anchors[i],
+                    ExtraTokens = accepted[i].Count > 0 ? accepted[i] : null,
+                    IsPrefill = false,
+                    FullBlocksCaptured = 0,
+                    ForwardElapsedTicks = ticksPerSequence,
+                });
+            }
+            if (ending != null)
+                foreach (var (seq, ctx, anchor) in ending)
+                    EmitEndingAnchor(seq, ctx, anchor, results);
+            _batchedSpecSteps++;
+            if (s_batchedSpecLog)
+            {
+                static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
+                long done = Stopwatch.GetTimestamp();
+                Console.Error.WriteLine(
+                    $"[batched-spec] n={n} window={window} kept=[{string.Join(",", kept)}] draft={Ms(drafted - started):F1} " +
+                    $"verify={Ms(verified - drafted):F1} commit={Ms(committed - verified):F1} drafter={Ms(done - committed):F1} ms");
+            }
+            return true;
+        }
+
+        /// <summary>Emit a batched-speculation lane's anchor that ends its sequence (a stop
+        /// token or the last of its budget) without forwarding it; the engine finishes the
+        /// sequence on it, with the cache one row short of the output.</summary>
+        private void EmitEndingAnchor(SequenceState seq, SpecSeqContext ctx, int anchor, List<SequenceStepResult> results)
+        {
+            if (ctx.PendingNextToken >= 0)
+            {
+                ctx.PendingNextToken = -1;
+                seq.PendingDeviceToken = null;
+            }
+            else
+            {
+                TakePendingOrSample(seq);
+            }
+            seq.AppendOutputToken(anchor);
+            seq.LastLogits = null;
+            if (!seq.FirstTokenAt.HasValue)
+                seq.FirstTokenAt = DateTime.UtcNow;
+            results.Add(new SequenceStepResult
+            {
+                Sequence = seq,
+                TokensForwarded = 0,
+                SampledToken = anchor,
+                IsPrefill = false,
+                FullBlocksCaptured = 0,
+            });
+        }
+
+        private static readonly bool s_batchedSpecLog =
+            Environment.GetEnvironmentVariable("TS_BATCHED_SPEC_LOG") == "1";
+
+        private float[]? _batchedSpecFeatures;
+
+        // The verify window a step falls back to when every gated draft fits it.
+        private const int NarrowBatchedWindow = 4;
+
+        /// <summary>Run <see cref="TryBatchedSpeculativeDecode"/> for a step's decode
+        /// subset. True when the subset was served (or failed and was marked failed:
+        /// a verify or commit that throws may have written their caches, so the
+        /// requests fail instead of being re-served from that state).</summary>
+        private bool TryRunBatchedSpeculativeSubset(
+            List<ScheduledSequenceWork> decodeWork, List<SequenceStepResult> results, ref HashSet<string>? handled)
+        {
+            try
+            {
+                if (!TryBatchedSpeculativeDecode(decodeWork, results))
+                    return false;
+            }
+            catch (Exception ex)
+            {
+                var failed = new HashSet<string>(decodeWork.Select(work => work.Sequence.RequestId), StringComparer.Ordinal);
+                results.RemoveAll(result => failed.Contains(result.Sequence.RequestId));
+                _logger.LogError(ex,
+                    "Batched speculative decode failed for {Count} sequences; failing the affected requests.",
+                    decodeWork.Count);
+                foreach (var work in decodeWork)
+                {
+                    work.Sequence.Error = ex;
+                    results.Add(new SequenceStepResult { Sequence = work.Sequence, Error = ex });
+                }
+                handled = failed;
+                return true;
+            }
+            handled = new HashSet<string>(decodeWork.Select(work => work.Sequence.RequestId), StringComparer.Ordinal);
+            return true;
+        }
+
+        /// <summary>
+        /// The speculative context of a sequence served from its per-request fused
+        /// holder: resumed over tokens the holder advanced plainly since its last
+        /// speculative step, or armed over the holder's committed tokens. False when
+        /// speculation cannot arm for this request.
+        /// </summary>
+        private bool TryGetFusedSpecContext(ISpeculativeTarget spec, SequenceState seq, int prevComputed,
+            [NotNullWhen(true)] out SpecSeqContext? ctx)
+        {
+            if (_fusedSpecCtx.TryGetValue(seq.RequestId, out ctx) && ctx.NextPosition < prevComputed
+                && ctx.Exec != null && ctx.Exec.CanSeedCommitted)
+            {
+                // The holder advanced plainly while this request shared its steps
+                // with neighbours (or took a plain step after a decline). Resume the
+                // context over those tokens rather than re-arming: a re-arm
+                // re-indexed the whole context and re-ran the probe on every
+                // 1 -> N -> 1 transition, which staggered short requests hit constantly.
+                var gap = new int[prevComputed - ctx.NextPosition];
+                for (int i = 0; i < gap.Length; i++)
+                    gap[i] = seq.TokenAt(ctx.NextPosition + i);
+                ctx.Exec.CatchUp(gap, ctx.NextPosition);
+                ctx.NextPosition = prevComputed;
+                ctx.PendingNextToken = -1;   // the plain path drew and consumed it
+            }
+            if (_fusedSpecCtx.TryGetValue(seq.RequestId, out ctx) && ctx.NextPosition == prevComputed)
+                return true;
+            if (ctx != null)
+            {
+                // Something forwarded past this context (a truncation, a head that
+                // cannot resume); start over from the holder's tokens.
+                _fusedSpecCtx.Remove(seq.RequestId);
+                ctx.Exec?.Dispose();
+                ctx = null;
+            }
+            if (_fusedSpecDeclined.Contains(seq.RequestId))
+                return false;
+            var speculator = SpeculatorRegistry.Create(spec, Speculation, out string? declineReason);
+            if (speculator == null)
+            {
+                WarnSpeculationDeclinedOnce(declineReason);
+                _fusedSpecDeclined.Add(seq.RequestId);
+                return false;
+            }
+            var exec = new SpeculativeExecution(spec, speculator, trunk: null, SharedGovernor);
+            if (!exec.CanSeedCommitted)
+            {
+                exec.Dispose();
+                _fusedSpecDeclined.Add(seq.RequestId);
+                return false;
+            }
+            var committed = new int[prevComputed];
+            for (int i = 0; i < prevComputed; i++)
+                committed[i] = seq.TokenAt(i);
+            exec.SeedCommitted(committed);
+            ctx = new SpecSeqContext { Seq = seq, Exec = exec, NextPosition = prevComputed };
+            _fusedSpecCtx[seq.RequestId] = ctx;
+            seq.SpecStats = exec.Stats;
+            _logger.LogInformation(
+                "Speculative decoding armed for {RequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
+                + "pMin={PMin}, trunk=fused holder over {Committed} committed tokens)",
+                seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, prevComputed);
             return true;
         }
 
@@ -2470,8 +3031,12 @@ namespace TensorSharp.Runtime.Scheduling
             if (RadixCache == null) return false;
             // Reserve rewind metadata before materialization transfers ownership.
             _pendingRetainedFusedTruncations.EnsureCapacity(_pendingRetainedFusedTruncations.Count + 1);
-            return RadixCache.TryAdopt(seq, lcp,
+            bool adopted = RadixCache.TryAdopt(seq, lcp,
                 (sequence, tokens) => _pendingRetainedFusedTruncations[sequence.RequestId] = tokens);
+            // The plan found a prefix, so the admission-time reason was cleared; say why adoption failed.
+            if (!adopted)
+                _lastFusedDeclineReason = RadixCache.LastDeclineReason ?? $"adopting the planned {lcp}-token prefix failed";
+            return adopted;
         }
 
         /// <summary>Track an in-flight fused sequence so the release hook can snapshot
@@ -2705,6 +3270,11 @@ namespace TensorSharp.Runtime.Scheduling
                     ExecutionOptions.FromEnvironment().KvGenerationReserveMax));
             }
 
+            return PrefillTokens(seq, work);
+        }
+
+        private static int[] PrefillTokens(SequenceState seq, ScheduledSequenceWork work)
+        {
             int want = work.NumScheduledTokens;
             int[] buf = new int[want];
             for (int i = 0; i < want; i++)

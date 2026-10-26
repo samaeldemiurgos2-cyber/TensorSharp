@@ -23,11 +23,14 @@ name: Release Binaries
 # Windows requires Evergreen WebView2. See docs/tensoragent_desktop.md.
 #   - linux-arm64-cuda13-GB10  SM121a GGML + PTX + CUDA 13 redist -> .tar.gz
 #
-# The x64 CUDA archives bundle the CUDA 12.x runtime libraries (cudart / cublas /
-# cublasLt) so they run against any NVIDIA driver new enough for the toolkit;
-# they still require an NVIDIA GPU + driver at run time. The CPU archives run
-# anywhere (the GGML CPU backend); their pure-C# `--backend cuda` has no PTX and
-# falls back to CPU — use a `-cuda` archive (or build from source) for GPU.
+# The x64 CUDA archives are built with CUDA 13.4 and bundle its runtime libraries
+# (cudart / cublas / cublasLt). Through CUDA minor-version compatibility they run
+# on any driver of the CUDA 13 family (R580 or newer), as do the `--backend cuda`
+# fatbins, whose SASS covers the release GPUs; PTX from 13.4 alone would need a
+# 13.4 driver to JIT. They still require an NVIDIA GPU + driver at run time.
+# The CPU archives run anywhere (the GGML CPU backend); their pure-C#
+# `--backend cuda` has no PTX and falls back to CPU — use a `-cuda` archive (or
+# build from source) for GPU.
 # GB10 uses the pinned CUDA 13 Docker builder on native hosted ARM64, without
 # a GPU. The artifacts target checks clean-runtime dependencies and startup,
 # not model inference. No self-hosted Spark runner is scheduled here.
@@ -53,9 +56,9 @@ on:
         type: boolean
         default: false
       cuda_arch:
-        description: "CMake CUDA architectures for ggml CUDA 12 builds (semicolon-separated; GB10 is pinned at SM121a)."
+        description: "CMake CUDA architectures for ggml CUDA 13.4 builds (semicolon-separated; 13.x starts at 75; GB10 is pinned at SM121a)."
         required: false
-        default: "75-real;86-real;89-real;90-real;90-virtual"
+        default: "75-real;86-real;89-real;90-real;120-real;90-virtual"
       draft:
         description: "Create the GitHub Release as a draft (manual runs only)."
         required: false
@@ -282,29 +285,15 @@ jobs:
           # Pin the desktop SDK/workload/Xcode combination together.
           dotnet-version: "10.0.302"
 
-      - name: Install CUDA toolkit
-        if: ${{ matrix.cuda }}
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: "12.6.3"
-          # network installer; full toolkit so the ggml CUDA backend links
-          # cuBLAS and the runtime libs are present to bundle.
-          method: "network"
-          # On Linux, install only cuda-toolkit-12-6: the default `cuda`
-          # metapackage also pulls in the NVIDIA driver + DKMS packages, whose
-          # kernel-module build fails on GitHub runners — and a build machine
-          # doesn't need the driver. On Windows keep the full default install.
-          sub-packages: ${{ runner.os == 'Linux' && '["toolkit"]' || '[]' }}
-
       - name: Set up MSVC environment (Windows)
         if: ${{ runner.os == 'Windows' }}
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
           # Pin the v143 (VS2022) toolset. windows-latest now ships Visual
-          # Studio 2026, whose default v145 (MSVC 14.5x) toolset is rejected by
-          # CUDA 12.6 nvcc as a host compiler; 14.44 is the newest toolset CUDA
-          # 12.6 accepts and is installed on the image alongside VS2026. This
+          # Studio 2026, whose v145 (MSVC 14.5x) toolset is newer than the host
+          # compilers nvcc has supported; 14.44 is accepted by every CUDA 12 and
+          # 13 nvcc and is installed on the image alongside VS2026. This
           # also sets VCToolsInstallDir, which the TensorSharp.Backends.Cuda
           # PTX compile uses to point nvcc at the right cl.exe.
           toolset: "14.44"
@@ -320,6 +309,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install CUDA toolkit
+        if: ${{ matrix.cuda }}
+        shell: bash
+        # NVIDIA's per-component redistributables, each checked against the
+        # SHA-256 in its release manifest: nvcc, crt, nvvm, cudart, cuBLAS and
+        # CCCL are all the native builds use. No driver/DKMS packages (whose
+        # kernel-module build fails on hosted runners), and no wait for setup
+        # actions to list a release - 13.4 has no Windows installer under the
+        # usual URLs. Exports CUDA_PATH and puts bin (and bin\x64) on PATH.
+        env:
+          CUDA_VERSION: "13.4.3"
+        run: python eng/install-cuda-redist.py --version "$CUDA_VERSION" --dest "$RUNNER_TEMP/cuda-$CUDA_VERSION" --github-env
 
       - name: Resolve version
         id: ver
@@ -367,7 +369,10 @@ jobs:
           # GGML build (and, when nvcc is present, the CUDA PTX compile); the
           # second is incremental.
           TENSORSHARP_GGML_NATIVE_ENABLE_CUDA: ${{ matrix.cuda && 'ON' || 'OFF' }}
-          TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES: ${{ matrix.cuda && (github.event.inputs.cuda_arch || '75-real;86-real;89-real;90-real;90-virtual') || '' }}
+          TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES: ${{ matrix.cuda && (github.event.inputs.cuda_arch || '75-real;86-real;89-real;90-real;120-real;90-virtual') || '' }}
+          # SASS in the `--backend cuda` fatbins (TensorSharp.Backends.Cuda.csproj);
+          # the PTX beside it targets compute_75, the CUDA 13 fallback on this GPU-less runner.
+          CudaFatbinArchitectures: ${{ matrix.cuda && '75,80,86,89,90,120' || '' }}
           # Keep the ggml-vulkan backend out of the release archives (the
           # Windows runners have vulkan-1.dll, so the build script would
           # otherwise auto-enable it): a Vulkan-linked GgmlOps.dll hard-imports
@@ -383,8 +388,8 @@ jobs:
             # from the MSVC setup step. The VS2026-only image has no VS2022
             # instance for CMake's "Visual Studio 17 2022" generator, and a VS
             # generator CUDA build would additionally need CUDA's MSBuild
-            # integration for VS2026, which CUDA 12.6 predates. Ninja drives
-            # cl.exe/nvcc directly and needs neither.
+            # integration, which the redist toolkit install leaves out. Ninja
+            # drives cl.exe/nvcc directly and needs neither.
             export CMAKE_GENERATOR=Ninja
           fi
           # "<archive dir>:<project>". The server's entry point lives in
@@ -410,7 +415,8 @@ jobs:
           APP_VERSION: ${{ steps.ver.outputs.app_version }}
           APP_BUILD: ${{ github.run_number }}
           TENSORSHARP_GGML_NATIVE_ENABLE_CUDA: ${{ matrix.cuda && 'ON' || 'OFF' }}
-          TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES: ${{ matrix.cuda && (inputs.cuda_arch || '75-real;86-real;89-real;90-real;90-virtual') || '' }}
+          TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES: ${{ matrix.cuda && (inputs.cuda_arch || '75-real;86-real;89-real;90-real;120-real;90-virtual') || '' }}
+          CudaFatbinArchitectures: ${{ matrix.cuda && '75,80,86,89,90,120' || '' }}
           TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN: "OFF"
           TENSORSHARP_MLX_NATIVE_SKIP: "true"
         run: |
@@ -502,21 +508,25 @@ jobs:
             echo "::error::CUDA PTX kernel not found at $ptxdir/tensorsharp_kernels.ptx (was nvcc available during publish?)." >&2
             exit 1
           fi
-          for app in server cli; do
-            mkdir -p "publish/$app/cuda_kernels"
-            cp "$ptxdir"/*.ptx "publish/$app/cuda_kernels/"
-          done
-          if [ "$RUNNER_OS" = Windows ]; then
-            mkdir -p publish/desktop/cuda_kernels
-            cp "$ptxdir"/*.ptx publish/desktop/cuda_kernels/
+          # Each fatbin carries the release GPUs' SASS; the loader uses it only
+          # beside the PTX its .fatbin.sha256 names.
+          if [ ! -f "$ptxdir/tensorsharp_kernels.fatbin" ] || [ ! -f "$ptxdir/tensorsharp_kernels.fatbin.sha256" ]; then
+            echo "::error::CUDA fatbin kernels not found in $ptxdir; a CUDA 13 driver older than the toolkit could not JIT the PTX alone." >&2
+            exit 1
           fi
+          targets="server cli"
+          if [ "$RUNNER_OS" = Windows ]; then targets="$targets desktop"; fi
+          for app in $targets; do
+            mkdir -p "publish/$app/cuda_kernels"
+            cp "$ptxdir"/*.ptx "$ptxdir"/*.fatbin "$ptxdir"/*.fatbin.sha256 "publish/$app/cuda_kernels/"
+          done
 
       - name: Stage CUDA runtime (Linux)
         if: ${{ matrix.cuda && runner.os == 'Linux' }}
         shell: bash
         run: |
           set -euo pipefail
-          for f in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+          for f in libcudart.so.13 libcublas.so.13 libcublasLt.so.13; do
             src="$CUDA_PATH/lib64/$f"
             if [ -f "$src" ]; then
               cp -L "$src" publish/server/
@@ -531,8 +541,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($dll in @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")) {
-            $src = Join-Path $env:CUDA_PATH "bin\$dll"
+          foreach ($dll in @("cudart64_13.dll", "cublas64_13.dll", "cublasLt64_13.dll")) {
+            # CUDA 13 keeps its Windows DLLs in bin\x64.
+            $src = Join-Path $env:CUDA_PATH "bin\x64\$dll"
+            if (-not (Test-Path $src)) { $src = Join-Path $env:CUDA_PATH "bin\$dll" }
             if (Test-Path $src) {
               Copy-Item $src publish/server/
               Copy-Item $src publish/cli/

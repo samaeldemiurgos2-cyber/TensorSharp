@@ -15,6 +15,8 @@ public sealed class ModelParallelismOptions
     private readonly Dictionary<string, string> _overrides = new();
     public int TpDegree { get; private set; }
     public int LayerSplitDegree { get; private set; }
+    /// <summary>Whole-layer execution was selected, including one GPU per node.</summary>
+    public bool IsLayerSplit { get; private set; }
     public DistributedTpConfig Distributed { get; private set; }
     public bool HasCliOverrides => _overrides.Count != 0;
 
@@ -91,6 +93,7 @@ public sealed class ModelParallelismOptions
             "--layer-split / " + LayerSplitDegreeVariable, 1);
         if (result.TpDegree > 1 && result.LayerSplitDegree > 1)
             throw new ArgumentException("--tp and --layer-split cannot both exceed 1. Choose tensor parallelism or layer splitting.");
+        result.IsLayerSplit = result.TpDegree == 1 && !string.IsNullOrWhiteSpace(Resolve(LayerSplitDegreeVariable));
 
         string node = Resolve(NodeIdVariable);
         string peers = Resolve(PeersVariable);
@@ -102,17 +105,16 @@ public sealed class ModelParallelismOptions
                 : "--tp-peers requires --tp-node-id (this node's 0-based ID).");
         if (hasNode)
         {
-            if (result.LayerSplitDegree > 1)
-                throw new ArgumentException("--layer-split supports GPUs on one node only; it cannot be combined with --tp-node-id/--tp-peers. Multi-node inference requires tensor parallelism.");
             int nodeId = ReadInteger(node, "--tp-node-id / " + NodeIdVariable, 0);
             try
             {
                 var endpoints = DistributedTpConfig.ParsePeers(peers);
                 if (endpoints.Length < 2)
-                    throw new ArgumentException("Distributed tensor parallelism requires at least two peer endpoints.");
+                    throw new ArgumentException("Distributed inference requires at least two peer endpoints.");
                 if (nodeId >= endpoints.Length)
                     throw new ArgumentException($"--tp-node-id {nodeId} must be less than the number of peers ({endpoints.Length}).");
-                result.Distributed = new DistributedTpConfig(nodeId, result.TpDegree, endpoints);
+                result.Distributed = new DistributedTpConfig(nodeId,
+                    result.IsLayerSplit ? result.LayerSplitDegree : result.TpDegree, endpoints);
             }
             catch (Exception ex) when (ex is ArgumentException or FormatException or System.Net.Sockets.SocketException)
             {

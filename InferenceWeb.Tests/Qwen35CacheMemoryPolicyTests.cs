@@ -25,6 +25,19 @@ public class Qwen35CacheMemoryPolicyTests
     }
 
     [Fact]
+    public void GrowthPolicy_BoundsGeometricSlackOfALongCache()
+    {
+        // A long cache grows by a quarter rather than doubling: 22,016 -> 27,648 (256-aligned)
+        // for a 22,987-token prompt, not a whole second copy at the 32,768-token context.
+        Assert.Equal(27648, Qwen35Model.ResolveAttentionCacheGrowthCapacity(22016, 22987, 32768, 128, null));
+        Assert.Equal(21504, Qwen35Model.ResolveAttentionCacheGrowthCapacity(17152, 18003, 32768, 128, null));
+        // The bound never cuts below what is required.
+        Assert.Equal(30208, Qwen35Model.ResolveAttentionCacheGrowthCapacity(17152, 30100, 32768, 128, null));
+        // A short cache still doubles.
+        Assert.Equal(16384, Qwen35Model.ResolveAttentionCacheGrowthCapacity(8192, 8370, 32768, 128, null));
+    }
+
+    [Fact]
     public void GrowthPolicy_PreservesRequiredRowsAndContextLimitWithoutIntegerOverflow()
     {
         Assert.Equal(8192, Qwen35Model.ResolveAttentionCacheGrowthCapacity(8192, 8100, 32768, 128, 0));
@@ -33,6 +46,22 @@ public class Qwen35CacheMemoryPolicyTests
         Assert.Equal(8371, Qwen35Model.ResolveAttentionCacheGrowthCapacity(8192, 8370, 8371, 128, 0));
         Assert.Equal(int.MaxValue, Qwen35Model.ResolveAttentionCacheGrowthCapacity(1 << 30, int.MaxValue - 1, int.MaxValue, 128, null));
         Assert.Throws<ArgumentOutOfRangeException>(() => Qwen35Model.ResolveAttentionCacheGrowthCapacity(8192, 9000, 8500, 128, 0));
+    }
+
+    [Theory]
+    [InlineData(0, 8)]
+    [InlineData(65536, 256)]
+    [InlineData(long.MaxValue, 2048)]
+    public void CloneReservation_FitsCurrentBudget_WithoutUsingInitialCapacity(long spare, int expected)
+    {
+        using var fixture = new Fixture();
+        object source = fixture.Holder();
+        fixture.Retained.Add("prefix", source);
+        fixture.Model.SpareBytes = spare;
+        Set(typeof(Qwen35Model), fixture.Model, "_initialKvCacheCapacity", 24576);
+        Assert.Equal(expected, fixture.Model.ResolveCloneReservationTokens("prefix", 1900));
+        Assert.Equal(8, Get(HolderType, source, "KvCapacity"));
+        Assert.Equal(0, fixture.Model.ResolveCloneReservationTokens("missing", 1900));
     }
 
     [Fact]
@@ -45,6 +74,19 @@ public class Qwen35CacheMemoryPolicyTests
         Assert.False(Qwen35Model.CanPoolIdleCache(1, 0, 4, 4, long.MaxValue));
         Assert.False(Qwen35Model.CanPoolIdleCache(long.MaxValue, long.MaxValue, 1, 64, long.MaxValue));
         Assert.True(Qwen35Model.CanPoolIdleCache(1, 0, 0, 64, null));
+    }
+
+    [Fact]
+    public void DemotionTakesUnclonedHoldersBeforeClonedOnes()
+    {
+        // A never-cloned holder goes first even when its K/V still needs a download,
+        // and a cloned one goes last even when demoting it would be free.
+        Assert.True(Qwen35Model.DeviceDemotionRank(0, kvOnHost: false, hostSyncRunning: false)
+            < Qwen35Model.DeviceDemotionRank(1, kvOnHost: true, hostSyncRunning: false));
+        // Within a tier: host-current first, then a running sync, then a pending download.
+        Assert.True(Qwen35Model.DeviceDemotionRank(0, true, false) < Qwen35Model.DeviceDemotionRank(0, false, true));
+        Assert.True(Qwen35Model.DeviceDemotionRank(0, false, true) < Qwen35Model.DeviceDemotionRank(0, false, false));
+        Assert.Equal(Qwen35Model.DeviceDemotionRank(2, true, false), Qwen35Model.DeviceDemotionRank(5, true, false));
     }
 
     [Theory]

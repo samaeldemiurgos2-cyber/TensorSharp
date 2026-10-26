@@ -54,8 +54,9 @@ namespace TensorSharp.Cuda.Interop
 
             // Prefer versioned runtime libraries; unversioned symlinks can point
             // at stubs or a different toolkit than the native GGML bridge uses.
-            yield return "libcublas.so.12";
+            // CUDA 13 first: the release builds bundle it next to the GGML bridge.
             yield return "libcublas.so.13";
+            yield return "libcublas.so.12";
             yield return "libcublas.so.11";
             yield return "libcublas.so";
         }
@@ -83,11 +84,15 @@ namespace TensorSharp.Cuda.Interop
 
         private static IEnumerable<string> EnumerateCudaBinDirectories()
         {
+            // CUDA 13 installs its DLLs in bin\x64, earlier toolkits in bin.
             foreach (string variableName in new[] { "CUDA_PATH", "CUDA_HOME" })
             {
                 string root = Environment.GetEnvironmentVariable(variableName);
                 if (!string.IsNullOrWhiteSpace(root))
+                {
+                    yield return Path.Combine(root, "bin", "x64");
                     yield return Path.Combine(root, "bin");
+                }
             }
 
             string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
@@ -96,7 +101,10 @@ namespace TensorSharp.Cuda.Interop
                 yield break;
 
             foreach (string versionDir in Directory.EnumerateDirectories(cudaRoot, "v*").OrderByDescending(path => path))
+            {
+                yield return Path.Combine(versionDir, "bin", "x64");
                 yield return Path.Combine(versionDir, "bin");
+            }
         }
     }
 }

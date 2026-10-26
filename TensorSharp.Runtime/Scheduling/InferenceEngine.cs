@@ -64,6 +64,14 @@ namespace TensorSharp.Runtime.Scheduling
             ArgumentNullException.ThrowIfNull(cfg);
             if (cfg.BlockSize <= 0) cfg = cfg.WithBlockSize(PreferredBlockSize(model));
             _logger = logger ?? NullLogger.Instance;
+            if (!cfg.MixedStepPrefillBudgetChosen
+                && model is Speculative.IMixedStepPrefillTarget { PreferredMixedStepPrefillTokens: > 0 } mixedTarget)
+            {
+                cfg = cfg.WithMixedStepPrefillBudget(mixedTarget.PreferredMixedStepPrefillTokens);
+                _logger.LogInformation(
+                    "Steps that also decode carry at most {Tokens} prompt tokens (the model's bound; " +
+                    "TS_SCHED_MIXED_PREFILL_TOKENS overrides it, 0 for none)", cfg.MixedStepPrefillBudget);
+            }
             _stopRepetition = cfg.StopRepetition;   // cfg is null-checked above
             _nativeSlotContextLimit = UsesNativeDeepSeek41Slots(model) ? Math.Max(0, model.MaxContextLength) : 0;
 
@@ -167,6 +175,11 @@ namespace TensorSharp.Runtime.Scheduling
             get => _executor.PrefixCheckpointStore;
             set => _executor.PrefixCheckpointStore = value;
         }
+
+        /// <summary>Wait for the checkpoint writes to <see cref="PrefixCheckpointStore"/> still in
+        /// flight: on hosts with memory to spare they run in the background, after the request that
+        /// produced them has completed.</summary>
+        public void FlushPrefixCheckpointSaves() => _executor.RadixCache?.FlushPendingSaves();
 
         /// <summary>
         /// How many times the step loop was actually held by a closed

@@ -12,6 +12,7 @@
 #include "ggml_ops_moe_stream_memory.h"
 #include "bonsai_quant.h"
 #include "ggml_ops_graph_optimize.h"
+#include "ggml_ops_cuda_launch_policy.h"
 
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-backend-impl.h"
@@ -34,6 +35,10 @@
 
 #if defined(GGML_USE_CUDA)
 #include "ggml-cuda.h"
+#endif
+
+#if defined(TSG_GGML_USE_CUDA)
+#include <cuda_runtime.h>
 #endif
 
 #if defined(GGML_USE_VULKAN)
@@ -476,6 +481,11 @@ namespace tsg
 #if defined(GGML_USE_CUDA)
         if (backend_type == BACKEND_TYPE_CUDA)
         {
+            if (!configure_cuda_launch_policy())
+            {
+                set_last_error("Failed to set the CUDA launch compatibility policy.");
+                return out;
+            }
             const size_t n = ggml_backend_dev_count();
             for (size_t i = 0; i < n; ++i)
             {
@@ -2015,6 +2025,61 @@ namespace tsg
         return true;
     }
 
+    // A download into host pages that were never touched (holder buffers built
+    // device-authoritative) runs at page-fault speed: the driver's staging copy
+    // faults every 4 KiB page from one thread, ~1-2 GB/s. Faulting the destination
+    // from several threads first measured 704 MB in 500 ms -> 113 ms on an RTX 5090
+    // host. MADV_POPULATE_WRITE keeps the bytes; the fallback rewrites each page's
+    // first byte with its own value.
+    void prefault_host_ranges(void* base, const std::int64_t* offsets, const std::int64_t* lengths, int count)
+    {
+#if defined(__linux__)
+        constexpr std::int64_t kMinBytes = 4ll << 20;
+        constexpr std::int64_t kPerThread = 2ll << 20;
+        constexpr std::int64_t kPage = 4096;
+        std::int64_t total = 0;
+        for (int i = 0; i < count; i++)
+            total += std::max<std::int64_t>(0, lengths[i]);
+        if (base == nullptr || total < kMinBytes)
+            return;
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency() / 2);
+        const int threads = static_cast<int>(std::min<std::int64_t>({16, hw, total / kPerThread}));
+        if (threads < 2)
+            return;
+        auto touch = [&](std::int64_t begin, std::int64_t end) {
+            // Map the [begin, end) share of the concatenated ranges back to addresses.
+            std::int64_t pos = 0;
+            for (int i = 0; i < count && pos < end; i++)
+            {
+                const std::int64_t len = std::max<std::int64_t>(0, lengths[i]);
+                const std::int64_t lo = std::max(begin, pos), hi = std::min(end, pos + len);
+                if (lo < hi)
+                {
+                    char* p = static_cast<char*>(base) + offsets[i] + (lo - pos);
+                    const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(p) & ~static_cast<std::uintptr_t>(kPage - 1);
+                    const std::uintptr_t b = reinterpret_cast<std::uintptr_t>(p + (hi - lo));
+                    if (madvise(reinterpret_cast<void*>(a), b - a, 23 /* MADV_POPULATE_WRITE */) != 0)
+                        for (std::uintptr_t q = a < reinterpret_cast<std::uintptr_t>(p) ? a + kPage : a; q < b; q += kPage)
+                        {
+                            volatile char* c = reinterpret_cast<volatile char*>(q);
+                            *c = *c;
+                        }
+                }
+                pos += len;
+            }
+        };
+        std::vector<std::thread> pool;
+        pool.reserve(static_cast<std::size_t>(threads - 1));
+        for (int t = 1; t < threads; t++)
+            pool.emplace_back(touch, total * t / threads, total * (t + 1) / threads);
+        touch(0, total / threads);
+        for (auto& th : pool)
+            th.join();
+#else
+        (void)base; (void)offsets; (void)lengths; (void)count;
+#endif
+    }
+
     bool sync_cached_buffer_to_host(void* data, std::size_t bytes)
     {
         if (data == nullptr || bytes == 0)
@@ -2065,6 +2130,8 @@ namespace tsg
         if (status != GGML_STATUS_SUCCESS)
             return false;
 
+        const std::int64_t zero = 0, length = static_cast<std::int64_t>(bytes);
+        prefault_host_ranges(data, &zero, &length, 1);
         ggml_backend_tensor_get(tensor, data, 0, bytes);
         tsg::sync_backend(g_backend);
         return true;
@@ -3127,6 +3194,7 @@ extern "C" void TSGgml_Gemma4ResetMoEBatchedDecodeCache();
 extern "C" void TSGgml_GptOssResetDecodeCache();
 extern "C" void TSGgml_GptOssResetBatchedDecodeCache();
 extern "C" void TSGgml_Qwen35ArenaResetBatchedDecodeCache();
+extern "C" void TSGgml_Qwen35BatchedVerifyReset();
 extern "C" void TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
 namespace tsg_q35arena { void on_drop(const void* host_ptr); }
 extern "C" void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
@@ -3152,6 +3220,7 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // about to free; their captured graphs must not survive it.
     TSGgml_GptOssResetBatchedDecodeCache();
     TSGgml_Qwen35ArenaResetBatchedDecodeCache();
+    TSGgml_Qwen35BatchedVerifyReset();
     TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
     // Drop any persistent whole-model graphs first: they bind weights resident by
     // GGUF pointer (shared via these caches), so freeing the caches below would leave
@@ -3311,6 +3380,7 @@ TSG_EXPORT void TSGgml_Shutdown()
     TSGgml_GptOssResetDecodeCache();
     TSGgml_GptOssResetBatchedDecodeCache();
     TSGgml_Qwen35ArenaResetBatchedDecodeCache();
+    TSGgml_Qwen35BatchedVerifyReset();
     TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
     TSGgml_GptOssInvalidateKvCache(nullptr, nullptr);
     // Same contract for the other whole-model graph caches: each parks a ggml
@@ -3554,6 +3624,69 @@ TSG_EXPORT void TSGgml_SetDeviceCopyBudget(int64_t bytes)
     }
 }
 
+namespace
+{
+    // cudaMemGetInfo for a discrete CUDA device, or false where ggml's query must
+    // answer. On Linux ggml's query also runs cudaGetDeviceProperties (~1.7 ms) to
+    // detect a unified-memory device, and the serving path asks for free VRAM
+    // around every request; that property cannot change, so it is resolved once.
+    bool try_discrete_cuda_memory(ggml_backend_dev_t dev, std::size_t& free_sz, std::size_t& total_sz)
+    {
+#if defined(TSG_GGML_USE_CUDA)
+        if (g_backend_type != BACKEND_TYPE_CUDA)
+            return false;
+        static std::mutex mutex;
+        static std::unordered_map<ggml_backend_dev_t, int> ordinals; // -1: ask ggml
+        int ordinal = -1;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = ordinals.find(dev);
+            if (it == ordinals.end())
+            {
+                int resolved = -1;
+                ggml_backend_dev_props props{};
+                ggml_backend_dev_get_props(dev, &props);
+                // ggml reports system memory for unified-memory devices and when
+                // GGML_CUDA_ENABLE_UNIFIED_MEMORY is set; a virtual device id
+                // ("<bus id>-vN") shares its GPU. Leave all of those to ggml.
+                if (props.type == GGML_BACKEND_DEVICE_TYPE_GPU && props.device_id != nullptr
+                    && std::strstr(props.device_id, "-v") == nullptr
+                    && std::getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") == nullptr
+                    && cudaDeviceGetByPCIBusId(&resolved, props.device_id) != cudaSuccess)
+                {
+                    (void)cudaGetLastError();
+                    resolved = -1;
+                }
+                it = ordinals.emplace(dev, resolved).first;
+            }
+            ordinal = it->second;
+        }
+        if (ordinal < 0)
+            return false;
+        int previous = -1;
+        if (cudaGetDevice(&previous) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+        if (previous != ordinal && cudaSetDevice(ordinal) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return false;
+        }
+        const bool ok = cudaMemGetInfo(&free_sz, &total_sz) == cudaSuccess;
+        if (!ok)
+            (void)cudaGetLastError();
+        if (previous != ordinal)
+            cudaSetDevice(previous);
+        return ok;
+#else
+        (void)dev; (void)free_sz; (void)total_sz;
+        return false;
+#endif
+    }
+}
+
 // Current free/total memory of the active backend's device, in bytes. For the
 // CUDA backend this is physical VRAM; C# uses it to size weight preloading and
 // the device-copy budget so VRAM is never oversubscribed. Returns 0 on failure
@@ -3566,7 +3699,8 @@ TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes
     if (dev == nullptr)
         return 0;
     std::size_t free_sz = 0, total_sz = 0;
-    ggml_backend_dev_memory(dev, &free_sz, &total_sz);
+    if (!try_discrete_cuda_memory(dev, free_sz, total_sz))
+        ggml_backend_dev_memory(dev, &free_sz, &total_sz);
     if (total_sz == 0)
         return 0;
     *free_bytes = static_cast<int64_t>(free_sz);
@@ -3705,6 +3839,8 @@ static bool cached_buffer_ranges(void* base, const std::int64_t* offsets, const 
     if (ggml_backend_tensor_alloc(buffer, tensor, addr) != GGML_STATUS_SUCCESS)
         return false;
 
+    if (to_host)
+        tsg::prefault_host_ranges(base, offsets, lengths, count);
     // Pending GPU work may still be writing (or reading) this buffer; drain it
     // before touching the bytes either way.
     tsg::host_read_barrier();
@@ -3720,6 +3856,28 @@ static bool cached_buffer_ranges(void* base, const std::int64_t* offsets, const 
     }
     tsg::sync_backend(g_backend);
     return true;
+}
+
+// Fault a set of host spans in from several threads before many small downloads
+// land in them: each download alone is under prefault_host_ranges' threshold, and
+// together they ran at single-thread page-fault speed (48 x 3 MB recurrent states).
+TSG_EXPORT void TSGgml_PrefaultHostSpans(void* const* ptrs, const std::int64_t* lengths, int count)
+{
+    if (ptrs == nullptr || lengths == nullptr || count <= 0)
+        return;
+    char* base = nullptr;
+    for (int i = 0; i < count; i++)
+        if (ptrs[i] != nullptr && (base == nullptr || static_cast<char*>(ptrs[i]) < base))
+            base = static_cast<char*>(ptrs[i]);
+    if (base == nullptr)
+        return;
+    std::vector<std::int64_t> offsets(static_cast<std::size_t>(count)), spans(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; i++)
+    {
+        offsets[i] = ptrs[i] != nullptr ? static_cast<char*>(ptrs[i]) - base : 0;
+        spans[i] = ptrs[i] != nullptr ? lengths[i] : 0;
+    }
+    tsg::prefault_host_ranges(base, offsets.data(), spans.data(), count);
 }
 
 TSG_EXPORT int TSGgml_SyncHostBufferRanges(void* ptr, const std::int64_t* offsets, const std::int64_t* lengths, int count)
@@ -3739,6 +3897,124 @@ TSG_EXPORT int TSGgml_SyncHostBufferRanges(void* ptr, const std::int64_t* offset
     return 0;
 }
 
+// Download ranges of an IDLE cached device copy from a background thread, so an
+// idle prefix-cache holder's K/V reaches host memory before memory pressure needs
+// its device copy back. Unlike TSGgml_SyncHostBufferRanges there is no global
+// host_read_barrier or backend synchronize: the main thread may be computing on
+// the shared stream. ggml-cuda's tensor_get copies on the calling thread's own
+// stream and waits for that stream only, so the transfer overlaps those kernels.
+// The caller guarantees that no queued or future work writes this buffer while the
+// copy runs (a retained, unbound holder whose last write has completed) and that
+// nothing frees the device copy or the host bytes meanwhile. Single device only.
+// Returns 1 when the ranges were copied, 0 when there is no matching device copy,
+// and -1 on failure.
+TSG_EXPORT int TSGgml_SyncIdleHostBufferRanges(void* ptr, const std::int64_t* offsets, const std::int64_t* lengths, int count)
+{
+    try
+    {
+        if (ptr == nullptr || count <= 0 || offsets == nullptr || lengths == nullptr)
+            return 0;
+        if (tsg::g_device_count.load(std::memory_order_acquire) > 1)
+            return -1;
+        ggml_backend_buffer_t buffer = nullptr;
+        tsg::CachedBufferMode mode = tsg::CachedBufferMode::HostPtr;
+        std::size_t cached_bytes = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            auto it = g_host_buffer_cache.find(ptr);
+            if (it == g_host_buffer_cache.end())
+                return 0;
+            buffer = it->second.buffer;
+            mode = it->second.mode;
+            cached_bytes = it->second.bytes;
+        }
+        if (mode != tsg::CachedBufferMode::DeviceCopy || buffer == nullptr)
+            return 0;
+        for (int i = 0; i < count; ++i)
+            if (offsets[i] < 0 || lengths[i] < 0 || static_cast<std::size_t>(offsets[i] + lengths[i]) > cached_bytes)
+                return 0;
+        void* addr = ggml_backend_buffer_get_base(buffer);
+        if (addr == nullptr)
+            return -1;
+        ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, /*no_alloc=*/true };
+        ggml_context* ctx = ggml_init(ip);
+        if (ctx == nullptr)
+            return -1;
+        ggml_tensor* tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, static_cast<std::int64_t>(cached_bytes));
+        bool ok = tensor != nullptr && ggml_backend_tensor_alloc(buffer, tensor, addr) == GGML_STATUS_SUCCESS;
+        if (ok)
+        {
+            tsg::prefault_host_ranges(ptr, offsets, lengths, count);
+            for (int i = 0; i < count; ++i)
+                if (lengths[i] > 0)
+                    ggml_backend_tensor_get(tensor, static_cast<char*>(ptr) + offsets[i],
+                        static_cast<std::size_t>(offsets[i]), static_cast<std::size_t>(lengths[i]));
+        }
+        ggml_free(ctx);
+        return ok ? 1 : -1;
+    }
+    catch (...) { return -1; }
+}
+
+// Background download of ranges of SRC's cached device copy into DST, another host
+// buffer, at its own offsets: a prefix checkpoint lands the request holder's
+// committed K/V rows straight in the checkpoint's host tensors while the worker
+// keeps computing. Same contract as TSGgml_SyncIdleHostBufferRanges: no barrier
+// (the caller has synchronized the work that wrote those rows), the copy runs on
+// the calling thread's own stream, and nothing may write the source ranges or free
+// either side meanwhile. Single device only. 1 copied, 0 no matching device copy,
+// -1 failure.
+TSG_EXPORT int TSGgml_DownloadDeviceCopyRanges(const void* src_key, void* dst,
+    const std::int64_t* src_offsets, const std::int64_t* dst_offsets, const std::int64_t* lengths, int count)
+{
+    try
+    {
+        if (src_key == nullptr || dst == nullptr || count <= 0 ||
+            src_offsets == nullptr || dst_offsets == nullptr || lengths == nullptr)
+            return 0;
+        if (tsg::g_device_count.load(std::memory_order_acquire) > 1)
+            return -1;
+        ggml_backend_buffer_t buffer = nullptr;
+        tsg::CachedBufferMode mode = tsg::CachedBufferMode::HostPtr;
+        std::size_t cached_bytes = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            auto it = g_host_buffer_cache.find(const_cast<void*>(src_key));
+            if (it == g_host_buffer_cache.end())
+                return 0;
+            buffer = it->second.buffer;
+            mode = it->second.mode;
+            cached_bytes = it->second.bytes;
+        }
+        if (mode != tsg::CachedBufferMode::DeviceCopy || buffer == nullptr)
+            return 0;
+        for (int i = 0; i < count; ++i)
+            if (src_offsets[i] < 0 || dst_offsets[i] < 0 || lengths[i] < 0 ||
+                static_cast<std::size_t>(src_offsets[i] + lengths[i]) > cached_bytes)
+                return 0;
+        void* addr = ggml_backend_buffer_get_base(buffer);
+        if (addr == nullptr)
+            return -1;
+        ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, /*no_alloc=*/true };
+        ggml_context* ctx = ggml_init(ip);
+        if (ctx == nullptr)
+            return -1;
+        ggml_tensor* tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, static_cast<std::int64_t>(cached_bytes));
+        bool ok = tensor != nullptr && ggml_backend_tensor_alloc(buffer, tensor, addr) == GGML_STATUS_SUCCESS;
+        if (ok)
+        {
+            tsg::prefault_host_ranges(dst, dst_offsets, lengths, count);
+            for (int i = 0; i < count; ++i)
+                if (lengths[i] > 0)
+                    ggml_backend_tensor_get(tensor, static_cast<char*>(dst) + dst_offsets[i],
+                        static_cast<std::size_t>(src_offsets[i]), static_cast<std::size_t>(lengths[i]));
+        }
+        ggml_free(ctx);
+        return ok ? 1 : -1;
+    }
+    catch (...) { return -1; }
+}
+
 TSG_EXPORT int TSGgml_UploadHostBufferRanges(void* ptr, const std::int64_t* offsets, const std::int64_t* lengths, int count)
 {
     bool ok = true;
@@ -3754,6 +4030,216 @@ TSG_EXPORT int TSGgml_UploadHostBufferRanges(void* ptr, const std::int64_t* offs
     }
     set_last_error("Failed to upload a range of host memory into a cached GGML device buffer.");
     return 0;
+}
+
+// Copy row ranges into a host-keyed device copy, creating it WITHOUT uploading its
+// own host bytes when absent. The source is either another key's resident device
+// copy (src_is_host == false) or host memory (src_is_host == true). Either way the
+// destination's host bytes are left untouched, so the caller owns the contract that
+// the destination is device-authoritative until it synchronizes them back. When
+// zero_dst != 0 the destination is cleared first so bytes outside the copied ranges
+// read as zero. Single-device only. Returns 1 on success and 0 (nothing changed for
+// an existing destination) otherwise.
+static int copy_ranges_into_device_copy(
+    const void* src, bool src_is_host, std::int64_t src_bytes, void* dst_key, std::int64_t dst_bytes,
+    const std::int64_t* src_offsets, const std::int64_t* dst_offsets, const std::int64_t* lengths,
+    int count, int zero_dst, const char* what)
+{
+    auto error = [what](const char* message) {
+        set_last_error(std::string(what) + ": " + message);
+        return 0;
+    };
+    if (src == nullptr || dst_key == nullptr || src == dst_key || src_bytes <= 0 || dst_bytes <= 0 ||
+        count < 0 || (count > 0 && (src_offsets == nullptr || dst_offsets == nullptr || lengths == nullptr)))
+        return error("invalid arguments.");
+    if (!ensure_backend() || g_backend == nullptr || tsg::g_device_count.load(std::memory_order_acquire) > 1)
+        return error("requires a single initialized device backend.");
+    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    if (dev == nullptr || !prefers_device_local_cache(dev))
+        return error("backend has no device-local copies.");
+    for (int i = 0; i < count; ++i)
+    {
+        if (src_offsets[i] < 0 || dst_offsets[i] < 0 || lengths[i] < 0 ||
+            src_offsets[i] + lengths[i] > src_bytes || dst_offsets[i] + lengths[i] > dst_bytes)
+            return error("range outside a buffer.");
+    }
+
+    ggml_backend_buffer_t src_buffer = nullptr;
+    ggml_backend_buffer_t dst_buffer = nullptr;
+    bool created = false;
+    {
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        if (!src_is_host)
+        {
+            auto source = g_host_buffer_cache.find(const_cast<void*>(src));
+            if (source == g_host_buffer_cache.end() || source->second.mode != CachedBufferMode::DeviceCopy ||
+                source->second.bytes != static_cast<std::size_t>(src_bytes) || source->second.buffer == nullptr)
+                return error("source has no resident device copy.");
+            src_buffer = source->second.buffer;
+        }
+        auto dst = g_host_buffer_cache.find(dst_key);
+        if (dst != g_host_buffer_cache.end())
+        {
+            // Replacing a differently sized copy would free memory a persistent
+            // graph may still reference; the caller's invalidating path owns that.
+            if (dst->second.mode != CachedBufferMode::DeviceCopy ||
+                dst->second.bytes != static_cast<std::size_t>(dst_bytes) || dst->second.buffer == nullptr)
+                return error("destination has an incompatible cached buffer.");
+            dst_buffer = dst->second.buffer;
+        }
+    }
+
+    if (dst_buffer == nullptr)
+    {
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
+        if (buft == nullptr)
+            return 0;
+        // Later binds compare the typed tensor's allocation size, which can add
+        // one padded row for quantized types; leave room for it.
+        const std::size_t alloc_size = static_cast<std::size_t>(dst_bytes) + 4096;
+        {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            if (g_device_copy_budget_bytes > 0 &&
+                g_device_copy_resident_bytes + static_cast<std::int64_t>(alloc_size) > g_device_copy_budget_bytes)
+                return error("device-copy budget exhausted.");
+        }
+        dst_buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
+        if (dst_buffer == nullptr)
+            return error("device allocation failed.");
+        ggml_backend_buffer_set_usage(dst_buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        created = true;
+    }
+
+    auto fail = [&](const char* message) {
+        if (created)
+            ggml_backend_buffer_free(dst_buffer);
+        return error(message);
+    };
+
+    tsg::PooledContextHandle context;
+    if (!context.init(64 * 1024))
+        return fail("context allocation failed.");
+    ggml_tensor* src_t = src_is_host ? nullptr : ggml_new_tensor_1d(context.value, GGML_TYPE_I8, src_bytes);
+    ggml_tensor* dst_t = ggml_new_tensor_1d(context.value, GGML_TYPE_I8, dst_bytes);
+    if ((!src_is_host && (src_t == nullptr ||
+            ggml_backend_tensor_alloc(src_buffer, src_t, ggml_backend_buffer_get_base(src_buffer)) != GGML_STATUS_SUCCESS)) ||
+        dst_t == nullptr ||
+        ggml_backend_tensor_alloc(dst_buffer, dst_t, ggml_backend_buffer_get_base(dst_buffer)) != GGML_STATUS_SUCCESS)
+        return fail("binding the device buffers failed.");
+
+    // Kernels still in flight may write the source rows or read the destination.
+    tsg::host_read_barrier();
+    tsg::sync_backend(g_backend);
+    if (zero_dst != 0)
+        ggml_backend_tensor_memset(dst_t, 0, 0, static_cast<std::size_t>(dst_bytes));
+    for (int i = 0; i < count; ++i)
+    {
+        if (lengths[i] == 0)
+            continue;
+        if (src_is_host)
+        {
+            ggml_backend_tensor_set(dst_t, static_cast<const std::uint8_t*>(src) + src_offsets[i],
+                static_cast<std::size_t>(dst_offsets[i]), static_cast<std::size_t>(lengths[i]));
+            continue;
+        }
+        ggml_tensor* from = ggml_view_1d(context.value, src_t, lengths[i], static_cast<std::size_t>(src_offsets[i]));
+        ggml_tensor* to = ggml_view_1d(context.value, dst_t, lengths[i], static_cast<std::size_t>(dst_offsets[i]));
+        if (from == nullptr || to == nullptr ||
+            ggml_backend_view_init(from) != GGML_STATUS_SUCCESS || ggml_backend_view_init(to) != GGML_STATUS_SUCCESS)
+            return fail("view creation failed.");
+        ggml_backend_tensor_copy(from, to);
+    }
+    tsg::sync_backend(g_backend);
+
+    if (created)
+    {
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        if (g_host_buffer_cache.find(dst_key) != g_host_buffer_cache.end())
+        {
+            ggml_backend_buffer_free(dst_buffer);
+            return error("destination was bound concurrently.");
+        }
+        g_host_buffer_cache[dst_key] = {
+            dst_buffer, static_cast<std::size_t>(dst_bytes),
+            ggml_backend_buffer_get_size(dst_buffer),
+            CachedBufferMode::DeviceCopy
+        };
+        g_device_copy_resident_bytes += static_cast<std::int64_t>(ggml_backend_buffer_get_size(dst_buffer));
+    }
+    clear_last_error();
+    return 1;
+}
+
+// Device-to-device copy between two host-keyed device copies, for prefix-cache
+// checkpoints and clones whose source rows already live on the device. Copying
+// through the host costs a download, a host copy and a re-upload of every row
+// (gigabytes per long-context request); this moves only device memory. The source
+// must have a resident DeviceCopy entry of exactly src_bytes.
+TSG_EXPORT int TSGgml_CopyDeviceCopyRanges(
+    void* src_key, std::int64_t src_bytes, void* dst_key, std::int64_t dst_bytes,
+    const std::int64_t* src_offsets, const std::int64_t* dst_offsets, const std::int64_t* lengths,
+    int count, int zero_dst)
+{
+    return copy_ranges_into_device_copy(src_key, /*src_is_host=*/false, src_bytes, dst_key, dst_bytes,
+        src_offsets, dst_offsets, lengths, count, zero_dst, "copy_device_copy_ranges");
+}
+
+// Upload host row ranges straight into another key's device copy: a clone of a
+// host-resident checkpoint lands on the device in one transfer, instead of a host
+// copy of every row followed by the clone's own upload at its first bind.
+TSG_EXPORT int TSGgml_UploadToDeviceCopyRanges(
+    const void* src_host, std::int64_t src_bytes, void* dst_key, std::int64_t dst_bytes,
+    const std::int64_t* src_offsets, const std::int64_t* dst_offsets, const std::int64_t* lengths,
+    int count, int zero_dst)
+{
+    return copy_ranges_into_device_copy(src_host, /*src_is_host=*/true, src_bytes, dst_key, dst_bytes,
+        src_offsets, dst_offsets, lengths, count, zero_dst, "upload_to_device_copy_ranges");
+}
+
+// Diagnostic: the host-byte size recorded for `key`'s cached buffer, negated for
+// a zero-copy HostPtr entry, or 0 when nothing is cached for it.
+TSG_EXPORT std::int64_t TSGgml_CachedBufferBytes(void* key)
+{
+    if (key == nullptr)
+        return 0;
+    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+    auto it = g_host_buffer_cache.find(key);
+    if (it == g_host_buffer_cache.end())
+        return 0;
+    const auto bytes = static_cast<std::int64_t>(it->second.bytes);
+    return it->second.mode == CachedBufferMode::DeviceCopy ? bytes : -bytes;
+}
+
+// Upload the complete host bytes of `key` into a device copy, creating the copy
+// when absent, so later device-to-device clones can read it. Reuses an exact
+// entry in place (re-uploading it). Returns 1 on success.
+TSG_EXPORT int TSGgml_EnsureDeviceCopyFromHost(void* key, std::int64_t bytes)
+{
+    if (key == nullptr || bytes <= 0)
+        return 0;
+    if (!ensure_backend() || g_backend == nullptr || tsg::g_device_count.load(std::memory_order_acquire) > 1)
+        return 0;
+    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    if (dev == nullptr || !prefers_device_local_cache(dev))
+        return 0;
+    tsg::PooledContextHandle context;
+    if (!context.init(64 * 1024))
+        return 0;
+    ggml_tensor* t = ggml_new_tensor_1d(context.value, GGML_TYPE_I8, bytes);
+    if (t == nullptr)
+        return 0;
+    ggml_backend_buffer_t buffer = nullptr;
+    void* addr = nullptr;
+    bool needs_upload = false;
+    if (!try_get_cacheable_tensor_buffer(g_backend, dev, t, key, static_cast<std::size_t>(bytes),
+            buffer, addr, needs_upload, GGML_BACKEND_BUFFER_USAGE_COMPUTE) || buffer == nullptr)
+        return 0;
+    if (ggml_backend_tensor_alloc(buffer, t, addr) != GGML_STATUS_SUCCESS)
+        return 0;
+    tsg::host_read_barrier();
+    ggml_backend_tensor_set(t, key, 0, static_cast<std::size_t>(bytes));
+    tsg::sync_backend(g_backend);
+    return 1;
 }
 
 // Diagnostic: total bytes of device-local COPY buffers currently resident in the

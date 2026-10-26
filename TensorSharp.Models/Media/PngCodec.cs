@@ -119,6 +119,9 @@ namespace TensorSharp.Models.Media
             return false;
         }
 
+        // Decoded on every image turn; a server's first screenshots otherwise run the
+        // unfiltering loops as unoptimized tier-0 code (tens of milliseconds per image).
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
         private static byte[] DecodeSimple(byte[] data, out int width, out int height)
         {
             using var ms = new MemoryStream(data);
@@ -162,78 +165,107 @@ namespace TensorSharp.Models.Media
                 }
             }
 
-            idatStream.Position = 0;
-            using var deflateStream = new DeflateStream(
-                new MemoryStream(idatStream.ToArray(), 2, (int)idatStream.Length - 2),
-                CompressionMode.Decompress);
-
+            // One inflate of the whole image ([filter byte | row] per row), then unfiltering in
+            // place with a loop per filter type and a loop per color type: a screenshot-sized
+            // image decoded row by row (a read per row, a switch per byte and per pixel) took
+            // about 23 ms on the request's critical path.
             int channels = colorType switch { 0 => 1, 2 => 3, 4 => 2, 6 => 4, _ => 3 };
             int bytesPerPixel = channels * (bitDepth / 8);
             int stride = width * bytesPerPixel;
-            byte[] rawPixels = new byte[height * stride];
-            byte[] prevRow = new byte[stride];
-
-            for (int y = 0; y < height; y++)
+            byte[] filtered = new byte[(long)height * (stride + 1)];
+            using (var deflateStream = new DeflateStream(
+                new MemoryStream(idatStream.GetBuffer(), 2, (int)idatStream.Length - 2), CompressionMode.Decompress))
             {
-                int filterByte = deflateStream.ReadByte();
-                byte[] row = new byte[stride];
                 int read = 0;
-                while (read < stride)
+                while (read < filtered.Length)
                 {
-                    int n = deflateStream.Read(row, read, stride - read);
+                    int n = deflateStream.Read(filtered, read, filtered.Length - read);
                     if (n <= 0) break;
                     read += n;
                 }
-
-                for (int x = 0; x < stride; x++)
-                {
-                    byte a = x >= bytesPerPixel ? row[x - bytesPerPixel] : (byte)0;
-                    byte b = prevRow[x];
-                    byte c = x >= bytesPerPixel ? prevRow[x - bytesPerPixel] : (byte)0;
-
-                    row[x] = filterByte switch
-                    {
-                        0 => row[x],
-                        1 => (byte)(row[x] + a),
-                        2 => (byte)(row[x] + b),
-                        3 => (byte)(row[x] + (a + b) / 2),
-                        4 => (byte)(row[x] + PaethPredictor(a, b, c)),
-                        _ => row[x],
-                    };
-                }
-
-                Buffer.BlockCopy(row, 0, rawPixels, y * stride, stride);
-                Buffer.BlockCopy(row, 0, prevRow, 0, stride);
             }
 
-            byte[] rgba = new byte[width * height * 4];
-            for (int i = 0; i < width * height; i++)
+            byte[] rawPixels = new byte[(long)height * stride];
+            Unfilter(filtered, rawPixels, height, stride, bytesPerPixel);
+            return ToRgba(rawPixels, width, height, colorType);
+        }
+
+        private static unsafe void Unfilter(byte[] filtered, byte[] raw, int height, int stride, int bpp)
+        {
+            byte[] zero = new byte[stride];
+            fixed (byte* fbase = filtered, rbase = raw, zbase = zero)
+            {
+                for (int y = 0; y < height; y++)
+                {
+                    byte* src = fbase + (long)y * (stride + 1) + 1;
+                    int filter = src[-1];
+                    byte* cur = rbase + (long)y * stride;
+                    byte* prev = y > 0 ? cur - stride : zbase;
+                    int x = 0;
+                    switch (filter)
+                    {
+                        case 1:
+                            for (; x < bpp; x++) cur[x] = src[x];
+                            for (; x < stride; x++) cur[x] = (byte)(src[x] + cur[x - bpp]);
+                            break;
+                        case 2:
+                            for (; x + 16 <= stride; x += 16)
+                                *(System.Runtime.Intrinsics.Vector128<byte>*)(cur + x) =
+                                    *(System.Runtime.Intrinsics.Vector128<byte>*)(src + x) + *(System.Runtime.Intrinsics.Vector128<byte>*)(prev + x);
+                            for (; x < stride; x++) cur[x] = (byte)(src[x] + prev[x]);
+                            break;
+                        case 3:
+                            for (; x < bpp; x++) cur[x] = (byte)(src[x] + (prev[x] >> 1));
+                            for (; x < stride; x++) cur[x] = (byte)(src[x] + ((cur[x - bpp] + prev[x]) >> 1));
+                            break;
+                        case 4:
+                            for (; x < bpp; x++) cur[x] = (byte)(src[x] + prev[x]);   // Paeth(0, b, 0) = b
+                            for (; x < stride; x++) cur[x] = (byte)(src[x] + PaethPredictor(cur[x - bpp], prev[x], prev[x - bpp]));
+                            break;
+                        default:
+                            Buffer.MemoryCopy(src, cur, stride, stride);
+                            break;
+                    }
+                }
+            }
+        }
+
+        private static unsafe byte[] ToRgba(byte[] raw, int width, int height, int colorType)
+        {
+            long pixels = (long)width * height;
+            byte[] rgba = new byte[pixels * 4];
+            fixed (byte* s = raw, d = rgba)
             {
                 switch (colorType)
                 {
                     case 2: // RGB
-                        rgba[i * 4] = rawPixels[i * 3];
-                        rgba[i * 4 + 1] = rawPixels[i * 3 + 1];
-                        rgba[i * 4 + 2] = rawPixels[i * 3 + 2];
-                        rgba[i * 4 + 3] = 255;
+                        for (long i = 0; i < pixels; i++)
+                        {
+                            d[4 * i] = s[3 * i];
+                            d[4 * i + 1] = s[3 * i + 1];
+                            d[4 * i + 2] = s[3 * i + 2];
+                            d[4 * i + 3] = 255;
+                        }
                         break;
                     case 6: // RGBA
-                        rgba[i * 4] = rawPixels[i * 4];
-                        rgba[i * 4 + 1] = rawPixels[i * 4 + 1];
-                        rgba[i * 4 + 2] = rawPixels[i * 4 + 2];
-                        rgba[i * 4 + 3] = rawPixels[i * 4 + 3];
+                        Buffer.MemoryCopy(s, d, pixels * 4, pixels * 4);
                         break;
                     case 0: // Grayscale
-                        rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = rawPixels[i];
-                        rgba[i * 4 + 3] = 255;
+                        for (long i = 0; i < pixels; i++)
+                        {
+                            d[4 * i] = d[4 * i + 1] = d[4 * i + 2] = s[i];
+                            d[4 * i + 3] = 255;
+                        }
                         break;
                     case 4: // Grayscale + Alpha
-                        rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = rawPixels[i * 2];
-                        rgba[i * 4 + 3] = rawPixels[i * 2 + 1];
+                        for (long i = 0; i < pixels; i++)
+                        {
+                            d[4 * i] = d[4 * i + 1] = d[4 * i + 2] = s[2 * i];
+                            d[4 * i + 3] = s[2 * i + 1];
+                        }
                         break;
                 }
             }
-
             return rgba;
         }
 

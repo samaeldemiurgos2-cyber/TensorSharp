@@ -6,6 +6,185 @@ below distinguishes passing checks from remaining numerical differences.
 Each run's recorded hardware, dependency versions and binary hashes define its
 measured environment.
 
+## Distributed TP validation — October 25, 2026
+
+The implementation extends the existing routed-MoE tensor-parallel executor
+and `DistributedTensorParallelGroup` transport. The completed checks below
+establish fixture/control coverage, matched full-checkpoint controls and five
+strict distributed HTTP quality cases.
+**Broad model-quality and performance qualification remain incomplete.** Generated reports, raw logit
+vectors and logs are retained in ignored `artifacts/tp1017/evidence/`; its
+`summary.json` records the completed collection, file digests, reported
+statuses and retained failures. Initial archives are explicitly partial
+snapshots; checkpoint verification reports were collected after completion.
+
+The two supplied Linux VMs each have two NVIDIA A40 GPUs and Xeon 6342 CPUs.
+The CUDA build uses CUDA 12.8, SM 8.6 and GCC 13 against unchanged upstream
+ggml `3612c0af93f2cfc8f048295300a61187723b12ae`; both source checkouts are
+clean. The native library SHA-256 is
+`69724a3babd18c2a6f58d8aaaf5f6a477984b41491ee04f5da834e0f15cea81e`
+and `TensorSharp.Models.dll` is
+`03c5a1db3ad23450ea1e4432ddbf9d7bce473c7d6900f764fbb3a231d93e062c`
+on both nodes. Separate local CPU-native checks use unchanged upstream
+`da8e2a54b919557b816b1c2beb432ccb766f7ce0`; they are simulated-transport
+coverage, not measurements of the VM network or GPUs.
+
+| Completed check | Observed result and scope |
+|---|---|
+| Managed topology/configuration/refusal regressions | 154 passed, zero skips/failures; includes collective configuration agreement, invalid topology/backend refusal and failure before the native hook closing transport exactly once |
+| Existing managed chat/tool/thinking/image/video regressions | 254 passed, zero skips/failures; parser and request contracts, not trained-model inference |
+| Linux parallel-runner regressions | 35/35 passed on VM1. The same Linux-oriented suite has Windows path/process-group failures; the new comparator/verifier tests pass separately |
+| CUDA native CTests | Five executed tests passed: CPU-backed MoE numerics, failure lifecycle, simulated distributed numerics, CUDA quantized-strip projections and local two-GPU MoE TP. Six three-through-eight-local-GPU cases were skipped because each VM has only two GPUs; they are uncovered |
+| Terminal transport abort | Latest three CPU-backed native CTests passed, including a local rank failure before the first gather issuing one terminal abort and preserving the original error. In the actual two-node injected-failure run, both probes report `failed`; the peer observes its connection closing instead of reporting inference success |
+| Independent F32 whole-model fixture oracle, CUDA local TP2 | 66/66 checks passed at `atol=rtol=2e-5`; maximum absolute error `7.7486e-6`, maximum relative L2 `2.4453e-6`. Covers prefill/chunking/decode/reset/cache/slot behavior on the local executor |
+| Actual two-node F32 fixed-token controls | Both one GPU per node (two global ranks) and two GPUs per node (four global ranks) match the local TP2 control bitwise on all 14 complete logit vectors per topology. Includes prefill, forced decode, chunking, reset, refill and shutdown |
+| Actual two-node mixed-quantization control | Two GPUs per node, four global ranks: Q2_K gate/up and Q3_K down, 2304-wide expert intermediate, nine quantization blocks with uneven rotated strips. All 14 vectors match the local TP2 control bitwise at the original `2e-5` numerical gates |
+| Actual Server.Host + CLI worker HTTP control | The separate byte-tokenizer F32 fixture passed all nine chat cases against the local-TP2, microbatch-256 baseline with exact visible output/token-count/finish parity. Covers reset, generated history, two overlapping requests, streaming and a request after the load guard. Same-model loading is accepted; a backend switch is refused and the server remains usable. Driver and worker exited with code zero after shutdown |
+| Mixed-quantization independent oracle | **Not passing:** both local TP2 and the unsharded CUDA control pass 15/66 checks and fail 51/66 at `atol=rtol=2e-5`; both have maximum absolute error `1.5663` and relative L2 `0.46075`. Cross-node bitwise equality does not close these independent-oracle failures |
+
+The standalone [fixed-token procedure](../eng/validation/DeepSeek41DistributedProbe/README.md)
+binds identical teacher-forced inputs and compares every complete vector. The
+synthetic GGUF is a five-layer, 256-wide random-weight fixture, not a language
+model. The mixed-quantization variant changes the expert intermediate width
+to 2304; its embedding width and expert/layer counts remain synthetic. Neither
+fixture establishes the published checkpoint's answer quality, long-context
+behavior or production throughput. The separate HTTP-only byte-tokenizer
+derivation changes vocabulary metadata while preserving all 142 tensor hashes;
+it enables protocol requests, not meaningful language answers.
+
+The HTTP run uses `TensorSharp.Chat.dll` SHA-256
+`709cb69bfdf28a0bee4f08e6c06ed2f0e7227b707317dff221ca4b60395cf1d0`
+in both server directories. It fixes the server factory to pass the existing
+group's local degree into model construction. The first distributed HTTP
+attempt failed that degree check; its `http-byte-distributed.json` and logs
+remain failed. The completed rerun is
+`http-byte-distributed-fixed.json`, with nine chat rows, two model-load guard
+rows and no reported failures. An earlier non-byte fixture HTTP attempt also
+remains failed because its synthetic vocabulary could not encode the prompts.
+Local byte-fixture controls passed independently with microbatch 8 and 256.
+Random fixture output, including replacement characters, is expected here;
+these requests establish protocol/control behavior rather than answer quality.
+
+The measured inter-node route uses SSH forwarding. Its median small-message
+round trip is approximately 104 ms; the 1 MiB echo round trip is approximately
+212 ms. These are path measurements, not a low-latency fabric benchmark. Two
+collectives per resident MoE layer make this latency material to decode speed.
+No throughput speedup or broad performance claim follows from the fixture
+comparisons.
+
+The published `UD-Q4_K_XL` checkpoint from
+`unsloth/DeepSeek-V4.1-Flash-1017-GGUF`, immutable revision
+`60ad3651641b5c97679c807e064ab1d7a3ca1455`, completed full-file verification
+on VM1: all nine shards, **500,707,576,573 bytes**, match the pinned manifest.
+Its subsequent server attempt **failed to load**: unchanged upstream ggml
+rejects `per_layer_token_embd.weight` with type 43 because its supported type
+range is `[0,43)`. The retained `q4-full-local2-server/run.json` remains failed
+with process exit code 2; a passing runtime-file identity check is not an
+inference pass. This checkpoint has no passing quality or benchmark result in
+this campaign. Incomplete VM2 Q4 verification is not counted as passing.
+
+### Supported IQ2 checkpoint: completed bounded full-model controls
+
+Both VMs completed full-file SHA-256 verification of the same revision's
+`UD-IQ2_XXS` package: all six text shards plus the DSpark drafter and BF16
+vision companion, eight files totaling **309,424,587,323 bytes**. The text
+shards alone total **300,475,464,795 bytes**. The model's Engram tensor is
+Q5_K (type 13), which unchanged upstream ggml accepts. Header inspection and
+hash verification are separate from inference coverage; the drafter and vision
+companion were not executed by these distributed text runs.
+
+The local two-GPU server and actual two-node/four-GPU server both completed
+the same capital and arithmetic requests with `Paris` and `42`, respectively.
+Both answers finish with `stop` and report one generated token; the strict
+HTTP baseline comparison passes 2/2 matching requests/content/finish reasons.
+Both drivers and the distributed CLI worker exited with code zero, with
+unchanged runtime-file identities. These are two simple answers, not a broad
+language/reasoning/tool/long-context evaluation.
+
+Both profiles explicitly offload the first **24 routed-MoE layers** to the CPU,
+use context 512, microbatch 128, 16 CPU threads, host-mapped Engram without
+warming, YOCO disabled, and sparse attention/compact raw gather disabled. The
+same CPU placement makes this a matched topology control. Median observed
+HTTP TTFT over these two requests is **15.09 s local** and **30.48 s
+distributed**. There is one repetition and no HTTP warmup exclusion; one-token
+answers do not measure sustained decode throughput. No performance improvement
+is established by this result. The completed CLI timings below use a separate,
+fixed compute workload.
+
+The two runs' first captured non-warmup public `ModelBase.Forward` logit vectors
+are bitwise identical across all **129,280 logits**: maximum error zero,
+cosine similarity one, SHA-256
+`1083d6a130f247d156d177e45cc25aa9e79acd56ecc919ddeba987b98a129c48`.
+The argmax is token 51119, which the GGUF vocabulary identifies as `Paris`;
+EOS is token 1. This is consistent with the first capital response. The
+generic output filename `prefill-logits.bin` does not itself establish a call
+phase, so the evidence labels it the first captured public forward rather than
+assuming a prefill/decode phase. The comparison is bound to identical verified
+shard hashes and matching HTTP requests in
+`iq2-full-captured-logit-validation.json`. One vector does not establish full
+autoregressive numerical parity.
+
+### Matched CPU24 CLI timing samples
+
+Both profiles completed four CLI runs with 64 random prefill tokens and eight
+random-inference decode steps, using the same 24 CPU-MoE layers, context 512
+and microbatch 128. The first run is excluded; the table gives medians of the
+remaining three runs, computed from logged milliseconds rather than rounded
+CLI rates. Local and distributed drivers and the worker exited normally and
+passed runtime identity checks. The local live-process environment observation
+and the distributed wrapper both record YOCO disabled.
+
+| Profile | Nodes × GPUs per node | Prefill tokens/s | Decode steps/s |
+|---|---:|---:|---:|
+| Local TP2, CPU24 | 1 × 2 | 4.92 | 6.09 |
+| Distributed TP4, CPU24 | 2 × 2 | 2.24 | 0.270 |
+
+The distributed profile is slower on the measured SSH route. These are short
+random-inference compute windows, not sustained autoregressive generation or
+an answer-quality score. The separately emitted untimed greedy control matches:
+prefill argmax 65 and continuation IDs
+`16386,201,1,764,5265,63,223,2788` on both profiles.
+
+Steady state was **not established**. Across the three retained local samples,
+prefill improves from 18,190 to 8,936 ms and decode from 2,063 to 1,263 ms;
+distributed prefill improves from 37,051 to 23,038 ms while decode changes
+from 30,669 to 29,155 ms. Storage/page-cache warming remains material after
+the first-run discard. The approximately 104 ms round-trip SSH path, host
+expert work and actual page residency are part of these observed timings;
+there is no low-latency-fabric or cross-engine scaling qualification. The
+[summary tool](../eng/validation/summarize-parallel-cli-benchmark.py) retains
+every sample and its run/log digests in the ignored evidence directory.
+
+### Final distributed HTTP quality checks
+
+The supported IQ2 checkpoint completed all **five strict quality cases** on
+two nodes/four GPUs: JSON schema, JSON Unicode, Chinese arithmetic, generated
+multi-turn history and a dependent weather-tool round trip. The profile uses
+context 4096, CPU24, microbatch 128 and YOCO disabled, with one client and one
+repetition. All final answers finish with `stop`; the intermediate tool turn
+finishes with `tool_calls`. No case is accepted with a token-limit finish.
+
+The generated history recalls `juniper-5938`. The tool case issues exactly
+`get_weather` with `{"city":"Paris","units":"celsius"}`, consumes the
+fixed tool result, and returns `{"city":"Paris","temperature_c":19}`.
+Its two turns use 55 and 13 completion tokens and take **393.79 s** together.
+The largest actual prompt in the suite is 332 tokens; the final tool request
+uses 127. A configured 4096-token capacity does not establish long-context
+coverage. This small suite does not qualify broad factual/reasoning quality,
+real-model concurrency, vision, DSpark or sustained decode performance.
+
+The driver and worker wrappers completed with exit code zero and passed
+runtime identity checks. Their `run.json` files retain the exact commands and
+matching source manifests. The final runner SHA-256 is
+`bf5cfb50669d98705fe3b2e2a3e366c16e8076a98654a02a7d4b90210448d23d`;
+the strict `validate_inference.py` harness is
+`7c05e69db126699907d28d44232eba792e47f4b043c4fac990dc80c1e7ac1999`.
+Both VMs' final upstream checkouts remain clean at `3612c0af…`, and all four
+GPUs report zero used memory after test shutdown. The evidence collection is
+complete with retained failures and coverage limits: the Q4 load refusal,
+mixed-quantization independent-oracle failures and skipped local GPU counts
+remain unresolved; the passing IQ2 cases do not supersede them.
+
 ## Embedded GGUF validation — September 19, 2026
 
 The current loader reads the published Engram metadata directly from the first

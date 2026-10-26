@@ -43,7 +43,7 @@ namespace TensorSharp.Models
         // False when the context belongs to a caller-supplied tensor-parallel group, which
         // outlives this model; the owner releases the context's pool when it is disposed.
         private readonly bool _ownsGgmlContext;
-        protected readonly IAllocator _allocator;
+        protected IAllocator _allocator;
         protected readonly BackendType _backend;
 
         protected readonly Dictionary<string, Tensor> _weights = new();
@@ -51,6 +51,9 @@ namespace TensorSharp.Models
 
         // ---- Tensor Parallelism ----
         protected readonly ITensorParallelGroup _tpGroup;
+        /// <summary>Whole-layer transport, separate from tensor-parallel sharding.</summary>
+        protected ILayerSplitGroup LayerSplitGroup { get; }
+        private ITensorParallelGroup DistributedControlGroup => (ITensorParallelGroup)LayerSplitGroup ?? _tpGroup;
         protected int TpDegree => _tpGroup?.Degree ?? 1;
         /// <summary>False for a component model that runs on a group its parent model owns.</summary>
         protected virtual bool OwnsTensorParallelGroup => true;
@@ -164,6 +167,29 @@ namespace TensorSharp.Models
             _kvCacheDtype = KvCacheDtypeConfig.Current;
         }
 
+        /// <summary>Resolve the default before a whole-layer stage filters out
+        /// other nodes' weights. Mixed-precision stages must use the same cache
+        /// precision as the complete model, including a stage containing only F32.</summary>
+        protected void ApplyModelAlignedKvCacheDefaultFromMetadata()
+        {
+            RefuseUnsupportedBlockQuantizedKvCache();
+            if (KvCacheDtypeConfig.IsExplicitlySet) return;
+            var typeBytes = new Dictionary<int, long>();
+            foreach (var info in _gguf.Tensors.Values)
+            {
+                if (!IsQuantizedLinearWeight(info)) continue;
+                int type = (int)info.Type;
+                typeBytes.TryGetValue(type, out long bytes);
+                typeBytes[type] = checked(bytes + _gguf.GetTensorByteCount(info));
+            }
+            int dominant = 0;
+            long bestBytes = 0;
+            foreach (var entry in typeBytes)
+                if (entry.Value > bestBytes) { bestBytes = entry.Value; dominant = entry.Key; }
+            KvCacheDtypeConfig.ApplyModelDtypeDefault(dominant);
+            _kvCacheDtype = KvCacheDtypeConfig.Current;
+        }
+
         /// <summary>
         /// Whether every path this architecture can take can READ a
         /// block-quantized (Q8_0 / Q4_0) K/V cache.
@@ -272,7 +298,11 @@ namespace TensorSharp.Models
         {
             if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
             if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
-            if (layerSplitDegree > 1 && (tpDegree > 1 || tpGroup != null))
+            LayerSplitGroup = tpGroup as ILayerSplitGroup;
+            if (LayerSplitGroup != null)
+                layerSplitDegree = LayerSplitGroup.Degree;
+            if ((layerSplitDegree > 1 || LayerSplitGroup != null) &&
+                (tpDegree > 1 || (tpGroup != null && LayerSplitGroup == null)))
                 throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
             LayerSplitDegree = layerSplitDegree;
             _backend = backend;
@@ -285,7 +315,7 @@ namespace TensorSharp.Models
             ExecutionPlan = new BackendExecutionPlan(backend);
             MultimodalInjector = new ModelMultimodalInjector(this);
 
-            if (tpGroup != null)
+            if (tpGroup != null && LayerSplitGroup == null)
                 _tpGroup = tpGroup;
             else if (tpDegree > 1 && backend == BackendType.Cuda)
                 _tpGroup = new Cuda.TensorParallelGroup(tpDegree);
@@ -309,16 +339,17 @@ namespace TensorSharp.Models
                     // A caller-supplied group (multi-node) already owns the
                     // multi-GPU context; reuse it rather than initializing the
                     // devices a second time.
-                    if (LayerSplitDegree > 1)
+                    if (LayerSplitDegree > 1 || LayerSplitGroup != null)
                     {
                         // LAYER SPLIT: one backend per GPU, NO tensor-parallel group.
                         // _tpGroup must stay null - IsTensorParallel gates the weight
                         // sharding and AllReduce machinery, none of which applies here,
                         // and leaving it set would also make the startup banner claim a
                         // transport that is never used.
-                        _ggmlContext = CreateGgmlContext(ggmlType, LayerSplitDegree, enableCollectives: false);
-                        _ownsGgmlContext = true;
-                        _allocator = new GgmlAllocator(_ggmlContext, 0);
+                        var shared = FindGgmlContext(LayerSplitGroup);
+                        _ggmlContext = shared ?? CreateGgmlContext(ggmlType, LayerSplitDegree, enableCollectives: false);
+                        _ownsGgmlContext = shared == null;
+                        _allocator = LayerSplitGroup?.GetAllocator(0) ?? new GgmlAllocator(_ggmlContext, 0);
                     }
                     else
                     {
@@ -334,7 +365,7 @@ namespace TensorSharp.Models
                     break;
                 }
                 case BackendType.Cuda:
-                    _allocator = _tpGroup != null ? _tpGroup.GetAllocator(0) : new CudaAllocator(0);
+                    _allocator = DistributedControlGroup?.GetAllocator(0) ?? new CudaAllocator(0);
                     break;
                 case BackendType.Mlx:
                     MlxBackend.Register();
@@ -427,7 +458,12 @@ namespace TensorSharp.Models
         {
             if (group is INestedTensorParallelGroup nested)
                 group = nested.LocalGroup;
-            return (group as GgmlTensorParallelGroup)?.Context;
+            return group switch
+            {
+                GgmlTensorParallelGroup tensorGroup => tensorGroup.Context,
+                GgmlLayerSplitDevices layerDevices => layerDevices.Context,
+                _ => null,
+            };
         }
 
         /// <summary>
@@ -444,6 +480,17 @@ namespace TensorSharp.Models
                 _ => throw new ArgumentException($"{backend} is not a multi-device GGML backend.", nameof(backend)),
             };
             return new GgmlTensorParallelGroup(CreateGgmlContext(ggmlType, Math.Max(1, localDegree)));
+        }
+
+        public static GgmlLayerSplitDevices CreateGgmlLocalLayerSplitGroup(BackendType backend, int localDegree)
+        {
+            var type = backend switch
+            {
+                BackendType.GgmlCuda => GgmlBackendType.Cuda,
+                BackendType.GgmlVulkan => GgmlBackendType.Vulkan,
+                _ => throw new NotSupportedException($"Distributed layer splitting is unavailable on {backend}."),
+            };
+            return new GgmlLayerSplitDevices(CreateGgmlContext(type, localDegree, enableCollectives: false));
         }
 
         /// <summary>
@@ -854,7 +901,9 @@ namespace TensorSharp.Models
             // Mlx stays excluded: its Fill goes through MlxNative.Full, whose
             // behaviour for block-quantized KV dtypes is unverified on this
             // machine, and no Mlx-specific failure of this kind has been observed.
-            if (tensor != null && _backend != BackendType.Mlx)
+            // A fresh anonymous mapping is zero already; filling it only page-faults every
+            // page (~1 GB/s) for the same bytes.
+            if (tensor != null && _backend != BackendType.Mlx && !tensor.Storage.TakeAllocationZeroGuarantee())
                 Ops.Fill(tensor, 0f);
         }
 
@@ -2204,13 +2253,7 @@ namespace TensorSharp.Models
             byte* dst = (byte*)destination.Storage.PtrAtElement(0);
             long perHead = rows * rowBytes;
             for (long h = 0; h < heads; h++)
-            {
-                Buffer.MemoryCopy(
-                    src + h * sourceCap * rowBytes,
-                    dst + h * destCap * rowBytes,
-                    destination.Storage.ByteLength - h * destCap * rowBytes,
-                    perHead);
-            }
+                HostMemory.Copy(src + h * sourceCap * rowBytes, dst + h * destCap * rowBytes, perHead);
         }
 
         /// <summary>A capacity that holds <paramref name="rows"/> with one 256-row
@@ -2304,10 +2347,25 @@ namespace TensorSharp.Models
         private const int TpControlTruncate      = 5;
 
         private bool _distributedDriver;
+        private Exception _distributedExecutionFailure;
+
+        private void AbortDistributedExecution(Exception failure)
+        {
+            if (DistributedControlGroup?.NodeCount is not > 1) return;
+            _distributedExecutionFailure ??= failure;
+            // A failed stage/collective cannot safely resume with a later request.
+            // Closing the transport also releases workers blocked on its output.
+            try
+            {
+                if (DistributedControlGroup is IDistributedExecutionGroup distributed) distributed.Abort(failure);
+                else DistributedControlGroup.Dispose();
+            }
+            catch { /* preserve the execution error */ }
+        }
 
         /// <summary>True when this process is a worker node in a multi-node TP group.</summary>
         public bool IsDistributedWorker =>
-            _tpGroup != null && _tpGroup.NodeCount > 1 && _tpGroup.GlobalRankOffset > 0;
+            DistributedControlGroup?.NodeCount > 1 && DistributedControlGroup.GlobalRankOffset > 0;
 
         /// <summary>
         /// Start acting as the distributed driver. After this call every
@@ -2318,17 +2376,35 @@ namespace TensorSharp.Models
         /// </summary>
         public void BeginDistributedDriver()
         {
-            if (_tpGroup != null && _tpGroup.NodeCount > 1 && _tpGroup.GlobalRankOffset == 0)
+            if (DistributedControlGroup?.NodeCount > 1 && DistributedControlGroup.GlobalRankOffset == 0)
                 _distributedDriver = true;
         }
+
+        /// <summary>A prompt chunk: the same forward, flagged so a model can tell a
+        /// one-token prompt tail from a decode token (<see cref="ForwardIsPrompt"/>).</summary>
+        public float[] ForwardPrompt(int[] tokens)
+        {
+            _forwardIsPrompt = true;
+            try { return Forward(tokens); }
+            finally { _forwardIsPrompt = false; }
+        }
+
+        private bool _forwardIsPrompt;
+        protected bool ForwardIsPrompt => _forwardIsPrompt;
 
         public float[] Forward(int[] tokens)
         {
             ThrowIfBackendFailed();
-            if (_distributedDriver) _tpGroup.BroadcastControl(TpControlForward, tokens);
+            if (_distributedDriver) DistributedControlGroup.BroadcastControl(TpControlForward, tokens);
             float[] logits;
             try { logits = ForwardCore(tokens); }
-            catch (Exception symptom) when (BackendHasFailed()) { throw BackendFailure(symptom); }
+            catch (Exception symptom)
+            {
+                Exception failure = BackendHasFailed() ? BackendFailure(symptom) : symptom;
+                AbortDistributedExecution(failure);
+                if (!ReferenceEquals(failure, symptom)) throw failure;
+                throw;
+            }
             ThrowIfBackendFailed();
             return DumpLogitsIfRequested(logits);
         }
@@ -2357,8 +2433,14 @@ namespace TensorSharp.Models
         /// </summary>
         private void ThrowIfBackendFailed()
         {
+            if (_distributedExecutionFailure != null)
+                throw new InvalidOperationException("Distributed execution failed and cannot resume. Restart every node.", _distributedExecutionFailure);
             if (BackendHasFailed())
-                throw BackendFailure(null);
+            {
+                var failure = BackendFailure(null);
+                AbortDistributedExecution(failure);
+                throw failure;
+            }
         }
 
         private bool BackendHasFailed() => TryGetBackendFailure(out _);
@@ -2434,18 +2516,26 @@ namespace TensorSharp.Models
         public float[] ForwardRefill(int[] tokens)
         {
             ThrowIfBackendFailed();
-            if (_distributedDriver) _tpGroup.BroadcastControl(TpControlForwardRefill, tokens);
+            if (_distributedDriver) DistributedControlGroup.BroadcastControl(TpControlForwardRefill, tokens);
             float[] logits;
             try { logits = ForwardRefillCore(tokens); }
-            catch (Exception symptom) when (BackendHasFailed()) { throw BackendFailure(symptom); }
+            catch (Exception symptom)
+            {
+                Exception failure = BackendHasFailed() ? BackendFailure(symptom) : symptom;
+                AbortDistributedExecution(failure);
+                if (!ReferenceEquals(failure, symptom)) throw failure;
+                throw;
+            }
             ThrowIfBackendFailed();
             return logits;
         }
 
         public void ResetKVCache()
         {
-            if (_distributedDriver) _tpGroup.BroadcastControl(TpControlReset, Array.Empty<int>());
-            ResetKVCacheCore();
+            ThrowIfBackendFailed();
+            if (_distributedDriver) DistributedControlGroup.BroadcastControl(TpControlReset, Array.Empty<int>());
+            try { ResetKVCacheCore(); }
+            catch (Exception failure) { AbortDistributedExecution(failure); throw; }
         }
 
         protected abstract float[] ForwardCore(int[] tokens);
@@ -2461,17 +2551,19 @@ namespace TensorSharp.Models
         /// </summary>
         public void RunDistributedWorkerLoop()
         {
-            if (_tpGroup == null || _tpGroup.NodeCount <= 1)
+            if (DistributedControlGroup == null || DistributedControlGroup.NodeCount <= 1)
                 return;
+            if (!IsDistributedWorker)
+                throw new InvalidOperationException("The distributed worker loop can only run on a worker node (global rank offset > 0).");
 
             Console.WriteLine(
-                $"[TP worker] ready — mirroring driver forward passes (global rank offset {_tpGroup.GlobalRankOffset}).");
+                $"[distributed worker] ready — mirroring driver forward passes (global rank offset {DistributedControlGroup.GlobalRankOffset}).");
 
             try
             {
                 while (true)
                 {
-                    var (op, payload) = _tpGroup.ReceiveControl();
+                    var (op, payload) = DistributedControlGroup.ReceiveControl();
                     switch (op)
                     {
                         case TpControlForward:       ForwardCore(payload); break;
@@ -2488,7 +2580,12 @@ namespace TensorSharp.Models
             }
             catch (Exception ex)
             {
+                AbortDistributedExecution(ex);
                 Console.Error.WriteLine($"[TP worker] loop ended: {ex.Message}");
+                // A failed worker must fail its host as well. Returning success
+                // here hid native/network failures from benchmark launchers and
+                // left the driver waiting for a missing collective contribution.
+                throw;
             }
         }
 
@@ -2500,7 +2597,7 @@ namespace TensorSharp.Models
         private void SignalDistributedWorkersShutdown()
         {
             if (!_distributedDriver) return;
-            try { _tpGroup.BroadcastControl(TpControlShutdown, Array.Empty<int>()); }
+            try { DistributedControlGroup.BroadcastControl(TpControlShutdown, Array.Empty<int>()); }
             catch { /* workers may already be gone; ignore */ }
             _distributedDriver = false;
         }
@@ -2555,8 +2652,10 @@ namespace TensorSharp.Models
         /// </summary>
         public void TruncateKVCache(int tokenCount)
         {
-            if (_distributedDriver) _tpGroup.BroadcastControl(TpControlTruncate, new[] { tokenCount });
-            TruncateKVCacheCore(tokenCount);
+            ThrowIfBackendFailed();
+            if (_distributedDriver) DistributedControlGroup.BroadcastControl(TpControlTruncate, new[] { tokenCount });
+            try { TruncateKVCacheCore(tokenCount); }
+            catch (Exception failure) { AbortDistributedExecution(failure); throw; }
         }
 
         /// <summary>
@@ -2570,9 +2669,14 @@ namespace TensorSharp.Models
         /// </summary>
         public bool TryTruncateKVCache(int tokenCount)
         {
-            if (!TryTruncateKVCacheCore(tokenCount)) return false;
-            if (_distributedDriver) _tpGroup.BroadcastControl(TpControlTruncate, new[] { tokenCount });
-            return true;
+            ThrowIfBackendFailed();
+            try
+            {
+                if (!TryTruncateKVCacheCore(tokenCount)) return false;
+                if (_distributedDriver) DistributedControlGroup.BroadcastControl(TpControlTruncate, new[] { tokenCount });
+                return true;
+            }
+            catch (Exception failure) { AbortDistributedExecution(failure); throw; }
         }
 
         /// <summary>See <see cref="IModelArchitecture.KVCacheTruncationGranularity"/>.</summary>
@@ -2617,6 +2721,15 @@ namespace TensorSharp.Models
         /// command buffer and aborts the process.
         /// </summary>
         public object GpuComputeLock { get; } = new object();
+
+        /// <summary>
+        /// The lock a request's media preparation (image / audio decoding and the encoder forward)
+        /// holds. <see cref="GpuComputeLock"/> by default, so encoders and engine steps never drive
+        /// a shared backend at once. A model whose encoder runs on a device stream of its own,
+        /// beside an engine that owns its stream (so the two cannot race one command queue),
+        /// returns a separate lock: preparation then overlaps engine steps instead of stalling them.
+        /// </summary>
+        public virtual object MediaPreparationLock => GpuComputeLock;
 
         /// <summary>
         /// Release <see cref="GpuComputeLock"/>, briefly yield, then re-acquire.
@@ -2955,7 +3068,7 @@ namespace TensorSharp.Models
             _tpWeights.Clear();
 
             if (OwnsTensorParallelGroup)
-                _tpGroup?.Dispose();
+                DistributedControlGroup?.Dispose();
 
             if (_allocator is IDisposable allocatorDisposable)
                 allocatorDisposable.Dispose();
@@ -3064,6 +3177,24 @@ namespace TensorSharp.Models
                     "Remove --tp-node-id/--tp-peers; its native or single-device executor cannot consume cross-node collectives.");
             if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
                 throw new NotSupportedException($"Distributed tensor parallelism requires a multi-device GPU backend; {backend} cannot honor --tp-node-id/--tp-peers.");
+            if (architecture.DistributedTensorParallelBackends is { } supported && !supported.Contains(backend))
+                throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement distributed tensor parallelism on {backend}. " +
+                    $"Use one of its distributed backends: {string.Join(", ", supported)}.");
+        }
+
+        /// <summary>Reject unavailable stage executors before allocating GPUs or connecting peers.</summary>
+        public static void ValidateDistributedLayerSplit(string ggufPath, BackendType backend)
+        {
+            using var probe = new GgufFile(ggufPath);
+            ValidateDistributedLayerSplit(ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe), backend);
+        }
+
+        internal static void ValidateDistributedLayerSplit(ModelArchitectureDescriptor architecture, BackendType backend)
+        {
+            ArgumentNullException.ThrowIfNull(architecture);
+            if (!architecture.SupportsDistributedLayerSplit || !architecture.DistributedLayerSplitBackends.Contains(backend))
+                throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement distributed --layer-split on {backend}. " +
+                    "Select a supported whole-layer stage executor or remove --tp-node-id/--tp-peers.");
         }
 
         /// <summary>
@@ -3080,6 +3211,17 @@ namespace TensorSharp.Models
 
             if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
             if (requestedLayerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(requestedLayerSplitDegree));
+            if (tpGroup is ILayerSplitGroup layers)
+            {
+                if (tpDegree > 1)
+                    throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
+                ValidateDistributedLayerSplit(architecture, backend);
+                if (requestedLayerSplitDegree > 1 && requestedLayerSplitDegree != layers.Degree)
+                    throw new ArgumentException("The layer-split degree must match the local device group.");
+                layerSplitDegree = layers.Degree;
+                Console.WriteLine($"  Distributed layer split: {layers.NodeCount} nodes, {layers.Degree} GPUs per node, whole-layer stage transfers.");
+                return 1;
+            }
             if (tpGroup?.NodeCount > 1)
                 ValidateDistributedTensorParallelism(architecture, backend);
             layerSplitDegree = requestedLayerSplitDegree;
@@ -3087,8 +3229,7 @@ namespace TensorSharp.Models
             if (requestedLayerSplitDegree > 1)
             {
                 if (tpGroup != null)
-                    throw new NotSupportedException("--layer-split supports GPUs in one node only; distributed layer " +
-                        "execution is not implemented. Remove --tp-node-id/--tp-peers and the tensor-parallel group.");
+                    throw new NotSupportedException("--layer-split requires a layer-split group; a tensor-parallel group cannot execute whole-layer stages.");
                 if (wantsTp)
                     throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
                 if (architecture.MultiGpu != MultiGpuMode.LayerSplit && !architecture.SupportsLayerSplit)

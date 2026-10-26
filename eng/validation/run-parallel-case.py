@@ -206,7 +206,7 @@ def companion_paths(arguments, directory=None):
 def source_identity(repo):
     """Bind tracked and new source files; generated/ignored build outputs are excluded."""
     native = "TensorSharp.GGML.Native"
-    managed = ("TensorSharp.Runtime", "TensorSharp.Models", "TensorSharp.Backends.GGML",
+    managed = ("TensorSharp.Core", "TensorSharp.Runtime", "TensorSharp.Models", "TensorSharp.Backends.GGML",
                "TensorSharp.Distributed", "TensorSharp.Cli", "TensorSharp.Chat", "TensorSharp.Server",
                "TensorSharp.Server.Host", "benchmarks/AgentTurnBench")
     build = ("Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props", "global.json")
@@ -223,7 +223,7 @@ def source_identity(repo):
                 children[:] = [name for name in children if name not in excluded and not name.startswith("build-")]
                 names.extend(str((Path(directory) / name).relative_to(repo)) for name in files)
         revision = None
-    suffixes = {".cs", ".csproj", ".props", ".targets", ".cpp", ".c", ".h", ".hpp", ".cu", ".cuh", ".cmake", ".sh", ".m", ".mm", ".metal"}
+    suffixes = {".cs", ".csproj", ".props", ".targets", ".cpp", ".c", ".h", ".hpp", ".inc", ".cu", ".cuh", ".cmake", ".sh", ".m", ".mm", ".metal"}
     groups = {"native_sources": {}, "managed_sources": {}, "shared_build_inputs": {}}
     for name in sorted(set(names) - {""}):
         path = repo / name
@@ -236,6 +236,32 @@ def source_identity(repo):
             "groups": {name: {"sha256": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest(),
                               "files": files} for name, files in groups.items()},
             "scope": "Launch-time source fingerprints, including untracked source; binary hashes separately identify what was executed."}
+
+
+def run_quality_evaluation(arguments, report, extra, env):
+    """Run the existing strict scenario suite before this same server is stopped."""
+    profile = json.dumps({"extra_arguments": extra, "context": arguments.context,
+                          "environment": report["environment"]}, sort_keys=True)
+    command = [sys.executable, str(arguments.repo / "benchmarks/engine_comparison/validate_inference.py"),
+        "--engine", "tensorsharp", "--url", f"http://127.0.0.1:{arguments.port}",
+        "--model", arguments.model.name,
+        "--weights-id", report.get("model_verification_report_sha256", report["model_sha256"]),
+        "--profile", profile, "--output", str(arguments.output / "quality.json"),
+        "--scenarios", arguments.quality_scenarios, "--concurrency", "1", "--repeats", "1",
+        "--max-tokens", str(arguments.quality_max_tokens), "--timeout", str(arguments.timeout)]
+    # validate_inference.py defaults to thinking=False and strict JSON/tool
+    # checks. Do not opt into any lenient or reasoning mode here.
+    report["quality_command"] = command
+    (arguments.output / "run.json").write_text(json.dumps(report, indent=2) + "\n")
+    try:
+        code = report["quality_exit_code"] = subprocess.call(command, cwd=arguments.repo, env=env)
+    except Exception:
+        report["coverage"]["strict_quality_http"] = "failed"
+        raise
+    report["coverage"]["strict_quality_http"] = "passed" if code == 0 else "failed"
+    # Keep the original text failure and each evaluator's actual exit code.
+    if report["exit_code"] == 0:
+        report["exit_code"] = code
 
 
 def main():
@@ -265,6 +291,8 @@ def main():
     p.add_argument("--tool-max-tokens", type=int, default=2048)
     p.add_argument("--reasoning-effort", choices=("low", "medium", "high"), help="Optional effort sent to text and media HTTP requests")
     p.add_argument("--eval-cases", help="Comma-separated server probe names; omitted runs all eight")
+    p.add_argument("--quality-scenarios", help="Optional existing strict validate_inference.py scenarios run in the same server")
+    p.add_argument("--quality-max-tokens", type=int, default=128)
     p.add_argument("--media-fixtures", type=Path, help="Run the existing image/video evaluator after text, in the same server")
     p.add_argument("--media-projector", type=Path, help="Projector passed to the server's --mmproj and hashed in evidence")
     p.add_argument("--media-scenarios", default="image_ocr,multi_image,image_follow_up")
@@ -277,6 +305,8 @@ def main():
         p.error("--server, --worker and --agent-turn are mutually exclusive")
     if (a.tool_calls or a.eval_stream) and not a.server:
         p.error("--tool-calls and --eval-stream require --server")
+    if a.quality_scenarios and (not a.server or a.quality_max_tokens < 1):
+        p.error("--quality-scenarios requires --server and positive --quality-max-tokens")
     if bool(a.media_fixtures) != bool(a.media_projector) or (a.media_fixtures and not a.server):
         p.error("media-fixtures and media-projector must be supplied together with --server")
     a.repo = a.repo.resolve()
@@ -330,6 +360,7 @@ def main():
         "No storage/page-cache eviction is performed; repeated loads are warm-cache measurements.",
         "Hashing model files at launch reads and may warm storage cache before timing."]
     report["coverage"] = {"text_http": "requested" if a.server else "not_requested",
+                          "strict_quality_http": "requested" if a.quality_scenarios else "not_requested",
                           "image_http": "requested" if a.media_fixtures else "not_requested",
                           "structured_tools": "requested" if a.tool_calls else "not_requested",
                           "learned_speculation": "requires separately validated nonzero drafter counters and exact token parity"}
@@ -365,6 +396,9 @@ def main():
                                                "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE",
                                                "TENSORSHARP_TP_DEVICES", "TENSORSHARP_LAYER_SPLIT_DEVICES",
                                                "TENSORSHARP_TP_NODE_ID", "TENSORSHARP_TP_PEERS",
+                                               "TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS", "TENSORSHARP_TP_RECV_TIMEOUT_SECONDS",
+                                               "TENSORSHARP_TP_OPERATION_TIMEOUT_SECONDS", "TENSORSHARP_TP_SOCKET_BUFFER_BYTES",
+                                               "TS_PREFILL_WARMUP",
                                                "TS_GLM_NATIVE", "TS_GLM_TP_SHARD",
                                                "TS_DSV41_TP_HOST_TOKENS", "TS_DSV4_UBATCH", "TS_DSV4_THREADS",
                                                "TS_DSV4_VRAM_RESERVE_MB", "TS_DSV4_LOAD_THREADS", "TS_DSV4_LOAD_CHUNK_MB",
@@ -377,6 +411,7 @@ def main():
                                                "TS_GLM_LOAD_THREADS", "TS_GLM_LOAD_CHUNK_MB", "TS_Q4E_LAYER_SPLIT") if k in env}
     for key in ("TS_GGUF_PREFAULT", "TS_GGUF_PREFAULT_THREADS", "TS_GGUF_PREFAULT_RESIDENT",
                 "KV_CACHE_DTYPE", "TS_DSV41_COMPACT_RAW_GATHER", "TS_DSV41_SPARSE_FA",
+                "TS_DSV41_YOCO_KEEP", "TS_DSV4_FUSED", "TS_DSV4_FA", "TS_DSV4_GATHER",
                 "TS_GGML_TP_F32_NCCL", "GGML_CUDA_ALLREDUCE", "GGML_CUDA_AR_BF16_THRESHOLD",
                 "TS_DSV4_WARM_PREAD", "TS_DSV4_LOAD_DROP_CACHE"):
         if key in env:
@@ -458,6 +493,8 @@ def main():
                 report["text_exit_code"] = subprocess.call(evaluate, cwd=a.repo, env=env)
                 report["coverage"]["text_http"] = "passed" if report["text_exit_code"] == 0 else "failed"
                 report["exit_code"] = report["text_exit_code"]
+                if a.quality_scenarios:
+                    run_quality_evaluation(a, report, extra, env)
                 if a.tool_calls:
                     tool_command = [sys.executable, str(Path(__file__).with_name("validate-qwen38-tool-calls.py")),
                         "--url", f"http://127.0.0.1:{a.port}", "--output", str(a.output / "tool-calls.json"),

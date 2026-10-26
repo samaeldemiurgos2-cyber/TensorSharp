@@ -24,18 +24,22 @@ def main():
     parser.add_argument("--k-mix", action="store_true", help="Store the down projections (routed and shared) as Q3_K beside Q2_K everywhere else, the type mix of the published Q2_K checkpoint")
     parser.add_argument("--index-topk", type=int, default=2, help="Use 512 to exercise the real checkpoint's gather/bucket boundary")
     parser.add_argument("--token-count", type=int, default=16)
+    parser.add_argument("--moe-intermediate-size", type=int, default=256,
+                        help="Expert hidden width, a positive multiple of 256 (2304 gives nine quantization blocks for uneven global TP strips)")
     args = parser.parse_args()
     if not 1 <= args.index_topk <= 1024 or not 1 <= args.token_count <= 4096:
         raise ValueError("Fixture requires index-topk1..1024 and token-count1..4096")
     if args.k_mix and args.q8:
         raise ValueError("--k-mix and --q8 choose different weight types")
+    if args.moe_intermediate_size <= 0 or args.moe_intermediate_size % 256:
+        raise ValueError("moe-intermediate-size must be a positive multiple of 256")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(4109)
     config = dict(model_type="deepseek_v41", text_config=dict(
         vocab_size=256, hidden_size=256, num_hidden_layers=5, num_attention_heads=4,
         num_key_value_heads=1, head_dim=64, qk_rope_head_dim=32, q_lora_rank=64,
         o_lora_rank=64, o_groups=2, rms_norm_eps=1e-20, n_routed_experts=4,
-        n_shared_experts=1, num_experts_per_tok=2, moe_intermediate_size=256,
+        n_shared_experts=1, num_experts_per_tok=2, moe_intermediate_size=args.moe_intermediate_size,
         scoring_func="sqrtsoftplus", norm_topk_prob=True, routed_scaling_factor=1.5,
         swiglu_limit=10.0, sliding_window=8, max_position_embeddings=4096,
         rope_theta=10000.0, compress_rope_theta=20000.0,
@@ -160,12 +164,16 @@ def main():
         else:
             writer.add_tensor(name, data)
 
-    dim, hc, qrank, heads, rank, groups = 256, 4, 64, 4, 64, 2
+    dim, hc = c["hidden_size"], c["hc_mult"]
+    qrank, heads = c["q_lora_rank"], c["num_attention_heads"]
+    rank, groups = c["o_lora_rank"], c["o_groups"]
+    experts, moe = c["n_routed_experts"], c["moe_intermediate_size"]
+    shared_moe = moe * c["n_shared_experts"]
     head = c["head_dim"]
-    add("token_embd.weight", (256, dim), scale=.3)
+    add("token_embd.weight", (c["vocab_size"], dim), scale=.3)
     add("output_norm.weight", (dim,), "norm")
-    add("output.weight", (256, dim))
-    for layer in range(5):
+    add("output.weight", (c["vocab_size"], dim))
+    for layer in range(c["num_hidden_layers"]):
         p = f"blk.{layer}."
         for sublayer in ("attn", "ffn"):
             add(p + sublayer + "_norm.weight", (dim,), "norm")
@@ -190,11 +198,13 @@ def main():
         if layer in c["index_source_layer_ids"]:
             add(p + "indexer.attn_q_b.weight", (c["index_n_heads"] * c["index_head_dim"], qrank))
             add(p + "indexer.proj.weight", (c["index_n_heads"], dim))
-        add(p + "ffn_gate_inp.weight", (4, dim), "float")
-        add(p + "exp_probs_b.bias", (4,), "float", .1)
+        add(p + "ffn_gate_inp.weight", (experts, dim), "float")
+        add(p + "exp_probs_b.bias", (experts,), "float", .1)
         for projection in ("gate", "up", "down"):
-            add(p + f"ffn_{projection}_exps.weight", (4, dim, dim))
-            add(p + f"ffn_{projection}_shexp.weight", (dim, dim))
+            routed_shape = (experts, dim, moe) if projection == "down" else (experts, moe, dim)
+            shared_shape = (dim, shared_moe) if projection == "down" else (shared_moe, dim)
+            add(p + f"ffn_{projection}_exps.weight", routed_shape)
+            add(p + f"ffn_{projection}_shexp.weight", shared_shape)
         if layer == 1:
             add(p + "engram_embd.weight", (408, 32), scale=.3)
             add(p + "engram_k.weight", (hc, dim), "norm")

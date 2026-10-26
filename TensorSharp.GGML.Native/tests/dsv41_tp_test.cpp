@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,8 +24,11 @@
 #include <iostream>
 #include <iomanip>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <stdexcept>
+#include <thread>
 
 #if defined(TSG_GGML_USE_CUDA)
 // Standalone collective code reports details through its returned error text;
@@ -1051,6 +1055,176 @@ void failure_recovery(const std::vector<ggml_backend_dev_t> & devices, bool gate
     std::cout << "Passed " << checks << " TP failure lifecycle checks\n";
 }
 
+// An independent two-node sum transport. It deliberately shares no executor
+// buffers: each participant contributes a copy and receives the complete sum.
+// The departure barrier prevents the next gather from overwriting a result a
+// slower node has not consumed yet. A bounded wait turns protocol drift into a
+// failed comparison instead of hanging the native test suite indefinitely.
+struct two_node_sum
+{
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<float> sum;
+    int arrived = 0, departed = 0, generation = 0, fail_generation = -1;
+    bool mismatch = false;
+
+    static bool reduce(void * user, float * data, int count)
+    {
+        // Production uses the sentinel to terminate the existing transport.
+        // This symmetric in-process fixture has no socket to close; its caller
+        // controls request boundaries explicitly when checking native recovery.
+        if (count < 0) return false;
+        auto & state = *static_cast<two_node_sum *>(user);
+        std::unique_lock<std::mutex> lock(state.mutex);
+        const int round = state.generation;
+        if (!state.arrived) { state.sum.assign(count, 0.0f); state.mismatch = false; }
+        if ((int) state.sum.size() != count) state.mismatch = true;
+        else for (int i = 0; i < count; ++i) state.sum[i] += data[i];
+        ++state.arrived;
+        state.changed.notify_all();
+        if (!state.changed.wait_for(lock, std::chrono::seconds(15), [&] { return state.arrived == 2; }))
+            return false;
+        const bool success = !state.mismatch && round != state.fail_generation;
+        if (success) std::copy(state.sum.begin(), state.sum.end(), data);
+        if (++state.departed == 2)
+        {
+            state.arrived = state.departed = 0;
+            ++state.generation;
+            state.changed.notify_all();
+        }
+        else if (!state.changed.wait_for(lock, std::chrono::seconds(15), [&] { return state.generation != round; }))
+            return false;
+        return success;
+    }
+};
+
+void distributed_rank_abort(ggml_backend_dev_t cpu)
+{
+    struct observer
+    {
+        int aborted = 0, normal = 0;
+        static bool reduce(void * user, float * data, int count)
+        {
+            auto & value = *static_cast<observer *>(user);
+            if (count == -1 && data == nullptr) ++value.aborted;
+            else ++value.normal;
+            return false;
+        }
+    } callback;
+    fixture data(GGML_TYPE_F32);
+    tsg_dsv41_tp::executor tp(std::vector<ggml_backend_dev_t>(2, cpu), data.used, 2,
+                             4, 0, observer::reduce, &callback);
+    for (int layer : {0, 1}) tp.add_layer(layer, data.gate, data.up, data.down, data.clamp);
+    tp.begin_forward();
+    // The rank-1 fault occurs before this node reaches its first collective.
+    // Without a terminal notification its peer can wait forever in AllReduce.
+    set_fault("tp-rank");
+    const auto failed = evaluation(data, 3, &tp, 0).run();
+    set_fault(nullptr);
+    require(tp.error().find("tp-rank") != std::string::npos,
+            "Distributed rank failure lost its original error");
+    require(callback.aborted == 1 && callback.normal == 0,
+            "Local distributed rank failure did not issue exactly one terminal transport abort before gather");
+    require(std::all_of(failed.begin(), failed.end(), [](float x) { return std::isnan(x); }),
+            "Local distributed rank failure returned apparently valid output");
+    const auto original = tp.error();
+    const auto later = evaluation(data, 3, &tp, 1).run();
+    require(tp.error() == original && callback.aborted == 1 && callback.normal == 0,
+            "A later layer replaced the original failure or re-entered an aborted transport");
+    require(std::all_of(later.begin(), later.end(), [](float x) { return std::isnan(x); }),
+            "A later layer concealed an aborted distributed request");
+    std::cout << "Passed distributed local-rank terminal abort regression\n";
+}
+
+void distributed_numerical(ggml_backend_dev_t cpu)
+{
+    distributed_rank_abort(cpu);
+    int checks = 0;
+    for (auto formats : {std::make_pair(GGML_TYPE_F32, GGML_TYPE_F32),
+                         std::make_pair(GGML_TYPE_BF16, GGML_TYPE_BF16),
+                         std::make_pair(GGML_TYPE_Q4_K, GGML_TYPE_Q6_K)})
+    for (int local_ranks : {1, 2})
+    {
+        fixture data(formats.first, formats.second);
+        two_node_sum transport;
+        std::unique_ptr<tsg_dsv41_tp::executor> nodes[2];
+        for (int node = 0; node < 2; ++node)
+        {
+            nodes[node] = std::make_unique<tsg_dsv41_tp::executor>(
+                std::vector<ggml_backend_dev_t>(local_ranks, cpu), data.used, 2,
+                local_ranks * 2, node * local_ranks, two_node_sum::reduce, &transport);
+            for (int layer : {0, 1}) nodes[node]->add_layer(layer, data.gate, data.up, data.down, data.clamp);
+        }
+        size_t total = 0;
+        for (auto & node : nodes) for (int rank = 0; rank < local_ranks; ++rank) total += node->rank_weight_bytes(rank);
+        require(total == 2 * (data.gate_data.size() + data.up_data.size() + data.down_data.size()),
+                "Distributed TP duplicated or dropped global weight strips");
+        auto pair = [&](int tokens, int layer, bool shared, bool reset_error = true) {
+            std::vector<float> output[2];
+            std::exception_ptr errors[2];
+            std::thread threads[2];
+            for (int node = 0; node < 2; ++node)
+            {
+                if (reset_error) nodes[node]->begin_forward();
+                threads[node] = std::thread([&, node] {
+                    try { output[node] = evaluation(data, tokens, nodes[node].get(), layer, nullptr, false, shared).run(); }
+                    catch (...) { errors[node] = std::current_exception(); }
+                });
+            }
+            for (auto & thread : threads) thread.join();
+            for (const auto & error : errors) if (error) std::rethrow_exception(error);
+            return std::make_pair(std::move(output[0]), std::move(output[1]));
+        };
+        for (bool shared : {false, true}) for (int tokens : {1, 3, 1}) for (int layer : {0, 1})
+        {
+            const auto expected = data.type == GGML_TYPE_F32 ? scalar_f32_reference(data, tokens, shared)
+                : evaluation(data, tokens, nullptr, layer, nullptr, false, shared).run();
+            const int before = transport.generation;
+            auto output = pair(tokens, layer, shared);
+            require(transport.generation == before + 2, "Distributed MoE must execute both activation and output collectives");
+            for (auto * actual : {&output.first, &output.second})
+            {
+                const auto diff = measure(expected, *actual);
+                require(diff.max_abs < (data.type == GGML_TYPE_F32 ? 1e-7 : 2e-6) && diff.rel_l2 < 1e-5,
+                        "Distributed TP differs from the independent full-weight oracle");
+                ++checks;
+            }
+            for (const auto & node : nodes) require(node->error().empty(), node->error().c_str());
+        }
+        if (data.type == GGML_TYPE_F32)
+        {
+            // Fail each collective separately. Both nodes must return poisoned
+            // vectors and preserve the failure until the next request starts.
+            for (int collective : {0, 1})
+            {
+                transport.fail_generation = transport.generation + collective;
+                auto failed = pair(3, 0, false);
+                for (auto * output : {&failed.first, &failed.second})
+                    require(std::all_of(output->begin(), output->end(), [](float x) { return std::isnan(x); }),
+                            "Failed distributed collective returned apparently valid output");
+                for (const auto & node : nodes)
+                    require(node->error().find(collective ? "output gather failed" : "activation gather failed") != std::string::npos,
+                            "Distributed collective failure was not latched");
+                transport.fail_generation = -1;
+                const auto first_error = nodes[0]->error(), second_error = nodes[1]->error();
+                pair(3, 1, false, false);
+                require(nodes[0]->error() == first_error && nodes[1]->error() == second_error,
+                        "A healthy later layer concealed a distributed failure");
+                const auto recovered = pair(3, 0, false);
+                const auto expected = scalar_f32_reference(data, 3, false);
+                for (auto * output : {&recovered.first, &recovered.second})
+                    require(measure(expected, *output).max_abs < 1e-7, "Distributed TP did not recover for the next request");
+                for (const auto & node : nodes) require(node->error().empty(), "Recovered distributed request retained an error");
+                ++checks;
+            }
+        }
+        std::cout << "Distributed TP nodes=2 local_ranks=" << local_ranks
+                  << " gate=" << ggml_type_name(data.gate.type) << " down=" << ggml_type_name(data.down.type)
+                  << " numerical, shared-output and shape-reuse checks passed\n";
+    }
+    std::cout << "Passed " << checks << " distributed TP numerical/failure checks (CPU-backed simulated transport)\n";
+}
+
 void paired_fanout(const std::vector<ggml_backend_dev_t> & devices, int pairs,
                    bool compare_staging = false)
 {
@@ -1262,7 +1436,7 @@ int main(int argc, char ** argv)
     try
     {
         bool cuda = false, checkpoint_shape = false, diagnostic = false, down_f32 = false, failure_only = false, strip_only = false;
-        bool resident_failure_only = false;
+        bool resident_failure_only = false, distributed_only = false;
         int cuda_ranks = 0, fanout_pairs = 0, staging_pairs = 0, upload_pairs = 0, gather_pairs = 0, gate_fence_pairs = 0;
         bool without_gate_fence = false;
         std::string model_directory;
@@ -1276,6 +1450,7 @@ int main(int argc, char ** argv)
             else if (option == "--diagnose") diagnostic = true;
             else if (option == "--diagnostic-down-f32") down_f32 = true;
             else if (option == "--failure-only") failure_only = true;
+            else if (option == "--distributed-only") distributed_only = true;
             else if (option == "--quant-strip-only") strip_only = true;
             else if (option == "--resident-failure-only") resident_failure_only = true;
             else if (option == "--fanout-pairs" && arg + 1 < argc) fanout_pairs = std::stoi(argv[++arg]);
@@ -1317,6 +1492,14 @@ int main(int argc, char ** argv)
         if (cuda) return 77;
 #endif
         const auto cpu = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+        if (distributed_only)
+        {
+            require(!cuda && !failure_only && !strip_only && !checkpoint_shape && !diagnostic &&
+                    !fanout_pairs && !staging_pairs && !upload_pairs && !gather_pairs && !gate_fence_pairs &&
+                    model_directory.empty(), "Distributed CPU numerical checks require an exclusive test mode");
+            distributed_numerical(cpu);
+            return 0;
+        }
         if (resident_failure_only)
         {
             require(cuda && devices.size() >= 2 && !failure_only && !strip_only && !checkpoint_shape && !diagnostic &&

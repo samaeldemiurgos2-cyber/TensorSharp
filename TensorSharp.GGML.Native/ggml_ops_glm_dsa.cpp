@@ -44,6 +44,7 @@
 // token-for-token parity with llama.cpp; reproducing it restores it.
 // ---------------------------------------------------------------------------
 
+#include "ggml_ops_cuda_launch_policy.h"
 #include "ggml_ops_internal.h"
 #include "dsv4_file_warm.h"
 #include "ggml_ops_precision_policy.h"
@@ -1544,6 +1545,8 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // without it the device scan would happily pick up Metal or CUDA, which is
     // never what that flag means.
     const bool cpu_only = backend_name && strcmp(backend_name, "CPU") == 0;
+    if (!cpu_only && !tsg::configure_cuda_launch_policy())
+        throw std::runtime_error("Failed to configure the CUDA launch policy");
     int n_gpu = 0;
     for (int pass = 0; pass < 2 && n_gpu == 0 && !cpu_only; pass++)
     {

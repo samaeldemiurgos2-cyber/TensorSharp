@@ -567,6 +567,7 @@ public class RadixHolderEngineTests
         engine.PrefixCheckpointStore = store;
         await Run(engine, new SequenceState("warmup", system.Concat(new[] { 201, 202 }).ToList(), 1, 8,
             SamplingConfig.Greedy, cacheScope: "warmup", sharedPrefixTokens: shared));
+        engine.FlushPrefixCheckpointSaves();
         Assert.Contains(shared, store.SavedLengths);
 
         var cat = new PromptMediaSpan(shared + 3, shared + 11, new string('a', 64));
@@ -587,6 +588,7 @@ public class RadixHolderEngineTests
         var later = ImageTurn("later", laterPrompt, new[] { cat, dog }, shared, "chat");
         Assert.True((await Run(engine, later)).PrefixCacheReusedTokens >= text.NumComputedTokens);
         // The media prefix is never what a store holds: only the text-only shared prefix was saved.
+        engine.FlushPrefixCheckpointSaves();
         Assert.All(store.SavedLengths, length => Assert.True(length <= cat.Start));
 
         using var cold = new InferenceEngine(MediaRecurrent(), Configuration(false));
@@ -647,6 +649,7 @@ public class RadixHolderEngineTests
             publicCheckpointBoundaries: new[] { 8 });
 
         Assert.Equal(0, (await Run(engine, request)).PrefixCacheReusedTokens);
+        engine.FlushPrefixCheckpointSaves();
         foreach (int length in saved)
             Assert.Contains(length, store.SavedLengths);
         Assert.All(store.SavedLengths, length => Assert.True(length < span.Start,

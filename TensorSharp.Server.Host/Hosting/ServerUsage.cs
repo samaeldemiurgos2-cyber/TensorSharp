@@ -161,21 +161,22 @@ namespace TensorSharp.Server.Host.Hosting
                     "Default: TENSORSHARP_TP_DEGREE or 1; the CLI overrides the environment.",
                     "--backend ggml_cuda --tp 2"),
                 new OptionHelp("--layer-split <N>",
-                    "Place contiguous runs of whole layers across N GPUs on this machine. This increases capacity; " +
+                    "Place contiguous runs of whole layers across N local GPUs. This increases capacity; " +
                     "it does not shard weight tensors or promise faster decoding. Requires an architecture with " +
                     "layer placement on the chosen backend (ggml_cuda/ggml_vulkan, or cuda for supported families). Unsupported combinations " +
-                    "are refused. Cannot combine with --tp above 1 or with --tp-node-id/--tp-peers; multi-node " +
-                    "layer splitting is not supported. Default: TENSORSHARP_LAYER_SPLIT_DEGREE or 1; the CLI " +
-                    "overrides the environment. Existing layer-split commands using --tp must migrate to this option.",
+                    "are refused. Add --tp-node-id/--tp-peers for multiple nodes with a supported stage executor " +
+                    "(DeepSeek V4.1 on ggml_cuda, Mistral 3 on ggml_cuda/ggml_vulkan). Use the same local degree " +
+                    "on every node; --layer-split 1 supports one GPU per node. Cannot combine with --tp above 1. " +
+                    "Default: TENSORSHARP_LAYER_SPLIT_DEGREE or 1; the CLI overrides the environment.",
                     "--backend ggml_cuda --layer-split 2"),
                 new OptionHelp("--tp-node-id <N>",
-                    "This node's 0-based ID for multi-node (distributed) tensor parallelism over TCP. The server can " +
+                    "This node's 0-based ID for multi-node tensor parallelism or layer splitting over TCP. The server can " +
                     "only be node 0 — the driver that owns sampling and serves HTTP; start every other node as a " +
                     "worker with TensorSharp.Cli using the same model, backend, and --tp-peers list. Requires " +
                     "--tp-peers. Default: none — single-node (TENSORSHARP_TP_NODE_ID supplies the default).",
                     "--tp 2 --tp-node-id 0 --tp-peers 192.168.1.10:9500,192.168.1.11:9500"),
                 new OptionHelp("--tp-peers <list>",
-                    "Comma-separated host:port list of ALL nodes in the distributed TP cluster, ordered by node ID; " +
+                    "Comma-separated host:port (or [IPv6]:port) list of ALL nodes in the cluster, ordered by node ID; " +
                     "every node passes the identical list. Requires --tp-node-id. Default: none " +
                     "(TENSORSHARP_TP_PEERS supplies the default).",
                     "--tp-peers 192.168.1.10:9500,192.168.1.11:9500"),

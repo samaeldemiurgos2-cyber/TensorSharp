@@ -339,7 +339,7 @@ and `usage.input_tokens` counts the expanded prompt including the soft rows.
 Decoded bytes are written content-addressed into the server's upload directory, so
 `--upload-max-mb`, `--upload-quota-mb` and `--upload-ttl-hours` govern them, the
 same picture resent across requests stores one file, and its embeddings are encoded
-once and cached (`TS_MM_EMBEDDING_CACHE_MB`, default 512). Image attention inside
+once and cached (`TS_MM_EMBEDDING_CACHE_MB`, default 1/64 of host memory within 512-4096 MB). Image attention inside
 each soft-token span is bidirectional on sliding layers and causal on global ones;
 `DIFFUSION_IMAGE_BIDIRECTIONAL=0` makes it causal everywhere.
 

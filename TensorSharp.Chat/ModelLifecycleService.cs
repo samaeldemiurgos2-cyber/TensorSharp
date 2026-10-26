@@ -29,7 +29,9 @@ namespace TensorSharp.Server
 
         public ModelLifecycleService(ILogger logger)
             : this(logger, static (path, backend, tpGroup, draftPath) =>
-                ModelBase.Create(path, backend, tpGroup: tpGroup, draftModelPath: draftPath))
+                ModelBase.Create(path, backend, tpDegree: tpGroup is ILayerSplitGroup ? 1 : tpGroup?.Degree ?? 1,
+                    tpGroup: tpGroup, draftModelPath: draftPath,
+                    layerSplitDegree: tpGroup is ILayerSplitGroup ? tpGroup.Degree : 1))
         {
         }
 
@@ -86,6 +88,30 @@ namespace TensorSharp.Server
         public bool IsModelAlreadyLoaded(string modelName)
         {
             return _model != null && string.Equals(LoadedModelName, modelName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Distributed workers are launched with one fixed checkpoint.
+        /// A runtime load cannot restart their warmup/worker loop or change their
+        /// weights, so it must be refused before disposing the serving model.</summary>
+        internal bool ShouldLoadDistributedModel(string modelPath, string mmProjPath, string backendStr, bool startupLoad)
+        {
+            bool distributed = TensorParallelGroupFactory != null &&
+                (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID")) ||
+                 !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")));
+            if (!distributed) return true;
+            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            bool SamePath(string left, string right) => string.IsNullOrEmpty(left) || string.IsNullOrEmpty(right)
+                ? string.IsNullOrEmpty(left) && string.IsNullOrEmpty(right)
+                : string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), comparison);
+            if (_model != null && SamePath(modelPath, _loadedModelPath) && SamePath(mmProjPath, _loadedMmProjPath)
+                && ResolveBackend(backendStr) == _backend)
+                return false;
+            if (!startupLoad)
+                throw new ModelLoadRefusedException(
+                    "Distributed tensor parallelism requires a startup --model. Runtime model loading, backend changes, " +
+                    "and model switching are not supported because the worker nodes must load the same checkpoint " +
+                    "and warm up together. Restart the driver server with --model and matching CLI workers.");
+            return true;
         }
 
         public void LoadModel(string modelPath, string mmProjPath, string backendStr)
@@ -276,7 +302,13 @@ namespace TensorSharp.Server
                 if (TensorParallelGroupFactory != null &&
                     !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID")) &&
                     !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
-                    ModelBase.ValidateDistributedTensorParallelism(modelPath, _backend);
+                {
+                    // Keep this portable library independent of TensorSharp.Distributed.
+                    bool layerSelected = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE")) &&
+                        (!int.TryParse(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"), out int tpDegree) || tpDegree <= 1);
+                    if (layerSelected) ModelBase.ValidateDistributedLayerSplit(modelPath, _backend);
+                    else ModelBase.ValidateDistributedTensorParallelism(modelPath, _backend);
+                }
                 tpGroup = TensorParallelGroupFactory?.Invoke(_backend);
 
                 // Block drafters go to the factory rather than being attached
@@ -292,10 +324,10 @@ namespace TensorSharp.Server
                 if (_model.IsDistributedWorker)
                 {
                     throw new ModelLoadRefusedException(
-                        "TensorSharp.Server cannot run as a distributed tensor-parallel WORKER node " +
+                        "TensorSharp.Server cannot run as a distributed WORKER node " +
                         "(--tp-node-id > 0 / TENSORSHARP_TP_NODE_ID > 0). Run this server as node 0 (the driver) " +
                         "and start each worker node with TensorSharp.Cli, e.g.: " +
-                        "TensorSharp.Cli --model <same.gguf> --backend <same> --tp <localGpus> --tp-node-id <N> --tp-peers <same list>.");
+                        "TensorSharp.Cli --model <same.gguf> --backend <same> <--tp or --layer-split> <localGpus> --tp-node-id <N> --tp-peers <same list>.");
                 }
 
                 _loadedModelPath = modelPath;

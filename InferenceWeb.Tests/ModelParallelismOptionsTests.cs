@@ -127,11 +127,51 @@ public sealed class ModelParallelismOptionsTests : IDisposable
     public void InvalidClusterIsRejectedBeforeConnecting(string node, string peers)
         => Assert.Throws<ArgumentException>(() => ModelParallelismOptions.Parse(new[] { "--tp-node-id", node, "--tp-peers", peers }));
 
-    [Fact]
-    public void LayerSplitCannotSilentlyUseTheTensorParallelTransport()
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void DistributedLayerSplitUsesTheRequestedLocalDegree(int degree)
     {
-        var error = Assert.Throws<ArgumentException>(() => ModelParallelismOptions.Parse(new[] {
-            "--layer-split=2", "--tp-node-id=0", "--tp-peers=127.0.0.1:9500,127.0.0.1:9501" }));
-        Assert.Contains("one node only", error.Message);
+        var options = ModelParallelismOptions.Parse(new[] {
+            $"--layer-split={degree}", "--tp-node-id=0", "--tp-peers=127.0.0.1:9500,127.0.0.1:9501" });
+        Assert.True(options.IsLayerSplit);
+        Assert.Equal(1, options.TpDegree);
+        Assert.Equal(degree, options.Distributed.LocalDegree);
+        Assert.Equal(2 * degree, options.Distributed.GlobalDegree);
+    }
+
+    [Fact]
+    public void EnvironmentSelectsLayerSplitWithOneGpuPerNode()
+    {
+        Environment.SetEnvironmentVariable(ModelParallelismOptions.LayerSplitDegreeVariable, "1");
+        var options = ModelParallelismOptions.Parse(new[] {
+            "--tp-node-id=1", "--tp-peers=127.0.0.1:9500,127.0.0.1:9501" });
+        Assert.True(options.IsLayerSplit);
+        Assert.Equal(1, options.Distributed.LocalDegree);
+    }
+
+    [Fact]
+    public void ExplicitLayerDegreeOneCanDisableLayerSplittingForTensorParallelism()
+    {
+        Environment.SetEnvironmentVariable(ModelParallelismOptions.LayerSplitDegreeVariable, "2");
+        var options = ModelParallelismOptions.Parse(new[] { "--layer-split=1", "--tp=2" });
+        Assert.False(options.IsLayerSplit);
+    }
+
+    [Theory]
+    [InlineData("127.0.0.1:9500,,127.0.0.1:9501")]
+    [InlineData("127.0.0.1:9500,")]
+    [InlineData("127.0.0.1:9500,127.0.0.1:9500")]
+    [InlineData("::1:9500,::1:9501")]
+    public void InvalidPeerListsAreRejected(string peers)
+        => Assert.Throws<ArgumentException>(() => ModelParallelismOptions.Parse(new[] {
+            "--tp-node-id=0", "--tp-peers=" + peers }));
+
+    [Fact]
+    public void BracketedIpv6PeersAreParsed()
+    {
+        var options = ModelParallelismOptions.Parse(new[] {
+            "--layer-split=2", "--tp-node-id=0", "--tp-peers=[::1]:9500,[::1]:9501" });
+        Assert.Equal(System.Net.IPAddress.IPv6Loopback, options.Distributed.PeerEndpoints[0].Address);
     }
 }

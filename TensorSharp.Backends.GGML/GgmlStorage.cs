@@ -21,7 +21,18 @@ namespace TensorSharp.GGML
             : base(allocator, elementType, elementCount)
         {
             Context = context ?? throw new ArgumentNullException(nameof(context));
-            buffer = context.MemoryPool.Allocate(ByteLength);
+            buffer = context.MemoryPool.AllocateReportingZero(ByteLength, out allocatedZero);
+        }
+
+        // Whether the pool handed out a fresh mapping (all zero); consumed by
+        // TakeAllocationZeroGuarantee.
+        private bool allocatedZero;
+
+        public override bool TakeAllocationZeroGuarantee()
+        {
+            bool zero = allocatedZero;
+            allocatedZero = false;
+            return zero;
         }
 
         public GgmlContext Context { get; }

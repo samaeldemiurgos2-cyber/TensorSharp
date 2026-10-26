@@ -10,4 +10,15 @@ namespace TensorSharp.GGML;
 public readonly record struct GgmlMemoryPoolStatistics(
     long PoolHits, long FreshAllocations, long SystemFrees, long SystemFreeFailures,
     int RetainedBlocks, int OutstandingBlocks, long RetainedBytes, long PeakRetainedBytes,
-    int MaxPooledBlocks, long MaxRetainedBlockBytes, bool IsClosed);
+    int MaxPooledBlocks, long MaxRetainedBlockBytes, bool IsClosed)
+{
+    /// <summary>Whether this pool opted into large Linux CUDA host-mapping hints.</summary>
+    public bool HugePageAdviceEnabled { get; init; }
+    public long HugePageAdviceRequests { get; init; }
+    /// <summary>Hints accepted by madvise, not proof of physical huge-page backing.
+    /// Inspect /proc/PID/smaps for actual AnonHugePages.</summary>
+    public long HugePageAdviceAccepted { get; init; }
+    public long HugePageAdviceFailures { get; init; }
+    /// <summary>Cumulative bytes in accepted hints, not live retained bytes.</summary>
+    public long HugePageAdvisedBytes { get; init; }
+}

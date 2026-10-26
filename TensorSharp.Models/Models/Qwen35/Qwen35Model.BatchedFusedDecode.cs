@@ -379,7 +379,7 @@ namespace TensorSharp.Models
         // subsequent linear->paged migration reads the LATEST recurrent state.
         private unsafe void DrainFusedDecodeStateForMigration()
         {
-            if (!_fdStateResident || _fdConvScratch == IntPtr.Zero || _fdGdnSlot == null)
+            if (!_fdStateResident || _fdConvScratch == IntPtr.Zero)
                 return; // host _convState / _deltaStateTensor are already current
 
             EnsureFusedDecodeStateHostSynchronized();

@@ -22,6 +22,7 @@
 // turn, which a thinking turn needs because its render drops the previous
 // answer's reasoning. Plain V4 and the pure-C# executor re-prefill.
 using System;
+using System.Runtime.InteropServices;
 using TensorSharp.GGML;
 using TensorSharp.Runtime.Scheduling;
 
@@ -41,12 +42,20 @@ namespace TensorSharp.Models
         // checkpoint's compression ratios, and SupportsKVCacheTruncation is read on hot
         // scheduler paths.
         private readonly int _truncateAlign;
+        private GgmlDeepSeek4Native.CrossNodeAllReduce _distributedTpReduce;
+        private GgmlDeepSeek4Native.LayerTransfer _distributedLayerTransfer;
+        private float[] _distributedTpBuffer = Array.Empty<float>();
+        private bool _distributedTpAborted;
+        protected bool IsDistributedNativeTensorParallel => _tpGroup?.NodeCount > 1;
+        protected bool IsDistributedNativeLayerSplit => LayerSplitGroup?.NodeCount > 1;
+        private ITensorParallelGroup NativeDistributedGroup => (ITensorParallelGroup)LayerSplitGroup ?? _tpGroup;
+        protected override bool ShardsWeightsInComponents => true;
         protected internal IntPtr NativeHandle => _handle;
         protected object NativeSync => _sync;
 
         public DeepSeek4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
             string draftModelPath = null, int layerSplitDegree = 1)
-            : base(ggufPath, ValidateParallelism(backend, tpDegree, tpGroup, layerSplitDegree), 1, null)
+            : base(ggufPath, ValidateParallelism(backend, tpDegree, tpGroup, layerSplitDegree), 1, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "deepseek4";
             bool isV41 = string.Equals(arch, "deepseek41", StringComparison.Ordinal);
@@ -83,7 +92,7 @@ namespace TensorSharp.Models
             {
                 try
                 {
-                    if (tpDegree > 1)
+                    if (tpDegree > 1 || tpGroup != null)
                         throw new NotSupportedException("DeepSeek V4 does not implement tensor parallelism; use --layer-split N. --tp is supported by DeepSeek V4.1.");
                     DeepSeek4Architecture.RefuseBlockQuantizedKvCache("DeepSeek V4 (Flash)", v41: false);
                 }
@@ -172,16 +181,70 @@ namespace TensorSharp.Models
                     (dspark != null ? ", DSpark drafter" : string.Empty));
 
                 int nCpuMoe = ResolveCpuMoeLayers();
-                // `backend`, not `_backend`: the base ctor coerces everything to
-                // GgmlCpu so no second GPU context is created, but the native
-                // executor still has to pick its devices from the backend the
-                // operator actually asked for.
+                // Use the operator's original backend: native execution owns
+                // its compute queues independently of the managed context.
                 string backendName = BackendRegistryName(backend);
-                int tensorParallelRanks = isV41 ? DeepSeek41Architecture.ResolveTensorParallelRanks(tpDegree) : 0;
+                int tensorParallelRanks = isV41
+                    ? (IsDistributedNativeTensorParallel ? tpDegree : DeepSeek41Architecture.ResolveTensorParallelRanks(tpDegree)) : 0;
                 if (tensorParallelRanks > 0)
-                    Console.WriteLine(DeepSeek41Architecture.DescribeTensorParallelPlacement(tensorParallelRanks));
-                _handle = GgmlDeepSeek4Native.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
-                    dspark, nCpuMoe, backendName, tensorParallelRanks);
+                    Console.WriteLine(DeepSeek41Architecture.DescribeTensorParallelPlacement(
+                        IsDistributedNativeTensorParallel ? _tpGroup.GlobalDegree : tensorParallelRanks));
+                if (IsDistributedNativeLayerSplit)
+                {
+                    if (dspark != null)
+                        throw new NotSupportedException("Distributed layer split does not mirror DSpark operations; omit --draft-model.");
+                    string headerIdentity = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                        ReadModelHeaderForIdentity(ggufPath)));
+                    DeepSeek41Architecture.ValidateDistributedExecutionConfig(LayerSplitGroup,
+                        $"layer|{arch}|header={headerIdentity}|layers={Config.NumLayers}|hidden={Config.HiddenSize}" +
+                        $"|nodes={LayerSplitGroup.NodeCount}|local={LayerSplitGroup.Degree}|ctx={maxContext}" +
+                        $"|ubatch={(nUbatch > 0 ? nUbatch : 256)}|cpu_moe={nCpuMoe}" +
+                        DeepSeek41Architecture.DistributedNumericalOptions());
+                    _distributedLayerTransfer = TransferLayerState;
+                    _handle = GgmlDeepSeek4Native.LoadModelLayerDistributed(ggufPath, LayerSplitGroup.Degree,
+                        LayerSplitGroup.NodeId, LayerSplitGroup.NodeCount, maxContext, nUbatch, nThreads,
+                        nCpuMoe, backendName, _distributedLayerTransfer);
+                }
+                else if (IsDistributedNativeTensorParallel)
+                {
+                    var reducer = (INestedTensorParallelGroup)tpGroup;
+                    string yoco = Environment.GetEnvironmentVariable(DeepSeek41Architecture.YocoKeepVariable)
+                        ?? Math.Max(140, Config.SlidingWindow + 8).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    string headerIdentity = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                        ReadModelHeaderForIdentity(ggufPath)));
+                    DeepSeek41Architecture.ValidateDistributedExecutionConfig(tpGroup,
+                        $"{arch}|header={headerIdentity}|layers={Config.NumLayers}|hidden={Config.HiddenSize}" +
+                        $"|experts={Config.NumExperts}|used={Config.NumExpertsUsed}|ff={Config.IntermediateSize}" +
+                        $"|local={tpDegree}|global={tpGroup.GlobalDegree}|ctx={maxContext}|ubatch={(nUbatch > 0 ? nUbatch : 256)}" +
+                        $"|cpu_moe={Math.Min(nCpuMoe, Config.NumLayers)}|yoco={yoco}" +
+                        DeepSeek41Architecture.DistributedNumericalOptions());
+                    _distributedTpReduce = (user, data, count) =>
+                    {
+                        if (_distributedTpAborted) return false;
+                        if (count < 0) { AbortDistributedTensorParallel(); return false; }
+                        try
+                        {
+                            if (count <= 0) return true;
+                            if (_distributedTpBuffer.Length < count) _distributedTpBuffer = new float[count];
+                            Marshal.Copy(data, _distributedTpBuffer, 0, count);
+                            reducer.CrossNodeAllReduce(_distributedTpBuffer, count);
+                            Marshal.Copy(_distributedTpBuffer, 0, data, count);
+                            return true;
+                        }
+                        catch (Exception error)
+                        {
+                            Console.Error.WriteLine($"[dsv41-tp] cross-node gather failed: {error.Message}");
+                            AbortDistributedTensorParallel(error);
+                            return false;
+                        }
+                    };
+                    Console.WriteLine($"  Distributed routed-MoE TP: {_tpGroup.NodeCount} nodes, {tpDegree} local / {_tpGroup.GlobalDegree} global ranks, offset {_tpGroup.GlobalRankOffset}.");
+                    _handle = GgmlDeepSeek4Native.LoadModelDistributed(ggufPath, tpDegree, _tpGroup.GlobalDegree,
+                        _tpGroup.GlobalRankOffset, maxContext, nUbatch, nThreads, nCpuMoe, backendName, _distributedTpReduce);
+                }
+                else
+                    _handle = GgmlDeepSeek4Native.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
+                        dspark, nCpuMoe, backendName, tensorParallelRanks);
                 _nativeDsparkBlock = _handle != IntPtr.Zero && dspark != null
                     ? GgmlDeepSeek4Native.DsparkBlockSize(_handle) : 0;
                 if (_handle == IntPtr.Zero)
@@ -191,8 +254,70 @@ namespace TensorSharp.Models
                 _nativeUBatch = GgmlDeepSeek4Native.UBatch(_handle);
                 // Zero for plain V4: its compressor overlaps blocks, so a rewind reads state
                 // rows an aligned target does not protect, and the native side declines.
-                _truncateAlign = GgmlDeepSeek4Native.TruncateAlign(_handle);
-                _slotExecutor = new NativeDsv4Slots(_handle);
+                // Existing distributed controls mirror ordinary forwards and
+                // resets. Slot selection, refusable truncation and retention
+                // have no mirrored control, so the scheduler uses its serial
+                // per-sequence fallback with reset/re-prefill between requests.
+                _truncateAlign = NativeDistributedGroup?.NodeCount > 1 ? 0 : GgmlDeepSeek4Native.TruncateAlign(_handle);
+                _slotExecutor = NativeDistributedGroup?.NodeCount > 1 ? null : new NativeDsv4Slots(_handle);
+            }
+        }
+
+        private static byte[] ReadModelHeaderForIdentity(string path)
+        {
+            // A bounded header identity catches accidental checkpoint/config
+            // differences without reading hundreds of GiB during model load.
+            // Validation records a separate immutable full-weight identity.
+            using var stream = System.IO.File.OpenRead(path);
+            var header = new byte[checked((int)Math.Min(stream.Length, 64 * 1024))];
+            stream.ReadExactly(header);
+            return header;
+        }
+
+        private void AbortDistributedTensorParallel(Exception failure = null)
+        {
+            if (NativeDistributedGroup?.NodeCount is not > 1 || _distributedTpAborted) return;
+            _distributedTpAborted = true;
+            // Native rank queues belong to the executor, independently of the
+            // managed group's allocators. Closing its sockets unblocks peers
+            // even when they entered a collective before this node failed.
+            try
+            {
+                if (NativeDistributedGroup is IDistributedExecutionGroup execution)
+                    execution.Abort(failure ?? new InvalidOperationException("DeepSeek distributed execution failed."));
+                else NativeDistributedGroup.Dispose();
+            }
+            catch (Exception error) { Console.Error.WriteLine($"[dsv41-tp] transport abort: {error.Message}"); }
+        }
+
+        private unsafe bool TransferLayerState(IntPtr user, int peer, int send, IntPtr data, int bytes)
+        {
+            if (_distributedTpAborted || bytes < 0 || data == IntPtr.Zero) return false;
+            try
+            {
+                int words = checked((bytes + 3) / 4);
+                if (_distributedTpBuffer.Length < words) _distributedTpBuffer = new float[words];
+                fixed (float* buffer = _distributedTpBuffer)
+                {
+                    if (send != 0)
+                    {
+                        if (words != 0) _distributedTpBuffer[words - 1] = 0;
+                        Buffer.MemoryCopy(data.ToPointer(), buffer, (long) words * 4, bytes);
+                        LayerSplitGroup.Send(_distributedTpBuffer, words, peer);
+                    }
+                    else
+                    {
+                        LayerSplitGroup.Receive(_distributedTpBuffer, words, peer);
+                        Buffer.MemoryCopy(buffer, data.ToPointer(), bytes, bytes);
+                    }
+                }
+                return true;
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine($"[dsv4-layer] state transfer failed: {error.Message}");
+                AbortDistributedTensorParallel(error);
+                return false;
             }
         }
 
@@ -292,9 +417,8 @@ namespace TensorSharp.Models
         {
             if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
             if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
-            if (tpGroup != null)
-                throw new NotSupportedException("DeepSeek V4/V4.1 use single-process native executors; remove --tp-node-id/--tp-peers.");
-            if (tpDegree > 1 && layerSplitDegree > 1)
+            DeepSeek41Architecture.ValidateTensorParallelGroup(backend, tpDegree, tpGroup);
+            if ((tpDegree > 1 || (tpGroup != null && tpGroup is not ILayerSplitGroup)) && layerSplitDegree > 1)
                 throw new ArgumentException("--layer-split and --tp cannot be combined.");
             if (layerSplitDegree > 1 && backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
                 throw new NotSupportedException($"DeepSeek --layer-split is unavailable on {backend}.");
@@ -326,9 +450,9 @@ namespace TensorSharp.Models
             // the direct-CUDA executor, which owns its own per-device contexts —
             // the base class only needs a lightweight CPU allocator, so it is
             // coerced to Cpu (the ctor dispatches on the ORIGINAL backend). The
-            // other backends drive the native ggml executor; the managed side
-            // only needs the GGML library loaded, so everything else is coerced
-            // to GgmlCpu so no second GPU context is created.
+            // GGML CUDA/Vulkan preserve their managed context for distributed
+            // transport and backend-failure tracking. Other native backends
+            // need only the lightweight GGML CPU context on the managed side.
             return backend switch
             {
                 BackendType.Cpu => BackendType.Cpu,
@@ -452,20 +576,32 @@ namespace TensorSharp.Models
         {
             lock (_sync)
             {
-                var logits = new float[Config.VocabSize];
-                if (_cudaExec != null)
+                if (_distributedTpAborted)
+                    throw new InvalidOperationException("DeepSeek distributed execution was aborted after a node failure; restart every node before generating again.");
+                try
                 {
-                    _cudaExec.Forward(tokens, logits);
+                    var logits = new float[Config.VocabSize];
+                    if (_cudaExec != null)
+                    {
+                        _cudaExec.Forward(tokens, logits);
+                    }
+                    else if (_cpuExec != null)
+                    {
+                        _cpuExec.Forward(tokens, logits);
+                    }
+                    else if (!GgmlDeepSeek4Native.Forward(_handle, tokens, logits))
+                    {
+                        throw new InvalidOperationException("DeepSeek V4 native forward failed (see stderr).");
+                    }
+                    return logits;
                 }
-                else if (_cpuExec != null)
+                catch (Exception error)
                 {
-                    _cpuExec.Forward(tokens, logits);
+                    // Covers failures before the native TP hook was reached
+                    // (graph construction/allocation, for example) as well.
+                    AbortDistributedTensorParallel(error);
+                    throw;
                 }
-                else if (!GgmlDeepSeek4Native.Forward(_handle, tokens, logits))
-                {
-                    throw new InvalidOperationException("DeepSeek V4 native forward failed (see stderr).");
-                }
-                return logits;
             }
         }
 
@@ -473,14 +609,24 @@ namespace TensorSharp.Models
         {
             lock (_sync)
             {
-                if (_cudaExec != null)
-                    _cudaExec.Reset();
-                else if (_cpuExec != null)
-                    _cpuExec.Reset();
-                else if (_handle != IntPtr.Zero)
+                if (_distributedTpAborted)
+                    throw new InvalidOperationException("Distributed DeepSeek execution was aborted; restart every node before resetting.");
+                try
                 {
-                    if (!GgmlDeepSeek4Native.ResetChecked(_handle))
-                        throw new InvalidOperationException("DSV4 native cache reset failed; cache remains unusable.");
+                    if (_cudaExec != null)
+                        _cudaExec.Reset();
+                    else if (_cpuExec != null)
+                        _cpuExec.Reset();
+                    else if (_handle != IntPtr.Zero)
+                    {
+                        if (!GgmlDeepSeek4Native.ResetChecked(_handle))
+                            throw new InvalidOperationException("DSV4 native cache reset failed; cache remains unusable.");
+                    }
+                }
+                catch (Exception error)
+                {
+                    AbortDistributedTensorParallel(error);
+                    throw;
                 }
             }
         }
@@ -489,6 +635,7 @@ namespace TensorSharp.Models
         {
             // One tiny forward allocates the scheduler's compute buffers so the
             // first user request does not pay the allocation cost.
+            if (NativeDistributedGroup?.NodeCount > 1) NativeDistributedGroup.Barrier();
             try
             {
                 int bos = Tokenizer?.BosTokenId ?? 0;
@@ -497,10 +644,11 @@ namespace TensorSharp.Models
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"[dsv4] warmup forward failed: {ex.Message}");
+                if (NativeDistributedGroup?.NodeCount > 1) throw;
             }
             finally
             {
-                ResetKVCacheCore();
+                if (!_distributedTpAborted) ResetKVCacheCore();
             }
         }
 
@@ -524,6 +672,8 @@ namespace TensorSharp.Models
                     GgmlDeepSeek4Native.Free(_handle);
                     _handle = IntPtr.Zero;
                 }
+                GC.KeepAlive(_distributedTpReduce);
+                GC.KeepAlive(_distributedLayerTransfer);
             }
             base.Dispose();
         }

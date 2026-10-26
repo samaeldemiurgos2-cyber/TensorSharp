@@ -413,11 +413,23 @@ struct executor::impl
     }
 #endif
 
-    impl(const std::vector<ggml_backend_dev_t> & devices, int used_experts, int reader_threads)
-        : used(used_experts), load_threads(reader_threads), pool((int) devices.size())
+    int global_ranks;
+    int rank_offset;
+    cross_node_all_reduce cross_node;
+    void * cross_node_user;
+
+    impl(const std::vector<ggml_backend_dev_t> & devices, int used_experts, int reader_threads,
+         int global_degree, int offset, cross_node_all_reduce reducer, void * reducer_user)
+        : used(used_experts), load_threads(reader_threads), pool((int) devices.size()),
+          global_ranks(global_degree ? global_degree : (int) devices.size()), rank_offset(offset),
+          cross_node(reducer), cross_node_user(reducer_user)
     {
-        require(devices.size() >= 2 && devices.size() <= 16 && used > 0,
-                "V4.1 TP requires two to sixteen ranks and positive expert count");
+        require(!devices.empty() && devices.size() <= 16 && used > 0 && global_ranks >= 2 && global_ranks <= 16 &&
+                rank_offset >= 0 && rank_offset <= global_ranks - (int) devices.size(),
+                "V4.1 TP requires valid local/global ranks (2..16 globally) and positive expert count");
+        require((global_ranks == (int) devices.size() && rank_offset == 0 && !cross_node) ||
+                (global_ranks > (int) devices.size() && cross_node),
+                "Distributed V4.1 TP requires the existing cross-node AllReduce callback");
         automatic_host_gather = std::getenv("TS_DSV41_TP_HOST_TOKENS") == nullptr;
         if (const char * configured = std::getenv("TS_DSV41_TP_HOST_TOKENS"))
         {
@@ -459,6 +471,9 @@ struct executor::impl
 
     bool device_resident() const
     {
+        // The existing distributed transport accepts host F32 buffers. Keep
+        // local CUDA queues asynchronous between the two collective boundaries.
+        if (cross_node) return false;
 #if defined(TSG_GGML_USE_CUDA)
         for (const auto & rank : ranks) if (!rank->cuda_backend) return false;
         return true;
@@ -473,6 +488,7 @@ struct executor::impl
     {
         if (gather_resolved) return;
         gather_resolved = true;
+        if (cross_node) return;
 #if defined(TSG_GGML_USE_CUDA)
         std::vector<ggml_backend_t> backends;
         for (const auto & rank : ranks) if (rank->cuda_backend) backends.push_back(rank->cuda_backend);
@@ -790,6 +806,7 @@ struct executor::impl
 #endif
             gathered = (float *) hidden_transfer.reserve(hidden_count * sizeof(float));
         }
+        if (cross_node) std::fill_n(gathered, hidden_count, 0.0f);
         auto synchronize = [&](int r) {
             ggml_backend_synchronize(ranks[r]->backend);
 #if defined(TSG_GGML_TEST_HOOKS)
@@ -887,6 +904,11 @@ struct executor::impl
                 std::copy_n(rank->result + column * rows, rows,
                             gathered + column * full_hidden + weight.first_row);
         }
+        if (cross_node)
+        {
+            require(hidden_count <= size_t(std::numeric_limits<int>::max()), "V4.1 TP hidden collective is too large");
+            require(cross_node(cross_node_user, gathered, (int) hidden_count), "V4.1 TP cross-node activation gather failed");
+        }
         dispatch([&](int r) {
             auto & rank = *ranks[r];
             auto & g = *rank.layers.at(spec.id)->graphs.at(tokens);
@@ -901,6 +923,7 @@ struct executor::impl
         });
         // Output rows are disjoint. Gather them without reducing partial sums.
         auto * output = (float *) dst->data;
+        if (cross_node) std::fill_n(output, ggml_nelements(dst), 0.0f);
         for (auto & rank : ranks)
         {
             const auto & weight = *rank->layers.at(spec.id);
@@ -909,6 +932,12 @@ struct executor::impl
                 std::copy_n(rank->result + token * rows, rows,
                             output + token * spec.embedding + weight.first_output);
         }
+        if (cross_node)
+        {
+            const int64_t count = ggml_nelements(dst);
+            require(count <= std::numeric_limits<int>::max(), "V4.1 TP output collective is too large");
+            require(cross_node(cross_node_user, output, (int) count), "V4.1 TP cross-node output gather failed");
+        }
     }
 
     // Host-driven execution (the node on the CPU backend): every rank runs
@@ -916,6 +945,11 @@ struct executor::impl
     static void host_hook(void * object, ggml_tensor * dst)
     {
         auto & spec = *(layer *) object;
+        if (spec.owner->cross_node && !spec.owner->failure.empty())
+        {
+            std::fill_n((float *) dst->data, ggml_nelements(dst), std::numeric_limits<float>::quiet_NaN());
+            return;
+        }
         const ggml_tensor * x = dst->src[0], * weights = dst->src[1], * ids = dst->src[2];
         try { spec.owner->compute(spec, dst, x, weights, ids); }
         catch (...)
@@ -927,14 +961,24 @@ struct executor::impl
             try { spec.owner->pool.run([&](int rank) {
                 ggml_backend_synchronize(spec.owner->ranks[rank]->backend);
             }); } catch (...) {}
-            if (spec.owner->failure.empty()) spec.owner->failure = error;
+            if (spec.owner->failure.empty())
+            {
+                spec.owner->failure = error;
+                // A local rank may fail before entering its next collective.
+                // Closing the existing transport releases a peer already there;
+                // heartbeats otherwise keep a stalled receive alive indefinitely.
+                if (spec.owner->cross_node)
+                    try { spec.owner->cross_node(spec.owner->cross_node_user, nullptr, -1); }
+                    catch (...) {} // Never replace the original native error.
+            }
             std::fill_n((float *) dst->data, ggml_nelements(dst), std::numeric_limits<float>::quiet_NaN());
         }
     }
 };
 
-executor::executor(const std::vector<ggml_backend_dev_t> & devices, int used_experts, int load_threads)
-    : state(std::make_unique<impl>(devices, used_experts, load_threads)) {}
+executor::executor(const std::vector<ggml_backend_dev_t> & devices, int used_experts, int load_threads,
+                   int global_ranks, int rank_offset, cross_node_all_reduce cross_node, void * cross_node_user)
+    : state(std::make_unique<impl>(devices, used_experts, load_threads, global_ranks, rank_offset, cross_node, cross_node_user)) {}
 executor::~executor() = default;
 
 void executor::add_layer(int id, const source & gate, const source & up, const source & down, float clamp_limit)
@@ -943,22 +987,23 @@ void executor::add_layer(int id, const source & gate, const source & up, const s
     require(gate.ne == up.ne && gate.ne[0] == down.ne[1] && gate.ne[1] == down.ne[0] &&
             gate.ne[2] == down.ne[2] && gate.ne[3] == 1 && down.ne[3] == 1 &&
             state->used <= gate.ne[2], "V4.1 TP expert tensor shapes disagree");
-    auto strips = split_weights(gate.ne[1], down.type, (int) state->ranks.size(), id);
-    auto output_strips = split_outputs(down.ne[1], (int) state->ranks.size(), id);
+    auto strips = split_weights(gate.ne[1], down.type, state->global_ranks, id);
+    auto output_strips = split_outputs(down.ne[1], state->global_ranks, id);
     {
     reader gate_file(gate), up_file(up), down_file(down);
     warm_layer(id, gate_file, up_file, down_file, state->load_threads);
     state->pool.run([&](int r) {
+        const int global_rank = state->rank_offset + r;
         auto & rank = *state->ranks[r];
         auto weights = std::make_unique<rank_layer>();
         weights->full_rows = gate.ne[1];
-        weights->first_row = strips[r].first;
-        weights->first_output = output_strips[r].first;
+        weights->first_row = strips[global_rank].first;
+        weights->first_output = output_strips[global_rank].first;
         weights->ctx = ggml_init({16 * ggml_tensor_overhead(), nullptr, true});
         require(weights->ctx != nullptr, "Cannot create V4.1 TP weight context");
-        weights->gate = ggml_new_tensor_3d(weights->ctx, gate.type, gate.ne[0], strips[r].count, gate.ne[2]);
-        weights->up = ggml_new_tensor_3d(weights->ctx, up.type, up.ne[0], strips[r].count, up.ne[2]);
-        weights->down = ggml_new_tensor_3d(weights->ctx, down.type, down.ne[0], output_strips[r].count, down.ne[2]);
+        weights->gate = ggml_new_tensor_3d(weights->ctx, gate.type, gate.ne[0], strips[global_rank].count, gate.ne[2]);
+        weights->up = ggml_new_tensor_3d(weights->ctx, up.type, up.ne[0], strips[global_rank].count, up.ne[2]);
+        weights->down = ggml_new_tensor_3d(weights->ctx, down.type, down.ne[0], output_strips[global_rank].count, down.ne[2]);
         weights->buffer = ggml_backend_alloc_ctx_tensors(weights->ctx, rank.backend);
         require(weights->buffer != nullptr, "Cannot allocate V4.1 TP weight strips");
         ggml_backend_buffer_set_usage(weights->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -966,9 +1011,9 @@ void executor::add_layer(int id, const source & gate, const source & up, const s
 #if defined(TSG_GGML_TEST_HOOKS)
         pipeline = state->pipelined_upload;
 #endif
-        upload_strip(weights->gate, gate_file, strips[r], false, rank.backend, rank.transfer, pipeline);
-        upload_strip(weights->up, up_file, strips[r], false, rank.backend, rank.transfer, pipeline);
-        upload_strip(weights->down, down_file, output_strips[r], false, rank.backend, rank.transfer, pipeline);
+        upload_strip(weights->gate, gate_file, strips[global_rank], false, rank.backend, rank.transfer, pipeline);
+        upload_strip(weights->up, up_file, strips[global_rank], false, rank.backend, rank.transfer, pipeline);
+        upload_strip(weights->down, down_file, output_strips[global_rank], false, rank.backend, rank.transfer, pipeline);
         rank.weight_bytes += ggml_nbytes(weights->gate) + ggml_nbytes(weights->up) + ggml_nbytes(weights->down);
         rank.layers.emplace(id, std::move(weights));
     });

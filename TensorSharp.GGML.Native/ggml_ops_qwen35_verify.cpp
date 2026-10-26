@@ -340,6 +340,61 @@ namespace
         return true;
     }
 
+    // Per recurrent layer the state buffer holds [delta side 0 | delta side 1 |
+    // conv side 0 | conv side 1], each slice padded to the backend alignment. The
+    // verify graph, the drain and the device hand-off all derive it here.
+    struct Q35StateGeometry
+    {
+        std::size_t delta_slice_bytes = 0;
+        std::size_t conv_slice_bytes = 0;
+        std::size_t state_stride = 0;
+    };
+
+    Q35StateGeometry q35v_state_geometry(std::size_t conv_bytes, std::size_t delta_bytes)
+    {
+        std::size_t align = 256;
+        if (ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend))
+            align = std::max<std::size_t>(align, ggml_backend_buft_get_alignment(buft));
+        auto align_up = [&](std::size_t v) { return (v + align - 1) / align * align; };
+        Q35StateGeometry geometry;
+        geometry.delta_slice_bytes = align_up(delta_bytes);
+        geometry.conv_slice_bytes = align_up(conv_bytes);
+        geometry.state_stride = 2 * geometry.delta_slice_bytes + 2 * geometry.conv_slice_bytes;
+        return geometry;
+    }
+
+    // Flat descriptors for recurrent layer `layer`'s live conv and delta slices on
+    // `side`, bound in place inside the owner's state buffer.
+    bool q35v_bind_live_slices(ggml_context* ctx, const Q35VerifyOwnerRankState& state,
+        const Q35VerifyChainedState& chain, int layer, int side,
+        ggml_tensor*& conv, ggml_tensor*& delta)
+    {
+        delta = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, static_cast<std::int64_t>(chain.delta_bytes / sizeof(float)));
+        conv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, static_cast<std::int64_t>(chain.conv_bytes / sizeof(float)));
+        if (delta == nullptr || conv == nullptr)
+            return false;
+        std::uint8_t* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(state.state_buf));
+        std::uint8_t* slice = base + static_cast<std::size_t>(layer) * chain.state_stride;
+        const std::size_t delta_offset = side == 0 ? 0 : chain.delta_slice_bytes;
+        const std::size_t conv_offset = 2 * chain.delta_slice_bytes + (side == 0 ? 0 : chain.conv_slice_bytes);
+        return ggml_backend_tensor_alloc(state.state_buf, delta, slice + delta_offset) == GGML_STATUS_SUCCESS
+            && ggml_backend_tensor_alloc(state.state_buf, conv, slice + conv_offset) == GGML_STATUS_SUCCESS;
+    }
+
+    // The single rank whose live state is valid, -1 for none, -2 when several
+    // claim it (a tensor-parallel owner, which never takes these paths).
+    int q35v_live_rank(const Q35VerifyOwnerState& owner)
+    {
+        int live_rank = -1;
+        for (int r = 0; r < TSG_MAX_DEVICES; ++r)
+        {
+            if (!owner.ranks[r].live_state.valid) continue;
+            if (live_rank >= 0) return -2;
+            live_rank = r;
+        }
+        return live_rank;
+    }
+
     void fill_verify_causal_mask(std::vector<ggml_fp16_t>& mask, int window, int n, int start_pos, int total_len)
     {
         mask.resize(static_cast<std::size_t>(window) * n);
@@ -531,8 +586,19 @@ namespace
         // contribute nothing; what the padding buys is a graph shape constant
         // across prefill chunks and the stride ggml-cuda's GQA-optimised flash
         // kernel requires. (Previously only the persist path padded.)
+        //
+        // A persistent decode/verify graph is rebuilt, warmed up and re-captured
+        // (tens of milliseconds) whenever its window changes, which a 256-token
+        // stride did every few speculative rounds. Its few query rows make a few
+        // hundred masked keys cheap, so it uses a coarser stride.
+        static const int persist_stride = [] {
+            const char* raw = std::getenv("TS_Q35_VERIFY_PERSIST_KV_STRIDE");
+            const int value = raw != nullptr ? std::atoi(raw) : 2048;
+            return value >= kVerifyKvStride ? value / kVerifyKvStride * kVerifyKvStride : kVerifyKvStride;
+        }();
+        const int kv_stride = fv_persist ? persist_stride : kVerifyKvStride;
         const int window = std::min(cache_size,
-            ((totalSeqLen + kVerifyKvStride - 1) / kVerifyKvStride) * kVerifyKvStride);
+            ((totalSeqLen + kv_stride - 1) / kv_stride) * kv_stride);
         const void* sig = layers[0].attn_norm_w;
 
         // Device-resident GDN state: when the C# caller points each recurrent layer's
@@ -574,7 +640,7 @@ namespace
         // device copy and the 151 MB host round trip. This is only a prefill contract
         // (last-row logits), never the non-persist MTP-draft path.
         const bool chain_state = defer_state_download != 0 && n_logits < N && !fv_persist
-            && !resident_state && g_backend_type == BACKEND_TYPE_METAL;
+            && !resident_state && (g_backend_type == BACKEND_TYPE_METAL || g_backend_type == BACKEND_TYPE_CUDA);
         int n_snap = (defer_state && state_snapshots > 1 && state_snapshots <= N)
             ? state_snapshots : 1;
         // Wide n-gram windows need not retain a complete recurrent-state matrix
@@ -739,18 +805,49 @@ namespace
         ggml_tensor* final_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
 
         ggml_tensor* kv_index = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, N);
-        ggml_tensor* attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, window, N, 1, 1);
+        // A prefill chunk's causal mask is window*N halves (172 MB for 4096 queries
+        // over 21K keys). Filling it on the host one element at a time and uploading
+        // it left the GPU idle ~100 ms before every chunk. Non-persistent CUDA graphs
+        // build it in-graph from a key index and per-query thresholds instead:
+        // step(k - (start_pos + q)) * -1e30 is 0 on visible keys and overflows to
+        // -inf in F16 on hidden ones, the same values the host fill writes (keys at
+        // or past totalSeqLen are always above the last threshold).
+        // TS_Q35_DEVICE_MASK=0 restores the host fill.
+        static const bool device_mask_enabled = [] {
+            const char* raw = std::getenv("TS_Q35_DEVICE_MASK");
+            return raw == nullptr || std::strcmp(raw, "0") != 0;
+        }();
+        const bool device_mask = device_mask_enabled && !fv_persist && g_backend_type == BACKEND_TYPE_CUDA;
+        ggml_tensor* mask_thresholds = nullptr;
+        ggml_tensor* attn_mask = nullptr;
+        if (device_mask)
+        {
+            mask_thresholds = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, N);
+            ggml_set_input(mask_thresholds);
+            ggml_tensor* keys = ggml_repeat_4d(ctx,
+                ggml_reshape_2d(ctx, ggml_arange(ctx, 0.0f, static_cast<float>(window), 1.0f), window, 1),
+                window, N, 1, 1);
+            ggml_tensor* hidden_keys = ggml_step_inplace(ctx, ggml_sub_inplace(ctx, keys, mask_thresholds));
+            attn_mask = ggml_reshape_4d(ctx,
+                ggml_cast(ctx, ggml_scale_inplace(ctx, hidden_keys, -1e30f), GGML_TYPE_F16), window, N, 1, 1);
+        }
+        else
+        {
+            attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, window, N, 1, 1);
+        }
         const bool uses_dynamic_kv_index =
             !(g_backend_type == BACKEND_TYPE_METAL && !fv_persist);
         ggml_set_input(hidden_t);
         ggml_set_input(pos_tensor);
         if (uses_dynamic_kv_index)
             ggml_set_input(kv_index);
-        ggml_set_input(attn_mask);
+        if (!device_mask)
+            ggml_set_input(attn_mask);
         std::vector<std::int64_t> kv_index_data(N);
         for (int i = 0; i < N; i++) kv_index_data[i] = start_pos + i;
         std::vector<ggml_fp16_t> attn_mask_data;
-        fill_verify_causal_mask(attn_mask_data, window, N, start_pos, totalSeqLen);
+        if (!device_mask)
+            fill_verify_causal_mask(attn_mask_data, window, N, start_pos, totalSeqLen);
 
         struct LayerTensors {
             ggml_tensor* attn_norm_w;
@@ -790,7 +887,6 @@ namespace
         // ALSO re-uploaded each call breaks ggml-cuda's CUDA-graph capture on the
         // persist replay path — the resident path can do in-place only because it
         // never re-uploads.)
-        std::size_t state_align = 256;
         std::size_t state_stride = 0;
         std::uint8_t* state_base = nullptr;
         std::size_t delta_slice_bytes = 0;
@@ -800,13 +896,10 @@ namespace
         {
             if (gdn_count > 0)
             {
-                ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
-                if (buft != nullptr)
-                    state_align = std::max<std::size_t>(state_align, ggml_backend_buft_get_alignment(buft));
-                auto align_up = [&](std::size_t v) { return (v + state_align - 1) / state_align * state_align; };
-                delta_slice_bytes = align_up(deltaStateBytes);
-                conv_slice_bytes = align_up(convStateBytes);
-                state_stride = 2 * delta_slice_bytes + 2 * conv_slice_bytes;
+                const Q35StateGeometry geometry = q35v_state_geometry(convStateBytes, deltaStateBytes);
+                delta_slice_bytes = geometry.delta_slice_bytes;
+                conv_slice_bytes = geometry.conv_slice_bytes;
+                state_stride = geometry.state_stride;
                 if (!ensure_q35v_state_buf(owner_id, owner_state, g_active_rank,
                     static_cast<std::size_t>(gdn_count) * state_stride))
                 {
@@ -1782,8 +1875,12 @@ namespace
         std::size_t persist_bytes = 0;
         if (fv_persist)
         {
+            // CUDA also packs: with unique slots every layer kept its own activations
+            // (including a dequantized F16 copy of a quantized K/V window per layer),
+            // about 2.4 GB per cached shape at a 19K context. A private allocator
+            // planned once keeps the replay addresses CUDA graphs capture stable.
             const char* pack_setting = std::getenv("TS_Q35_VERIFY_PACK");
-            const bool pack = g_backend_type == BACKEND_TYPE_METAL &&
+            const bool pack = (g_backend_type == BACKEND_TYPE_METAL || g_backend_type == BACKEND_TYPE_CUDA) &&
                 (pack_setting == nullptr || pack_setting[0] != '0');
             if (pack)
             {
@@ -1905,8 +2002,14 @@ namespace
         }
         if (uses_dynamic_kv_index && kv_index->buffer != nullptr)
             ggml_backend_tensor_set(kv_index, kv_index_data.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int64_t));
-        if (attn_mask->buffer != nullptr)
+        if (!device_mask && attn_mask->buffer != nullptr)
             ggml_backend_tensor_set(attn_mask, attn_mask_data.data(), 0, attn_mask_data.size() * sizeof(ggml_fp16_t));
+        if (device_mask && mask_thresholds->buffer != nullptr)
+        {
+            std::vector<float> thresholds(static_cast<std::size_t>(N));
+            for (int i = 0; i < N; i++) thresholds[static_cast<std::size_t>(i)] = static_cast<float>(start_pos + i);
+            ggml_backend_tensor_set(mask_thresholds, thresholds.data(), 0, thresholds.size() * sizeof(float));
+        }
         if (!resident_state && device_state_current == 0)
         {
             // Host mode: upload the per-call GDN state. Resident mode skips this — the
@@ -2530,9 +2633,12 @@ TSG_EXPORT int TSGgml_Qwen35CommitStateSnapshotOwned(
         // layers together without pulling their snapshots through host caches.
         // The runtime switch supports an exact CPU/GPU commit comparison; value
         // 2 requires the GPU path so regression tests cannot pass via a fallback.
+        // CUDA: one graph of device copies replaces 2 x layers synchronous tensor
+        // copies (each paying a stream synchronization) per speculative round.
         bool copied = false;
         const char* gpu_commit = std::getenv("TS_Q35_GPU_STATE_COMMIT");
-        if (g_backend_type == BACKEND_TYPE_METAL && (gpu_commit == nullptr || gpu_commit[0] != '0'))
+        if ((g_backend_type == BACKEND_TYPE_METAL || g_backend_type == BACKEND_TYPE_CUDA)
+            && (gpu_commit == nullptr || gpu_commit[0] != '0'))
         {
             ScopedRank rank(c->rank);
             if (ggml_cgraph* graph = q35v_commit_graph(*c, slot))
@@ -2586,9 +2692,11 @@ TSG_EXPORT int TSGgml_Qwen35CommitStateSnapshotOwned(
 // while a speculative session keeps committing snapshots into it; anything that has
 // to run the op-by-op recurrent path (a prefill chunk, an unsupported shape, a
 // backend without the fused verify) needs the host mirror to catch up first.
-TSG_EXPORT int TSGgml_Qwen35DrainDeviceStateOwned(
+// `retire` hands authority to the host copy (a drain); without it the device
+// state stays live and the host gets a copy (a checkpoint capture).
+static int q35v_download_live_state(
     void** conv_out_arr, void** delta_out_arr, int num_recurrent_layers,
-    std::uint64_t owner_id)
+    std::uint64_t owner_id, bool retire)
 {
     try
     {
@@ -2603,16 +2711,11 @@ TSG_EXPORT int TSGgml_Qwen35DrainDeviceStateOwned(
         // publish the authoritative side into the owner-private long-lived buffer.
         // Locate that rank and rebuild two tiny descriptors per recurrent layer;
         // the graph/cache entry itself is deliberately not required to survive.
-        int live_rank = -1;
-        for (int r = 0; r < TSG_MAX_DEVICES; ++r)
+        const int live_rank = q35v_live_rank(*owner);
+        if (live_rank == -2)
         {
-            if (!owner->ranks[r].live_state.valid) continue;
-            if (live_rank >= 0)
-            {
-                set_last_error("Qwen3.5 state drain: multiple owner ranks claim live recurrent state.");
-                return 0;
-            }
-            live_rank = r;
+            set_last_error("Qwen3.5 state drain: multiple owner ranks claim live recurrent state.");
+            return 0;
         }
         if (live_rank < 0)
             return 0;
@@ -2626,27 +2729,34 @@ TSG_EXPORT int TSGgml_Qwen35DrainDeviceStateOwned(
         }
         ScopedRank rank(live_rank);
         host_read_barrier();
-        std::uint8_t* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(state.state_buf));
+        {
+            // A holder built device-authoritative has never touched these host pages,
+            // and 96 serial downloads into them ran at page-fault speed (151 MB in
+            // ~115 ms on Qwen3.8-27B). Fault them from several threads first.
+            std::vector<char*> spans;
+            std::vector<std::int64_t> lengths;
+            for (int i = 0; i < num_recurrent_layers; i++)
+            {
+                if (conv_out_arr[i] != nullptr) { spans.push_back(static_cast<char*>(conv_out_arr[i])); lengths.push_back(chain.conv_bytes); }
+                if (delta_out_arr[i] != nullptr) { spans.push_back(static_cast<char*>(delta_out_arr[i])); lengths.push_back(chain.delta_bytes); }
+            }
+            if (!spans.empty())
+            {
+                char* base = *std::min_element(spans.begin(), spans.end());
+                std::vector<std::int64_t> offsets(spans.size());
+                for (std::size_t i = 0; i < spans.size(); i++)
+                    offsets[i] = spans[i] - base;
+                prefault_host_ranges(base, offsets.data(), lengths.data(), static_cast<int>(spans.size()));
+            }
+        }
         for (int i = 0; i < num_recurrent_layers; i++)
         {
             ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, /*no_alloc=*/true };
             ContextHandle tmp(ggml_init(ip));
-            if (tmp.value == nullptr)
-            {
-                set_last_error("Qwen3.5 state drain: failed to create tensor descriptors.");
-                return 0;
-            }
-            ggml_tensor* delta = ggml_new_tensor_1d(tmp.value, GGML_TYPE_F32,
-                chain.delta_bytes / sizeof(float));
-            ggml_tensor* conv = ggml_new_tensor_1d(tmp.value, GGML_TYPE_F32,
-                chain.conv_bytes / sizeof(float));
-            std::uint8_t* slice = base + static_cast<std::size_t>(i) * chain.state_stride;
-            const std::size_t delta_offset = chain.current_side == 0 ? 0 : chain.delta_slice_bytes;
-            const std::size_t conv_offset = 2 * chain.delta_slice_bytes
-                + (chain.current_side == 0 ? 0 : chain.conv_slice_bytes);
-            if (ggml_backend_tensor_alloc(state.state_buf, delta, slice + delta_offset) != GGML_STATUS_SUCCESS
-                || ggml_backend_tensor_alloc(state.state_buf, conv,
-                    slice + conv_offset) != GGML_STATUS_SUCCESS)
+            ggml_tensor* conv = nullptr;
+            ggml_tensor* delta = nullptr;
+            if (tmp.value == nullptr
+                || !q35v_bind_live_slices(tmp.value, state, chain, i, chain.current_side, conv, delta))
             {
                 set_last_error("Qwen3.5 state drain: failed to bind tensor descriptors.");
                 return 0;
@@ -2657,13 +2767,321 @@ TSG_EXPORT int TSGgml_Qwen35DrainDeviceStateOwned(
                 ggml_backend_tensor_get(delta, delta_out_arr[i], 0, chain.delta_bytes);
         }
         host_read_barrier();
-        state.live_state = {};
-        owner->last_snap = nullptr;
+        if (retire)
+        {
+            state.live_state = {};
+            owner->last_snap = nullptr;
+        }
         clear_last_error();
         return 1;
     }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("Unknown error in Qwen3.5 state drain."); return 0; }
+}
+
+TSG_EXPORT int TSGgml_Qwen35DrainDeviceStateOwned(
+    void** conv_out_arr, void** delta_out_arr, int num_recurrent_layers,
+    std::uint64_t owner_id)
+{
+    return q35v_download_live_state(conv_out_arr, delta_out_arr, num_recurrent_layers, owner_id, /*retire=*/true);
+}
+
+// Copy the live state to the host and keep it live: a prefix checkpoint taken
+// between prefill chunks gets the bytes, and the next chunk continues on the
+// device instead of re-uploading the 151 MB a drain would have handed back.
+TSG_EXPORT int TSGgml_Qwen35ReadLiveStateOwned(
+    void** conv_out_arr, void** delta_out_arr, int num_recurrent_layers,
+    std::uint64_t owner_id)
+{
+    return q35v_download_live_state(conv_out_arr, delta_out_arr, num_recurrent_layers, owner_id, /*retire=*/false);
+}
+
+// ---------------------------------------------------------------------------
+// Device hand-off of the live recurrent state.
+//
+// The verifier keeps ONE live state per model, while every sequence owns device
+// copies of its own state (keyed by its conv-scratch slots and delta-state host
+// pointers) that the solo decode, the arena decode and the batched verify bind.
+// Moving between the two used to go through the host: switching the verifier to
+// another sequence drained 151 MB and the next use uploaded it again, ~55 ms of
+// idle GPU around every chunk of a multi-sequence prefill on Qwen3.8-27B. These
+// three calls keep the transfer on the device. Each returns 0 without touching
+// the authoritative state when it cannot complete, and the caller takes the host
+// path.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    bool q35v_valid_state_shape(int num_recurrent_layers, std::int64_t conv_bytes, std::int64_t delta_bytes)
+    {
+        return num_recurrent_layers > 0 && conv_bytes > 0 && delta_bytes > 0
+            && conv_bytes % static_cast<std::int64_t>(sizeof(float)) == 0
+            && delta_bytes % static_cast<std::int64_t>(sizeof(float)) == 0;
+    }
+
+    // Allocate the active rank's live slices for this geometry and describe them as
+    // the live state with input side 0, which is where the caller wrote it.
+    bool q35v_publish_live_state(std::uint64_t owner_id, Q35VerifyOwnerState& owner, const void* sig,
+        int num_recurrent_layers, std::size_t conv_bytes, std::size_t delta_bytes)
+    {
+        const Q35StateGeometry geometry = q35v_state_geometry(conv_bytes, delta_bytes);
+        if (!ensure_q35v_state_buf(owner_id, owner, g_active_rank,
+                static_cast<std::size_t>(num_recurrent_layers) * geometry.state_stride))
+            return false;
+        Q35VerifyChainedState& live = owner.ranks[g_active_rank].live_state;
+        live = {};
+        live.valid = true;
+        live.sig = sig;
+        live.count = num_recurrent_layers;
+        live.conv_bytes = conv_bytes;
+        live.delta_bytes = delta_bytes;
+        live.state_stride = geometry.state_stride;
+        live.delta_slice_bytes = geometry.delta_slice_bytes;
+        live.conv_slice_bytes = geometry.conv_slice_bytes;
+        live.current_side = 0;
+        return true;
+    }
+
+    // The verify owner is single-rank on these paths; refuse one whose state lives
+    // on another rank rather than overwrite or orphan it.
+    bool q35v_owner_is_local(const Q35VerifyOwnerState& owner)
+    {
+        const int live_rank = q35v_live_rank(owner);
+        return live_rank == -1 || live_rank == g_active_rank;
+    }
+}
+
+// The state a sequence's first prompt chunk (position 0) reads is all zeros. Clear
+// the live slices on the device instead of packing and uploading 151 MB of host
+// zeros, and mark them current.
+TSG_EXPORT int TSGgml_Qwen35ZeroLiveStateOwned(
+    const void* sig, int num_recurrent_layers, std::int64_t conv_bytes, std::int64_t delta_bytes,
+    std::uint64_t owner_id)
+{
+    try
+    {
+        std::lock_guard<std::recursive_mutex> lock(q35v_mutex());
+        if (sig == nullptr || !q35v_valid_state_shape(num_recurrent_layers, conv_bytes, delta_bytes))
+            return 0;
+        if (!ensure_backend() || g_backend == nullptr || g_active_rank < 0 || g_active_rank >= TSG_MAX_DEVICES)
+            return 0;
+        Q35VerifyOwnerState& owner = get_q35v_owner(owner_id);
+        if (!q35v_owner_is_local(owner))
+            return 0;
+        owner.ranks[g_active_rank].live_state = {};
+        owner.last_snap = nullptr;
+        if (!q35v_publish_live_state(owner_id, owner, sig, num_recurrent_layers,
+                static_cast<std::size_t>(conv_bytes), static_cast<std::size_t>(delta_bytes)))
+        {
+            set_last_error("Qwen3.5 state zero: failed to allocate the live state buffer.");
+            return 0;
+        }
+        // The clear runs outside the compute stream; let any graph still reading or
+        // writing the slices finish first.
+        sync_backend(g_backend);
+        ggml_backend_buffer_clear(owner.ranks[g_active_rank].state_buf, 0);
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in Qwen3.5 state zero."); return 0; }
+}
+
+// Forget the live state without reading it: its sequence finished and nothing can
+// observe it any more, so draining 151 MB to the host would be pure cost.
+TSG_EXPORT void TSGgml_Qwen35DiscardLiveStateOwned(std::uint64_t owner_id)
+{
+    std::lock_guard<std::recursive_mutex> lock(q35v_mutex());
+    Q35VerifyOwnerState* owner = find_q35v_owner(owner_id);
+    if (owner == nullptr)
+        return;
+    for (auto& rank : owner->ranks)
+        rank.live_state = {};
+    owner->last_snap = nullptr;
+}
+
+// Copy the live state into the sequence's own device copies, creating them where
+// they do not exist, and retire it from the verifier. The copies are then the
+// sequence's authoritative state, exactly as after a solo fused decode step.
+TSG_EXPORT int TSGgml_Qwen35ExportLiveStateOwned(
+    void** conv_keys, void** delta_keys, int num_recurrent_layers, std::uint64_t owner_id)
+{
+    std::vector<void*> created;
+    // A copy created here holds no bytes until the copies below land; never leave
+    // one published for a later bind to accept as the sequence's state.
+    auto discard_created = [&created]() {
+        for (void* key : created)
+            invalidate_cached_buffer(key);
+    };
+    try
+    {
+        std::lock_guard<std::recursive_mutex> lock(q35v_mutex());
+        if (conv_keys == nullptr || delta_keys == nullptr || num_recurrent_layers <= 0)
+            return 0;
+        Q35VerifyOwnerState* owner = find_q35v_owner(owner_id);
+        if (owner == nullptr)
+            return 0;
+        const int live_rank = q35v_live_rank(*owner);
+        if (live_rank < 0)
+            return 0;
+        Q35VerifyOwnerRankState& state = owner->ranks[live_rank];
+        const Q35VerifyChainedState chain = state.live_state;
+        if (chain.count != num_recurrent_layers || state.state_buf == nullptr)
+        {
+            set_last_error("Qwen3.5 state export: recurrent layer count/buffer mismatch.");
+            return 0;
+        }
+        ScopedRank rank(live_rank);
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev == nullptr || !prefers_device_local_cache(dev))
+        {
+            set_last_error("Qwen3.5 state export: the backend keeps no device copies.");
+            return 0;
+        }
+        ggml_init_params ip = { ggml_tensor_overhead() * 4 * static_cast<std::size_t>(num_recurrent_layers) + 1024,
+            nullptr, /*no_alloc=*/true };
+        ContextHandle tmp(ggml_init(ip));
+        if (tmp.value == nullptr)
+            return 0;
+        std::vector<std::pair<ggml_tensor*, ggml_tensor*>> copies;
+        copies.reserve(static_cast<std::size_t>(num_recurrent_layers) * 2);
+        auto bind_copy = [&](void* key, std::size_t bytes, ggml_tensor*& out) -> bool {
+            if (key == nullptr)
+                return false;
+            out = ggml_new_tensor_1d(tmp.value, GGML_TYPE_F32, static_cast<std::int64_t>(bytes / sizeof(float)));
+            ggml_backend_buffer_t buffer = nullptr;
+            void* addr = nullptr;
+            bool fresh = false;
+            if (out == nullptr || !try_get_cacheable_tensor_buffer(g_backend, dev, out, key, bytes,
+                    buffer, addr, fresh, GGML_BACKEND_BUFFER_USAGE_COMPUTE))
+                return false;
+            if (fresh)
+                created.push_back(key);
+            // A zero-copy host wrap is not a device copy; the state must stay on the device.
+            return addr != key && ggml_backend_tensor_alloc(buffer, out, addr) == GGML_STATUS_SUCCESS;
+        };
+        for (int i = 0; i < num_recurrent_layers; i++)
+        {
+            ggml_tensor* live_conv = nullptr;
+            ggml_tensor* live_delta = nullptr;
+            ggml_tensor* conv_copy = nullptr;
+            ggml_tensor* delta_copy = nullptr;
+            if (!q35v_bind_live_slices(tmp.value, state, chain, i, chain.current_side, live_conv, live_delta)
+                || !bind_copy(conv_keys[i], chain.conv_bytes, conv_copy)
+                || !bind_copy(delta_keys[i], chain.delta_bytes, delta_copy))
+            {
+                discard_created();
+                set_last_error("Qwen3.5 state export: could not bind a sequence's device copies.");
+                return 0;
+            }
+            copies.emplace_back(live_conv, conv_copy);
+            copies.emplace_back(live_delta, delta_copy);
+        }
+        // Queued behind whatever graph produced the live state; one wait at the end,
+        // because the host-side readers of these copies use another stream.
+        for (auto& [from, to] : copies)
+            ggml_backend_tensor_copy_async(g_backend, g_backend, from, to);
+        sync_backend(g_backend);
+        if (g_backend_compute_failed.load(std::memory_order_acquire))
+        {
+            discard_created();
+            set_last_error("Qwen3.5 state export: the device copy failed.");
+            return 0;
+        }
+        state.live_state = {};
+        owner->last_snap = nullptr;
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { discard_created(); set_last_error(ex.what()); return 0; }
+    catch (...) { discard_created(); set_last_error("Unknown error in Qwen3.5 state export."); return 0; }
+}
+
+// The reverse: seed the live slices from a sequence's device copies, so the
+// verifier continues a sequence whose newest state a solo or batched decode left
+// on the device. Every copy must already exist; nothing is written otherwise.
+TSG_EXPORT int TSGgml_Qwen35ImportLiveStateOwned(
+    const void* sig, void** conv_keys, void** delta_keys, int num_recurrent_layers,
+    std::int64_t conv_bytes, std::int64_t delta_bytes, std::uint64_t owner_id)
+{
+    try
+    {
+        std::lock_guard<std::recursive_mutex> lock(q35v_mutex());
+        if (sig == nullptr || conv_keys == nullptr || delta_keys == nullptr
+            || !q35v_valid_state_shape(num_recurrent_layers, conv_bytes, delta_bytes))
+            return 0;
+        if (!ensure_backend() || g_backend == nullptr || g_active_rank < 0 || g_active_rank >= TSG_MAX_DEVICES)
+            return 0;
+        Q35VerifyOwnerState& owner = get_q35v_owner(owner_id);
+        if (!q35v_owner_is_local(owner))
+            return 0;
+
+        struct Source { ggml_backend_buffer_t buffer; void* addr; };
+        std::vector<Source> conv_src(static_cast<std::size_t>(num_recurrent_layers));
+        std::vector<Source> delta_src(static_cast<std::size_t>(num_recurrent_layers));
+        for (int i = 0; i < num_recurrent_layers; i++)
+        {
+            if (!try_peek_cached_device_copy(conv_keys[i], static_cast<std::size_t>(conv_bytes),
+                    conv_src[i].buffer, conv_src[i].addr)
+                || !try_peek_cached_device_copy(delta_keys[i], static_cast<std::size_t>(delta_bytes),
+                    delta_src[i].buffer, delta_src[i].addr))
+            {
+                set_last_error("Qwen3.5 state import: a sequence's device copy is missing.");
+                return 0;
+            }
+        }
+
+        owner.ranks[g_active_rank].live_state = {};
+        owner.last_snap = nullptr;
+        if (!q35v_publish_live_state(owner_id, owner, sig, num_recurrent_layers,
+                static_cast<std::size_t>(conv_bytes), static_cast<std::size_t>(delta_bytes)))
+        {
+            set_last_error("Qwen3.5 state import: failed to allocate the live state buffer.");
+            return 0;
+        }
+        Q35VerifyOwnerRankState& state = owner.ranks[g_active_rank];
+        const Q35VerifyChainedState chain = state.live_state;
+        ggml_init_params ip = { ggml_tensor_overhead() * 4 * static_cast<std::size_t>(num_recurrent_layers) + 1024,
+            nullptr, /*no_alloc=*/true };
+        ContextHandle tmp(ggml_init(ip));
+        bool bound = tmp.value != nullptr;
+        std::vector<std::pair<ggml_tensor*, ggml_tensor*>> copies;
+        for (int i = 0; bound && i < num_recurrent_layers; i++)
+        {
+            ggml_tensor* live_conv = nullptr;
+            ggml_tensor* live_delta = nullptr;
+            ggml_tensor* conv_copy = ggml_new_tensor_1d(tmp.value, GGML_TYPE_F32, conv_bytes / static_cast<std::int64_t>(sizeof(float)));
+            ggml_tensor* delta_copy = ggml_new_tensor_1d(tmp.value, GGML_TYPE_F32, delta_bytes / static_cast<std::int64_t>(sizeof(float)));
+            bound = conv_copy != nullptr && delta_copy != nullptr
+                && ggml_backend_tensor_alloc(conv_src[i].buffer, conv_copy, conv_src[i].addr) == GGML_STATUS_SUCCESS
+                && ggml_backend_tensor_alloc(delta_src[i].buffer, delta_copy, delta_src[i].addr) == GGML_STATUS_SUCCESS
+                && q35v_bind_live_slices(tmp.value, state, chain, i, 0, live_conv, live_delta);
+            if (bound)
+            {
+                copies.emplace_back(conv_copy, live_conv);
+                copies.emplace_back(delta_copy, live_delta);
+            }
+        }
+        if (!bound)
+        {
+            state.live_state = {};
+            set_last_error("Qwen3.5 state import: failed to bind tensor descriptors.");
+            return 0;
+        }
+        for (auto& [from, to] : copies)
+            ggml_backend_tensor_copy_async(g_backend, g_backend, from, to);
+        sync_backend(g_backend);
+        if (g_backend_compute_failed.load(std::memory_order_acquire))
+        {
+            state.live_state = {};
+            set_last_error("Qwen3.5 state import: the device copy failed.");
+            return 0;
+        }
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in Qwen3.5 state import."); return 0; }
 }
 
 // Process-wide shutdown hook. Per-model teardown uses Qwen35ReleaseVerifyOwner

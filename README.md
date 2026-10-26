@@ -162,6 +162,7 @@ New here? The sections above are all you need to get running. Everything else is
 | [Screenshots](docs/showcase.md) | The CLI, the Web UI, and TensorAgent on iPhone and Mac at work, with what each run did |
 | [Model Downloads](MODEL_DOWNLOADS.md) | Per-model `huggingface-cli` download + run quick reference (quant tiers, projectors, companions) |
 | [Usage](USAGE.md) | Full CLI reference (options, interactive REPL, JSONL batch), server hosting, logging, HTTP API examples, backends, and the env-var matrix |
+| [Multi-node inference](docs/multi-node-inference.md) | Whole-layer pipelines and tensor parallelism across nodes, supported stage executors, shared transport and validation |
 | [Features](FEATURES.md) | Deep dives on continuous batching, speculative decoding, tool calling, thinking mode, multimodal, MoE, KV codecs, and more |
 | [Configuration files](config/README.md) | Put options in a reusable JSON file with `${variables}` and auto-downloading models |
 | [Development](DEVELOPMENT.md) | Prerequisites, building the native GGML/MLX libraries, repository layout, package boundaries, internal architecture, and the test harness |

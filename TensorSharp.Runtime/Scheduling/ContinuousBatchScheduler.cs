@@ -103,12 +103,50 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Let <paramref name="policy"/> size a lone prompt's prefill steps.</summary>
         public void SetSoloPrefillPolicy(ISoloPrefillBudgetModel? policy) => _soloPrefillPolicy = policy;
 
+
         /// <summary>
         /// Cut a prefill chunk at the sequence's public checkpoint boundaries when the chunk
         /// would otherwise run past it, so the state the executor checkpoints is the
         /// state after exactly those tokens. Reused boundaries are already behind
         /// the sequence's computed position and need no additional forward pass.
         /// </summary>
+        // A budget cut that leaves at most this many tokens (and an eighth of the step) before the
+        // point the prompt stops at anyway - a checkpoint boundary, the prompt end, the chunk cap -
+        // runs them in this step: the step of their own they would take costs a whole forward pass.
+        private const int TinyPrefillRemainder = 64;
+
+        private int RunTinyRemainder(SequenceState seq, int want, int desired, int tokenBudget)
+        {
+            if (want <= 0 || want >= desired)
+                return want;
+            int start = seq.NumComputedTokens, cut = start + want, stop = start + desired;
+            bool cutIsBoundary = false;
+            void Boundary(int b)
+            {
+                if (b == cut)
+                    cutIsBoundary = true;
+                else if (b > cut && b < stop)
+                    stop = b;
+            }
+            if (_alignToSharedPrefix && _radixCache != null)
+            {
+                if (seq.CacheBreakpoints != null)
+                    foreach (int breakpoint in seq.CacheBreakpoints)
+                        Boundary(breakpoint);
+                foreach (int boundary in seq.PublicCheckpointBoundaries)
+                    if (seq.IsPublicCheckpointBoundary(boundary))
+                        Boundary(boundary);
+            }
+            if (_radixCache != null)
+            {
+                Boundary(_radixCache.AutomaticCheckpointBoundary(seq));
+                Boundary(_radixCache.PromptTailCheckpointBoundary(seq));
+            }
+            int extended = stop - start;
+            return !cutIsBoundary && extended - want <= Math.Min(TinyPrefillRemainder, want / 8) && extended <= tokenBudget
+                ? extended : want;
+        }
+
         private int AlignSharedPrefixBoundary(SequenceState seq, int want)
         {
             if (!_alignToSharedPrefix || want <= 0)
@@ -128,6 +166,12 @@ namespace TensorSharp.Runtime.Scheduling
                 foreach (int boundary in seq.PublicCheckpointBoundaries)
                     if (boundary > start && boundary < start + want && seq.IsPublicCheckpointBoundary(boundary)
                         && !(reused > 0 && boundary - reused <= _checkpointGapTokens))
+                        want = boundary - start;
+            }
+            if (_radixCache != null)
+            {
+                foreach (int boundary in new[] { _radixCache.AutomaticCheckpointBoundary(seq), _radixCache.PromptTailCheckpointBoundary(seq) })
+                    if (boundary > start && boundary < start + want)
                         want = boundary - start;
             }
             return want;
@@ -298,6 +342,12 @@ namespace TensorSharp.Runtime.Scheduling
                     prefillSnapshot.Add(seq);
             }
             bool hasActiveDecode = decodeSnapshot.Count > 0;
+            // Prompt tokens this step may still carry beside its decodes (see
+            // SchedulerConfig.MixedStepPrefillBudget); unbounded without a decode.
+            int mixedPrefillLeft = hasActiveDecode && _cfg.MixedStepPrefillBudget > 0
+                ? _cfg.MixedStepPrefillBudget : int.MaxValue;
+            SequenceState? firstPrefillServed = null;
+            int firstPrefillTokens = 0;
 
             // -------------------------------------------------------------- 1. Decode first.
             // A fixed running-order traversal can otherwise let enough prefills
@@ -315,9 +365,10 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             // -------------------------------------------------------------- 2. Existing prefills.
-            // With no decoder active, split the whole remaining batch budget
-            // across all runnable/admittable prompts. The old fixed per-request
-            // cap used only half of a 4096-token step for two prompts. In a mixed
+            // With no decoder active, hand out the whole remaining batch budget
+            // to the runnable/admittable prompts, evenly (or oldest first, see
+            // SchedulerConfig.PrefillOnlyFirstComeFirstServed). The old fixed
+            // per-request cap used only half of a 4096-token step for two prompts. In a mixed
             // step retain the configured latency cap and rotate the first prefill
             // whenever the budget is exhausted, avoiding permanent tail-request
             // starvation (4/4/1, 4/4/1, ...).
@@ -349,28 +400,43 @@ namespace TensorSharp.Runtime.Scheduling
                     prefillCandidatesRemaining, soloPrefillCap);
                 if (noContention) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
                 int desired = Math.Min(promptUncomputed, cap);
-                int want = Math.Min(desired, tokenBudget);
+                int want = Math.Min(desired, Math.Min(tokenBudget, mixedPrefillLeft));
+                want = RunTinyRemainder(seq, want, desired, tokenBudget);
                 want = AlignRecurrentPrefillBoundary(seq, want, promptUncomputed);
                 want = AlignSharedPrefixBoundary(seq, want);
                 if (want <= 0)
                 {
-                    _nextPrefillRequestId = seq.RequestId;
+                    _nextPrefillRequestId = MixedPrefillResumePoint(seq, firstPrefillServed, firstPrefillTokens, mixedPrefillLeft);
                     break;
                 }
 
                 bool scheduled = TryScheduleRunningSequence(
                     seq, want, isPrefill: true, output, ref tokenBudget);
                 prefillCandidatesRemaining = Math.Max(0, prefillCandidatesRemaining - 1);
+                if (scheduled)
+                {
+                    mixedPrefillLeft -= want;
+                    if (firstPrefillServed == null)
+                    {
+                        firstPrefillServed = seq;
+                        firstPrefillTokens = want;
+                    }
+                }
                 if (!scheduled || want < desired)
                     _nextPrefillRequestId = seq.RequestId;
+                else if (mixedPrefillLeft <= 0 && i + 1 < prefillSnapshot.Count)
+                    _nextPrefillRequestId = MixedPrefillResumePoint(prefillSnapshot[i + 1], firstPrefillServed, firstPrefillTokens, mixedPrefillLeft);
                 else if (tokenBudget == 0 && i + 1 < prefillSnapshot.Count)
                     _nextPrefillRequestId = prefillSnapshot[i + 1].RequestId;
+                if (mixedPrefillLeft <= 0)
+                    break;
             }
 
             // -------------------------------------------------------------- 3. Admit waiting sequences.
             // --------------------------------------------------------------
             int waitingVisitsRemaining = _waiting.Count;
-            while (_waiting.First is { } node && tokenBudget > 0 && _running.Count < Math.Min(_cfg.MaxNumRunningSequences, _sequenceSlotCap)
+            while (_waiting.First is { } node && tokenBudget > 0 && mixedPrefillLeft > 0
+                && _running.Count < Math.Min(_cfg.MaxNumRunningSequences, _sequenceSlotCap)
                 && waitingVisitsRemaining-- > 0)
             {
                 var seq = node.Value;
@@ -443,8 +509,8 @@ namespace TensorSharp.Runtime.Scheduling
                     Math.Max(1, prefillCandidatesRemaining), soloPrefillCap);
                 if (noContention) SoloPrefillStep(seq, promptUncomputed, ref cap, ref tokenBudget);
                 int desired = Math.Min(promptUncomputed, cap);
-                int want = Math.Min(desired, tokenBudget);
-                want = Math.Min(want, tokenBudget);
+                int want = Math.Min(desired, Math.Min(tokenBudget, mixedPrefillLeft));
+                want = RunTinyRemainder(seq, want, desired, tokenBudget);
                 want = AlignRecurrentPrefillBoundary(seq, want, promptUncomputed);
                 want = AlignSharedPrefixBoundary(seq, want);
                 if (want <= 0) break;
@@ -466,6 +532,7 @@ namespace TensorSharp.Runtime.Scheduling
                 bool isPrefill = want > 1 || promptUncomputed > 0;
                 output.ScheduledWork.Add(new ScheduledSequenceWork(seq, want, true, isPrefill));
                 tokenBudget -= want;
+                mixedPrefillLeft -= want;
                 prefillCandidatesRemaining = Math.Max(0, prefillCandidatesRemaining - 1);
                 if (want < desired)
                     _nextPrefillRequestId = seq.RequestId;
@@ -479,6 +546,17 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             return output;
+        }
+
+        /// <summary>The prefill a step whose mixed prompt budget ran out resumes with: the
+        /// one this step served, while its prompt lasts, when the oldest prompt keeps the
+        /// budget (MixedStepPrefillFirstComeFirstServed); otherwise the next in rotation.</summary>
+        private string MixedPrefillResumePoint(SequenceState next, SequenceState? served, int servedTokens, int mixedPrefillLeft)
+        {
+            if (mixedPrefillLeft <= 0 && _cfg.MixedStepPrefillFirstComeFirstServed && served != null
+                && served.NumComputedTokens + servedTokens < served.PromptTokens.Count)
+                return served.RequestId;
+            return next.RequestId;
         }
 
         private bool WaitForScheduledPublicCheckpoint(SequenceState sequence, SchedulerOutput output, int reusableLength)
@@ -550,6 +628,8 @@ namespace TensorSharp.Runtime.Scheduling
                 return soloPrefillCap;
             if (hasActiveDecode)
                 return _cfg.MaxPrefillChunkSize;
+            if (_cfg.PrefillOnlyFirstComeFirstServed)
+                return Math.Max(1, tokenBudget);
 
             candidatesRemaining = Math.Max(1, candidatesRemaining);
             int evenShare = tokenBudget / candidatesRemaining;

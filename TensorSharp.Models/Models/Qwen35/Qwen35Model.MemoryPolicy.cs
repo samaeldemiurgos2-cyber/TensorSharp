@@ -17,6 +17,16 @@ namespace TensorSharp.Models
         {
             long? spare = GpuMemoryBudget.TryGetReservationSpareBytes(_backend, out long deviceSpare)
                 ? deviceSpare : null;
+            long? hostSpare = GetHostMemorySpareBytes();
+            if (hostSpare.HasValue)
+                spare = spare.HasValue ? Math.Min(spare.Value, hostSpare.Value) : hostSpare;
+            return spare;
+        }
+
+        /// <summary>The host half of <see cref="GetCacheMemorySpareBytes"/>, or null when the
+        /// process cannot measure it.</summary>
+        protected virtual long? GetHostMemorySpareBytes()
+        {
             // The GC's available-memory limit accounts for a container/VM or an
             // explicit heap limit. WorkingSet includes the native host allocations
             // and mapped weights that managed-heap accounting alone would miss.
@@ -27,15 +37,17 @@ namespace TensorSharp.Models
                 {
                     using var process = Process.GetCurrentProcess();
                     long reserve = Math.Max(GpuMemoryBudget.MinHeadroomBytes, available / 16);
-                    long hostSpare = Math.Max(0, available - Math.Min(available, process.WorkingSet64) - reserve);
-                    spare = spare.HasValue ? Math.Min(spare.Value, hostSpare) : hostSpare;
+                    return Math.Max(0, available - Math.Min(available, process.WorkingSet64) - reserve);
                 }
             }
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
             catch (NotSupportedException) { }
-            return spare;
+            return null;
         }
+
+        private const int LongCacheTokens = 16384;
+        private const int MinGeometricSlackTokens = 4096;
 
         internal static int ResolveAttentionCacheGrowthCapacity(
             int currentCapacity, int requiredTokens, int maxContext, long bytesPerToken,
@@ -50,6 +62,16 @@ namespace TensorSharp.Models
             long geometric = Math.Max(currentCapacity, 1);
             while (geometric < requiredTokens)
                 geometric = Math.Min(maxContext, geometric * 2);
+            // Bounded slack: doubling a long cache reserved a second copy of it. A
+            // 22,016-row Qwen3.8-27B holder grew to 32,768 rows for a 22,987-token
+            // prompt (370 MB of q8 K/V each), which four concurrent requests could not
+            // afford next to their retained prefixes. Short caches still double; long
+            // ones grow by a quarter.
+            long slack = currentCapacity < LongCacheTokens ? currentCapacity
+                : Math.Max(MinGeometricSlackTokens, currentCapacity / 4);
+            long bounded = (long)currentCapacity + slack;
+            bounded = (bounded + CacheCapacityAlignment - 1) / CacheCapacityAlignment * CacheCapacityAlignment;
+            geometric = Math.Max(minimum, Math.Min(geometric, Math.Min(maxContext, bounded)));
             // Free bytes exclude the existing cache. Compare the additional KV
             // cost, leaving half the spare for graph scratch and replacement
             // transients. Required rows still grow even when no optional slack fits.

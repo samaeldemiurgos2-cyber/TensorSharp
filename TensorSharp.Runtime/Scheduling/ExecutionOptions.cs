@@ -81,6 +81,15 @@ namespace TensorSharp.Runtime.Scheduling
         /// Env: <c>TS_PREFIX_CHECKPOINTS_MAX</c> (default 4).</summary>
         public int PrefixCheckpointBudget { get; init; } = 4;
 
+        /// <summary>Cache isolation for shared, stateless chat API sessions. Lineage
+        /// (the default) requires a recorded conversation continuation; Strict gives
+        /// every request a fresh scope. Shared is an operator opt-in for a trusted
+        /// single-tenant server whose requests may reuse matching private prefixes
+        /// even when a client edits earlier assistant turns or replaces screenshots.
+        /// Named chat sessions retain their own isolation in every mode. Env:
+        /// <c>TS_PREFIX_CACHE_ISOLATION</c> = lineage | strict | shared.</summary>
+        public PrefixCache.IsolationMode PrefixCacheIsolation { get; init; } = PrefixCache.IsolationMode.Lineage;
+
         /// <summary>Tokens of K/V a cache is given when it is CREATED — the model's
         /// primary cache at load, and every per-request holder — before any request
         /// has declared a budget of its own. 0 keeps the engine's policy: the whole
@@ -121,6 +130,7 @@ namespace TensorSharp.Runtime.Scheduling
             BatchedFusedDecodeEnabled = ReadFlag("TS_BATCHED_FUSED_DECODE", true),
             RetainedFusedCacheBudget = ReadOptionalNonNegativeInt("TS_RETAINED_FUSED_CACHE_MAX"),
             PrefixCheckpointBudget = ReadNonNegativeInt("TS_PREFIX_CHECKPOINTS_MAX", 4),
+            PrefixCacheIsolation = ReadPrefixCacheIsolation(),
             KvInitialTokens = ReadNonNegativeInt("TS_KV_INITIAL_TOKENS", 0),
             KvGenerationReserveMax = ReadNonNegativeInt("TS_KV_GENERATION_RESERVE_MAX", 0),
             KvHolderPoolMax = ReadNonNegativeInt("TS_KV_HOLDER_POOL_MAX", 64),
@@ -136,6 +146,8 @@ namespace TensorSharp.Runtime.Scheduling
             if (!BatchedFusedDecodeEnabled) parts.Add("TS_BATCHED_FUSED_DECODE=0");
             if (RetainedFusedCacheBudget is int retained) parts.Add($"TS_RETAINED_FUSED_CACHE_MAX={retained}");
             if (PrefixCheckpointBudget != 4) parts.Add($"TS_PREFIX_CHECKPOINTS_MAX={PrefixCheckpointBudget}");
+            if (PrefixCacheIsolation != PrefixCache.IsolationMode.Lineage)
+                parts.Add($"TS_PREFIX_CACHE_ISOLATION={PrefixCacheIsolation.ToString().ToLowerInvariant()}");
             if (KvInitialTokens != 0) parts.Add($"TS_KV_INITIAL_TOKENS={KvInitialTokens}");
             if (KvGenerationReserveMax != 0) parts.Add($"TS_KV_GENERATION_RESERVE_MAX={KvGenerationReserveMax}");
             if (KvHolderPoolMax != 64) parts.Add($"TS_KV_HOLDER_POOL_MAX={KvHolderPoolMax}");
@@ -143,6 +155,18 @@ namespace TensorSharp.Runtime.Scheduling
         }
 
         // Loose boolean: unset -> default; "0"/"false" -> false; anything else -> true.
+        private static PrefixCache.IsolationMode ReadPrefixCacheIsolation()
+        {
+            string? raw = Environment.GetEnvironmentVariable("TS_PREFIX_CACHE_ISOLATION");
+            return raw?.Trim().ToLowerInvariant() switch
+            {
+                null or "" or "lineage" => PrefixCache.IsolationMode.Lineage,
+                "strict" => PrefixCache.IsolationMode.Strict,
+                "shared" => PrefixCache.IsolationMode.Shared,
+                _ => throw new ArgumentException("TS_PREFIX_CACHE_ISOLATION must be lineage, strict, or shared (trusted single-tenant only)."),
+            };
+        }
+
         private static bool ReadFlag(string name, bool fallback)
         {
             string? raw = Environment.GetEnvironmentVariable(name);

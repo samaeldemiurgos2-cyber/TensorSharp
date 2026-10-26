@@ -1889,6 +1889,65 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35VisionEncoderMergedF32(
+            GgmlTensorView2D hidden, GgmlTensorView2D merged, in VisionMergerArgs merger,
+            int blockCount, float eps, float attnScale,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            IntPtr cosTable, IntPtr sinTable,
+            IntPtr[] ln1W, IntPtr[] ln1B,
+            IntPtr[] qkvW, IntPtr[] qkvB,
+            IntPtr[] outW, IntPtr[] outB,
+            IntPtr[] ln2W, IntPtr[] ln2B,
+            IntPtr[] upW, IntPtr[] upB,
+            IntPtr[] downW, IntPtr[] downB,
+            int lnDim,
+            int qkvNe0, int qkvNe1, long qkvBytes, int qkvBDim,
+            int outNe0, int outNe1, long outBytes, int outBDim,
+            int upNe0, int upNe1, long upBytes, int upBDim,
+            int downNe0, int downNe1, long downBytes, int downBDim, int geluErf, int linearWeightType);
+
+        /// <summary>Mirror of the native TSGgmlVisionMergerArgs: post-LN plus the
+        /// fc1/GELU/fc2 spatial merger folded into the whole-encoder graph.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct VisionMergerArgs
+        {
+            public int StructBytes;
+            public int MergeUnit;
+            public int GeluErf;
+            public int LnDim;
+            public IntPtr PostLnW;
+            public IntPtr PostLnB;
+            public IntPtr Fc1W;
+            public IntPtr Fc1B;
+            public int Fc1Ne0;
+            public int Fc1Ne1;
+            public IntPtr Fc2W;
+            public IntPtr Fc2B;
+            public int Fc2Ne0;
+            public int Fc2Ne1;
+        }
+
+        public static bool Qwen35VisionEncoderMerged(
+            GgmlTensorView2D hidden, GgmlTensorView2D merged, in VisionMergerArgs merger,
+            int blockCount, float eps, float attnScale,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            IntPtr cosTable, IntPtr sinTable,
+            IntPtr[] ln1W, IntPtr[] ln1B, IntPtr[] qkvW, IntPtr[] qkvB,
+            IntPtr[] outW, IntPtr[] outB, IntPtr[] ln2W, IntPtr[] ln2B,
+            IntPtr[] upW, IntPtr[] upB, IntPtr[] downW, IntPtr[] downB,
+            int lnDim,
+            int qkvNe0, int qkvNe1, long qkvBytes, int qkvBDim,
+            int outNe0, int outNe1, long outBytes, int outBDim,
+            int upNe0, int upNe1, long upBytes, int upBDim,
+            int downNe0, int downNe1, long downBytes, int downBDim, bool geluErf, int linearWeightType)
+            => TSGgml_Qwen35VisionEncoderMergedF32(hidden, merged, merger,
+                blockCount, eps, attnScale, numPatches, numHeads, headDim, halfDim,
+                cosTable, sinTable, ln1W, ln1B, qkvW, qkvB, outW, outB, ln2W, ln2B, upW, upB, downW, downB,
+                lnDim, qkvNe0, qkvNe1, qkvBytes, qkvBDim, outNe0, outNe1, outBytes, outBDim,
+                upNe0, upNe1, upBytes, upBDim, downNe0, downNe1, downBytes, downBDim, geluErf ? 1 : 0, linearWeightType) != 0;
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_Qwen21VisionEncoderF32(
             GgmlTensorView2D hidden,
             int blockCount, float eps, float attnScale,
@@ -2657,6 +2716,37 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_DFlashInjectScaled(
+            float[] featRows, int featureSize, int nRows,
+            long[] ringRowsIdx, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale,
+            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
+            IntPtr encNormData,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] kNormArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr,
+            int ringDtype, float[] scales, int scaleCount);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_DFlashInjectBatched(
+            int nLanes, int maxRows, int totalRows,
+            float[] featRows, int featureSize,
+            int[] gather, long[] ringRowsIdx, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale,
+            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
+            IntPtr encNormData,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] kNormArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr,
+            int ringDtype, float[] scales, int scaleCount);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_DFlashDraftBlock(
             int[] blockIds, int blockLen, int[] positions,
             int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
@@ -2696,6 +2786,137 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_DFlashDraftBlockScaled(
+            int[] blockIds, int blockLen, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale, float kqScale,
+            int[] ringSlotPos, int slidingWindow,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
+            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
+            IntPtr outNormData,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocabSize, int[] idsOut, float[] confOut,
+            // DFlash2 grouped dynamic convolution. convTaps == 0 disables it and
+            // every array below may be null (a first-generation drafter).
+            int convTaps, int convGroupSize, int convNumGroups,
+            IntPtr[] attnConvBaseArr,
+            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
+            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
+            IntPtr[] ffnConvBaseArr,
+            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
+            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
+            // DFlash2 candidate selector. selRank == 0 disables it; when it is on,
+            // idsOut/confOut are left untouched and the lattice comes back instead.
+            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
+            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
+            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
+            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
+            float[] selScoresOut, int[] selCandOut, float[] scales, int scaleCount);
+
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_DFlashDraftBlockBatched(
+            int nLanes, int[] blockIds, int blockLen, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale, float kqScale,
+            int[] ringSlotPos, int slidingWindow,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
+            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
+            IntPtr outNormData,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocabSize, int[] idsOut, float[] confOut,
+            // DFlash2 grouped dynamic convolution. convTaps == 0 disables it and
+            // every array below may be null (a first-generation drafter).
+            int convTaps, int convGroupSize, int convNumGroups,
+            IntPtr[] attnConvBaseArr,
+            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
+            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
+            IntPtr[] ffnConvBaseArr,
+            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
+            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
+            // DFlash2 candidate selector. selRank == 0 disables it; when it is on,
+            // idsOut/confOut are left untouched and the lattice comes back instead.
+            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
+            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
+            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
+            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
+            float[] selScoresOut, int[] selCandOut, float[] scales, int scaleCount);
+
+        /// <summary>DFlash PASS C for several sequences in one graph (CUDA). Arrays are
+        /// lane-major: blockIds/positions [nLanes * blockLen], ringSlotPos
+        /// [nLanes * ringRows], ringKArr/ringVArr [nLanes * numLayers]; outputs hold
+        /// each lane's block exactly as <see cref="DFlashDraftBlock"/> returns it, one
+        /// after another. False = declined (or an older native library).</summary>
+        public static bool DFlashDraftBlockBatched(
+            int nLanes, int[] blockIds, int blockLen, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale, float kqScale,
+            int[] ringSlotPos, int slidingWindow,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
+            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
+            IntPtr outNormData,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocabSize, int[] idsOut, float[] confOut,
+            
+            
+            int convTaps, int convGroupSize, int convNumGroups,
+            IntPtr[] attnConvBaseArr,
+            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
+            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
+            IntPtr[] ffnConvBaseArr,
+            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
+            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
+            
+            
+            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
+            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
+            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
+            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
+            float[] selScoresOut, int[] selCandOut, float[] scales)
+        {
+            try
+            {
+                return TSGgml_DFlashDraftBlockBatched(nLanes, blockIds, blockLen, positions, numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows, eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow, attnNormArr, qArr, qTypeArr, qNe0Arr, qNe1Arr, qBytesArr, kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr, vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr, qNormArr, kNormArr, oArr, oTypeArr, oNe0Arr, oNe1Arr, oBytesArr, ffnNormArr, gateArr, gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr, upArr, upTypeArr, upNe0Arr, upNe1Arr, upBytesArr, downArr, downTypeArr, downNe0Arr, downNe1Arr, downBytesArr, ringKArr, ringVArr, ringDtype, outNormData, tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, vocabSize, idsOut, confOut, convTaps, convGroupSize, convNumGroups, attnConvBaseArr, attnConvProjArr, attnConvProjTypeArr, attnConvProjNe0Arr, attnConvProjNe1Arr, attnConvProjBytesArr, ffnConvBaseArr, ffnConvProjArr, ffnConvProjTypeArr, ffnConvProjNe0Arr, ffnConvProjNe1Arr, ffnConvProjBytesArr, selRank, selTopK, selLogitScale, selLogitSoftcap, selHiddenData, selHiddenType, selHiddenNe0, selHiddenNe1, selHiddenBytes, selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes, selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes, selScoresOut, selCandOut, scales, scales?.Length ?? 0) != 0;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return false;
+            }
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial void TSGgml_DFlashResetCaches();
 
         /// <summary>DFlash PASS A+B in one graph. False = declined, caller falls back.</summary>
@@ -2708,14 +2929,66 @@ internal enum GgmlIndexReductionOp
             IntPtr encNormData,
             IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
             IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
-            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype)
-            => TSGgml_DFlashInject(featRows, featureSize, nRows, ringRowsIdx, positions,
+            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype, float[] scales = null)
+        {
+            if (scales == null)
+                return TSGgml_DFlashInject(featRows, featureSize, nRows, ringRowsIdx, positions,
                 numLayers, hiddenSize, headDim, numKvHeads, ringRows,
                 eps, ropeBase, ropeFreqScale,
                 fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
                 kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
                 kNormArr, ringKArr, ringVArr, ringDtype) != 0;
+            // Older native libraries must use the scale-aware per-op drafter,
+            // never silently run their unscaled fused graph.
+            try
+            {
+                return TSGgml_DFlashInjectScaled(featRows, featureSize, nRows, ringRowsIdx, positions,
+                numLayers, hiddenSize, headDim, numKvHeads, ringRows,
+                eps, ropeBase, ropeFreqScale,
+                fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                kNormArr, ringKArr, ringVArr, ringDtype, scales, scales.Length) != 0;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>DFlash PASS A+B for several rings in one graph (CUDA): lane i's
+        /// <paramref name="maxRows"/> padded rows gather compact feature rows and land in
+        /// rings <paramref name="ringKArr"/>[i * numLayers ..]. False = declined (older
+        /// native library included); the caller injects lane by lane.</summary>
+        public static bool DFlashInjectBatched(
+            int nLanes, int maxRows, int totalRows,
+            float[] featRows, int featureSize,
+            int[] gather, long[] ringRowsIdx, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale,
+            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
+            IntPtr encNormData,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype, float[] scales = null)
+        {
+            try
+            {
+                return TSGgml_DFlashInjectBatched(nLanes, maxRows, totalRows, featRows, featureSize,
+                    gather, ringRowsIdx, positions,
+                    numLayers, hiddenSize, headDim, numKvHeads, ringRows,
+                    eps, ropeBase, ropeFreqScale,
+                    fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
+                    kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                    vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                    kNormArr, ringKArr, ringVArr, ringDtype, scales, scales?.Length ?? 0) != 0;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return false;
+            }
+        }
 
         /// <summary>
         /// DFlash PASS C in one graph.
@@ -2764,8 +3037,10 @@ internal enum GgmlIndexReductionOp
             IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
             IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
             IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
-            float[] selScoresOut, int[] selCandOut)
-            => TSGgml_DFlashDraftBlock(blockIds, blockLen, positions,
+            float[] selScoresOut, int[] selCandOut, float[] scales = null)
+        {
+            if (scales == null)
+                return TSGgml_DFlashDraftBlock(blockIds, blockLen, positions,
                 numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows,
                 eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow,
                 attnNormArr,
@@ -2792,6 +3067,43 @@ internal enum GgmlIndexReductionOp
                 selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes,
                 selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes,
                 selScoresOut, selCandOut) != 0;
+            // Older native libraries must use the scale-aware per-op drafter,
+            // never silently run their unscaled fused graph.
+            try
+            {
+                return TSGgml_DFlashDraftBlockScaled(blockIds, blockLen, positions,
+                numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows,
+                eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow,
+                attnNormArr,
+                qArr, qTypeArr, qNe0Arr, qNe1Arr, qBytesArr,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                qNormArr, kNormArr,
+                oArr, oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                ffnNormArr,
+                gateArr, gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr,
+                upArr, upTypeArr, upNe0Arr, upNe1Arr, upBytesArr,
+                downArr, downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                ringKArr, ringVArr, ringDtype, outNormData,
+                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                vocabSize, idsOut, confOut,
+                convTaps, convGroupSize, convNumGroups,
+                attnConvBaseArr, attnConvProjArr, attnConvProjTypeArr,
+                attnConvProjNe0Arr, attnConvProjNe1Arr, attnConvProjBytesArr,
+                ffnConvBaseArr, ffnConvProjArr, ffnConvProjTypeArr,
+                ffnConvProjNe0Arr, ffnConvProjNe1Arr, ffnConvProjBytesArr,
+                selRank, selTopK, selLogitScale, selLogitSoftcap,
+                selHiddenData, selHiddenType, selHiddenNe0, selHiddenNe1, selHiddenBytes,
+                selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes,
+                selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes,
+                selScoresOut, selCandOut, scales, scales.Length) != 0;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return false;
+            }
+        }
 
         /// <summary>Drop the persistent DFlash graphs (ring reallocation / KV reset).</summary>
         public static void DFlashResetCaches() => TSGgml_DFlashResetCaches();
@@ -3698,6 +4010,75 @@ internal enum GgmlIndexReductionOp
                 finalNorm, tokenEmbd, tokenEmbdType, tokenEmbdNe0, tokenEmbdNe1, tokenEmbdBytes,
                 sampled, wantLogits ? 1 : 0);
 
+        // Qwen3.5/3.8 batched speculative verify: N sequences x T tokens in one graph
+        // over the holders' resident copies (see ggml_ops_qwen35_batched_verify.cpp).
+        // tokenIds/ropePositions are [n * T] sequence-major; kCaches/vCaches are
+        // [attn_layer * n + s] and convStates/deltaStates [gdn_layer * n + s].
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35BatchedVerify(
+            [In] Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs, int nTok,
+            [In] int[] tokenIds, [In] int[] positions, [In] int[] ropePositions,
+            [In] IntPtr[] kCaches, [In] IntPtr[] vCaches,
+            [In] IntPtr[] convStates, [In] IntPtr[] deltaStates,
+            [In] int[] cacheSizes,
+            int numHeads, int numKvHeads, int headDim, int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm,
+            IntPtr tokenEmbd, int tokenEmbdType, long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
+            [In] int[] captureLayers, int captureCount, [Out] float[] captureData,
+            [Out] int[] sampled);
+
+        /// <summary>Returns 1 on success, 0 on a safe decline (no holder touched), and
+        /// -1 when execution failed after K/V writes began.</summary>
+        public static int Qwen35BatchedVerify(
+            Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs, int nTok,
+            int[] tokenIds, int[] positions, int[] ropePositions,
+            IntPtr[] kCaches, IntPtr[] vCaches, IntPtr[] convStates, IntPtr[] deltaStates,
+            int[] cacheSizes,
+            int numHeads, int numKvHeads, int headDim, int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm,
+            IntPtr tokenEmbd, int tokenEmbdType, long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
+            int[] captureLayers, float[] captureData, int[] sampled)
+            => TSGgml_Qwen35BatchedVerify(layers, numLayers, nSeqs, nTok, tokenIds, positions, ropePositions,
+                kCaches, vCaches, convStates, deltaStates, cacheSizes,
+                numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads, eps, ropeBase, ropeFreqScale,
+                vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm,
+                tokenEmbd, tokenEmbdType, tokenEmbdNe0, tokenEmbdNe1, tokenEmbdBytes,
+                captureLayers, captureLayers?.Length ?? 0, captureData, sampled);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35BatchedVerifyCommit(int nSeqs, [In] int[] accepted);
+
+        /// <summary>Advance each sequence of the last batched verify by its accepted
+        /// prefix (accepted[s] drafts kept). 1 ok, 0 nothing pending, -1 failed midway.</summary>
+        public static int Qwen35BatchedVerifyCommit(int[] accepted)
+            => TSGgml_Qwen35BatchedVerifyCommit(accepted.Length, accepted);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial void TSGgml_Qwen35BatchedVerifyReset();
+
+        public static void Qwen35BatchedVerifyReset() => TSGgml_Qwen35BatchedVerifyReset();
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35ArenaUsesHolderBuffers();
+
+        /// <summary>True when the qwen35 batched decode binds each holder's own resident
+        /// cache copies: a successful step leaves holders as a solo fused decode does,
+        /// with no arena slot to flush.</summary>
+        public static bool Qwen35ArenaUsesHolderBuffers() => TSGgml_Qwen35ArenaUsesHolderBuffers() != 0;
+
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial void TSGgml_Qwen35ArenaResetBatchedDecodeCache();
@@ -3961,6 +4342,69 @@ internal enum GgmlIndexReductionOp
             int numRecurrentLayers, long ownerId = 0)
             => TSGgml_Qwen35DrainDeviceStateOwned(
                 convOut, deltaOut, numRecurrentLayers, ownerId) != 0;
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35ReadLiveStateOwned(
+            IntPtr[] convOut, IntPtr[] deltaOut, int numRecurrentLayers, long ownerId);
+
+        /// <summary>Copy the live device recurrent state to host buffers and keep it
+        /// live. False = no live state, or an older native library.</summary>
+        public static bool Qwen35ReadLiveState(IntPtr[] convOut, IntPtr[] deltaOut,
+            int numRecurrentLayers, long ownerId = 0)
+        {
+            try
+            {
+                return TSGgml_Qwen35ReadLiveStateOwned(convOut, deltaOut, numRecurrentLayers, ownerId) != 0;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return false;
+            }
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35ZeroLiveStateOwned(
+            IntPtr sig, int numRecurrentLayers, long convBytes, long deltaBytes, long ownerId);
+
+        /// <summary>Make the live device recurrent state the all-zero state a sequence
+        /// starts from, without uploading host zeros.</summary>
+        public static bool Qwen35ZeroLiveState(IntPtr sig, int numRecurrentLayers,
+            long convBytes, long deltaBytes, long ownerId)
+            => TSGgml_Qwen35ZeroLiveStateOwned(sig, numRecurrentLayers, convBytes, deltaBytes, ownerId) != 0;
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial void TSGgml_Qwen35DiscardLiveStateOwned(long ownerId);
+
+        /// <summary>Forget the live device recurrent state of a finished sequence.</summary>
+        public static void Qwen35DiscardLiveState(long ownerId)
+            => TSGgml_Qwen35DiscardLiveStateOwned(ownerId);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35ExportLiveStateOwned(
+            IntPtr[] convKeys, IntPtr[] deltaKeys, int numRecurrentLayers, long ownerId);
+
+        /// <summary>Move the live device recurrent state into the device copies keyed by
+        /// a sequence's own conv-scratch and delta-state host pointers.</summary>
+        public static bool Qwen35ExportLiveState(IntPtr[] convKeys, IntPtr[] deltaKeys,
+            int numRecurrentLayers, long ownerId)
+            => TSGgml_Qwen35ExportLiveStateOwned(convKeys, deltaKeys, numRecurrentLayers, ownerId) != 0;
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35ImportLiveStateOwned(
+            IntPtr sig, IntPtr[] convKeys, IntPtr[] deltaKeys, int numRecurrentLayers,
+            long convBytes, long deltaBytes, long ownerId);
+
+        /// <summary>Seed the live device recurrent state from a sequence's existing
+        /// device copies.</summary>
+        public static bool Qwen35ImportLiveState(IntPtr sig, IntPtr[] convKeys, IntPtr[] deltaKeys,
+            int numRecurrentLayers, long convBytes, long deltaBytes, long ownerId)
+            => TSGgml_Qwen35ImportLiveStateOwned(
+                sig, convKeys, deltaKeys, numRecurrentLayers, convBytes, deltaBytes, ownerId) != 0;
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -4389,11 +4833,70 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial void TSGgml_PrefaultHostSpans(IntPtr[] ptrs, long[] lengths, int count);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static unsafe partial int TSGgml_SyncHostBufferRanges(IntPtr ptr, long* offsets, long* lengths, int count);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_SyncIdleHostBufferRanges(IntPtr ptr, long* offsets, long* lengths, int count);
+
+        /// <summary>Background download of an idle device copy's ranges (no global barrier).
+        /// 1 copied, 0 no matching device copy, -1 failure. See the native contract.</summary>
+        public static unsafe int SyncIdleHostBufferRanges(IntPtr ptr, ReadOnlySpan<long> offsets, ReadOnlySpan<long> lengths)
+        {
+            if (ptr == IntPtr.Zero || offsets.Length == 0 || offsets.Length != lengths.Length)
+                return 0;
+            fixed (long* o = offsets)
+            fixed (long* l = lengths)
+                return TSGgml_SyncIdleHostBufferRanges(ptr, o, l, offsets.Length);
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_DownloadDeviceCopyRanges(IntPtr srcKey, IntPtr dst,
+            long* srcOffsets, long* dstOffsets, long* lengths, int count);
+
+        /// <summary>Background download of ranges of <paramref name="srcKey"/>'s device copy
+        /// into <paramref name="dst"/> host memory (no global barrier). 1 copied, 0 no
+        /// matching device copy, -1 failure. See the native contract.</summary>
+        public static unsafe int DownloadDeviceCopyRanges(IntPtr srcKey, IntPtr dst,
+            ReadOnlySpan<long> srcOffsets, ReadOnlySpan<long> dstOffsets, ReadOnlySpan<long> lengths)
+        {
+            if (srcKey == IntPtr.Zero || dst == IntPtr.Zero || lengths.Length == 0
+                || srcOffsets.Length != lengths.Length || dstOffsets.Length != lengths.Length)
+                return 0;
+            fixed (long* s = srcOffsets)
+            fixed (long* d = dstOffsets)
+            fixed (long* l = lengths)
+                return TSGgml_DownloadDeviceCopyRanges(srcKey, dst, s, d, l, lengths.Length);
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static unsafe partial int TSGgml_UploadHostBufferRanges(IntPtr ptr, long* offsets, long* lengths, int count);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_CopyDeviceCopyRanges(
+            IntPtr srcKey, long srcBytes, IntPtr dstKey, long dstBytes,
+            long* srcOffsets, long* dstOffsets, long* lengths, int count, int zeroDst);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_UploadToDeviceCopyRanges(
+            IntPtr srcHost, long srcBytes, IntPtr dstKey, long dstBytes,
+            long* srcOffsets, long* dstOffsets, long* lengths, int count, int zeroDst);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_EnsureDeviceCopyFromHost(IntPtr key, long bytes);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial long TSGgml_CachedBufferBytes(IntPtr key);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -6328,6 +6831,16 @@ internal enum GgmlIndexReductionOp
             CheckResult(TSGgml_SyncHostBuffer(ptr, byteCount), "sync_host_buffer");
         }
 
+        /// <summary>Fault host spans in from several threads ahead of many small
+        /// downloads into them (Linux; a no-op elsewhere or on an older library).</summary>
+        public static void PrefaultHostSpans(IntPtr[] ptrs, long[] lengths)
+        {
+            if (ptrs == null || lengths == null || ptrs.Length == 0)
+                return;
+            try { TSGgml_PrefaultHostSpans(ptrs, lengths, Math.Min(ptrs.Length, lengths.Length)); }
+            catch (EntryPointNotFoundException) { }
+        }
+
         /// <summary>
         /// Pull only the given byte ranges of a cached tensor's device copy back
         /// into its host memory (offsets are relative to <paramref name="ptr"/>).
@@ -6360,6 +6873,51 @@ internal enum GgmlIndexReductionOp
             fixed (long* l = lengths)
                 CheckResult(TSGgml_UploadHostBufferRanges(ptr, o, l, offsets.Length), "upload_host_buffer_ranges");
         }
+
+        /// <summary>
+        /// Copy byte ranges from one host key's resident device copy into another's on the
+        /// device, creating the destination copy without an upload when it is absent. The
+        /// destination's host bytes are not written: the caller must treat it as
+        /// device-authoritative. Returns false (destination unchanged when it existed) if
+        /// the source is not resident or the backend has no device copies.
+        /// </summary>
+        public static unsafe bool CopyDeviceCopyRanges(
+            IntPtr srcKey, long srcBytes, IntPtr dstKey, long dstBytes,
+            ReadOnlySpan<long> srcOffsets, ReadOnlySpan<long> dstOffsets, ReadOnlySpan<long> lengths, bool zeroDestination)
+        {
+            if (srcOffsets.Length != dstOffsets.Length || srcOffsets.Length != lengths.Length)
+                throw new ArgumentException("offset and length spans must have the same length.");
+            fixed (long* so = srcOffsets)
+            fixed (long* d = dstOffsets)
+            fixed (long* l = lengths)
+                return TSGgml_CopyDeviceCopyRanges(srcKey, srcBytes, dstKey, dstBytes, so, d, l, lengths.Length, zeroDestination ? 1 : 0) == 1;
+        }
+
+        /// <summary>
+        /// Upload byte ranges of host memory into another host key's device copy, creating
+        /// it without an upload of its own host bytes when absent. As with
+        /// <see cref="CopyDeviceCopyRanges"/>, the destination becomes device-authoritative.
+        /// </summary>
+        public static unsafe bool UploadToDeviceCopyRanges(
+            IntPtr srcHost, long srcBytes, IntPtr dstKey, long dstBytes,
+            ReadOnlySpan<long> srcOffsets, ReadOnlySpan<long> dstOffsets, ReadOnlySpan<long> lengths, bool zeroDestination)
+        {
+            if (srcOffsets.Length != dstOffsets.Length || srcOffsets.Length != lengths.Length)
+                throw new ArgumentException("offset and length spans must have the same length.");
+            fixed (long* so = srcOffsets)
+            fixed (long* d = dstOffsets)
+            fixed (long* l = lengths)
+                return TSGgml_UploadToDeviceCopyRanges(srcHost, srcBytes, dstKey, dstBytes, so, d, l, lengths.Length, zeroDestination ? 1 : 0) == 1;
+        }
+
+        /// <summary>Upload all host bytes of <paramref name="key"/> into its device copy,
+        /// creating it when absent. Only for buffers whose host bytes are authoritative.</summary>
+        public static bool EnsureDeviceCopyFromHost(IntPtr key, long bytes)
+            => key != IntPtr.Zero && bytes > 0 && TSGgml_EnsureDeviceCopyFromHost(key, bytes) == 1;
+
+        /// <summary>Diagnostic: the cached buffer size recorded for a host key (negative for a
+        /// zero-copy host mapping, 0 when none).</summary>
+        public static long CachedBufferBytes(IntPtr key) => key == IntPtr.Zero ? 0 : TSGgml_CachedBufferBytes(key);
 
         /// <summary>
         /// Enable lazy synchronization on the Metal backend. When on, per-op kernels
@@ -6734,11 +7292,15 @@ internal enum GgmlIndexReductionOp
 
         private static IEnumerable<string> EnumerateWindowsNativeDependencyDirectories()
         {
+            // CUDA 13 installs its DLLs in bin\x64, earlier toolkits in bin.
             foreach (string variableName in new[] { "CUDA_PATH", "CUDA_HOME" })
             {
                 string root = Environment.GetEnvironmentVariable(variableName);
                 if (!string.IsNullOrWhiteSpace(root))
+                {
+                    yield return Path.Combine(root, "bin", "x64");
                     yield return Path.Combine(root, "bin");
+                }
             }
 
             string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
@@ -6747,7 +7309,10 @@ internal enum GgmlIndexReductionOp
                 yield break;
 
             foreach (string versionDir in Directory.EnumerateDirectories(cudaRoot, "v*").OrderByDescending(path => path))
+            {
+                yield return Path.Combine(versionDir, "bin", "x64");
                 yield return Path.Combine(versionDir, "bin");
+            }
         }
 
         private static bool IsRepoRoot(string path)

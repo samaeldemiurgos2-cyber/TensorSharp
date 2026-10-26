@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash (`deepseek41`)
 
-> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Older commands and measurements below predate that default: migrate multi-GPU launches by adding `--layer-split N`. Layer split is single-node only.
+> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Add `--tp-node-id` and `--tp-peers` to span nodes on `ggml_cuda`; N is the local GPU count. See [multi-node setup and limitations](../multi-node-inference.md). Older measurements below retain their original topology and do not validate the new distributed layer path.
 
 [← back to model index](README.md) | [中文](deepseek41_zh-cn.md)
 
@@ -119,9 +119,9 @@ revision and all shard hashes with every new validation result.
 ## Unsloth's DeepSeek-V4.1-Flash-1017 GGUFs
 
 [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/60ad3651641b5c97679c807e064ab1d7a3ca1455)
-packages the 1017 checkpoint for llama.cpp. TensorSharp loads its files as
-published; they differ from the layout above in four ways, all handled by the
-loader:
+packages the 1017 checkpoint for llama.cpp. TensorSharp loads the tested
+`UD-IQ2_XXS` files as published. Their layout differs from the one above in
+four ways handled by the loader:
 
 - The Engram tables are one tensor, `per_layer_token_embd.weight` (Q5_K, in its
   own shard), described by `deepseek41.ple.*` metadata. The loader slices it
@@ -136,6 +136,11 @@ loader:
 - The vision tower ships as llama.cpp's `mmproj-BF16.gguf` / `mmproj-F16.gguf`
   (`clip`, projector `deepseek41v`), which `--mmproj` loads directly; the image
   tokens' routing biases come from the text shards (`blk.N.exp_probs_b_vl.bias`).
+
+The completed loading and distributed controls cover `UD-IQ2_XXS`; other
+quantizations need separate validation. At revision `60ad3651…`, `UD-Q4_K_XL` contains Engram type 43,
+which the tested unchanged ggml `3612c0af…` rejects. Its load failed; see the
+[validation report](../deepseek41_validation.md).
 
 Download one `--include` pattern per call (several patterns in one call matched
 only the root files with `hf` 2.2.0):
@@ -484,9 +489,61 @@ output rows are then gathered without summing partial dot products. This keeps
 the down projection's reduction order, avoiding rounding changes that later
 activation quantization can amplify. Quantization blocks are never split, and
 uneven strips rotate across layers to balance storage. Attention,
-shared experts, and caches retain their layer placement. This is a partial
-tensor-parallel implementation; it does not shard attention or enable
-distributed tensor-parallel groups.
+shared experts, and caches retain their local layer placement. The same routed
+tensor-parallel path can span nodes on `ggml_cuda`; attention remains unsharded.
+
+### Distributed routed-MoE tensor parallelism
+
+For DeepSeek V4.1 Flash 1017, the existing `--tp-node-id` and `--tp-peers`
+options extend routed-MoE sharding across nodes. `--tp` is the GPU count **per
+node**: two nodes with `--tp 2` use four global ranks. Each node must use the
+same local degree (1–8), with 2–16 global ranks, identical checkpoint shards,
+and matching context, precision and CPU-offload settings. Keep both nodes'
+GGUF sources and upstream ggml unchanged.
+Quantization-block geometry can impose a smaller rank limit; layouts that
+would leave an empty strip on any rank are refused.
+The 2–16 range is the executor's capacity, not a guarantee for every GGUF.
+A 2304-wide K-quantized down row contains nine 256-value blocks, so more than
+nine global ranks cannot form nonempty strips. In particular, two nodes with
+eight GPUs each are refused for that layout. The completed cross-node fixture
+coverage is two nodes with one or two GPUs per node; see the validation report.
+Set the same explicit `--n-cpu-moe N` on both nodes when host expert offload is
+needed; automatic per-node CPU placement is refused because it could change
+the collective sequence. The loader still refuses an explicit count that does
+not fit the available memory.
+
+```bash
+# Node 1: existing CLI worker (the first endpoint is node 0).
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model /models/FIRST-SHARD.gguf \
+  --backend ggml_cuda --tp 2 --tp-node-id 1 --tp-peers NODE0:9500,NODE1:9500
+# Node 0: HTTP driver, started while the worker waits for its peer.
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model /models/FIRST-SHARD.gguf \
+  --backend ggml_cuda --tp 2 --tp-node-id 0 --tp-peers NODE0:9500,NODE1:9500 \
+  --no-multi-agent --no-skills
+```
+
+Each GPU holds its global routed-expert gate/up and down-output strips. The
+existing cross-node F32 AllReduce assembles disjoint activations and output
+rows twice per GPU-resident MoE layer. Attention, shared experts, Engram and
+CPU-offloaded expert layers are computed on each node. This preserves the
+existing tensor-parallel computation and makes network latency material to
+decode speed; use the measured transport and matched controls when assessing
+performance.
+
+Distributed serving uses a single mirrored sequence and serializes overlapping
+requests. Sequence slots, retained-prefix/truncation reuse, vision and DSpark
+are unavailable in this mode; load-time/capability checks prevent unsupported
+execution. Start the driver with `--model`; loading or switching models,
+backends or projectors through a running distributed server is refused. Restart
+the driver and matching CLI workers together to change that configuration.
+Requests for the already loaded model remain available. Local multi-GPU
+behavior retains its existing paths. Distributed
+automatic prefill uses microbatches of 256; explicit positive
+`TS_DSV4_UBATCH` remains configurable. `--layer-split` cannot be combined with
+distributed groups. Use the [fixed-token validation procedure](../../eng/validation/DeepSeek41DistributedProbe/README.md)
+for numerical controls and the HTTP suites for actual checkpoint quality.
+
+The following device-resident exchange description applies to local TP.
 
 On `ggml_cuda` the routed-expert exchange is device-resident
 (`ggml_ops_deepseek41_tp_cuda.cu`). Each TP layer is a launch node and a gather
@@ -1551,7 +1608,9 @@ original output limit retain precedence.
   than loading V4.1 weights into a graph that does not implement it.
 - Execution uses one GPU by default. `--layer-split N` selects whole-layer
   placement; `--tp N` selects routed-MoE tensor parallelism with F32 activation/output gathers.
-  Attention tensor parallelism and distributed groups are not implemented.
+  The existing distributed groups extend routed-MoE TP across nodes on
+  `ggml_cuda`; attention remains unsharded. Distributed requests use one
+  mirrored sequence and omit slots, prefix retention/truncation, vision and DSpark.
 - Concurrent requests have isolated sequence slots. On the native executor
   with the CUDA fused backend (`--backend ggml_cuda`), their decode steps run
   as one token-batched graph (see

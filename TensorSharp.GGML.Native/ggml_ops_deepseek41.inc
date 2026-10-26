@@ -5,6 +5,8 @@
 ggml_tensor * v41_shared_mask = nullptr;
 ggml_tensor * v41_shared_top = nullptr;
 ggml_tensor * v41_candidates = nullptr;
+ggml_tensor * v41_candidate_scores = nullptr;
+ggml_tensor * v41_candidate_top = nullptr;
 
 ggml_tensor * v41_quant(ggml_tensor * x, int mode, int dev)
 {
@@ -312,6 +314,8 @@ ggml_tensor * build_attention_v41(int il, ggml_tensor * cur, ggml_tensor * pos)
                     (plan.n_kv + hp.candidate_block - 1) / hp.candidate_block, nt, 1, 1,
                     { scores, pos }, dev, hp.candidate_block);
                 ggml_tensor * selected = ggml_cont(ctx, ggml_top_k(ctx, blocks, std::min<int64_t>(hp.candidate_topk, blocks->ne[0])));
+                v41_candidate_scores = blocks;
+                v41_candidate_top = selected;
                 v41_candidates = fused_node(TSG_DSV41_CANDIDATE_MASK, GGML_TYPE_F16,
                     plan.n_kv, nt, 1, 1, { blocks, selected }, dev, hp.candidate_block);
             }

@@ -1030,6 +1030,33 @@ namespace TensorSharp.Models
         // ====================================================================
 
         private Qwen35LayerDecodeArgs[] _fdLayers;
+
+        /// <summary>True when every layer's cached K/V and delta-state pointers still name
+        /// the active holder's storage. The first-layer key alone is not enough: a freed
+        /// holder's addresses are handed back by mmap, so a new holder can match the first
+        /// K, first delta and conv scratch while its other layers moved, leaving
+        /// descriptors that point into unmapped memory.</summary>
+        private bool FdStateBindingsCurrent()
+        {
+            if (_fdLayers == null)
+                return false;
+            for (int l = 0; l < _fdLayers.Length; l++)
+            {
+                ref readonly Qwen35LayerDecodeArgs a = ref _fdLayers[l];
+                if (_isRecurrent[l])
+                {
+                    if (a.DeltaStateIn != TensorComputePrimitives.GetStoragePointer(_deltaStateTensor[l]))
+                        return false;
+                }
+                else if (a.KCache != TensorComputePrimitives.GetStoragePointer(_kvCacheK[l])
+                    || a.VCache != TensorComputePrimitives.GetStoragePointer(_kvCacheV[l]))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         private IntPtr _fdBindingKCache;
         private IntPtr _fdBindingDeltaState;
         private IntPtr _fdBindingConvScratch;
@@ -1101,17 +1128,34 @@ namespace TensorSharp.Models
         private unsafe void EnsureFusedDecodeStateHostSynchronized()
         {
             FlushArenaSlotForActiveHolder();
-            if (!_gdnStateHostDirty || !_fdStateResident || _fdConvScratch == IntPtr.Zero || _fdGdnSlot == null)
+            if (!_gdnStateHostDirty || !_fdStateResident || _fdConvScratch == IntPtr.Zero)
                 return;
 
             int convDim = _convKernel - 1;
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
             float* convBase = (float*)_fdConvScratch;
-            for (int l = 0; l < Config.NumLayers; l++)
+            // The device hand-off can make a cache decode-resident before any solo decode
+            // built _fdGdnSlot; the slot is the recurrent ordinal either way.
+            int[] recurrentLayers = EnsureRecurrentLayerList();
+            if (!_useMetalGdnInplaceState)
             {
-                if (!_isRecurrent[l]) continue;
-
-                int gi = _fdGdnSlot[l];
+                // A holder built device-authoritative never touched these host pages; 96 small
+                // downloads into them ran at single-thread page-fault speed (~120 ms).
+                var spans = new IntPtr[recurrentLayers.Length * 2];
+                var lengths = new long[spans.Length];
+                for (int gi = 0; gi < recurrentLayers.Length; gi++)
+                {
+                    Tensor deltaState = _deltaStateTensor[recurrentLayers[gi]];
+                    spans[2 * gi] = (IntPtr)(convBase + (long)gi * convDim * qkvDim);
+                    lengths[2 * gi] = (long)convDim * qkvDim * sizeof(float);
+                    spans[2 * gi + 1] = GdnDeltaStatePointer(deltaState);
+                    lengths[2 * gi + 1] = GdnDeltaStateBytes(deltaState);
+                }
+                GgmlBasicOps.PrefaultHostSpans(spans, lengths);
+            }
+            for (int gi = 0; gi < recurrentLayers.Length; gi++)
+            {
+                int l = recurrentLayers[gi];
                 float* conv = convBase + (long)gi * convDim * qkvDim;
                 // Native binds each layer's offset pointer as an independent
                 // cacheable buffer. Syncing the enclosing allocation would miss
@@ -1189,8 +1233,9 @@ namespace TensorSharp.Models
         {
             // A device-held verify state lives in the same buffers; a KV reset/grow
             // invalidates it, so preserve an in-flight prefill chain before dropping
-            // the native slice metadata, then re-seed on the next verify.
-            DrainDeviceRecurrentState();
+            // the native slice metadata (in the cache's own device copies where the
+            // backend keeps them), then re-seed on the next verify.
+            SettleVerifyStateOnDevice();
             if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan
                 || _backend == BackendType.GgmlMetal)
                 GgmlBasicOps.Qwen35ResetVerifyCache(_verifyOwnerId);
@@ -1221,23 +1266,26 @@ namespace TensorSharp.Models
             // which invalidate the state buffers captured by the decode graph.
             // Speculation already latches fused decode off for the session, so
             // retaining that graph has no benefit and risks dangling bindings.
-            InvalidateFullDecodeState(hardBindings: !SpecKeepsDecodeGraph);
+            // On CUDA a decode-resident state moves to the verifier on the device.
+            if (!TryImportDecodeStateToVerifier())
+                InvalidateFullDecodeState(hardBindings: !SpecKeepsDecodeGraph);
         }
 
         /// <summary>
         /// Leave the speculative session so the fused whole-model decode can run
         /// again: the verify family may have left the recurrent state device-live in
-        /// its own slices, so settle it into the host mirrors first (the decode
-        /// graph re-seeds from them). Costs one state drain per family switch, which
-        /// happens at request boundaries, not per step. Until this existed the latch
-        /// held until the next KV reset, and on the TensorAgent path (one holder per
-        /// chat, never reset) that meant per-op decode for the rest of the process.
+        /// its own slices, so settle it first - into the decode's device copies where
+        /// the backend keeps them, else the host mirrors the decode graph re-seeds
+        /// from. Costs one state hand-off per family switch, which happens at request
+        /// boundaries, not per step. Until this existed the latch held until the next
+        /// KV reset, and on the TensorAgent path (one holder per chat, never reset)
+        /// that meant per-op decode for the rest of the process.
         /// </summary>
         internal void ExitSpecSession()
         {
             if (!_fdSpecSessionActive)
                 return;
-            DrainDeviceRecurrentState();
+            SettleVerifyStateOnDevice();
             _fdSpecSessionActive = false;
         }
 
@@ -1399,11 +1447,11 @@ namespace TensorSharp.Models
             if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal
                 && _backend != BackendType.GgmlVulkan)
                 return FdBail($"backend {_backend} has no fused whole-model decode graph");
-            // Interior Metal prefill chunks can leave GDN state in the verify
-            // ping-pong buffer. The decode graph owns different resident-state
-            // bindings, so synchronize the authoritative verify state before its
-            // first reseed (normally avoided by keeping the final refill chunk >1).
-            DrainDeviceRecurrentState();
+            // Interior prefill chunks can leave GDN state in the verify ping-pong
+            // buffer. The decode graph owns different resident-state bindings, so
+            // hand the authoritative verify state to them (on CUDA directly into the
+            // device copies the graph binds) before its first step.
+            SettleVerifyStateOnDevice();
             if (_fdUnsupported)
                 return false;
             if (!tokenInput &&
@@ -1577,7 +1625,8 @@ namespace TensorSharp.Models
                 _fdBindingKCache != bindingKCache ||
                 _fdBindingDeltaState != bindingDeltaState ||
                 _fdBindingConvScratch != _fdConvScratch ||
-                _fdBindingCacheSize != cacheSize;
+                _fdBindingCacheSize != cacheSize ||
+                !FdStateBindingsCurrent();
 
             if (rebuildBindings)
             {
@@ -1847,10 +1896,187 @@ namespace TensorSharp.Models
             _fvDeviceStateCurrent = false;
         }
 
+        // TS_QWEN35_DEVICE_STATE_HANDOFF=0 restores the host round trip whenever the
+        // verifier's live state changes hands (a drain on every switch, an upload on
+        // every resume).
+        private static readonly bool s_deviceStateHandoff =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_DEVICE_STATE_HANDOFF"), "0", StringComparison.Ordinal);
+
+        /// <summary>
+        /// CUDA keeps every sequence's recurrent state in device copies keyed by its own
+        /// conv-scratch and delta-state host pointers (the solo decode, the arena decode
+        /// and the batched verify all bind them), so the verifier's single live state can
+        /// be handed to and from them without crossing PCIe.
+        /// </summary>
+        private bool DeviceStateHandoffAvailable =>
+            s_deviceStateHandoff && _backend == BackendType.GgmlCuda && !IsTensorParallel
+            && _isRecurrent != null && _deltaStateTensor != null && _verifyOwnerId != 0;
+
+        private IntPtr[] _handoffConvKeys;
+        private IntPtr[] _handoffDeltaKeys;
+
+        private int[] EnsureRecurrentLayerList()
+        {
+            if (_fvRecurrentLayers == null)
+            {
+                int count = 0;
+                for (int l = 0; l < Config.NumLayers; l++)
+                    if (_isRecurrent[l]) count++;
+                var layers = new int[count];
+                for (int l = 0, w = 0; l < Config.NumLayers; l++)
+                    if (_isRecurrent[l]) layers[w++] = l;
+                _fvSnapConvPtrs = new IntPtr[count];
+                _fvSnapDeltaPtrs = new IntPtr[count];
+                _fvRecurrentLayers = layers;
+            }
+            return _fvRecurrentLayers;
+        }
+
+        private long ConvStateBytesPerLayer =>
+            (long)(_convKernel - 1) * (_headKDim * _numKHeads * 2 + _headVDim * _numVHeads) * sizeof(float);
+
+        /// <summary>The active cache's device-copy keys, one conv-scratch slot and one
+        /// delta-state pointer per recurrent layer in order (the slot order of
+        /// <see cref="_fdGdnSlot"/>).</summary>
+        private bool PrepareDeviceStateKeys()
+        {
+            int[] layers = EnsureRecurrentLayerList();
+            if (layers.Length == 0)
+                return false;
+            if (_fdConvScratch == IntPtr.Zero)
+            {
+                _fdConvScratch = AllocateConvScratch();
+                _fdStateResident = false;
+            }
+            if (_handoffConvKeys == null || _handoffConvKeys.Length != layers.Length)
+            {
+                _handoffConvKeys = new IntPtr[layers.Length];
+                _handoffDeltaKeys = new IntPtr[layers.Length];
+            }
+            long convBytes = ConvStateBytesPerLayer;
+            for (int i = 0; i < layers.Length; i++)
+            {
+                Tensor delta = _deltaStateTensor[layers[i]];
+                if (delta == null)
+                    return false;
+                _handoffConvKeys[i] = _fdConvScratch + (nint)(i * convBytes);
+                _handoffDeltaKeys[i] = GdnDeltaStatePointer(delta);
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Settle a device-held verify state into the active cache's own device copies
+        /// rather than its host mirrors. A sequence the verifier switches away from then
+        /// keeps its state on the device, where its next decode, batched step or verify
+        /// reads it; before, every switch drained 151 MB and the resume uploaded it
+        /// again (~55 ms of idle GPU per prefill chunk with four Qwen3.8 lanes). Falls
+        /// back to the host drain when the copies cannot be made.
+        /// </summary>
+        internal void SettleVerifyStateOnDevice()
+        {
+            if (!_fvDeviceStateCurrent)
+                return;
+            if (DeviceStateHandoffAvailable && !_arenaStateResident && PrepareDeviceStateKeys()
+                && GgmlBasicOps.Qwen35ExportLiveState(_handoffConvKeys, _handoffDeltaKeys,
+                    _handoffConvKeys.Length, _verifyOwnerId))
+            {
+                _fvDeviceStateCurrent = false;
+                _fdStateResident = true;
+                _gdnStateHostDirty = true;
+                return;
+            }
+            DrainDeviceRecurrentState();
+        }
+
+        /// <summary>A released sequence's holder is recycled or freed, so nothing can read
+        /// its live verify state again: forget it rather than drain 151 MB into host bytes
+        /// that are about to be reset.</summary>
+        private void DiscardVerifyStateOfReleasedCache()
+        {
+            if (!_fvDeviceStateCurrent || !DeviceStateHandoffAvailable)
+                return;
+            GgmlBasicOps.Qwen35DiscardLiveState(_verifyOwnerId);
+            _fvDeviceStateCurrent = false;
+        }
+
+        /// <summary>The verify graph's state signature (its first layer's attention norm)
+        /// and per-layer state sizes, as the native live-state descriptor records them.</summary>
+        private unsafe bool TryGetVerifyStateShape(out IntPtr sig, out int layers, out long convBytes, out long deltaBytes)
+        {
+            sig = IntPtr.Zero;
+            convBytes = deltaBytes = 0;
+            int[] recurrent = EnsureRecurrentLayerList();
+            layers = recurrent.Length;
+            if (layers == 0 || _attnNormW?[0] == null || _deltaStateTensor[recurrent[0]] == null)
+                return false;
+            sig = (IntPtr)GetFloatPtr(_attnNormW[0]);
+            convBytes = ConvStateBytesPerLayer;
+            deltaBytes = GdnDeltaStateBytes(_deltaStateTensor[recurrent[0]]);
+            return true;
+        }
+
+        /// <summary>The live slices are the state from here; the decode's device copies
+        /// and the host mirrors trail them until the next hand-off or drain. Retires the
+        /// decode residency the way <see cref="InvalidateFullDecodeState"/> does, minus
+        /// its host sync.</summary>
+        private void MarkVerifyStateSeededOnDevice()
+        {
+            if (_fdStateResident)
+            {
+                _fdStateResident = false;
+                _bfdPoolSeeded = false;
+                GgmlBasicOps.Qwen35ResetDecodeCache();
+                CountDecodeGraphReset();
+            }
+            _fvDeviceStateCurrent = true;
+            _gdnStateHostDirty = true;
+        }
+
+        /// <summary>
+        /// Hand a state the decode left in the active cache's device copies to the
+        /// verifier's live slices, on the device. Before a verify this replaces syncing
+        /// those copies to the host and uploading the host mirrors again. Any later host
+        /// reader drains the verifier first, as it does after every verify.
+        /// </summary>
+        private bool TryImportDecodeStateToVerifier()
+        {
+            if (_fvDeviceStateCurrent || !_fdStateResident || !DeviceStateHandoffAvailable || _arenaStateResident)
+                return false;
+            if (!TryGetVerifyStateShape(out IntPtr sig, out int layers, out long convBytes, out long deltaBytes)
+                || !PrepareDeviceStateKeys()
+                || !GgmlBasicOps.Qwen35ImportLiveState(sig, _handoffConvKeys, _handoffDeltaKeys,
+                    layers, convBytes, deltaBytes, _verifyOwnerId))
+                return false;
+            MarkVerifyStateSeededOnDevice();
+            return true;
+        }
+
+        /// <summary>
+        /// Seed the verifier's live state on the device when the host mirrors are not
+        /// the state's only copy: a sequence's first chunk (position 0) starts from the
+        /// zero state, and a cache whose newest state is in its device copies resumes
+        /// from them. False leaves the caller to seed from the host as before.
+        /// </summary>
+        private bool TrySeedVerifyStateOnDevice(int startPos)
+        {
+            if (startPos != 0)
+                return TryImportDecodeStateToVerifier();
+            if (!DeviceStateHandoffAvailable || _arenaStateResident
+                || !TryGetVerifyStateShape(out IntPtr sig, out int layers, out long convBytes, out long deltaBytes)
+                || !GgmlBasicOps.Qwen35ZeroLiveState(sig, layers, convBytes, deltaBytes, _verifyOwnerId))
+                return false;
+            MarkVerifyStateSeededOnDevice();
+            return true;
+        }
+
         // TS_Q35_VERIFY_SNAPSHOTS=0 restores the pre-verify state copy and re-forwards the
         // accepted prefix instead of keeping per-row snapshots: the workaround for the
         // open divergence of verifies wider than eight rows on ggml_cuda
         // (docs/speculative_decoding.md). The native side reads it too.
+        private static readonly bool s_verifyLog =
+            Environment.GetEnvironmentVariable("TS_Q35_VERIFY_LOG") == "1";
+
         private static readonly bool _fvSnapshotsEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_Q35_VERIFY_SNAPSHOTS"), "0", StringComparison.Ordinal);
 
@@ -1886,8 +2112,9 @@ namespace TensorSharp.Models
             // A multi-token verify may follow fused single-token decode (for
             // example a same-session refill).  Verify seeds its recurrent graph
             // from the host ring, so preserve the resident decode state before
-            // switching graph families.
-            if (_fdStateResident)
+            // switching graph families - unless the state can be seeded on the
+            // device (TrySeedVerifyStateOnDevice).
+            if (!TrySeedVerifyStateOnDevice(startPos) && _fdStateResident)
                 InvalidateFullDecodeState();
             // The verifier tracks which shared state half is authoritative,
             // including after prefill and snapshot commits. It selects that half
@@ -2136,12 +2363,14 @@ namespace TensorSharp.Models
             // interleaves with it. Those plain steps used to break the device-state
             // chain: each one downloaded 151 MB and forced the NEXT verify to upload
             // it again, which on an MTP run (46 plain steps of 125) was most of the
-            // gap to the captured decode. Interior Metal prefill chunks are also
+            // gap to the captured decode. Interior prefill chunks are also
             // non-persisted, but keepDeviceState lets their two shared state halves
-            // ping-pong until the final chunk downloads the result.
+            // ping-pong on the device (Metal and CUDA) instead of downloading and
+            // re-uploading the 151 MB recurrent state around every chunk.
             bool deferState = (_fvSnapshotsEnabled && (nLogitRows <= 0 || seqLen == 1))
                 || (keepDeviceState
-                    && _backend == BackendType.GgmlMetal && nLogitRows > 0 && nLogitRows < seqLen);
+                    && (_backend is BackendType.GgmlMetal or BackendType.GgmlCuda)
+                    && nLogitRows > 0 && nLogitRows < seqLen);
             int snapshotsUsed = 1;
             // The live state is already correct on the device exactly when the last
             // step committed a snapshot into it and nothing has drained it since.
@@ -2149,6 +2378,7 @@ namespace TensorSharp.Models
             _fvSnapshotRows = 0;
             _fvAcceptedPrefixCommitted = false;
             bool ok2;
+            long verifyStart = s_verifyLog ? Stopwatch.GetTimestamp() : 0;
             fixed (float* lp = logitsOut)
             fixed (float* np = normedOut)
             fixed (float* cp = captureData)
@@ -2183,6 +2413,10 @@ namespace TensorSharp.Models
                         ropePositionDelta: mropePos != null ? 0 : _ropeDelta);
                 }
             }
+            if (s_verifyLog)
+                Console.Error.WriteLine($"[q35-verify] start={startPos} n={seqLen} logits={nLogitRows} cap={capCount} " +
+                    $"keep={keepDeviceState} defer={deferState} devCur={deviceStateCurrent} snaps={snapshotsUsed} " +
+                    $"{Stopwatch.GetElapsedTime(verifyStart).TotalMilliseconds:F1}ms");
             if (!ok2)
             {
                 // Latched for the process lifetime, exactly like the weight/state
@@ -2282,19 +2516,7 @@ namespace TensorSharp.Models
             if (!IsGgmlBackend || _fvConvOut == IntPtr.Zero || _convState == null || _fvGdnSlot == null)
                 return false;
 
-            int n = Config.NumLayers;
-            if (_fvRecurrentLayers == null)
-            {
-                int count = 0;
-                for (int l = 0; l < n; l++)
-                    if (_isRecurrent[l]) count++;
-                _fvRecurrentLayers = new int[count];
-                int w = 0;
-                for (int l = 0; l < n; l++)
-                    if (_isRecurrent[l]) _fvRecurrentLayers[w++] = l;
-                _fvSnapConvPtrs = new IntPtr[_fvRecurrentLayers.Length];
-                _fvSnapDeltaPtrs = new IntPtr[_fvRecurrentLayers.Length];
-            }
+            EnsureRecurrentLayerList();
 
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
             int convBlock = (_convKernel - 1) * qkvDim;

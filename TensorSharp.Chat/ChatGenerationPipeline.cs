@@ -526,8 +526,17 @@ namespace TensorSharp.Server
                 // the lock for the full encode. Adding YieldGpuComputeLock
                 // calls to their per-layer/per-block loops is the same
                 // ~3-line change as for Gemma 4 and recommended.
-                lock (model.GpuComputeLock)
+                //
+                // Registered while waiting, so the engine worker lets this request
+                // in at its next step boundary instead of re-taking the lock.
+                //
+                // A model whose encoder has a device stream of its own names a separate lock
+                // (ModelBase.MediaPreparationLock): preparation then runs beside engine steps.
+                object preparationLock = model.MediaPreparationLock;
+                GpuLockWaiters.Enter(preparationLock);
+                lock (preparationLock)
                 {
+                    GpuLockWaiters.Exit(preparationLock);
                     var unexpandedTokens = inputTokens;
                     // ClearPreparedPromptState is safe when preparation fails
                     // before creating a bucket. Arm cleanup first so partial

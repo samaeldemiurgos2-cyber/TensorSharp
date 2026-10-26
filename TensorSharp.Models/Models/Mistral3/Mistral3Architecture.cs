@@ -26,7 +26,9 @@ namespace TensorSharp.Models
             Id = "mistral3",
             DisplayName = "Mistral 3",
             Aliases = new[] { "mistral3" },
-            Factory = c => new Mistral3Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+            SupportsLayerSplit = true,
+            SupportsDistributedLayerSplit = true,
+            Factory = c => new Mistral3Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree),
             RecognizeRelabelledFile = IsLlamaLabelledMistral3,
             RelabelledFileDescription =
                 "a 'llama'-labelled dense Mistral checkpoint with the Tekken tokenizer, the [INST]/[SYSTEM_PROMPT] " +

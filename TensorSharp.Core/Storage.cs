@@ -66,6 +66,14 @@ namespace TensorSharp
         /// </summary>
         public virtual IntPtr PtrAtElementForOverwrite(long index) => PtrAtElement(index);
 
+        /// <summary>
+        /// True, once, when this storage's memory was all zero at allocation and nothing has
+        /// claimed that since: an allocation-time zero fill can then be skipped (a fresh
+        /// anonymous mapping is zero already, and touching it page-faults every page). Call it
+        /// right after allocation; later writes do not reset it. Default false.
+        /// </summary>
+        public virtual bool TakeAllocationZeroGuarantee() => false;
+
 
         public abstract int[] GetElementsAsInt(long index, int length);
         public abstract void SetElementsAsInt(long index, int[] value);

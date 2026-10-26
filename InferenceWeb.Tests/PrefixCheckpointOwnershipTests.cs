@@ -7,6 +7,7 @@ using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace InferenceWeb.Tests;
 
@@ -140,6 +141,146 @@ public class PrefixCheckpointOwnershipTests
 
         Assert.True(f.Clone("source", "retry"));
         f.AssertIndependent(retained, f.Active["retry"]!);
+    }
+
+    [Fact]
+    public void QwenReservedClone_CopiesOnce_AndFirstPrefillKeepsItsAllocation()
+    {
+        using var f = new Fixture(qwen: true);
+        var model = (Qwen35Model)f.Model;
+        Set(typeof(ModelBase), model, "_maxContextLength", 4096);
+        Assert.True(f.Checkpoint("source"));
+        object retained = f.Retained["source"]!;
+        IPrefixCacheModel pcm = model;
+        int reservation = pcm.ResolveCloneReservationTokens("source", 617);
+        Assert.Equal(768, reservation);
+        ResourceVector estimate = pcm.EstimateCloneBytes("source", 9, reservation);
+        int allocations = f.Allocator.Allocations;
+
+        Assert.True(pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "active", 9, 9, reservation)));
+        object clone = f.Active["active"]!;
+        Assert.Equal(768, Get(clone, "KvCapacity"));
+        Assert.Equal(16, Get(retained, "KvCapacity")); // Retained snapshots stay compact.
+        Assert.Equal(6, f.Allocator.Allocations - allocations); // Four KV slabs, two recurrent states.
+        Assert.Equal(f.State(retained, true), f.State(clone, true));
+        long actualKv = ((Tensor[])Get(clone, "K")!).Concat((Tensor[])Get(clone, "V")!)
+            .Where(t => t != null).Sum(t => t.Storage.ByteLength);
+        Assert.Equal(actualKv, estimate.HostKv);
+        Assert.Equal(0, estimate.DeviceKv); // Cloning allocates host storage; GPU mirrors stay lazy.
+        Tensor[] before = f.Tensors(clone);
+        f.Load(clone);
+        model.PrepareForPrefill(617);
+        Assert.Equal(6, f.Allocator.Allocations - allocations);
+        Assert.Equal(before, f.Tensors(clone));
+        Assert.Equal(f.State(retained, true), f.State(clone, true));
+        f.AssertIndependent(retained, clone);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void QwenCudaActiveClones_ReuseDistinctExactCapacityHolders_WithoutNewStorage(int count)
+    {
+        using var f = new Fixture(qwen: true);
+        var model = (Qwen35Model)f.Model;
+        Set(typeof(ModelBase), model, "_backend", BackendType.GgmlCuda);
+        Set(typeof(ModelBase), model, "_maxContextLength", 4096);
+        Assert.True(f.Checkpoint("source"));
+        object source = f.Retained["source"]!;
+        var oldOwners = new List<object>();
+        for (int i = 0; i < count; i++)
+        {
+            object holder = Invoke(model, "AllocateHolder", 768)!;
+            f.TrackOwner(holder);
+            f.Pool(holder);
+            foreach (var tensor in f.Tensors(holder))
+                tensor.SetElementsAsFloat(Enumerable.Repeat(-12345f, (int)tensor.ElementCount()).ToArray());
+            foreach (string flag in new[] { "KvHostDirty", "GdnHostDirty", "FdStateResident", "ArenaStateResident", "DeviceMirrored" })
+                Set(holder.GetType(), holder, flag, true);
+            oldOwners.Add(holder);
+        }
+        int allocations = f.Allocator.Allocations;
+        IPrefixCacheModel pcm = model;
+        for (int i = 0; i < count; i++)
+        {
+            Assert.True(pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "clone-" + i, 9, 9, 768)));
+            object copy = f.Active["clone-" + i]!;
+            Assert.Contains(copy, oldOwners);
+            Assert.Equal(f.State(source, true), f.State(copy, true));
+            Assert.Equal(768, Get(copy, "KvCapacity"));
+            foreach (string flag in new[] { "KvHostDirty", "GdnHostDirty", "FdStateResident", "ArenaStateResident", "DeviceMirrored" })
+                Assert.False((bool)Get(copy, flag)!);
+            foreach (var tensor in ((Tensor[])Get(copy, "K")!).Concat((Tensor[])Get(copy, "V")!).Where(t => t != null))
+            {
+                int heads = (int)tensor.Sizes[0], dim = (int)tensor.Sizes[2];
+                float[] values = tensor.GetElementsAsFloat((int)tensor.ElementCount());
+                for (int h = 0; h < heads; h++)
+                    Assert.All(values.AsSpan((h * 768 + 9) * dim, (768 - 9) * dim).ToArray(), x => Assert.Equal(0, x));
+            }
+        }
+        Assert.Equal(count, f.Active.Values.Cast<object>().Distinct().Count());
+        Assert.Equal(allocations, f.Allocator.Allocations);
+        Assert.Empty((IList)Get(model, "_holderPool")!);
+    }
+
+    [Theory]
+    [InlineData(false, 768)] // Other backends keep their established allocation policy.
+    [InlineData(true, 1024)] // A bigger idle holder must not inflate the clone's frozen budget.
+    public void QwenClone_DoesNotConsumeAnIneligibleIdleHolder(bool cuda, int idleCapacity)
+    {
+        using var f = new Fixture(qwen: true);
+        var model = (Qwen35Model)f.Model;
+        if (cuda) Set(typeof(ModelBase), model, "_backend", BackendType.GgmlCuda);
+        Set(typeof(ModelBase), model, "_maxContextLength", 4096);
+        Assert.True(f.Checkpoint("source"));
+        object parked = Invoke(model, "AllocateHolder", idleCapacity)!;
+        f.TrackOwner(parked); f.Pool(parked);
+        int allocations = f.Allocator.Allocations;
+        IPrefixCacheModel pcm = model;
+        Assert.True(pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "clone", 9, 9, 768)));
+        Assert.NotSame(parked, f.Active["clone"]);
+        Assert.Same(parked, Assert.Single(((IList)Get(model, "_holderPool")!).Cast<object>()));
+        Assert.Equal(6, f.Allocator.Allocations - allocations);
+    }
+
+    [Fact]
+    public void QwenPooledClone_CopyFailureDisposesThePartialOwner_AndPreservesSource()
+    {
+        using var f = new Fixture(qwen: true);
+        var model = (Qwen35Model)f.Model;
+        Set(typeof(ModelBase), model, "_backend", BackendType.GgmlCuda);
+        Set(typeof(ModelBase), model, "_maxContextLength", 4096);
+        Assert.True(f.Checkpoint("source"));
+        object source = f.Retained["source"]!;
+        byte[] before = f.State(source);
+        object parked = Invoke(model, "AllocateHolder", 768)!;
+        f.TrackOwner(parked); f.Pool(parked);
+        var parkedStorage = f.Tensors(parked).Select(t => (TrackedStorage)t.Storage).ToArray();
+        ((TrackedStorage)f.Tensors(source)[0].Storage).FailNextRead = true;
+        IPrefixCacheModel pcm = model;
+        Assert.Throws<IOException>(() => pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "clone", 9, 9, 768)));
+        Assert.Empty((IList)Get(model, "_holderPool")!);
+        Assert.False(f.Active.Contains("clone"));
+        Assert.All(parkedStorage, storage => Assert.True(storage.Freed));
+        Assert.Equal(before, f.State(source));
+        Assert.True(pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "source", "retry", 9, 9, 768)));
+        f.AssertIndependent(source, f.Active["retry"]!);
+    }
+
+    [Fact]
+    public void QwenCheckpoint_DoesNotConsumeAnExactCapacityIdleHolder()
+    {
+        using var f = new Fixture(qwen: true);
+        var model = (Qwen35Model)f.Model;
+        Set(typeof(ModelBase), model, "_backend", BackendType.GgmlCuda);
+        object parked = Invoke(model, "AllocateHolder", 16)!;
+        f.TrackOwner(parked); f.Pool(parked);
+        int allocations = f.Allocator.Allocations;
+        Assert.True(f.Checkpoint("snapshot"));
+        Assert.Equal(6, f.Allocator.Allocations - allocations);
+        Assert.NotSame(parked, f.Retained["snapshot"]);
+        Assert.Same(parked, Assert.Single(((IList)Get(model, "_holderPool")!).Cast<object>()));
     }
 
     [Theory]
@@ -371,6 +512,16 @@ public class PrefixCheckpointOwnershipTests
         }
         internal void Load(object holder) => Invoke(Model, "LoadCacheHolder", holder);
         internal void TrackOwner(object holder) => owners.Add(holder);
+        internal void Pool(object holder)
+        {
+            var list = (IList?)Get(Model, "_holderPool");
+            if (list == null)
+            {
+                list = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(holder.GetType()))!;
+                Set(modelType, Model, "_holderPool", list);
+            }
+            list.Add(holder);
+        }
         internal void ForgetOwner(object holder) => owners.Remove(holder);
         internal Tensor[] Tensors(object holder)
         {

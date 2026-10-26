@@ -413,7 +413,8 @@ namespace TensorSharp.Models
             {
                 // The DFlash ring holds committed positions only, and the executor
                 // hands back exactly the rows it committed.
-                EnterSpecSession();
+                if (!_batchedSpecScope)
+                    EnterSpecSession();
                 DFlashCommit(tokens, hRows, startPos);
                 return;
             }
@@ -776,8 +777,9 @@ namespace TensorSharp.Models
             // this snapshot before the verify forward that would sync it, so the
             // host mirrors below could still hold the pre-park state. Settle it
             // first, or a rollback that restores from this snapshot (the host-mode
-            // verify, the per-op fallback) would continue from stale state.
-            if (_fdStateResident)
+            // verify, the per-op fallback) would continue from stale state. On CUDA it
+            // moves into the verifier's live slices, which then serve as the snapshot.
+            if (_fdStateResident && !TryImportDecodeStateToVerifier())
                 InvalidateFullDecodeState();
             // Nothing to copy: the state the verify is about to run from lives in the
             // shared device slices, the verify writes its results elsewhere (the

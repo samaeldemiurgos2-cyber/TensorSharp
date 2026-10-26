@@ -17,7 +17,7 @@ namespace TensorSharp.Distributed
     /// This minimises network traffic: only one buffer per AllReduce
     /// crosses the network, regardless of how many local GPUs participate.
     /// </summary>
-    public sealed class DistributedTensorParallelGroup : ITensorParallelGroup, INestedTensorParallelGroup
+    public sealed class DistributedTensorParallelGroup : ITensorParallelGroup, INestedTensorParallelGroup, IDistributedExecutionGroup
     {
         /// <summary>The group that owns this node's GPUs.</summary>
         public ITensorParallelGroup LocalGroup => _localGroup;
@@ -27,13 +27,6 @@ namespace TensorSharp.Distributed
         private readonly int _nodeId;
         private readonly int _nodeCount;
         private bool _disposed;
-
-        // Reusable host buffers for GPU↔network transfers. Pinned so the
-        // kernel can DMA directly to/from the NIC without an extra copy.
-        private float[] _hostBuffer = Array.Empty<float>();
-        private float[] _resultBuffer = Array.Empty<float>();
-        private System.Runtime.InteropServices.GCHandle _hostPin;
-        private System.Runtime.InteropServices.GCHandle _resultPin;
 
         /// <param name="localDegree">Number of GPUs on this node.</param>
         /// <param name="nodeId">This node's ID (0..nodeCount-1).</param>
@@ -58,6 +51,7 @@ namespace TensorSharp.Distributed
         /// </param>
         public DistributedTensorParallelGroup(ITensorParallelGroup localGroup, int nodeId, IPEndPoint[] peerEndpoints)
         {
+            ArgumentNullException.ThrowIfNull(peerEndpoints);
             _nodeId = nodeId;
             _nodeCount = peerEndpoints.Length;
 
@@ -68,7 +62,12 @@ namespace TensorSharp.Distributed
 
             _localGroup = localGroup;
             int localDegree = localGroup.Degree;
-            _tcp = new TcpCommunicator(nodeId, peerEndpoints);
+            try
+            {
+                _tcp = new TcpCommunicator(nodeId, peerEndpoints);
+                _tcp.ValidateConfiguration($"tensor-parallel:{localDegree}");
+            }
+            catch { _tcp?.Dispose(); localGroup.Dispose(); throw; }
 
             Console.WriteLine($"Distributed tensor parallelism: node {nodeId}/{_nodeCount}, " +
                 $"{localDegree} local GPU(s), {_nodeCount * localDegree} total across cluster.");
@@ -108,23 +107,18 @@ namespace TensorSharp.Distributed
             _localGroup.AllReduce(tensors);
 
             // Phase 2: Copy rank-0 GPU data to host buffer.
-            int elementCount = (int)tensors[0].Storage.ElementCount;
-            EnsureBuffers(elementCount);
-
+            int elementCount = checked((int)tensors[0].ElementCount());
             var hostData = tensors[0].GetElementsAsFloat(elementCount);
-            Array.Copy(hostData, _hostBuffer, elementCount);
 
-            // Phase 3: TCP AllReduce across nodes (modifies _hostBuffer in-place).
-            // Runs on the dedicated I/O thread inside TcpCommunicator.
-            _tcp.AllReduce(_hostBuffer, elementCount);
+            // Phase 3: Reduce the actual host copy in-place. GC pinning alone
+            // does not register page-locked CUDA/NIC memory; additional pinned
+            // arrays only introduced copies on this portable staging path.
+            _tcp.AllReduce(hostData, elementCount);
 
             // Phase 4: Broadcast the reduced result from host to all local GPUs.
-            // Reuse _resultBuffer to avoid a per-call allocation.
-            Array.Copy(_hostBuffer, _resultBuffer, elementCount);
-
             for (int r = 0; r < Degree; r++)
             {
-                tensors[r].SetElementsAsFloat(_resultBuffer);
+                tensors[r].SetElementsAsFloat(hostData);
                 tensors[r].EnsureDeviceCurrent();
             }
 
@@ -142,8 +136,9 @@ namespace TensorSharp.Distributed
         public void CrossNodeAllReduce(float[] buffer, int count)
         {
             ArgumentNullException.ThrowIfNull(buffer);
-            if (count > 0)
-                _tcp.AllReduce(buffer, count);
+            if ((uint)count > (uint)buffer.Length)
+                throw new ArgumentOutOfRangeException(nameof(count));
+            _tcp.AllReduce(buffer, count);
         }
 
         public void Synchronize()
@@ -164,33 +159,12 @@ namespace TensorSharp.Distributed
         /// <summary>Worker node blocks for the next control message from the driver.</summary>
         public (int op, int[] payload) ReceiveControl() => _tcp.ReceiveControl();
 
-        private int _bufferSize;
-
-        private void EnsureBuffers(int elementCount)
-        {
-            if (_bufferSize == elementCount)
-                return;
-
-            if (_hostPin.IsAllocated) _hostPin.Free();
-            if (_resultPin.IsAllocated) _resultPin.Free();
-
-            _hostBuffer = new float[elementCount];
-            _resultBuffer = new float[elementCount];
-            _bufferSize = elementCount;
-
-            _hostPin = System.Runtime.InteropServices.GCHandle.Alloc(_hostBuffer,
-                System.Runtime.InteropServices.GCHandleType.Pinned);
-            _resultPin = System.Runtime.InteropServices.GCHandle.Alloc(_resultBuffer,
-                System.Runtime.InteropServices.GCHandleType.Pinned);
-        }
+        public void Abort(Exception failure) => _tcp.Abort(failure);
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-
-            if (_hostPin.IsAllocated) _hostPin.Free();
-            if (_resultPin.IsAllocated) _resultPin.Free();
 
             _tcp?.Dispose();
             _localGroup?.Dispose();

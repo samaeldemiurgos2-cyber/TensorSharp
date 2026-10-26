@@ -1483,6 +1483,7 @@ namespace tsg
         ggml_tensor* tensor, void* data, std::size_t bytes, bool& out_needs_upload,
         enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+    void prefault_host_ranges(void* base, const std::int64_t* offsets, const std::int64_t* lengths, int count);
     bool sync_cached_buffer_to_host(void* data, std::size_t bytes);
 
     // --- Tensor binding creation ---

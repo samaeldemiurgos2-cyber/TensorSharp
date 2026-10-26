@@ -41,7 +41,10 @@ public sealed class CliInferenceSessionTests
         using var cold = new CliInferenceSession(reference, Config, NullLogger.Instance);
         var expected = cold.Generate(prompt, 4, SamplingConfig.Greedy, cancellationToken: timeout.Token,
             enablePrefixCache: false);
-        Assert.Equal(64, reused.Completion.PrefixCacheReusedTokens);
+        // A recurrent cache cannot rewind, so its automatic prompt checkpoint sits one
+        // token before the prompt end (PrefixCacheCoordinator.AutomaticCheckpointBoundary):
+        // the same prompt can then be served again, and this extension re-prefills that token.
+        Assert.Equal(recurrent ? 63 : 64, reused.Completion.PrefixCacheReusedTokens);
         Assert.Equal(expected.Tokens, reused.Tokens);
     }
 

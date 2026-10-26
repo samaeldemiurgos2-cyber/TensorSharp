@@ -40,6 +40,7 @@ using System.Runtime.InteropServices;
 using TensorSharp.GGML;
 using TensorSharp.MLX;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace TensorSharp.Models
 {
@@ -89,6 +90,23 @@ namespace TensorSharp.Models
             // recurrent state have device copies besides the host bytes (the prefix
             // cache's MeasureEndState charges both). Copies and imports start without.
             public bool DeviceMirrored;
+            // Last use of a retained holder's device K/V copies (clone source, capture,
+            // retention); the least recent are demoted to host first under pressure.
+            public long DeviceUseStamp;
+            // Clones taken from this retained holder. Demotion takes holders nothing has
+            // reused (a finished request's end state, a checkpoint never matched) before
+            // ones that have served a clone, whatever their recency.
+            public int CloneCount;
+            // Background download of this idle holder's K/V rows to its host bytes
+            // (ScheduleIdleKvSyncs). True on success; every path that reads, frees or
+            // binds the holder's K/V waits for it first (WaitIdleKvSync).
+            public System.Threading.Tasks.Task<bool> IdleKvSync;
+            // IdleKvSync is a checkpoint capture filling this holder's otherwise
+            // unwritten host K/V: a failure leaves no copy of the rows to fall back on.
+            public bool IdleKvSyncIsCapture;
+            // A checkpoint file is being written from this holder's host bytes on another
+            // thread; nothing may free or rewrite them until it completes.
+            public System.Threading.Tasks.Task ExportTask;
         }
 
         // Per-request fused-decode holders, keyed by RequestId.
@@ -282,6 +300,8 @@ namespace TensorSharp.Models
 
         private void LoadCacheHolder(Qwen35KvCacheHolder h)
         {
+            WaitIdleKvSync(h);
+            WaitExport(h);
             // The persistent verify cache is keyed by graph shape, not by the
             // per-request K/V holder whose device addresses it captures. Drop it
             // before switching holders so an all-logits/spec verify cannot replay
@@ -322,10 +342,65 @@ namespace TensorSharp.Models
             return AllocateHolder(_initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity);
         }
 
+        // Only active CUDA clones opt into this reuse. Long-lived checkpoints
+        // still allocate compact independent storage, and other backends retain
+        // their existing host/device ownership rules. Exact capacity prevents an
+        // idle large reservation from inflating a smaller request's footprint.
+        private Qwen35KvCacheHolder TakePooledCloneHolder(int cap)
+        {
+            if (_backend != BackendType.GgmlCuda || _holderPool == null)
+                return null;
+            for (int i = _holderPool.Count - 1; i >= 0; i--)
+            {
+                var holder = _holderPool[i];
+                if (holder.KvCapacity != cap || holder.DisposalStarted || holder.Retired)
+                    continue;
+                _holderPool.RemoveAt(i); // One owner from here through copy/publication or disposal.
+                return holder;
+            }
+            return null;
+        }
+
+        private void PreparePooledHolderForClone(Qwen35KvCacheHolder holder)
+        {
+            // Discard the old request's arena mapping BEFORE overwriting its host
+            // bytes. Invalidation may flush other live slots, but must never flush
+            // this completed slot over the new prefix. Existing invalidation hooks
+            // retire graphs before freeing their cached device bindings.
+            DiscardArenaSlotForHolder(holder);
+            WaitCaptureReads(holder.K, holder.V);
+            foreach (var set in new[] { holder.K, holder.V })
+                if (set != null)
+                    foreach (var tensor in set) InvalidateTensorDeviceCache(tensor);
+            if (holder.DeltaState != null)
+                foreach (var tensor in holder.DeltaState)
+                    if (tensor != null) InvalidateGdnDeltaStateDeviceCaches(tensor);
+            int convDim = _convKernel - 1;
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            long layerBytes = (long)Math.Max(0, convDim) * qkvDim * sizeof(float);
+            int recurrentSlot = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_isRecurrent[l]) continue;
+                if (holder.ConvScratch != IntPtr.Zero && layerBytes > 0)
+                    GgmlBasicOps.InvalidateHostBuffer(new IntPtr(holder.ConvScratch.ToInt64() + recurrentSlot * layerBytes));
+                recurrentSlot++;
+            }
+            // Do not ResetHolderForReuse: the copy below overwrites every live
+            // attention row and recurrent state, then clears only KV padding.
+            holder.DeviceMirrored = false;
+        }
+
         /// <summary>A brand-new, zeroed holder with attention K/V of <paramref name="cap"/>
         /// rows. The allocation half of <see cref="CreateFreshHolder"/>, on its own so a
         /// copy can be sized to its source (a pooled holder may have grown).</summary>
         private Qwen35KvCacheHolder AllocateHolder(int cap)
+            => AllocateHolderStorage(cap, overwriteAttention: false);
+
+        /// <param name="overwriteAttention">The caller writes every attention row it reads; skip zeroing K/V.</param>
+        /// <param name="overwriteState">The caller copies every recurrent layer's delta state; skip
+        /// zeroing it (on fresh memory the fill is a page-faulting pass the copy repeats).</param>
+        private Qwen35KvCacheHolder AllocateHolderStorage(int cap, bool overwriteAttention, bool overwriteState = false)
         {
             int numLayers = _kvCacheK.Length;
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
@@ -355,15 +430,21 @@ namespace TensorSharp.Models
                     {
                         holder.K[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, cap, Config.HeadDim);
                         holder.V[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, cap, Config.HeadDim);
-                        InitializeCacheTensor(holder.K[l]);
-                        InitializeCacheTensor(holder.V[l]);
+                        if (!overwriteAttention)
+                        {
+                            InitializeCacheTensor(holder.K[l]);
+                            InitializeCacheTensor(holder.V[l]);
+                        }
                     }
                     else
                     {
                         holder.ConvState[l] = new float[checked(Math.Max(0, convDim) * qkvDim)];
                         holder.DeltaState[l] = AllocateGdnDeltaStateTensor(
                             _allocator, _useMetalGdnInplaceState, _numVHeads, _headVDim, _headKDim);
-                        Ops.Fill(holder.DeltaState[l], 0);
+                        // 3 MB per layer, 151 MB per Qwen3.8 holder: on a fresh mapping the fill
+                        // page-faulted ~0.15 s into every new request once the pool had been trimmed.
+                        if (!overwriteState && !holder.DeltaState[l].Storage.TakeAllocationZeroGuarantee())
+                            Ops.Fill(holder.DeltaState[l], 0);
                         if (holder.MlxGdn != null)
                             holder.MlxGdn[l] = new MlxFusedOps.GatedDeltaNetCache();
                         gdnCount++;
@@ -396,7 +477,10 @@ namespace TensorSharp.Models
                 return false; // already active
 
             // Save whatever cache is currently checked out so its (possibly grown)
-            // tensors aren't lost when we repoint the active fields.
+            // tensors aren't lost when we repoint the active fields. Its verify state
+            // moves into its own device copies first, so the snapshot records where
+            // that state now lives.
+            SettleVerifyStateOnDevice();
             if (_activeFusedKey == null)
                 _primaryHolder = SnapshotActiveCache();
             else
@@ -467,6 +551,7 @@ namespace TensorSharp.Models
                 _activeFusedKey = null;
                 return;
             }
+            SettleVerifyStateOnDevice();
             _fusedHolders[_activeFusedKey] = SnapshotActiveCache();
             _activeFusedKey = null;
             if (_primaryHolder != null)
@@ -490,7 +575,9 @@ namespace TensorSharp.Models
                 // The released sequence's cache is currently checked out. Swap the
                 // primary back in so the active fields don't dangle. Snapshot
                 // first: growth or state reseeding may have replaced fields since
-                // this holder was loaded, making the dictionary entry stale.
+                // this holder was loaded, making the dictionary entry stale. Nothing
+                // can read its verify state any more, so it is dropped, not drained.
+                DiscardVerifyStateOfReleasedCache();
                 holder = SnapshotActiveCache();
                 _activeFusedKey = null;
                 if (_primaryHolder != null)
@@ -530,6 +617,10 @@ namespace TensorSharp.Models
                 // Capture replacements caused by growth/reseeding before checking
                 // the holder in, then restore the primary model cache. Do not flush
                 // or discard the arena slot: it may contain the newest KV/GDN state.
+                // A device-held verify state is settled first, so the snapshot's
+                // residency flags say where it went (switching back to the primary
+                // would otherwise move it after the flags were recorded).
+                SettleVerifyStateOnDevice();
                 holder = SnapshotActiveCache();
                 _activeFusedKey = null;
                 if (_primaryHolder != null)
@@ -541,6 +632,8 @@ namespace TensorSharp.Models
 
             _retainedFusedHolders.Add(key, holder);
             _fusedHolders.Remove(requestId);
+            TouchDeviceRetained(holder);
+            ScheduleIdleKvSyncs();
             return true;
         }
 
@@ -557,6 +650,8 @@ namespace TensorSharp.Models
             if (!_retainedFusedHolders.TryGetValue(retainedRequestId, out var holder))
                 return false;
             if (holder.Retired) return false;
+            WaitIdleKvSync(holder);
+            WaitExport(holder);
 
             _fusedHolders ??= new Dictionary<string, Qwen35KvCacheHolder>(StringComparer.Ordinal);
             if (_fusedHolders.ContainsKey(newRequestId))
@@ -586,6 +681,9 @@ namespace TensorSharp.Models
         private void RecycleHolder(Qwen35KvCacheHolder holder)
         {
             if (holder == null) return;
+            WaitIdleKvSync(holder);
+            WaitExport(holder);
+            WaitCaptureReads(holder.K, holder.V);
             if (holder.DisposalStarted)
             {
                 DisposeHolder(holder);
@@ -605,7 +703,7 @@ namespace TensorSharp.Models
             if (!memoryFits)
             {
                 DisposeHolder(holder);
-                TrimIdleMemory();
+                TrimIdleMemoryForPressure();
                 return;
             }
             // A parked Metal holder is re-zeroed and re-seeded at reuse, so its
@@ -630,20 +728,43 @@ namespace TensorSharp.Models
         /// capture -- is worth nothing to a process about to be killed for memory.</summary>
         public override void TrimIdleMemory()
         {
-            if (_holderPool != null && _holderPool.Count > 0)
-            {
-                // Taken out of the pool BEFORE anything is disposed, so a dispose that
-                // throws part-way cannot leave a freed holder where CreateFreshHolder
-                // would hand it out again. Whatever survives the throw is simply leaked
-                // until the model is disposed, which is the safe direction.
-                var parked = _holderPool;
-                _holderPool = null;
-                int count = parked.Count;
-                foreach (var holder in parked)
-                    DisposeHolder(holder);
-                Console.WriteLine($"[memory] Qwen35: freed {count} parked K/V holder(s)");
-            }
+            DisposeParkedHolders();
             base.TrimIdleMemory();
+        }
+
+        private void DisposeParkedHolders()
+        {
+            if (_holderPool == null || _holderPool.Count == 0)
+                return;
+            // Taken out of the pool BEFORE anything is disposed, so a dispose that
+            // throws part-way cannot leave a freed holder where CreateFreshHolder
+            // would hand it out again. Whatever survives the throw is simply leaked
+            // until the model is disposed, which is the safe direction.
+            var parked = _holderPool;
+            _holderPool = null;
+            int count = parked.Count;
+            foreach (var holder in parked)
+                DisposeHolder(holder);
+            Console.WriteLine($"[memory] Qwen35: freed {count} parked K/V holder(s)");
+        }
+
+        /// <summary>
+        /// <see cref="TrimIdleMemory"/> for a holder that could not be parked: the parked
+        /// holders (and their device copies) are freed, but the host memory pool goes back
+        /// to the system only when host memory is what ran short. With four long Qwen3.8
+        /// requests device memory is the usual limit, and releasing the host pool on every
+        /// such discard cost ~0.6 s of unmapping on the worker and turned the next
+        /// holders' host allocations into page faults.
+        /// </summary>
+        private const long HostPoolKeepSpareBytes = 4L * 1024 * 1024 * 1024;
+
+        private void TrimIdleMemoryForPressure()
+        {
+            long? hostSpare = GetHostMemorySpareBytes();
+            if (hostSpare.HasValue && hostSpare.Value >= HostPoolKeepSpareBytes)
+                DisposeParkedHolders();
+            else
+                TrimIdleMemory();
         }
 
         // ---- Shared-prefix checkpoints (IBatchedPagedModel) ----
@@ -667,19 +788,64 @@ namespace TensorSharp.Models
                 return false;
             _retainedFusedHolders.EnsureCapacity(checked(_retainedFusedHolders.Count + 1));
             // Three places can hold state newer than the host bytes the copy reads: the
-            // native arena slot and the K/V device mirrors (EnsureKvCacheHostSynchronized
-            // flushes and syncs both), the fused-decode conv scratch and delta mirrors
+            // native arena slot and the K/V device mirrors (SynchronizeCheckpointKvRows
+            // flushes the slot and syncs committed rows), the fused-decode conv scratch and delta mirrors
             // (EnsureFusedDecodeStateHostSynchronized), and verify-owned device slices
-            // (DrainDeviceRecurrentState). Same order TryExtractKVBlock uses.
-            EnsureKvCacheHostSynchronized();
+            // (DrainDeviceRecurrentState). Same order TryExtractKVBlock uses. On CUDA the
+            // committed K/V rows are copied on the device instead: the checkpoint keeps
+            // device-authoritative K/V and host recurrent state.
+            long captureStarted = PrefixReleaseDebug ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            FlushArenaSlotForActiveHolder();
             EnsureFusedDecodeStateHostSynchronized();
-            DrainDeviceRecurrentState();
-            var copy = DeepCopyHolder(SnapshotActiveCache());
+            // Between prefill chunks the verifier holds the newest recurrent state. The device
+            // route copies it straight into the checkpoint's host bytes and leaves it live:
+            // a drain handed it to the active cache's host copy, which the checkpoint then
+            // duplicated and the next chunk uploaded again (151 MB each on Qwen3.8-27B).
+            bool stateFromLive = s_captureReadsLiveState && _fvDeviceStateCurrent && _backend == BackendType.GgmlCuda;
+            if (!stateFromLive)
+                DrainDeviceRecurrentState();
+            double syncedMs = PrefixReleaseDebug ? System.Diagnostics.Stopwatch.GetElapsedTime(captureStarted).TotalMilliseconds : 0;
+            string route = "host";
+            Qwen35KvCacheHolder copy = null;
+            Qwen35KvCacheHolder active = SnapshotActiveCache();
+            if (CanCopyHolderKvOnDevice(active)
+                && EnsureDeviceRetainHeadroom(HolderKvBytes(active, CloneCapacity(active, 0)), requireReserve: true))
+            {
+                copy = DeepCopyHolderOnDevice(active, 0, recurrentFromLive: stateFromLive);
+                route = stateFromLive ? "device+live" : "device";
+            }
+            if (copy == null && stateFromLive)
+            {
+                // The other routes copy the active cache's host state: bring it current.
+                DrainDeviceRecurrentState();
+                active = SnapshotActiveCache();
+            }
+            if (copy == null && CanCaptureCheckpointInBackground())
+            {
+                var pairs = new List<(Tensor Source, Tensor Destination)>();
+                copy = DeepCopyHolder(active, 0, pairs);
+                StartCaptureCopy(copy, pairs, Math.Max(0, Math.Min(active.CacheSeqLen, active.KvCapacity)));
+                route = "background";
+            }
+            double rowSyncMs = 0;
+            if (copy == null)
+            {
+                long rowSyncStarted = PrefixReleaseDebug ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                SynchronizeCheckpointKvRows();
+                if (PrefixReleaseDebug) rowSyncMs = System.Diagnostics.Stopwatch.GetElapsedTime(rowSyncStarted).TotalMilliseconds;
+                copy = DeepCopyHolder(SnapshotActiveCache());
+            }
+            if (PrefixReleaseDebug)
+                Console.Error.WriteLine($"[prefix-capture] {active.CacheSeqLen} tokens via {route}: state sync {syncedMs:F1} ms, " +
+                    $"row sync {rowSyncMs:F1} ms, hostDirty={_kvCacheHostDirty}, " +
+                    $"total {System.Diagnostics.Stopwatch.GetElapsedTime(captureStarted).TotalMilliseconds:F1} ms");
             bool published = false;
             try
             {
                 _retainedFusedHolders.Add(key, copy);
+                TouchDeviceRetained(copy);
                 published = true;
+                ScheduleIdleKvSyncs();
             }
             finally
             {
@@ -688,10 +854,58 @@ namespace TensorSharp.Models
             return true;
         }
 
+        /// <summary>A checkpoint copies only the committed rows. Downloading the
+        /// entire reserved context first transfers unused capacity on every turn.
+        /// Keep the active cache device-dirty: its unwritten rows (including an MTP
+        /// draft ahead of the trunk) have deliberately not been synchronized.</summary>
+        private void SynchronizeCheckpointKvRows()
+        {
+            if (_backend != BackendType.GgmlCuda)
+            {
+                EnsureKvCacheHostSynchronized();
+                return;
+            }
+            FlushArenaSlotForActiveHolder();
+            if (!_kvCacheHostDirty) return;
+            int rows = Math.Max(0, Math.Min(_cacheSeqLen, _kvCacheCapacity));
+            if (rows == 0) return;
+            foreach (Tensor[] tensors in new[] { _kvCacheK, _kvCacheV })
+                foreach (Tensor tensor in tensors)
+                {
+                    if (tensor == null) continue;
+                    IntPtr pointer = TensorComputePrimitives.GetStorageBasePointer(tensor);
+                    // The range API also serves optional mirrors and accepts an
+                    // absent or resized entry as a no-op. A device-dirty checkpoint
+                    // cannot accept that: use the full sync's checked path instead.
+                    if (!GgmlBasicOps.HasResidentDeviceCopy(pointer, tensor.Storage.ByteLength))
+                    {
+                        SyncTensorHostCache(tensor);
+                        continue;
+                    }
+                    int heads = checked((int)tensor.Sizes[0]);
+                    long capacity = tensor.Sizes[1];
+                    long rowBytes = tensor.Storage.ByteLength / checked(heads * capacity);
+                    var offsets = new long[heads];
+                    var lengths = new long[heads];
+                    for (int h = 0; h < heads; h++)
+                    {
+                        offsets[h] = checked(h * capacity * rowBytes);
+                        lengths[h] = checked(rows * rowBytes);
+                    }
+                    GgmlBasicOps.SyncHostBufferRanges(pointer, offsets, lengths);
+                }
+        }
+
         /// <summary>Deep-copy the retained holder <paramref name="retainedKey"/> into a
         /// fresh active holder for <paramref name="newRequestId"/>; the retained one is
         /// untouched. See <see cref="IBatchedPagedModel.TryCloneRetainedCache"/>.</summary>
         public bool TryCloneRetainedCache(string retainedKey, string newRequestId)
+            => CloneRetainedCacheCore(retainedKey, newRequestId, 0);
+
+        bool IHolderPrefixCacheModel.TryCloneRetainedCache(string retainedKey, string newRequestId, int requiredContextTokens)
+            => CloneRetainedCacheCore(retainedKey, newRequestId, requiredContextTokens);
+
+        private bool CloneRetainedCacheCore(string retainedKey, string newRequestId, int requiredContextTokens)
         {
             if (_retainedFusedHolders == null
                 || string.IsNullOrEmpty(retainedKey)
@@ -699,16 +913,55 @@ namespace TensorSharp.Models
                 return false;
             if (!_retainedFusedHolders.TryGetValue(retainedKey, out var source))
                 return false;
+            long cloneStarted = PrefixReleaseDebug ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            WaitIdleKvSync(source);
+            double waitedMs = PrefixReleaseDebug ? System.Diagnostics.Stopwatch.GetElapsedTime(cloneStarted).TotalMilliseconds : 0;
             _fusedHolders ??= new Dictionary<string, Qwen35KvCacheHolder>(StringComparer.Ordinal);
             if (_fusedHolders.ContainsKey(newRequestId)
                 || string.Equals(_activeFusedKey, newRequestId, StringComparison.Ordinal))
                 return false;
-            // A checkpoint is never bound, so its host bytes stay the truth; a retained
-            // conversation holder may be device-dirty and is re-keyed, never copied.
-            if (source.KvHostDirty || source.GdnHostDirty || source.ArenaStateResident || source.FdStateResident || source.Retired)
+            // A checkpoint is never bound, so its recurrent state stays in host bytes; a
+            // retained conversation holder with device-only recurrent state is re-keyed,
+            // never copied. CUDA K/V may be device-authoritative and is copied there.
+            if (source.GdnHostDirty || source.ArenaStateResident || source.FdStateResident || source.Retired)
+                return false;
+            // The clone becomes the active cache and needs its K/V on the device either
+            // way; make room by demoting idle retained copies, without requiring the
+            // reserve. Giving a host-only checkpoint a device copy is optional and does.
+            int cloneCapacity = CloneCapacity(source, requiredContextTokens);
+            bool onDevice = CanCopyHolderKvOnDevice(source);
+            if (!onDevice && !source.KvHostDirty
+                && EnsureDeviceRetainHeadroom(HolderKvBytes(source, source.KvCapacity) + HolderKvBytes(source, cloneCapacity), requireReserve: true))
+                onDevice = TryUploadHolderKvForDeviceCopies(source);
+            double uploadedMs = PrefixReleaseDebug ? System.Diagnostics.Stopwatch.GetElapsedTime(cloneStarted).TotalMilliseconds : 0;
+            if (onDevice)
+            {
+                TouchDeviceRetained(source);
+                EnsureDeviceRetainHeadroom(HolderKvBytes(source, cloneCapacity), requireReserve: false, exclude: source);
+            }
+            double headroomMs = PrefixReleaseDebug ? System.Diagnostics.Stopwatch.GetElapsedTime(cloneStarted).TotalMilliseconds : 0;
+            if (source.KvHostDirty && !onDevice)
                 return false;
             _fusedHolders.EnsureCapacity(checked(_fusedHolders.Count + 1));
-            var copy = DeepCopyHolder(source);
+            var copy = onDevice ? DeepCopyHolderOnDevice(source, requiredContextTokens, liveClone: true) : null;
+            if (copy == null && source.KvHostDirty)
+                return false;
+            string route = copy != null ? "device" : "host";
+            // A checkpoint that stays in host memory (no room to give it device copies of
+            // its own) is uploaded straight into the clone's device copies: the clone is
+            // bound next and needs them either way, and the host route first copied every
+            // row on the host (~100 ms at 17K tokens) and then uploaded the copy.
+            if (copy == null && !onDevice && DeviceHolderCopiesEnabled && !source.ArenaStateResident)
+            {
+                EnsureDeviceRetainHeadroom(HolderKvBytes(source, cloneCapacity), requireReserve: false, exclude: source);
+                copy = DeepCopyHolderOnDevice(source, requiredContextTokens, uploadHostRows: true, liveClone: true);
+                if (copy != null) route = "upload";
+            }
+            copy ??= DeepCopyHolder(source, requiredContextTokens);
+            if (PrefixReleaseDebug)
+                Console.Error.WriteLine($"[prefix-clone] {source.CacheSeqLen} tokens via {route} " +
+                    $"(capacity {copy.KvCapacity}): {System.Diagnostics.Stopwatch.GetElapsedTime(cloneStarted).TotalMilliseconds:F1} ms " +
+                    $"(sync wait {waitedMs:F1}, upload {uploadedMs - waitedMs:F1}, headroom {headroomMs - uploadedMs:F1})");
             bool published = false;
             try
             {
@@ -719,6 +972,7 @@ namespace TensorSharp.Models
             {
                 if (!published) DisposeHolder(copy);
             }
+            source.CloneCount++;
             return true;
         }
 
@@ -746,11 +1000,68 @@ namespace TensorSharp.Models
                 return false;
             if (!_retainedFusedHolders.TryGetValue(key, out var h) || h.K == null)
                 return false;
+            WaitIdleKvSync(h);
             // Only host-authoritative state can be written: a checkpoint is never bound.
-            if (h.KvHostDirty || h.GdnHostDirty || h.ArenaStateResident || h.FdStateResident || h.Retired)
+            // A CUDA checkpoint's K/V rows live on the device; download them first.
+            if (h.GdnHostDirty || h.ArenaStateResident || h.FdStateResident || h.Retired)
                 return false;
+            if (h.KvHostDirty && !TrySyncHolderKvRowsToHost(h))
+                return false;
+            WriteHolderCheckpoint(h, Math.Max(0, Math.Min(h.CacheSeqLen, h.KvCapacity)), destination);
+            return true;
+        }
 
+        /// <summary>
+        /// Prepare a checkpoint file write that runs off the worker (see
+        /// IPrefixCacheModel.TryPrepareBackgroundExport): a device-authoritative holder's
+        /// K/V reaches its host bytes through the background idle sync, and the writer
+        /// waits for that sync before reading them. Inline, the export downloaded the rows
+        /// and serialized ~820 MB on the worker in the middle of the request that
+        /// published the shared prefix - 350 ms of an 8K prompt's first token.
+        /// </summary>
+        public bool TryPrepareBackgroundRetainedExport(string key, out Action<System.IO.Stream> write)
+        {
+            write = null;
+            if (!SupportsPrefixCheckpoints || _backend != BackendType.GgmlCuda || string.IsNullOrEmpty(key)
+                || _retainedFusedHolders == null || _isRecurrent == null)
+                return false;
+            if (!_retainedFusedHolders.TryGetValue(key, out var h) || h.K == null || h.MlxGdn != null
+                || h.ExportTask != null)
+                return false;
+            if (h.GdnHostDirty || h.ArenaStateResident || h.FdStateResident || h.Retired)
+                return false;
+            var pending = h.IdleKvSync;
+            if (pending == null && h.KvHostDirty)
+            {
+                if (!s_idleKvSyncEnabled)
+                    return false;
+                StartIdleKvSync(h);
+                pending = h.IdleKvSync;
+                if (pending == null)
+                    return false;
+            }
             int rows = Math.Max(0, Math.Min(h.CacheSeqLen, h.KvCapacity));
+            write = stream =>
+            {
+                if (pending != null && !pending.GetAwaiter().GetResult())
+                    throw new InvalidOperationException("The checkpoint's K/V rows could not be downloaded for export.");
+                WriteHolderCheckpoint(h, rows, stream);
+            };
+            return true;
+        }
+
+        public void NoteBackgroundRetainedExport(string key, System.Threading.Tasks.Task task)
+        {
+            if (_retainedFusedHolders != null && !string.IsNullOrEmpty(key)
+                && _retainedFusedHolders.TryGetValue(key, out var h))
+                h.ExportTask = task;
+        }
+
+        /// <summary>Serialize a host-authoritative holder's first <paramref name="rows"/>
+        /// rows and its recurrent state. Reads host bytes only, so it may run on another
+        /// thread while the holder is pinned (ExportTask).</summary>
+        private unsafe void WriteHolderCheckpoint(Qwen35KvCacheHolder h, int rows, System.IO.Stream destination)
+        {
             int numLayers = h.K.Length;
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
             var w = new System.IO.BinaryWriter(destination, System.Text.Encoding.UTF8, leaveOpen: true);
@@ -806,7 +1117,6 @@ namespace TensorSharp.Models
                 }
             }
             w.Flush();
-            return true;
         }
 
         public unsafe bool TryImportRetainedCache(string key, System.IO.Stream source)
@@ -1054,36 +1364,67 @@ namespace TensorSharp.Models
         /// storage and every recurrent layer's conv ring, write index and delta state
         /// copied, and every residency flag off so the next fused decode re-seeds its
         /// device state from the copied host state and builds its own graphs.</summary>
-        private unsafe Qwen35KvCacheHolder DeepCopyHolder(Qwen35KvCacheHolder source)
+        private unsafe Qwen35KvCacheHolder DeepCopyHolder(Qwen35KvCacheHolder source, int requiredContextTokens = 0,
+            List<(Tensor Source, Tensor Destination)> deferredAttention = null)
         {
             // Sized to what the source HOLDS, not to what it reserved. The first
             // request's primary cache was reserved for its whole generation budget
             // (PrepareForPrefill), and a checkpoint is kept for the life of the model
             // while every new chat gets a clone of it; copying and pinning that whole
             // reservation each time is hundreds of megabytes a phone does not have.
-            // The copy grows on demand like any holder when a chat outlives it.
+            // A checkpoint stays compact. A live clone can reserve the next request's
+            // fitted prompt/generation capacity here, so its first prefill does not
+            // allocate again and copy the same prefix a second time.
             int rows = Math.Max(0, Math.Min(source.CacheSeqLen, source.KvCapacity));
-            int cap = Math.Min(source.KvCapacity, CacheCapacityFor(rows));
-            var dst = AllocateHolder(Math.Max(cap, 1));
+            int cap = CloneCapacity(source, requiredContextTokens);
+            // The CUDA host checkpoint used to fill its entire allocation with
+            // zero and immediately overwrite almost every byte. Copy the valid
+            // rows once and clear only the padding the attention kernels may read.
+            bool overwriteAttention = _backend == BackendType.GgmlCuda;
+            var dst = requiredContextTokens > 0 ? TakePooledCloneHolder(cap) : null;
+            bool pooled = dst != null;
+            dst ??= AllocateHolderStorage(Math.Max(cap, 1), overwriteAttention,
+                overwriteState: source.MlxGdn == null && SourceHasEveryDeltaState(source));
             bool complete = false;
             try
             {
+                if (pooled) PreparePooledHolderForClone(dst);
                 int numLayers = Math.Min(source.K.Length, dst.K.Length);
                 for (int l = 0; l < numLayers; l++)
                 {
                     bool recurrent = l < _isRecurrent.Length && _isRecurrent[l];
+                    if (!recurrent && deferredAttention != null && source.K[l] != null && dst.K[l] != null
+                        && source.V[l] != null && dst.V[l] != null
+                        && HasKvDeviceCopy(source.K[l]) && HasKvDeviceCopy(source.V[l]))
+                    {
+                        // The caller fills rows [0, rows) from the source's device copies;
+                        // only the padding the attention kernels may read is cleared here.
+                        // A layer without device copies (an unbound auxiliary layer) has
+                        // authoritative host bytes and takes the host copy below.
+                        deferredAttention.Add((source.K[l], dst.K[l]));
+                        deferredAttention.Add((source.V[l], dst.V[l]));
+                        ClearCheckpointPadding(dst.K[l], rows);
+                        ClearCheckpointPadding(dst.V[l], rows);
+                        InvalidateTensorDeviceCache(dst.K[l]);
+                        InvalidateTensorDeviceCache(dst.V[l]);
+                        continue;
+                    }
                     if (!recurrent)
                     {
                         if (source.K[l] != null && dst.K[l] != null)
                         {
                             CopyCacheRows(source.K[l], dst.K[l], rows);
+                            if (overwriteAttention) ClearCheckpointPadding(dst.K[l], rows);
                             InvalidateTensorDeviceCache(dst.K[l]);
                         }
+                        else if (overwriteAttention && dst.K[l] != null) InitializeCacheTensor(dst.K[l]);
                         if (source.V[l] != null && dst.V[l] != null)
                         {
                             CopyCacheRows(source.V[l], dst.V[l], rows);
+                            if (overwriteAttention) ClearCheckpointPadding(dst.V[l], rows);
                             InvalidateTensorDeviceCache(dst.V[l]);
                         }
+                        else if (overwriteAttention && dst.V[l] != null) InitializeCacheTensor(dst.V[l]);
                         continue;
                     }
 
@@ -1114,7 +1455,7 @@ namespace TensorSharp.Models
                         // The Metal in-place layout is a VIEW at an offset inside a backing
                         // [attention output | state] storage: copy the state slice only,
                         // through the offset pointer, and drop both of the copy's mirrors.
-                        Buffer.MemoryCopy((void*)GdnDeltaStatePointer(from), (void*)GdnDeltaStatePointer(to), bytes, bytes);
+                        HostMemory.Copy((void*)GdnDeltaStatePointer(from), (void*)GdnDeltaStatePointer(to), bytes);
                         if (IsGgmlBackend)
                             InvalidateGdnDeltaStateDeviceCaches(to);
                     }
@@ -1138,6 +1479,732 @@ namespace TensorSharp.Models
             }
         }
 
+        // ---- Device-resident holder copies (CUDA) ----
+        //
+        // A host deep copy of a long-context holder downloads the committed K/V rows,
+        // copies them on the host and uploads them again at the copy's first bind:
+        // gigabytes and around a second per checkpoint or clone at 20K+ tokens. On a
+        // single CUDA device the rows are copied between the host keys' device copies
+        // instead. The copy's K/V is then device-authoritative (KvHostDirty) and its
+        // host bytes are not written; every host reader already syncs a dirty holder
+        // first. Recurrent state (a few percent of the bytes) keeps the host path.
+
+        // Device copies are keyed by GGML host storage; any other allocator has none to copy.
+        private bool DeviceHolderCopiesEnabled =>
+            _backend == BackendType.GgmlCuda && !IsTensorParallel && _allocator is GgmlAllocator
+            && !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_DEVICE_HOLDER_COPY"), "0", StringComparison.Ordinal);
+
+        /// <summary>True when every main-stack attention K/V tensor of <paramref name="holder"/>
+        /// has a resident device copy that a device-to-device clone can read. Auxiliary
+        /// (NextN) layers that no graph has bound keep their host bytes and are copied
+        /// on the host.</summary>
+        private bool CanCopyHolderKvOnDevice(Qwen35KvCacheHolder holder)
+        {
+            if (!DeviceHolderCopiesEnabled || holder?.K == null || holder.V == null || _isRecurrent == null)
+                return false;
+            bool any = false;
+            for (int l = 0; l < holder.K.Length && l < Config.NumLayers; l++)
+                foreach (Tensor tensor in new[] { holder.K[l], holder.V[l] })
+                {
+                    if (tensor == null) continue;
+                    if (!HasKvDeviceCopy(tensor))
+                    {
+                        if (_deviceHolderCopyDeclines < 4)
+                        {
+                            _deviceHolderCopyDeclines++;
+                            Console.Error.WriteLine($"[qwen35] device holder copy declined: layer {l} K/V {tensor.ElementType} " +
+                                $"[{string.Join(",", tensor.Sizes.ToArray())}] has no resident device copy (hostDirty={holder.KvHostDirty}).");
+                        }
+                        return false;
+                    }
+                    any = true;
+                }
+            return any;
+        }
+
+        private long _deviceUseClock;
+
+        /// <summary>Free device memory a retained (idle) holder's device K/V copies must leave
+        /// for activations, graphs and new requests. Env TS_QWEN35_DEVICE_RETAIN_RESERVE_MB.</summary>
+        private static long DeviceRetainReserveBytes(long totalBytes)
+        {
+            string raw = Environment.GetEnvironmentVariable("TS_QWEN35_DEVICE_RETAIN_RESERVE_MB");
+            if (long.TryParse(raw, out long mb) && mb >= 0)
+                return mb * 1024 * 1024;
+            // Covers the verify graph cache (1.5 GB budget), a 4K-token prefill
+            // chunk's packed buffer (~1 GB) and a vision encode; 2 GiB measured a
+            // packed-buffer OOM mid-request on a 32 GB card.
+            return Math.Max(4L * 1024 * 1024 * 1024, totalBytes / 8);
+        }
+
+        /// <summary>Attention K/V bytes of <paramref name="holder"/>'s layout at <paramref name="capacity"/> rows.</summary>
+        private static long HolderKvBytes(Qwen35KvCacheHolder holder, int capacity)
+        {
+            long bytes = 0;
+            foreach (Tensor[] set in new[] { holder.K, holder.V })
+                if (set != null)
+                    foreach (Tensor t in set)
+                        if (t != null && t.Sizes[1] > 0)
+                            bytes += t.Storage.ByteLength / t.Sizes[1] * capacity;
+            return bytes;
+        }
+
+        private void TouchDeviceRetained(Qwen35KvCacheHolder holder)
+        {
+            if (holder != null) holder.DeviceUseStamp = ++_deviceUseClock;
+        }
+
+        /// <summary>Make room for <paramref name="neededBytes"/> of new device copies by demoting
+        /// the least recently used retained holders' K/V to host memory. True when the free
+        /// memory left afterwards covers the retain reserve. Without
+        /// <paramref name="requireReserve"/> the caller proceeds either way.</summary>
+        private bool EnsureDeviceRetainHeadroom(long neededBytes, bool requireReserve, Qwen35KvCacheHolder exclude = null)
+        {
+            if (!DeviceHolderCopiesEnabled)
+                return false;
+            for (int attempt = 0; attempt < 32; attempt++)
+            {
+                if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+                    return !requireReserve;
+                if (free - neededBytes >= DeviceRetainReserveBytes(total))
+                    return true;
+                // Least recently used first, but a holder whose K/V already reached host
+                // memory (a finished idle sync) demotes for free, so it goes first. Above
+                // both, a holder no clone has used yet goes before one that has served
+                // clones: with four Qwen3.8 agent lanes every finished request retained a
+                // 25K-token end state that nothing reused, and by recency alone those
+                // pushed each lane's shared-prompt checkpoint - cloned on every turn - off
+                // the device, so most clones took the ~155 ms host route.
+                Qwen35KvCacheHolder victim = null;
+                int victimRank = int.MaxValue;
+                if (_retainedFusedHolders != null)
+                    foreach (var holder in _retainedFusedHolders.Values)
+                    {
+                        if (ReferenceEquals(holder, exclude) || holder.Retired || holder.ArenaStateResident
+                            || !holder.DeviceMirrored || !CanCopyHolderKvOnDevice(holder))
+                            continue;
+                        int rank = DeviceDemotionRank(holder.CloneCount,
+                            !holder.KvHostDirty || holder.IdleKvSync is { IsCompletedSuccessfully: true, Result: true },
+                            holder.IdleKvSync != null);
+                        if (victim == null || rank < victimRank
+                            || (rank == victimRank && holder.DeviceUseStamp < victim.DeviceUseStamp))
+                        {
+                            victim = holder;
+                            victimRank = rank;
+                        }
+                    }
+                if (victim == null)
+                    return false;
+                long demoteStart = PrefixReleaseDebug ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                if (!DemoteRetainedHolderKv(victim))
+                    return false;
+                if (PrefixReleaseDebug)
+                    Console.Error.WriteLine($"[prefix-demote] free={free >> 20}MiB need={neededBytes >> 20}MiB " +
+                        $"reserve={DeviceRetainReserveBytes(total) >> 20}MiB victim={victim.CacheSeqLen}tok " +
+                        $"{System.Diagnostics.Stopwatch.GetElapsedTime(demoteStart).TotalMilliseconds:F0}ms");
+            }
+            return false;
+        }
+
+        /// <summary>Order in which retained holders give up their device K/V copies under
+        /// pressure, lowest first (least recent first within a rank). Holders no clone has
+        /// used come before holders that have served clones; within each, a holder whose
+        /// K/V already reached host memory demotes for free, then one whose background sync
+        /// is running, then one that still needs a download.</summary>
+        internal static int DeviceDemotionRank(int cloneCount, bool kvOnHost, bool hostSyncRunning)
+            => (cloneCount > 0 ? 3 : 0) + (kvOnHost ? 0 : hostSyncRunning ? 1 : 2);
+
+        // ---- Background host syncs of idle retained holders (CUDA) ----
+
+        private System.Threading.Tasks.Task _idleKvSyncChain = System.Threading.Tasks.Task.CompletedTask;
+        private static readonly bool s_idleKvSyncEnabled =
+            Environment.GetEnvironmentVariable("TS_QWEN35_IDLE_KV_SYNC") != "0";
+
+        /// <summary>
+        /// Demoting a device-authoritative holder downloads its K/V on the request's
+        /// critical path (~150 ms per GB). A retained holder never changes, so download
+        /// each one once, early: on a background thread and stream that overlap the
+        /// model's own work, oldest first, one at a time. A later demotion of a synced
+        /// holder only frees its device copies. Device copies are never freed here, so
+        /// nothing changes for a holder that is reused before memory runs short. Sizing
+        /// the queue to a predicted deficit left concurrent requests demoting holders it
+        /// had not reached yet.
+        /// </summary>
+        private void ScheduleIdleKvSyncs()
+        {
+            if (!s_idleKvSyncEnabled || !DeviceHolderCopiesEnabled || _retainedFusedHolders == null)
+                return;
+            var candidates = new List<Qwen35KvCacheHolder>();
+            foreach (var h in _retainedFusedHolders.Values)
+                if (!h.Retired && !h.DisposalStarted && !h.ArenaStateResident && h.DeviceMirrored
+                    && h.KvHostDirty && h.IdleKvSync == null && CanCopyHolderKvOnDevice(h))
+                    candidates.Add(h);
+            candidates.Sort((a, b) => a.DeviceUseStamp.CompareTo(b.DeviceUseStamp));
+            foreach (var h in candidates)
+                StartIdleKvSync(h);
+        }
+
+        private void StartIdleKvSync(Qwen35KvCacheHolder holder)
+        {
+            int rows = Math.Max(0, Math.Min(holder.CacheSeqLen, holder.KvCapacity));
+            var tensors = new List<Tensor>();
+            foreach (Tensor[] set in new[] { holder.K, holder.V })
+                foreach (Tensor tensor in set)
+                    if (tensor != null && HasKvDeviceCopy(tensor)) tensors.Add(tensor);
+            if (tensors.Count == 0)
+                return;
+            // Captured on this thread: the background job touches only these tensors'
+            // bytes, and every owner of the holder waits for it before using them.
+            var task = _idleKvSyncChain.ContinueWith(_ => SyncIdleHolderKv(tensors, rows),
+                System.Threading.CancellationToken.None, System.Threading.Tasks.TaskContinuationOptions.None,
+                System.Threading.Tasks.TaskScheduler.Default);
+            holder.IdleKvSync = task;
+            _idleKvSyncChain = task;
+        }
+
+        private static bool SyncIdleHolderKv(List<Tensor> tensors, int rows)
+        {
+            var planes = new (IntPtr, long)[tensors.Count];
+            for (int i = 0; i < tensors.Count; i++)
+                planes[i] = (TensorComputePrimitives.GetStorageBasePointer(tensors[i]), tensors[i].Storage.ByteLength);
+            HostMemory.Clear(planes);   // padding reads as zero, and the pages are faulted in
+            foreach (Tensor tensor in tensors)
+            {
+                int heads = checked((int)tensor.Sizes[0]);
+                long capacity = tensor.Sizes[1];
+                long rowBytes = tensor.Storage.ByteLength / checked(heads * capacity);
+                var offsets = new long[heads];
+                var lengths = new long[heads];
+                for (int h = 0; h < heads; h++)
+                {
+                    offsets[h] = checked(h * capacity * rowBytes);
+                    lengths[h] = checked(rows * rowBytes);
+                }
+                if (GgmlBasicOps.SyncIdleHostBufferRanges(TensorComputePrimitives.GetStorageBasePointer(tensor), offsets, lengths) != 1)
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>Finish <paramref name="holder"/>'s background K/V sync, if any, before its
+        /// bytes are read, freed or bound. A completed sync leaves the host bytes current.</summary>
+        private void WaitIdleKvSync(Qwen35KvCacheHolder holder,
+            [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
+        {
+            var task = holder?.IdleKvSync;
+            if (task == null)
+                return;
+            holder.IdleKvSync = null;
+            long started = PrefixReleaseDebug && !task.IsCompleted ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            bool synced;
+            try { synced = task.GetAwaiter().GetResult(); }
+            catch (Exception) { synced = false; }
+            if (started != 0)
+                Console.Error.WriteLine($"[prefix-idle-wait] {caller} waited " +
+                    $"{System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} ms for a background K/V sync");
+            bool capture = holder.IdleKvSyncIsCapture;
+            holder.IdleKvSyncIsCapture = false;
+            if (synced)
+                holder.KvHostDirty = false;
+            else if (capture)
+                throw new InvalidOperationException(
+                    "A background prefix-checkpoint capture failed to download its K/V rows; the checkpoint is unusable.");
+        }
+
+        // Background checkpoint captures still reading a source holder's device K/V
+        // copies, with the host keys they read. Anything that frees or replaces one of
+        // those copies waits for the captures reading it first.
+        // Created on first use: tests build this model without running its constructor.
+        private List<(HashSet<IntPtr> Sources, System.Threading.Tasks.Task<bool> Task)> _captureReads;
+
+        private void WaitCaptureReads(Tensor[] k, Tensor[] v)
+        {
+            if (_captureReads == null || _captureReads.Count == 0)
+                return;
+            for (int i = _captureReads.Count - 1; i >= 0; i--)
+            {
+                var (sources, task) = _captureReads[i];
+                if (!task.IsCompleted && !ReadsAny(sources, k) && !ReadsAny(sources, v))
+                    continue;
+                try { task.Wait(); }
+                catch (Exception) { /* the checkpoint reports it when it is used */ }
+                _captureReads.RemoveAt(i);
+            }
+
+            static bool ReadsAny(HashSet<IntPtr> sources, Tensor[] tensors)
+            {
+                if (tensors == null)
+                    return false;
+                foreach (Tensor t in tensors)
+                    if (t != null && sources.Contains(TensorComputePrimitives.GetStorageBasePointer(t)))
+                        return true;
+                return false;
+            }
+        }
+
+        /// <summary>Finish a background checkpoint file write reading <paramref name="holder"/>'s
+        /// host bytes before they are freed or rewritten.</summary>
+        private static void WaitExport(Qwen35KvCacheHolder holder)
+        {
+            var task = holder?.ExportTask;
+            if (task == null)
+                return;
+            holder.ExportTask = null;
+            try { task.Wait(); }
+            catch (Exception) { /* the store reports a failed save itself */ }
+        }
+
+        private void WaitAllCaptureReads()
+        {
+            if (_captureReads == null)
+                return;
+            foreach (var (_, task) in _captureReads)
+            {
+                try { task.Wait(); }
+                catch (Exception) { }
+            }
+            _captureReads.Clear();
+        }
+
+        private static readonly bool s_backgroundCapture =
+            Environment.GetEnvironmentVariable("TS_QWEN35_BACKGROUND_CAPTURE") != "0";
+
+        /// <summary>
+        /// Fill a host checkpoint's K/V from the active holder's device copies on a
+        /// background stream (see TSGgml_DownloadDeviceCopyRanges). Synchronously,
+        /// the host path downloaded the committed rows into the ACTIVE holder's host
+        /// mirror and then copied them a second time into the checkpoint: 600 ms of a
+        /// four-request step for 25K-token Qwen3.8-27B holders, every turn, while the
+        /// next request waited. The checkpoint's consumers wait for the copy
+        /// (WaitIdleKvSync); whatever frees the active copies waits too (WaitCaptureReads).
+        /// </summary>
+        private void StartCaptureCopy(Qwen35KvCacheHolder copy, List<(Tensor Source, Tensor Destination)> pairs, int rows)
+        {
+            var sources = new HashSet<IntPtr>();
+            var jobs = new List<(IntPtr Source, IntPtr Destination, long[] SourceOffsets, long[] DestinationOffsets, long[] Lengths)>(pairs.Count);
+            foreach (var (src, dst) in pairs)
+            {
+                int heads = checked((int)src.Sizes[0]);
+                long srcCap = src.Sizes[1];
+                long dstCap = dst.Sizes[1];
+                long rowBytes = src.Storage.ByteLength / checked(heads * srcCap);
+                var so = new long[heads];
+                var dO = new long[heads];
+                var len = new long[heads];
+                for (int h = 0; h < heads; h++)
+                {
+                    so[h] = checked(h * srcCap * rowBytes);
+                    dO[h] = checked(h * dstCap * rowBytes);
+                    len[h] = checked(rows * rowBytes);
+                }
+                IntPtr srcKey = TensorComputePrimitives.GetStorageBasePointer(src);
+                sources.Add(srcKey);
+                jobs.Add((srcKey, TensorComputePrimitives.GetStorageBasePointer(dst), so, dO, len));
+            }
+            var task = (_idleKvSyncChain ?? System.Threading.Tasks.Task.CompletedTask).ContinueWith(_ =>
+            {
+                foreach (var job in jobs)
+                    if (GgmlBasicOps.DownloadDeviceCopyRanges(job.Source, job.Destination,
+                            job.SourceOffsets, job.DestinationOffsets, job.Lengths) != 1)
+                        return false;
+                return true;
+            }, System.Threading.CancellationToken.None, System.Threading.Tasks.TaskContinuationOptions.None,
+                System.Threading.Tasks.TaskScheduler.Default);
+            _idleKvSyncChain = task;
+            copy.IdleKvSync = task;
+            copy.IdleKvSyncIsCapture = true;
+            (_captureReads ??= new()).Add((sources, task));
+        }
+
+        /// <summary>True when every main-stack attention K/V tensor of the active cache has a
+        /// resident device copy holding rows its host mirror lacks, so a checkpoint can take
+        /// them from the device in the background. An auxiliary (NextN) layer no graph has
+        /// bound keeps authoritative host bytes and is copied on the host (DeepCopyHolder):
+        /// requiring a device copy of it declined every clone of a checkpoint - which copies
+        /// that layer on the host - and sent four-lane Qwen3.8 agent turns through the
+        /// synchronous host capture, ~270-500 ms each.</summary>
+        private bool CanCaptureCheckpointInBackground()
+        {
+            if (!s_backgroundCapture || _backend != BackendType.GgmlCuda || !_kvCacheHostDirty
+                || _kvCacheK == null || IsTensorParallel)
+                return false;
+            for (int l = 0; l < _kvCacheK.Length && l < Config.NumLayers; l++)
+            {
+                if (_isRecurrent[l]) continue;
+                if (_kvCacheK[l] == null || _kvCacheV[l] == null
+                    || !HasKvDeviceCopy(_kvCacheK[l]) || !HasKvDeviceCopy(_kvCacheV[l]))
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>Move an idle retained holder's K/V to host memory: download device-
+        /// authoritative rows, then drop the device copies (which also retires any graph
+        /// still bound to them). Its recurrent state is untouched.</summary>
+        private bool DemoteRetainedHolderKv(Qwen35KvCacheHolder holder)
+        {
+            WaitIdleKvSync(holder);
+            WaitCaptureReads(holder.K, holder.V);
+            if (holder.KvHostDirty && !TrySyncHolderKvRowsToHost(holder))
+                return false;
+            foreach (Tensor[] set in new[] { holder.K, holder.V })
+                foreach (Tensor tensor in set)
+                    if (tensor != null)
+                        InvalidateTensorDeviceCache(tensor);
+            holder.DeviceMirrored = holder.FdStateResident || holder.GdnHostDirty;
+            CountDecodeGraphReset();
+            return true;
+        }
+
+        /// <summary>True when every recurrent layer of <paramref name="source"/> has a delta state
+        /// to copy, so a copy overwrites every destination state it allocates.</summary>
+        private bool SourceHasEveryDeltaState(Qwen35KvCacheHolder source)
+        {
+            if (source.DeltaState == null || _isRecurrent == null)
+                return false;
+            for (int l = 0; l < _isRecurrent.Length; l++)
+                if (_isRecurrent[l] && (l >= source.DeltaState.Length || source.DeltaState[l] == null))
+                    return false;
+            return true;
+        }
+
+        private static bool HasKvDeviceCopy(Tensor tensor)
+            => GgmlBasicOps.HasResidentDeviceCopy(TensorComputePrimitives.GetStorageBasePointer(tensor), tensor.Storage.ByteLength);
+
+        /// <summary>Copy one attention tensor's rows into a holder being built on the device
+        /// path: between device copies when the source has one, from the source's host rows
+        /// straight into the destination's device copy when <paramref name="uploadHostRows"/>
+        /// (a host-resident checkpoint), otherwise on the host (an unbound auxiliary layer),
+        /// dropping any stale destination mirror.</summary>
+        private bool CopyHolderKvTensor(Tensor source, Tensor destination, int rows, bool uploadHostRows = false)
+        {
+            if (HasKvDeviceCopy(source))
+                return CopyCacheRowsOnDevice(source, destination, rows);
+            if (uploadHostRows)
+                return UploadCacheRowsToDevice(source, destination, rows);
+            CopyCacheRows(source, destination, rows);
+            ClearCheckpointPadding(destination, rows);
+            InvalidateTensorDeviceCache(destination);
+            return true;
+        }
+
+        private int _deviceHolderCopyDeclines;
+
+        /// <summary>Give a host-authoritative retained holder (a checkpoint imported from
+        /// disk or captured on the host path) device copies of its K/V once, so it and
+        /// every later clone of it copy on the device.</summary>
+        private bool TryUploadHolderKvForDeviceCopies(Qwen35KvCacheHolder holder)
+        {
+            if (!DeviceHolderCopiesEnabled || holder?.K == null || holder.KvHostDirty || holder.ArenaStateResident)
+                return false;
+            foreach (Tensor[] set in new[] { holder.K, holder.V })
+                foreach (Tensor tensor in set)
+                {
+                    if (tensor == null) continue;
+                    IntPtr key = TensorComputePrimitives.GetStorageBasePointer(tensor);
+                    if (GgmlBasicOps.HasResidentDeviceCopy(key, tensor.Storage.ByteLength)) continue;
+                    tensor.Storage.EnsureHostReadable();
+                    if (!GgmlBasicOps.EnsureDeviceCopyFromHost(key, tensor.Storage.ByteLength))
+                        return false;
+                }
+            holder.DeviceMirrored = true;
+            return CanCopyHolderKvOnDevice(holder);
+        }
+
+        /// <summary>Download a device-authoritative holder's committed K/V rows and zero its
+        /// host padding, making its host bytes current again. The device copies stay.</summary>
+        private bool TrySyncHolderKvRowsToHost(Qwen35KvCacheHolder holder)
+        {
+            WaitIdleKvSync(holder);
+            WaitExport(holder);
+            if (!CanCopyHolderKvOnDevice(holder))
+                return false;
+            int rows = Math.Max(0, Math.Min(holder.CacheSeqLen, holder.KvCapacity));
+            var synced = new List<Tensor>();
+            foreach (Tensor[] set in new[] { holder.K, holder.V })
+                foreach (Tensor tensor in set)
+                    if (tensor != null && HasKvDeviceCopy(tensor)) synced.Add(tensor);
+            // A device-authoritative holder's host planes were never written: zero them
+            // (rows and padding) in one parallel pass so the downloads below land in
+            // faulted pages instead of faulting 4 KiB at a time on the driver's copy.
+            var planes = new (IntPtr, long)[synced.Count];
+            for (int i = 0; i < synced.Count; i++)
+            {
+                synced[i].Storage.EnsureHostReadable();
+                planes[i] = (TensorComputePrimitives.GetStorageBasePointer(synced[i]), synced[i].Storage.ByteLength);
+            }
+            long clearStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            HostMemory.Clear(planes);
+            double clearMs = System.Diagnostics.Stopwatch.GetElapsedTime(clearStart).TotalMilliseconds;
+            long syncStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            long syncedBytes = 0;
+            foreach (Tensor tensor in synced)
+                {
+                    int heads = checked((int)tensor.Sizes[0]);
+                    long capacity = tensor.Sizes[1];
+                    long rowBytes = tensor.Storage.ByteLength / checked(heads * capacity);
+                    var offsets = new long[heads];
+                    var lengths = new long[heads];
+                    for (int h = 0; h < heads; h++)
+                    {
+                        offsets[h] = checked(h * capacity * rowBytes);
+                        lengths[h] = checked(rows * rowBytes);
+                    }
+                    GgmlBasicOps.SyncHostBufferRanges(TensorComputePrimitives.GetStorageBasePointer(tensor), offsets, lengths);
+                    syncedBytes += heads * rows * rowBytes;
+                }
+            if (PrefixReleaseDebug)
+                Console.Error.WriteLine($"[prefix-sync] tensors={synced.Count} clear={clearMs:F0}ms " +
+                    $"sync={System.Diagnostics.Stopwatch.GetElapsedTime(syncStart).TotalMilliseconds:F0}ms bytes={syncedBytes >> 20}MiB");
+            holder.KvHostDirty = false;
+            return true;
+        }
+
+        /// <summary>Copy rows [0, <paramref name="rows"/>) of every head plane between two
+        /// K/V tensors' device copies (capacities may differ), zeroing the destination's
+        /// other rows. The destination copy is created without an upload when absent.</summary>
+        private static bool CopyCacheRowsOnDevice(Tensor source, Tensor destination, int rows)
+        {
+            long heads = source.Sizes[0];
+            if (destination.Sizes[0] != heads || destination.ElementType != source.ElementType
+                || destination.Sizes[2] != source.Sizes[2])
+                return false;
+            long sourceCapacity = source.Sizes[1], destinationCapacity = destination.Sizes[1];
+            if (rows > sourceCapacity || rows > destinationCapacity)
+                return false;
+            long rowBytes = source.Storage.ByteLength / checked(heads * sourceCapacity);
+            if (rowBytes * heads * destinationCapacity != destination.Storage.ByteLength)
+                return false;
+            var sourceOffsets = new long[heads];
+            var destinationOffsets = new long[heads];
+            var lengths = new long[heads];
+            for (long h = 0; h < heads; h++)
+            {
+                sourceOffsets[h] = checked(h * sourceCapacity * rowBytes);
+                destinationOffsets[h] = checked(h * destinationCapacity * rowBytes);
+                lengths[h] = checked(rows * rowBytes);
+            }
+            return GgmlBasicOps.CopyDeviceCopyRanges(
+                TensorComputePrimitives.GetStorageBasePointer(source), source.Storage.ByteLength,
+                TensorComputePrimitives.GetStorageBasePointer(destination), destination.Storage.ByteLength,
+                sourceOffsets, destinationOffsets, lengths, zeroDestination: true);
+        }
+
+        /// <summary><see cref="CopyCacheRowsOnDevice"/> for a source whose rows are in host
+        /// memory only: they are uploaded straight into the destination's device copy.</summary>
+        private static bool UploadCacheRowsToDevice(Tensor source, Tensor destination, int rows)
+        {
+            long heads = source.Sizes[0];
+            if (destination.Sizes[0] != heads || destination.ElementType != source.ElementType
+                || destination.Sizes[2] != source.Sizes[2])
+                return false;
+            long sourceCapacity = source.Sizes[1], destinationCapacity = destination.Sizes[1];
+            if (rows > sourceCapacity || rows > destinationCapacity)
+                return false;
+            long rowBytes = source.Storage.ByteLength / checked(heads * sourceCapacity);
+            if (rowBytes * heads * destinationCapacity != destination.Storage.ByteLength)
+                return false;
+            var sourceOffsets = new long[heads];
+            var destinationOffsets = new long[heads];
+            var lengths = new long[heads];
+            for (long h = 0; h < heads; h++)
+            {
+                sourceOffsets[h] = checked(h * sourceCapacity * rowBytes);
+                destinationOffsets[h] = checked(h * destinationCapacity * rowBytes);
+                lengths[h] = checked(rows * rowBytes);
+            }
+            source.Storage.EnsureHostReadable();
+            return GgmlBasicOps.UploadToDeviceCopyRanges(
+                TensorComputePrimitives.GetStorageBasePointer(source), source.Storage.ByteLength,
+                TensorComputePrimitives.GetStorageBasePointer(destination), destination.Storage.ByteLength,
+                sourceOffsets, destinationOffsets, lengths, zeroDestination: true);
+        }
+
+        /// <summary>The device-copy counterpart of <see cref="DeepCopyHolder"/> for a source whose
+        /// K/V device copies are resident and whose recurrent host state is current. With
+        /// <paramref name="uploadHostRows"/> the source is a host-resident checkpoint instead,
+        /// and its main-stack rows are uploaded straight into the copy's device copies. Returns
+        /// null when a device copy fails; the caller then takes the host path.</summary>
+        private unsafe Qwen35KvCacheHolder DeepCopyHolderOnDevice(Qwen35KvCacheHolder source, int requiredContextTokens,
+            bool uploadHostRows = false, bool liveClone = false, bool recurrentFromLive = false)
+        {
+            int rows = Math.Max(0, Math.Min(source.CacheSeqLen, source.KvCapacity));
+            int cap = CloneCapacity(source, requiredContextTokens);
+            // A pooled holder of the same capacity keeps its device copies, so the rows are
+            // written in place and graphs keyed by its pointers stay valid.
+            var dst = requiredContextTokens > 0 ? TakePooledCloneHolder(cap) : null;
+            bool pooled = dst != null;
+            dst ??= AllocateHolderStorage(Math.Max(cap, 1), overwriteAttention: true, overwriteState: SourceHasEveryDeltaState(source));
+            bool complete = false;
+            // A live clone's recurrent state goes straight into its own device copies (the
+            // solo decode's conv-scratch slots and delta mirrors) where the verifier can take
+            // a state over from them: the clone is bound next, and its first verify then
+            // starts on the device. Its host ring and delta bytes are never written, which
+            // saves a 151 MB host copy into fresh pages and the upload of that copy. A
+            // checkpoint keeps host state: clones and the disk export read it from there.
+            bool stateOnDevice = liveClone && DeviceStateHandoffAvailable && dst.ConvScratch != IntPtr.Zero
+                && source.ConvState != null && SourceHasEveryDeltaState(source);
+            try
+            {
+                if (pooled) DiscardArenaSlotForHolder(dst);
+                int numLayers = Math.Min(source.K.Length, dst.K.Length);
+                int recurrentSlot = 0;
+                for (int l = 0; l < numLayers; l++)
+                {
+                    bool recurrent = l < _isRecurrent.Length && _isRecurrent[l];
+                    if (!recurrent)
+                    {
+                        if (source.K[l] == null || dst.K[l] == null || source.V[l] == null || dst.V[l] == null)
+                            return null;
+                        bool upload = uploadHostRows && l < Config.NumLayers;
+                        if (!CopyHolderKvTensor(source.K[l], dst.K[l], rows, upload)
+                            || !CopyHolderKvTensor(source.V[l], dst.V[l], rows, upload))
+                            return null;
+                        continue;
+                    }
+
+                    if (stateOnDevice)
+                    {
+                        if (!UploadRecurrentLayerToDevice(source, dst, l, recurrentSlot++))
+                            return null;
+                        continue;
+                    }
+                    if (recurrentFromLive)
+                        continue;   // ReadLiveStateInto below writes every recurrent layer
+
+                    if (source.ConvState[l] != null && dst.ConvState[l] != null)
+                        Array.Copy(source.ConvState[l], dst.ConvState[l], Math.Min(source.ConvState[l].Length, dst.ConvState[l].Length));
+                    dst.ConvWriteIdx[l] = source.ConvWriteIdx[l];
+
+                    Tensor from = source.DeltaState[l];
+                    Tensor to = dst.DeltaState[l];
+                    if (from != null && to != null)
+                    {
+                        long bytes = GdnDeltaStateBytes(from);
+                        if (bytes != GdnDeltaStateBytes(to))
+                            throw new InvalidOperationException("delta-state tensors differ in size");
+                        from.Storage.EnsureHostReadable();
+                        to.Storage.EnsureHostReadable();
+                        IntPtr target = GdnDeltaStatePointer(to);
+                        HostMemory.Copy((void*)GdnDeltaStatePointer(from), (void*)target, bytes);
+                        // A pooled holder's delta mirror is refreshed in place (no-op when it
+                        // has none) rather than freed, which would reset every decode graph.
+                        if (pooled) GgmlBasicOps.UploadHostBufferRanges(target, new long[] { 0 }, new long[] { bytes });
+                        else InvalidateGdnDeltaStateDeviceCaches(to);
+                    }
+                }
+                if (recurrentFromLive && (stateOnDevice || pooled || !ReadLiveStateInto(dst)))
+                    return null;
+                dst.CacheSeqLen = source.CacheSeqLen;
+                dst.RopeDelta = source.RopeDelta;
+                dst.MtpCacheStart = source.MtpCacheStart;
+                dst.KvHostDirty = true;
+                dst.GdnHostDirty = stateOnDevice;
+                dst.FdStateResident = stateOnDevice;
+                dst.ArenaStateResident = false;
+                dst.DeviceMirrored = true;
+                dst.Logits = null;
+                complete = true;
+                return dst;
+            }
+            finally
+            {
+                if (!complete) DisposeHolder(dst);
+            }
+        }
+
+        // TS_QWEN35_CAPTURE_LIVE_STATE=0 drains the live state before every checkpoint, as before.
+        private static readonly bool s_captureReadsLiveState =
+            Environment.GetEnvironmentVariable("TS_QWEN35_CAPTURE_LIVE_STATE") != "0";
+
+        /// <summary>Copy the verifier's live recurrent state into <paramref name="dst"/>'s host
+        /// conv rings and delta bytes, leaving it live on the device. False (nothing
+        /// written that the caller keeps) when there is no live state or a size differs.</summary>
+        private unsafe bool ReadLiveStateInto(Qwen35KvCacheHolder dst)
+        {
+            if (!PrepareRecurrentStatePointers() || dst.ConvState == null || dst.DeltaState == null)
+                return false;
+            int[] layers = _fvRecurrentLayers;
+            var deltaOut = new IntPtr[layers.Length];
+            for (int i = 0; i < layers.Length; i++)
+            {
+                int l = layers[i];
+                Tensor to = l < dst.DeltaState.Length ? dst.DeltaState[l] : null;
+                if (to == null || l >= dst.ConvState.Length || dst.ConvState[l] == null
+                    || GdnDeltaStateBytes(to) != GdnDeltaStateBytes(_deltaStateTensor[l]))
+                    return false;
+                deltaOut[i] = GdnDeltaStatePointer(to);
+            }
+            if (!GgmlBasicOps.Qwen35ReadLiveState(_fvSnapConvPtrs, deltaOut, layers.Length, _verifyOwnerId))
+                return false;
+            // The conv window arrives in the kernel's time-major layout; the ring is
+            // channel-major per time step from write index 0 (UnpackRecurrentStateFromNative).
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            int convDim = _convKernel - 1;
+            for (int i = 0; i < layers.Length; i++)
+            {
+                int l = layers[i];
+                float* convSrc = (float*)_fvSnapConvPtrs[i];
+                float[] ring = dst.ConvState[l];
+                for (int t = 0; t < convDim; t++)
+                {
+                    int dstBase = t * qkvDim;
+                    for (int ch = 0; ch < qkvDim; ch++)
+                        ring[dstBase + ch] = convSrc[ch * convDim + t];
+                }
+                dst.ConvWriteIdx[l] = 0;
+                InvalidateGdnDeltaStateDeviceCaches(dst.DeltaState[l]);
+            }
+            return true;
+        }
+
+        /// <summary>Write one recurrent layer of <paramref name="source"/>'s host state into
+        /// <paramref name="dst"/>'s device copies under the solo decode's keys: the conv ring
+        /// packed into the ggml [time, channel] scratch layout (the decode reseed's transform),
+        /// the delta state uploaded from the source's bytes into the destination's key.</summary>
+        private unsafe bool UploadRecurrentLayerToDevice(Qwen35KvCacheHolder source, Qwen35KvCacheHolder dst, int layer, int slot)
+        {
+            Tensor from = source.DeltaState[layer], to = dst.DeltaState[layer];
+            float[] ring = source.ConvState[layer];
+            if (from == null || to == null || ring == null)
+                return false;
+            long deltaBytes = GdnDeltaStateBytes(from);
+            if (deltaBytes != GdnDeltaStateBytes(to))
+                return false;
+            int convDim = _convKernel - 1;
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            float* conv = (float*)dst.ConvScratch + (long)slot * convDim * qkvDim;
+            int w = source.ConvWriteIdx[layer];
+            for (int t = 0; t < convDim; t++)
+            {
+                int srcBase = ((w + t) % convDim) * qkvDim;
+                for (int ch = 0; ch < qkvDim; ch++)
+                    conv[ch * convDim + t] = ring[srcBase + ch];
+            }
+            from.Storage.EnsureHostReadable();
+            return GgmlBasicOps.EnsureDeviceCopyFromHost((IntPtr)conv, (long)convDim * qkvDim * sizeof(float))
+                && GgmlBasicOps.UploadToDeviceCopyRanges(GdnDeltaStatePointer(from), deltaBytes,
+                    GdnDeltaStatePointer(to), deltaBytes, new long[] { 0 }, new long[] { 0 }, new long[] { deltaBytes },
+                    zeroDestination: false);
+        }
+
+        /// <summary>Keep every unwritten attention row finite without touching the
+        /// prefix just copied. All-zero bytes encode zero in F32/F16 and the supported
+        /// block-quantized cache formats. Used only for host-backed CUDA checkpoints.</summary>
+        internal static unsafe void ClearCheckpointPadding(Tensor tensor, int writtenRows)
+        {
+            long heads = tensor.Sizes[0], capacity = tensor.Sizes[1];
+            if (writtenRows < 0 || writtenRows > capacity)
+                throw new ArgumentOutOfRangeException(nameof(writtenRows));
+            if (heads == 0 || capacity == 0 || writtenRows == capacity) return;
+            long rowBytes = tensor.Storage.ByteLength / checked(heads * capacity);
+            tensor.Storage.EnsureHostReadable();
+            byte* start = (byte*)TensorComputePrimitives.GetStorageBasePointer(tensor);
+            long tailBytes = checked((capacity - writtenRows) * rowBytes);
+            for (long h = 0; h < heads; h++)
+                HostMemory.Clear(start + checked((h * capacity + writtenRows) * rowBytes), tailBytes);
+        }
+
         /// <summary>
         /// Evaluates an MLX holder's K/V copies and GDN states. They are lazy on MLX, and a
         /// checkpoint kept for the life of the model would otherwise hold the whole graph
@@ -1157,6 +2224,9 @@ namespace TensorSharp.Models
         private void DisposeHolder(Qwen35KvCacheHolder holder)
         {
             if (holder == null) return;
+            WaitIdleKvSync(holder);
+            WaitExport(holder);
+            WaitCaptureReads(holder.K, holder.V);
             holder.Retired = true;
             holder.DisposalStarted = true;
 
@@ -1240,6 +2310,7 @@ namespace TensorSharp.Models
         /// freed by the normal cache teardown).</summary>
         private void DisposeAllFusedHolders()
         {
+            WaitAllCaptureReads();
             // Read once, before the key is cleared: the primary-holder block below
             // still has to know whether a fused holder was active, and the key itself
             // must not outlive the dictionary it indexes (see RestorePrimaryCache).

@@ -28,6 +28,7 @@ nvidia-smi() { echo UNEXPECTED_GPU_PROBE; return 1; }
 
 for build, target, system, cuda, error in [
     ("linux/arm64", "linux/arm64", "Linux aarch64", "13.0", None),
+    ("linux/arm64", "linux/arm64", "Linux aarch64", "13.4", None),
     ("linux/arm64", "linux/arm64", "Linux aarch64", "12.9", "require CUDA 13"),
     ("linux/arm64", "linux/arm64", "Linux aarch64", "14.0", "require CUDA 13"),
     ("linux/amd64", "linux/arm64", "Linux aarch64", "13.0", "native Linux ARM64"),

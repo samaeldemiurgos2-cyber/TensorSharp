@@ -57,8 +57,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             EngineSerial = Interlocked.Increment(ref s_engineSerial),
             BlockSize = pool.BlockSize,
             ContextLength = model.MaxContextLength > 0 ? model.MaxContextLength : int.MaxValue,
-            PublicMax = options.PrefixCheckpointBudget,
-            ScopedEndStateLeavesMax = options.RetainedFusedCacheBudgetFor(scheduler.Config.MaxNumRunningSequences),
+            PublicMax = capabilities.CountCapsByBytes && options.PrefixCheckpointBudget > 0
+                ? Math.Max(options.PrefixCheckpointBudget, ByteBoundPublicMax) : options.PrefixCheckpointBudget,
+            ScopedEndStateLeavesMax = capabilities.CountCapsByBytes && options.RetainedFusedCacheBudget is null
+                ? 0 : options.RetainedFusedCacheBudgetFor(scheduler.Config.MaxNumRunningSequences),
             PageHost = new PageHost(pool),
             PageHostBytes = InferenceEngine.ComputeBlockByteSize(model, pool.BlockSize),
             PoolPagesCap = pool.NumBlocks,
@@ -78,6 +80,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         => ExecutionOptions.FromEnvironment() is { RetainedFusedCacheBudget: null or > 0 };
     private static bool PublicCheckpointsEnabled
         => ExecutionOptions.FromEnvironment() is { PrefixCheckpointBudget: > 0 };
+    /// <summary>Public checkpoints a <see cref="PrefixCacheCapabilities.CountCapsByBytes"/> family keeps
+    /// at least.</summary>
+    private const int ByteBoundPublicMax = 32;
+
     internal bool CheckpointsSupported => _tree.Caps.CanCaptureCopy && (PublicCheckpointsEnabled || RetentionEnabled);
     internal bool PublicCheckpointsSupported => PublicCheckpointsEnabled && CheckpointsSupported;
     internal string? LastSource { get; private set; }
@@ -182,6 +188,11 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         LastBlockedByScope = _plan.BlockedByScope;
         LastDeclineReason = _plan.HasReuse ? null
             : DescribeDecline(_plan, request.PublicBoundary, _tree.Caps.RewindCapTokens);
+        if (ReleaseDebug && !_plan.HasReuse)
+            _logger.LogInformation("[prefix-plan] {RequestId} {Plan} route={Route} candidates={Candidates} blockedByScope={Blocked} nodes={Nodes} scoped={Scoped} public={Public} primary={Primary} decline={Decline}",
+                sequence.RequestId, _plan.ToString(), request.Route, _plan.CandidateCount, _plan.BlockedByScope, _tree.NodeCount,
+                _tree.ScopedEndStateCount, _tree.PublicEndStateCount, _tree.PrimaryResidentCount,
+                $"{_plan.EndStateDecline}/{_plan.PrimaryDecline}/{_plan.TruncationDecline}/{_plan.PageDecline}");
         // The executor never continues the live cache for a request with explicit cache breakpoints
         // (BatchExecutor.EnsureOwnership), so do not promise it one: admission announced the reuse and
         // execution took it back.
@@ -319,7 +330,11 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             sequence.BlockTable.EnsureBlockCapacity(count);
             EnsureFreePages(count);
             KvBlock[]? blocks = _pool.AllocateNew(count);
-            if (blocks is null) return false;
+            if (blocks is null)
+            {
+                LastDeclineReason = $"the block pool has no {count} free blocks for the {length}-token prefix";
+                return false;
+            }
             bool transferred = false;
             try
             {
@@ -335,10 +350,21 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                 {
                     bool donate = _plan.Mode == MaterializeMode.DonateEndState;
                     if (!donate && _plan.Mode != MaterializeMode.CloneEndState) return false;
-                    if (!donate && !ReserveClone(payload.Key, length)) return false;
+                    int reservation = donate ? 0 : _cacheModel.ResolveCloneReservationTokens(payload.Key,
+                        BatchExecutor.ResolvePrefillReservation(sequence.PromptTokens.Count, sequence.MaxNewTokens,
+                            _model.MaxContextLength, ExecutionOptions.FromEnvironment().KvGenerationReserveMax));
+                    if (!donate && !ReserveClone(payload.Key, length, reservation)) return false;
                     var materialize = new MaterializeRequest(donate ? MaterializeOp.Donate : MaterializeOp.Clone,
-                        payload.Key, sequence.RequestId, payload.Footprint.Tokens, length);
-                    if (!_cacheModel.TryMaterialize(materialize)) return false;
+                        payload.Key, sequence.RequestId, payload.Footprint.Tokens, length, reservation);
+                    if (!_cacheModel.TryMaterialize(materialize))
+                    {
+                        LastDeclineReason = $"the model declined to {(donate ? "donate" : "clone")} the {length}-token end state";
+                        return false;
+                    }
+                    // The clone already took this request's fitted reservation.
+                    // Re-fitting at its first prefill can undo a memory clamp and
+                    // recreate the immediate allocate/copy cycle this avoids.
+                    if (!donate && reservation > 0) sequence.PrefillReservationTaken = true;
                     if (donate) _tree.DetachEndState(node, ReleaseReason.Rollback, enqueue: false);
                     if (length < payload.Footprint.Tokens) pendingTruncation(sequence, length);
                 }
@@ -355,20 +381,73 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         finally { _tree.Release(ref receipt); Drain(); }
     }
 
-    private bool ReserveClone(string key, int tokens)
+    private bool ReserveClone(string key, int tokens, int requiredContextTokens)
     {
-        ResourceVector bytes = _cacheModel.EstimateCloneBytes(key, tokens);
+        ResourceVector bytes = _cacheModel.EstimateCloneBytes(key, tokens, requiredContextTokens);
         for (int i = 1; i < ResourceVector.ClassCount; i++)
         {
             var cls = (ResourceClass)i;
             long spare = _cacheModel.QuerySpareBytes(cls);
             if (spare >= 0 && bytes[cls] > spare)
             {
-                if (!_tree.Evict(cls, bytes[cls] - spare, ReleaseReason.Pressure, EvictionTier.ScopeNewest)) return false;
+                _logger.LogInformation("Prefix cache: a clone needs {Needed} MiB of {Class} with {Spare} MiB spare; evicting cached payloads.",
+                    bytes[cls] >> 20, cls, spare >> 20);
+                if (!_tree.Evict(cls, bytes[cls] - spare, ReleaseReason.Pressure, EvictionTier.ScopeNewest))
+                {
+                    LastDeclineReason = $"a clone needs {bytes[cls] >> 20} MiB of {cls} but {spare >> 20} MiB is spare";
+                    return false;
+                }
             }
         }
         Drain();
         return true;
+    }
+
+    /// <summary>The private checkpoint a later retry or branch can actually resume.
+    /// A non-rewindable recurrent state saved at the complete prompt cannot serve
+    /// the same prompt again: admission must leave a tail to produce logits. Save
+    /// before that tail, or before the newest image/audio span when it can change
+    /// between agent steps. The latter also avoids copying the media's K/V only to
+    /// discard it on the next screenshot. Public and explicit boundaries retain
+    /// their existing meaning.</summary>
+    internal int AutomaticCheckpointBoundary(SequenceState sequence)
+    {
+        if (!CheckpointsSupported || !RetentionEnabled || sequence.CacheScope is null
+            || sequence.CacheBreakpoints is not null)
+            return 0;
+        int length = sequence.PromptTokens.Count;
+        if (_tree.Caps.Truncation == TruncationKind.None)
+        {
+            length -= Math.Max(1, _tree.Caps.MinTailPrefillTokens);
+            // Only the latest span needs a branch checkpoint when prior media
+            // can be resumed; otherwise the first span bounds every cache hit.
+            if (!_tree.Caps.ReuseAcrossMediaSpan && sequence.MediaSpans.Count > 0)
+                length = Math.Min(length, sequence.MediaSpans[0].Start);
+            else
+                for (int i = sequence.MediaSpans.Count - 1; i >= 0; i--)
+                    if (sequence.MediaSpans[i].Start <= length)
+                    {
+                        length = sequence.MediaSpans[i].Start;
+                        break;
+                    }
+        }
+        return length > sequence.SharedPrefixTokens && length >= _tree.Caps.MinRetainTokens ? length : 0;
+    }
+
+    /// <summary>The second automatic checkpoint of a prompt with media
+    /// (<see cref="PrefixCacheCapabilities.CheckpointPromptTailWithMedia"/>): before the
+    /// non-rewindable tail, past every span, when that lies beyond the first boundary. 0 when
+    /// none.</summary>
+    internal int PromptTailCheckpointBoundary(SequenceState sequence)
+    {
+        if (!_tree.Caps.CheckpointPromptTailWithMedia || !_tree.Caps.ReuseAcrossMediaSpan
+            || _tree.Caps.Truncation != TruncationKind.None || sequence.MediaSpans.Count == 0)
+            return 0;
+        int first = AutomaticCheckpointBoundary(sequence);
+        if (first <= 0)
+            return 0;
+        int length = sequence.PromptTokens.Count - Math.Max(1, _tree.Caps.MinTailPrefillTokens);
+        return length > first ? length : 0;
     }
 
     internal void CaptureCheckpoint(SequenceState sequence)
@@ -376,9 +455,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         if (!CheckpointsSupported) return;
         int length = sequence.NumComputedTokens;
         bool publicBoundary = sequence.IsPublicCheckpointBoundary(length);
-        // Recurrent caches cannot rewind the generated tail. Keep the exact prompt
-        // boundary in its private scope so retries and branches can resume there.
-        bool promptBoundary = length == sequence.PromptTokens.Count && sequence.CacheScope is not null;
+        bool automaticBoundary = length == AutomaticCheckpointBoundary(sequence) || length == PromptTailCheckpointBoundary(sequence);
         bool explicitBoundary = false;
         if (sequence.CacheBreakpoints is not null)
         {
@@ -386,13 +463,14 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                 if (boundary == length) { explicitBoundary = true; break; }
             if (!explicitBoundary) return;
         }
-        if (length <= 0 || (!publicBoundary && !explicitBoundary && !promptBoundary)) return;
+        if (length <= 0 || (!publicBoundary && !explicitBoundary && !automaticBoundary)) return;
         if (length <= sequence.SharedPrefixTokens ? !PublicCheckpointsEnabled : !RetentionEnabled) return;
         if (publicBoundary && length == sequence.SharedPrefixTokens) sequence.PrefixCheckpointTaken = true;
         Drain();
         RadixNode node = _tree.Insert(GetKey(sequence), length, GetScope(sequence),
             publicBoundary ? length : sequence.SharedPrefixTokens,
-            explicitBoundary ? NodeFlags.EndsAtBreakpoint : promptBoundary ? NodeFlags.PromptEnd : NodeFlags.None,
+            explicitBoundary ? NodeFlags.EndsAtBreakpoint
+                : length == sequence.PromptTokens.Count ? NodeFlags.PromptEnd : NodeFlags.None,
             GetSpans(sequence));
         if (node.EndState is not null) return;
         string key = _tree.MintKey();
@@ -405,9 +483,11 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             return;
         }
         if (Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy) && publicBoundary)
-            SaveCheckpoint(sequence, key, length);
+            SaveCheckpoint(sequence, key, length, footprint);
         Trim();
     }
+
+    private static readonly bool ReleaseDebug = Environment.GetEnvironmentVariable("TS_PREFIX_RELEASE_DEBUG") == "1";
 
     internal bool RetainFinished(SequenceState sequence, bool primary)
     {
@@ -421,6 +501,8 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         string payloadKey = _tree.MintKey();
         if (primary && _tree.Caps.DeferPrimaryConversion)
         {
+            if (ReleaseDebug)
+                _logger.LogInformation("[prefix-retain] {RequestId} length={Length} registered as the primary", sequence.RequestId, length);
             RegisterPrimary(node, payloadKey, length);
             return false; // The live primary still belongs to the executor, not a retained holder.
         }
@@ -440,6 +522,9 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             origin = PayloadOrigin.PrimaryConversion;
             conversionFailed = !captured;
         }
+        if (ReleaseDebug)
+            _logger.LogInformation("[prefix-retain] {RequestId} length={Length} primary={Primary} captured={Captured} origin={Origin}",
+                sequence.RequestId, length, primary, captured, origin);
         if (captured)
         {
             bool published = Publish(node, payloadKey, _cacheModel.MeasureEndState(payloadKey), length, origin);
@@ -643,6 +728,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
 
     internal void Reset()
     {
+        FlushPendingSaves();
         foreach (var request in _requests.Values) _tree.ReleaseRopeOwner(request.Key);
         _requests.Clear();
         _tree.Reset();
@@ -651,7 +737,11 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         Drain();
     }
 
-    internal void Detach() => _cacheModel.DetachPrefixCache();
+    internal void Detach()
+    {
+        FlushPendingSaves();
+        _cacheModel.DetachPrefixCache();
+    }
 
     private static int[] PrefixTokens(SequenceState sequence, int length)
     {
@@ -743,7 +833,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         return false;
     }
 
-    private void SaveCheckpoint(SequenceState sequence, string key, int length)
+    private void SaveCheckpoint(SequenceState sequence, string key, int length, PayloadFootprint footprint)
     {
         var store = CheckpointStore;
         // The store key is the prefix's text tokens, which say nothing of an image's
@@ -753,11 +843,91 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         try
         {
             int[] tokens = PrefixTokens(sequence, length);
-            if (store.Save(_tree.Caps.NamespaceFingerprint, tokens, stream =>
+            string fingerprint = _tree.Caps.NamespaceFingerprint;
+            // Best: the model writes its bytes off the worker after anything it must still
+            // download lands, and holds the payload until the file is written.
+            if (AsyncCheckpointSaves && _cacheModel.TryPrepareBackgroundExport(key, out Action<System.IO.Stream>? write) && write != null)
             {
-                if (!_cacheModel.TryExport(key, stream)) throw new InvalidOperationException("The model declined prefix export.");
-            })) _storeMisses.Remove(PrefixStoreHash(tokens));
+                _storeMisses.Remove(PrefixStoreHash(tokens));
+                var task = _pendingSave.ContinueWith(_ =>
+                {
+                    try
+                    {
+                        if (!store.Save(fingerprint, tokens, write))
+                            _logger.LogWarning("Saving radix prefix checkpoint failed.");
+                    }
+                    catch (Exception ex) { _logger.LogWarning(ex, "Saving radix prefix checkpoint failed."); }
+                }, System.Threading.CancellationToken.None, System.Threading.Tasks.TaskContinuationOptions.None,
+                    System.Threading.Tasks.TaskScheduler.Default);
+                _pendingSave = task;
+                _cacheModel.NoteBackgroundExport(key, task);
+                return;
+            }
+            // The serialized size is about the payload's K/V plus its state; leave room
+            // for the format's headers. An estimate that falls short writes inline.
+            long estimate = Math.Max(footprint.Bytes.HostKv, footprint.Bytes.DeviceKv)
+                + footprint.Bytes.StateSnapshot + (16L << 20);
+            if (!AsyncCheckpointSaves || estimate > Array.MaxLength)
+            {
+                if (store.Save(fingerprint, tokens, stream =>
+                {
+                    if (!_cacheModel.TryExport(key, stream)) throw new InvalidOperationException("The model declined prefix export.");
+                })) _storeMisses.Remove(PrefixStoreHash(tokens));
+                return;
+            }
+            // The payload is serialized here, where the model's state is consistent, and
+            // the file is written and flushed off the worker. Writing it inline held the
+            // worker for the whole write and fsync of a Qwen3.8-27B shared-prefix
+            // checkpoint (821 MB) - once per distinct system prompt, so four concurrent
+            // agents with their own prompts stalled every request for about two seconds.
+            // Uninitialized and fixed-size: a growing MemoryStream re-copied the
+            // payload on every doubling and a zeroed buffer cleared it once more.
+            byte[] buffer = GC.AllocateUninitializedArray<byte>((int)estimate);
+            var payload = new System.IO.MemoryStream(buffer, 0, buffer.Length, writable: true, publiclyVisible: true);
+            bool exported;
+            try { exported = _cacheModel.TryExport(key, payload); }
+            catch (NotSupportedException) { exported = false; }   // the estimate fell short
+            if (!exported)
+            {
+                payload.Dispose();
+                if (store.Save(fingerprint, tokens, stream =>
+                {
+                    if (!_cacheModel.TryExport(key, stream)) throw new InvalidOperationException("The model declined prefix export.");
+                })) _storeMisses.Remove(PrefixStoreHash(tokens));
+                return;
+            }
+            long written = payload.Position;
+            payload.Position = 0;
+            payload.SetLength(written);
+            _storeMisses.Remove(PrefixStoreHash(tokens));
+            _pendingSave = _pendingSave.ContinueWith(_ =>
+            {
+                using (payload)
+                {
+                    try
+                    {
+                        if (!store.Save(fingerprint, tokens, stream => payload.CopyTo(stream)))
+                            _logger.LogWarning("Saving radix prefix checkpoint failed.");
+                    }
+                    catch (Exception ex) { _logger.LogWarning(ex, "Saving radix prefix checkpoint failed."); }
+                }
+            }, System.Threading.CancellationToken.None, System.Threading.Tasks.TaskContinuationOptions.None,
+                System.Threading.Tasks.TaskScheduler.Default);
         }
         catch (Exception ex) { _logger.LogWarning(ex, "Saving radix prefix checkpoint failed."); }
+    }
+
+    // Background checkpoint file writes, in submission order. Only on hosts with
+    // memory to spare for one serialized checkpoint per pending write.
+    private System.Threading.Tasks.Task _pendingSave = System.Threading.Tasks.Task.CompletedTask;
+    private static readonly bool AsyncCheckpointSaves =
+        Environment.GetEnvironmentVariable("TS_PREFIX_ASYNC_SAVE") != "0"
+        && GC.GetGCMemoryInfo().TotalAvailableMemoryBytes >= (32L << 30);
+
+    /// <summary>Wait for checkpoint files still being written.</summary>
+    internal void FlushPendingSaves()
+    {
+        try { _pendingSave.Wait(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "A background prefix checkpoint write failed."); }
     }
 }

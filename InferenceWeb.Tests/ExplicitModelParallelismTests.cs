@@ -51,7 +51,9 @@ public sealed class ExplicitModelParallelismTests : IDisposable
     public void ConflictingModesAndUnsupportedLayerPlacementAreRefused()
     {
         Assert.Throws<ArgumentException>(() => Resolve("glm-dsa", BackendType.GgmlCuda, 2, 2, out _));
-        Assert.Throws<NotSupportedException>(() => Resolve("mistral3", BackendType.GgmlCuda, 1, 2, out _));
+        Assert.Throws<NotSupportedException>(() => Resolve("mistral3", BackendType.Cpu, 1, 2, out _));
+        Assert.Equal(1, Resolve("mistral3", BackendType.GgmlCuda, 1, 2, out int split));
+        Assert.Equal(2, split);
     }
 
     [Theory]
@@ -137,7 +139,6 @@ public sealed class ExplicitModelParallelismTests : IDisposable
     [InlineData("glm-dsa")]
     [InlineData("glm5next")]
     [InlineData("deepseek4")]
-    [InlineData("deepseek41")]
     [InlineData("qwen-image")]
     [InlineData("diffusion-gemma")]
     public void DistributedPreflightRejectsExecutorsWithoutCrossNodeCollectives(string architecture)

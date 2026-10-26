@@ -35,6 +35,17 @@ namespace TensorSharp.Models
     {
         private string _lastArenaDeclineLogged;
         private float[] _arenaLogitsStaging;
+        private int _arenaUsesHolderBuffers = -1;
+
+        private bool ArenaUsesHolderBuffers
+        {
+            get
+            {
+                if (_arenaUsesHolderBuffers < 0)
+                    _arenaUsesHolderBuffers = GgmlBasicOps.Qwen35ArenaUsesHolderBuffers() ? 1 : 0;
+                return _arenaUsesHolderBuffers == 1;
+            }
+        }
 
         public string BatchedFusedDecodeDeclineReason { get; private set; }
 
@@ -106,6 +117,7 @@ namespace TensorSharp.Models
         /// host-authoritative, the way <see cref="SettleForCopy"/> does for the whole holder.</summary>
         private void SettleSoloDecodeStateForArena(Qwen35KvCacheHolder holder)
         {
+            SettleVerifyStateOnDevice();
             Qwen35KvCacheHolder previous = SnapshotActiveCache();
             LoadCacheHolder(holder);
             try
@@ -151,6 +163,13 @@ namespace TensorSharp.Models
                 return ArenaDecline("per-sequence caches have not been initialized");
             if (_fdUnsupported)
                 return ArenaDecline("the whole-model fused decode capability check failed");
+            // The arena carries the dense/GDN projection scales in the layer
+            // descriptors. Its embedding, head and MoE expert bindings do not
+            // yet carry scales; keep those combinations on the serial path.
+            if (HasSidecarWeightScales && HasMoEExpertWeights)
+                return ArenaDecline("MoE sidecar scales are not supported by the arena graph");
+            if (_lmHeadQW != null && _lmHeadQW.Scale != 1.0f)
+                return ArenaDecline("lm-head sidecar scale is not supported by the arena graph");
             ExitSpecSession();   // a batched decode outside the speculative session ends it
             int n = requestIds.Count;
             if (n < 2 || tokens.Length != n || positions.Length != n)
@@ -166,18 +185,6 @@ namespace TensorSharp.Models
                 return ArenaDecline("fused weight descriptors need one serial decode warmup step");
             if (MoeCpuOffloadConfig.IsEnabled)
                 return ArenaDecline("MoE CPU offload active");
-            // NVFP4 per-tensor weight scales (the `<base>.scale` sidecars, HF
-            // weight_scale_2). Every OTHER fused qwen35 graph multiplies each
-            // projection output by its slot from the proj_scales table; the arena
-            // graph does not read TSGgmlQwen35LayerDesc::proj_scales at all. Running
-            // it anyway would not fail - it would quietly compute every QKV/O/GDN/
-            // FFN matmul with an effective scale of 1.0, so the same model would
-            // answer correctly with one request in flight and produce garbage the
-            // moment a second one joined. Decline instead and let the round-robin
-            // per-sequence path (which does apply the scales) serve the batch, the
-            // same contract the fused per-block TP kernels already follow.
-            if (HasSidecarWeightScales)
-                return ArenaDecline("per-tensor sidecar weight scales (NVFP4 scale2) are not applied by the arena graph");
             if (!IsGgmlBackend)
                 return ArenaDecline("the arena graph runs on the GGML backends only");
             DType kvDt = _kvCacheDtype.ToDType();
@@ -204,6 +211,8 @@ namespace TensorSharp.Models
             QuantizedWeight hostEmbedding = null;
             if (_quantWeights.TryGetValue("token_embd.weight", out QuantizedWeight tokenQw))
             {
+                if (tokenQw.Scale != 1.0f)
+                    return ArenaDecline("token embedding sidecar scale is not supported by the arena graph");
                 if (!CanUseGgmlQuantizedGetRows(tokenQw.GgmlType) || tokenQw.DevicePreloadTooLarge)
                 {
                     if (!tokenQw.HasHostData)
@@ -257,8 +266,10 @@ namespace TensorSharp.Models
             // for the rest of the request - every request that was decoding alone when a second one
             // arrived. Bring such a holder's recurrent state back to the host first; the seeding below
             // then starts its slot from those bytes (Qwen35ArenaSoloTransitionTests).
+            // Holder-bound batches read the solo decode's resident copies directly.
+            bool holderBuffers = ArenaUsesHolderBuffers;
             for (int i = 0; i < n; i++)
-                if (holders[i].FdStateResident && !holders[i].ArenaStateResident)
+                if (!holderBuffers && holders[i].FdStateResident && !holders[i].ArenaStateResident)
                     SettleSoloDecodeStateForArena(holders[i]);
 
             // Canonical order: ascending first-attention-layer K storage pointer.
@@ -402,7 +413,17 @@ namespace TensorSharp.Models
                 h.CacheSeqLen = posSorted[i] + 1;
                 h.KvHostDirty = true;
                 h.GdnHostDirty = true;
-                h.ArenaStateResident = true;
+                if (holderBuffers)
+                {
+                    // The step advanced the holder's own resident copies, exactly
+                    // like a solo fused decode step.
+                    h.FdStateResident = true;
+                    h.DeviceMirrored = true;
+                }
+                else
+                {
+                    h.ArenaStateResident = true;
+                }
             }
             _arenaBatchedDecodeSteps++;
             return true;

@@ -33,11 +33,17 @@ public static class DistributedTensorParallel
     /// </summary>
     public static ITensorParallelGroup? CreateGroup(BackendType backend)
     {
-        var distConfig = ModelParallelismOptions.Parse(Array.Empty<string>()).Distributed;
+        var options = ModelParallelismOptions.Parse(Array.Empty<string>());
+        var distConfig = options.Distributed;
         if (distConfig == null)
             return null;
         if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
             throw new ArgumentException("Distributed --tp requires cuda, ggml_cuda, or ggml_vulkan.");
+
+        if (options.IsLayerSplit)
+            return new DistributedLayerSplitGroup(
+                ModelBase.CreateGgmlLocalLayerSplitGroup(backend, distConfig.LocalDegree),
+                distConfig.NodeId, distConfig.PeerEndpoints);
 
         // The on-node group has to match the backend: direct CUDA
         // drives CudaAllocators, the ggml backends drive per-rank

@@ -19,6 +19,11 @@ namespace TensorSharp.Runtime
         IMultimodalInjector MultimodalInjector { get; }
         IBackendExecutionPlan ExecutionPlan { get; }
         float[] Forward(int[] tokens);
+
+        /// <summary>Forward a prompt (prefill) chunk. Identical to <see cref="Forward"/>
+        /// unless the model routes a prompt chunk differently from a decode token.</summary>
+        float[] ForwardPrompt(int[] tokens) => Forward(tokens);
+
         void ResetKVCache();
 
         /// <summary>

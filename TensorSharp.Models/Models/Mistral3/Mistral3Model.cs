@@ -61,8 +61,15 @@ namespace TensorSharp.Models
         private Mistral3VisionEncoder _visionEncoder;
         private List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
 
-        public Mistral3Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
-            : base(ggufPath, backend, tpDegree, tpGroup)
+        // Preserve the CLR signature used by existing compiled callers.
+        public Mistral3Model(string ggufPath, BackendType backend, int tpDegree, ITensorParallelGroup tpGroup)
+            : this(ggufPath, backend, tpDegree, tpGroup, 1)
+        {
+        }
+
+        public Mistral3Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            int layerSplitDegree = 1)
+            : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree)
         {
             // Hyperparameters live under whatever prefix the converter wrote: "mistral3"
             // for current conversions, "llama" for Mistral Small 3.x files converted before
@@ -106,6 +113,14 @@ namespace TensorSharp.Models
                     $"betaSlow={_ropeBetaSlow}, extFactor={_ropeExtFactor}");
 
             ParseTokenizer();
+            try
+            {
+                if (LayerSplitGroup != null || LayerSplitDegree > 1)
+                    ApplyModelAlignedKvCacheDefaultFromMetadata();
+                ConfigureLayerPlacement(FormattableString.Invariant(
+                    $"mistral3|{Config.NumHeads}|{Config.NumKVHeads}|{_attnKeyLen}|{_attnValLen}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeType}|{_ropeDim}|{_ropeOrigCtx}|{_ropeScalingBeta:R}|{_ropeExtFactor:R}|{_ropeBetaFast:R}|{_ropeBetaSlow:R}|{_ropeMscale:R}|{_ropeMscaleAllDim:R}|{KvCacheDtypeConfig.Current}"), balanceWeightBytes: true);
+            }
+            catch { base.Dispose(); throw; }
             LoadWeights();
             FuseQKVWeights();
             FuseGateUpWeights();
@@ -164,7 +179,7 @@ namespace TensorSharp.Models
                 {
                     int qDim = (int)qf.Sizes[0], kDim = (int)kf.Sizes[0], vDim = (int)vf.Sizes[0];
                     int inDim = (int)qf.Sizes[1];
-                    var fusedTensor = new Tensor(_allocator, DType.Float32, qDim + kDim + vDim, inDim);
+                    var fusedTensor = new Tensor(AllocatorForWeight(qkvName), DType.Float32, qDim + kDim + vDim, inDim);
                     using (var s0 = fusedTensor.Narrow(0, 0, qDim)) Ops.Copy(s0, qf);
                     using (var s1 = fusedTensor.Narrow(0, qDim, kDim)) Ops.Copy(s1, kf);
                     using (var s2 = fusedTensor.Narrow(0, qDim + kDim, vDim)) Ops.Copy(s2, vf);
@@ -284,14 +299,16 @@ namespace TensorSharp.Models
             _maxContextLength = maxSeqLen;
             _kvCacheCapacity = initialSeqLen;
             int numKVHeads = Config.NumKVHeads;
-            ApplyModelAlignedKvCacheDefault(_quantWeights);
+            if (LayerPlacement == null)
+                ApplyModelAlignedKvCacheDefault(_quantWeights);
             DType kvDtype = _kvCacheDtype.ToDType();
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                _kvCacheK[l] = new Tensor(_allocator, kvDtype, numKVHeads, initialSeqLen, _attnKeyLen);
-                _kvCacheV[l] = new Tensor(_allocator, kvDtype, numKVHeads, initialSeqLen, _attnValLen);
+                if (LayerPlacement != null && !LayerPlacement.Owns(l)) continue;
+                _kvCacheK[l] = new Tensor(LayerAllocator(l), kvDtype, numKVHeads, initialSeqLen, _attnKeyLen);
+                _kvCacheV[l] = new Tensor(LayerAllocator(l), kvDtype, numKVHeads, initialSeqLen, _attnValLen);
                 InitializeCacheTensor(_kvCacheK[l]);
                 InitializeCacheTensor(_kvCacheV[l]);
             }
@@ -313,8 +330,9 @@ namespace TensorSharp.Models
             DType kvDtype = _kvCacheDtype.ToDType();
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                var newK = new Tensor(_allocator, kvDtype, numKVHeads, newCapacity, _attnKeyLen);
-                var newV = new Tensor(_allocator, kvDtype, numKVHeads, newCapacity, _attnValLen);
+                if (LayerPlacement != null && !LayerPlacement.Owns(l)) continue;
+                var newK = new Tensor(LayerAllocator(l), kvDtype, numKVHeads, newCapacity, _attnKeyLen);
+                var newV = new Tensor(LayerAllocator(l), kvDtype, numKVHeads, newCapacity, _attnValLen);
                 InitializeCacheTensor(newK);
                 InitializeCacheTensor(newV);
 
@@ -352,6 +370,7 @@ namespace TensorSharp.Models
             if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
+                if (_kvCacheK[l] == null) continue;
                 ResetCacheTensor(_kvCacheK[l]);
                 ResetCacheTensor(_kvCacheV[l]);
             }
@@ -363,12 +382,13 @@ namespace TensorSharp.Models
             if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
+                if (_kvCacheK[l] == null) continue;
                 InvalidateTensorDeviceCache(_kvCacheK[l]);
                 InvalidateTensorDeviceCache(_kvCacheV[l]);
             }
         }
 
-        public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
+        public override bool SupportsKVStateSnapshot => LayerPlacement == null && _kvCacheK != null && _kvCacheV != null;
 
         public override string KVStateFingerprint =>
             $"mistral3|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|kL={_attnKeyLen}|vL={_attnValLen}|dtype={_kvCacheDtype.ToShortString()}";
@@ -444,7 +464,7 @@ namespace TensorSharp.Models
             // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
             // layer loop and non-sharded weights, which are unavailable under
             // tensor parallelism. Route through ForwardCore → ForwardTP instead.
-            if (IsTensorParallel)
+            if (IsTensorParallel || LayerPlacement != null)
                 return ForwardCore(tokens);
 
             // Multimodal embeddings carry absolute insert positions within the
@@ -500,6 +520,8 @@ namespace TensorSharp.Models
 
         protected override float[] ForwardCore(int[] tokens)
         {
+            if (LayerPlacement != null)
+                return ForwardLayerSplit(tokens);
             if (IsTensorParallel)
                 return ForwardTP(tokens);
 

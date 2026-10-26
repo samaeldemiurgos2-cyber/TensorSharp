@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Runtime.Speculative
@@ -96,6 +97,14 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         int SpecFeatureSize => Config.HiddenSize;
 
+        /// <summary>
+        /// True when the drafter reads the taps of every committed row from the
+        /// model's own state (prefill, plain steps and commits all write them), so
+        /// the carried feature row is a placeholder: a plain prefill, a prefix
+        /// reuse or a gap leaves no carry to recapture with a plain step first.
+        /// </summary>
+        bool SpecCarryOnDevice => false;
+
         /// <summary>Prompt-prefill chunk the model prefers for speculative
         /// prefill (0 = let the caller choose). Models whose trunk re-reads
         /// per-expert weights once per micro-batch want whole micro-batches.</summary>
@@ -127,6 +136,16 @@ namespace TensorSharp.Runtime.Speculative
         /// with the same drafter and the same acceptance per position.
         /// </summary>
         int SpecPreferredDraftWindow => 0;
+
+        /// <summary>
+        /// Cap on drafts for the SINGLE-sequence verify only, below the draft budget a
+        /// batched verify (<see cref="IBatchedSpeculativeTarget"/>) may spend. On a
+        /// recurrent trunk the single-sequence verify keeps one state snapshot per
+        /// row, so its cost grows with the window, while the batched verify replays
+        /// only the accepted prefix and costs about the same at 8 rows as at 4.
+        /// Default: no extra cap.
+        /// </summary>
+        int SpecSoloMaxDraftTokens => int.MaxValue;
 
         /// <summary>
         /// Optional default specifically for weight-free n-gram drafting. A positive
@@ -284,6 +303,10 @@ namespace TensorSharp.Runtime.Speculative
         /// row, with the hidden state of the LAST token it processed.
         /// </summary>
         bool DraftSelfCatchUp => false;
+
+        /// <summary>Trailing committed positions the head's private state keeps (a
+        /// sliding KV ring); <see cref="int.MaxValue"/> when it keeps all of them.</summary>
+        int DraftContextRows => int.MaxValue;
         /// <summary>
         /// True when this head can safely restart at any trunk position, including
         /// right after a request
@@ -355,4 +378,104 @@ namespace TensorSharp.Runtime.Speculative
     /// <summary>Convenience alias for the common case: a model that is its own
     /// speculative target AND ships its own draft head.</summary>
     public interface ISpeculativeModel : ISpeculativeTarget, IDraftHead { }
+
+    /// <summary>
+    /// A trunk that verifies the draft windows of SEVERAL concurrent sequences, each
+    /// in its own per-request cache, in one forward. Without it concurrent requests
+    /// decode one token per step in a token-batched graph while a lone request
+    /// verifies a whole window per step, so the second request in flight cut every
+    /// request's rate to that of plain decoding.
+    ///
+    /// Greedy only: each verify row comes back as its argmax. The drafter keeps one
+    /// state per request (<see cref="BindDraftState"/>), because several sequences
+    /// now draft between the same pair of verifies.
+    /// </summary>
+    public interface IBatchedSpeculativeTarget
+    {
+        /// <summary>Tokens per sequence (anchor plus drafts) one batched verify of
+        /// <paramref name="sequences"/> sequences forwards, or 0 when the trunk cannot
+        /// serve that many now.</summary>
+        int BatchedSpecWindow(int sequences);
+
+        /// <summary>Tokens committed to <paramref name="requestId"/>'s per-request
+        /// cache, or -1 when it has none.</summary>
+        int FusedCacheSeqLen(string requestId);
+
+        /// <summary>Rows <paramref name="requestId"/>'s per-request cache can take past its
+        /// committed tokens without growing, or 0 when it has none. A batched verify
+        /// writes its whole window for every sequence, padding included, so the window
+        /// must fit every sequence's free rows.</summary>
+        int FusedCacheFreeRows(string requestId) => 0;
+
+        /// <summary>Point the drafter's per-sequence state at
+        /// <paramref name="requestId"/> (created on first use); null selects the shared state.</summary>
+        void BindDraftState(string? requestId);
+
+        /// <summary>Return <paramref name="requestId"/>'s drafter state.</summary>
+        void ReleaseDraftState(string requestId);
+
+        /// <summary>Scope of one batched step: drafting inside it must not end or
+        /// re-enter the trunk's single-sequence speculative session.</summary>
+        IDisposable BeginBatchedSpeculation();
+
+        /// <summary>
+        /// Draft one block for each of several sequences in one pass, each over its
+        /// own drafter state: <paramref name="anchors"/>[i] is sequence i's next token
+        /// at <paramref name="positions"/>[i], <paramref name="carries"/>[i] its carried
+        /// feature row. Fills each <paramref name="tokensOut"/>[i] / <paramref name="confOut"/>[i]
+        /// with the drafter's full proposal block, before any gate. False when the
+        /// drafter cannot batch; the caller then drafts per sequence.
+        /// </summary>
+        bool TryDraftBatch(IReadOnlyList<string> requestIds, int[] anchors, float[][] carries, int[] positions,
+            int[][] tokensOut, float[][] confOut) => false;
+
+        /// <summary>Width of the proposal block <see cref="TryDraftBatch"/> fills per sequence.</summary>
+        int BatchDraftBlockWidth => 0;
+
+        /// <summary>
+        /// Forward <paramref name="tokens"/> ([sequences * window], sequence-major:
+        /// each sequence's anchor then its drafts, padded) at
+        /// <paramref name="positions"/> (each sequence's cache length). Fills
+        /// <paramref name="drawn"/> with each row's argmax and
+        /// <paramref name="features"/> ([sequences * window * SpecFeatureSize]) with
+        /// each row's drafter taps. Returns false, with every cache untouched, when
+        /// the trunk declines; throws when it failed after writing.
+        /// </summary>
+        bool TryBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int window,
+            int[] tokens, int[] drawn, float[] features);
+
+        /// <summary>Advance sequence i of the last verify by <c>kept[i]</c> tokens
+        /// (1 .. window). Throws when the caches may be partially advanced.</summary>
+        void CommitBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int[] kept);
+    }
+
+    /// <summary>
+    /// A batched trunk that can run one sequence's prompt chunk inside its next
+    /// <see cref="IBatchedSpeculativeTarget.TryBatchedSpecVerify"/>: one forward over the
+    /// chunk's rows and the verify windows, so the verify reads no weights of its own.
+    /// </summary>
+    public interface IMixedStepPrefillTarget
+    {
+        /// <summary>
+        /// Stage <paramref name="tokens"/> of <paramref name="requestId"/> at
+        /// <paramref name="position"/> (its cache length) for the next batched verify. The
+        /// chunk takes the media rows queued since the last forward (queue them for its slice
+        /// first). <paramref name="whole"/>: the chunk must run whole (it ends the prompt or a
+        /// checkpoint); otherwise the trunk may run only a prefix of it. False when the chunk
+        /// cannot ride a verify; its media is then dropped, as it is when no verify runs it.
+        /// </summary>
+        bool StageMixedPrefill(string requestId, int[] tokens, int position, bool whole);
+
+        /// <summary>
+        /// End the staged chunk: true with the tokens a verify ran (a prefix of the chunk) and
+        /// its last row's logits; false when no verify ran it (nothing advanced). Throws when the
+        /// forward that carried it failed after writing its cache.
+        /// </summary>
+        bool TakeMixedPrefill(string requestId, out int tokensRun, out float[]? logits);
+
+        /// <summary>The prompt tokens a step that also decodes should carry
+        /// (<see cref="Scheduling.SchedulerConfig.MixedStepPrefillBudget"/>) when the configuration
+        /// does not set it; 0 leaves it unbounded.</summary>
+        int PreferredMixedStepPrefillTokens => 0;
+    }
 }

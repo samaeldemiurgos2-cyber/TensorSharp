@@ -23,12 +23,13 @@ public enum InvalidationReason : byte { ModelBudgetEviction, NativeSlotReclaimed
 
 /// <summary>
 /// One materialization. <see cref="TargetTokens"/> below <see cref="PayloadTokens"/> means the
-/// caller truncates at the first bind (the executor's pending truncation); the model never
+/// caller truncates at the first bind (the executor's pending truncation). RequiredContextTokens
+/// is an optional, already fitted reservation for a clone, not its valid token count; the model never
 /// truncates a payload in <see cref="IPrefixCacheModel.TryMaterialize"/> (P7).
 /// </summary>
 public readonly record struct MaterializeRequest(
     MaterializeOp Op, string PayloadKey, string TargetRequestId,
-    int PayloadTokens, int TargetTokens);
+    int PayloadTokens, int TargetTokens, int RequiredContextTokens = 0);
 
 /// <summary>Where a model reports the payloads it still evicts itself (DEC-23).</summary>
 public interface IPrefixPayloadSink
@@ -119,6 +120,17 @@ public interface IPrefixCacheModel
     /// <paramref name="targetTokens"/> would allocate (the pre-clone budget check).</summary>
     ResourceVector EstimateCloneBytes(string payloadKey, int targetTokens);
 
+    /// <summary>Fit a request's prefill reservation before estimating and allocating a clone.
+    /// The returned hint is frozen for both operations; zero preserves the compact-clone policy.
+    /// A positive result promises that materialization takes this reservation, so the caller
+    /// skips its later PrepareForPrefill. This method is side-effect free and must not allocate cache storage.</summary>
+    int ResolveCloneReservationTokens(string payloadKey, int requiredContextTokens) => 0;
+
+    /// <summary>Estimate the clone with the same fitted reservation passed to materialization.
+    /// Families without reservation-aware clones keep their existing allocation policy.</summary>
+    ResourceVector EstimateCloneBytes(string payloadKey, int targetTokens, int requiredContextTokens)
+        => EstimateCloneBytes(payloadKey, targetTokens);
+
     // ---- pages (class P, M7a) ----
 
     /// <summary>Copy model-paged (A2) rows of <paramref name="blockIds"/> into a fresh private
@@ -128,6 +140,23 @@ public interface IPrefixCacheModel
     // ---- persistence (Persistable only) ----
 
     bool TryExport(string payloadKey, System.IO.Stream destination);
+
+    /// <summary>
+    /// Worker: prepare an export of <paramref name="payloadKey"/> whose bytes are written
+    /// later on another thread, by <paramref name="write"/>. The caller then reports the
+    /// running write through <see cref="NoteBackgroundExport"/>, and the model keeps the
+    /// payload's bytes alive and unchanged until it completes. False when the model can
+    /// only export inline (<see cref="TryExport"/>).
+    /// </summary>
+    bool TryPrepareBackgroundExport(string payloadKey, out Action<System.IO.Stream>? write)
+    {
+        write = null;
+        return false;
+    }
+
+    /// <summary>Worker: the background write prepared for <paramref name="payloadKey"/> runs as
+    /// <paramref name="task"/>.</summary>
+    void NoteBackgroundExport(string payloadKey, System.Threading.Tasks.Task task) { }
 
     /// <summary>Create <paramref name="payloadKey"/> from an export of the same model; false and
     /// nothing created when the bytes do not describe <paramref name="tokens"/> tokens of this model.</summary>

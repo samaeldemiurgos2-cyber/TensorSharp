@@ -224,8 +224,12 @@ docker build -f Dockerfile \
   -t tensorsharp-server-gpu .
 ```
 
-Pin the CUDA toolkit with `--build-arg CUDA_VERSION=12.4.1` (the `-devel` and
-`-runtime` tags share it). 12.2.2 (default) JIT-compiles on any driver ≥ 535.
+Pin the CUDA toolkit with `--build-arg CUDA_VERSION=<version>` (the `-devel` and
+`-runtime` tags share it). The default, 13.4.3, needs a CUDA 13 driver (R580 or
+newer), and with the default PTX-only `CUDA_ARCHS` the driver must also support
+CUDA 13.4 to JIT-compile it. For an older host driver use
+`--build-arg CUDA_VERSION=12.2.2` (JIT-compiles on any driver ≥ 535) or a `-real`
+architecture.
 
 ## Build OOM-killed (exit code 137 / `OOMKilled`)
 

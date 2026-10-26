@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Linq;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -1130,13 +1131,23 @@ namespace TensorSharp.Models
             FlushArenaSlotForActiveHolder();
             if (requiredSeqLen <= _kvCacheCapacity)
                 return;
+            // A background checkpoint capture may still be reading these copies.
+            WaitCaptureReads(_kvCacheK, _kvCacheV);
             if (requiredSeqLen > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {requiredSeqLen} exceeds configured max context {_maxContextLength}.");
 
             // Ops.Copy below is a host-side copy.  Whole-model GGML prefill and
             // decode leave attention K/V and recurrent state device-resident, so
             // drain both before replacing the buffers / invalidating their graphs.
-            EnsureKvCacheHostSynchronized();
+            // On CUDA the committed rows move between device copies instead - or,
+            // when the host bytes are the cache's only copy (a cache that has not
+            // been bound yet), are uploaded straight into the new device copies.
+            // The host path zero-filled the whole new capacity and uploaded it at
+            // the next bind: ~0.7 GB and ~150 ms before a cold 19K-token prompt.
+            bool growOnDevice = DeviceHolderCopiesEnabled
+                && (!_kvCacheHostDirty || CanCopyHolderKvOnDevice(SnapshotActiveCache()));
+            if (!growOnDevice)
+                EnsureKvCacheHostSynchronized();
             EnsureFusedDecodeStateHostSynchronized();
             // Native graphs retain bindings to the current cache/state buffers.
             // Drop them while those pointers are still alive, before any tensor is
@@ -1147,19 +1158,32 @@ namespace TensorSharp.Models
             long? spare = GetCacheMemorySpareBytes();
             int newCapacity = ResolveAttentionCacheGrowthCapacity(
                 _kvCacheCapacity, requiredSeqLen, _maxContextLength, KvCacheBytesPerToken, spare, geometricGrowth);
+            if (PrefixReleaseDebug)
+                Console.Error.WriteLine($"[kv-grow] {_kvCacheCapacity} -> {newCapacity} for {requiredSeqLen} (seq {_cacheSeqLen}) via " +
+                    string.Join(" < ", new System.Diagnostics.StackTrace(1, false).GetFrames()
+                        .Take(6).Select(f => f.GetMethod()?.Name)));
             if (geometricGrowth && _holderPool?.Count > 0
                 && newCapacity < ResolveAttentionCacheGrowthCapacity(
                     _kvCacheCapacity, requiredSeqLen, _maxContextLength, KvCacheBytesPerToken, null))
             {
                 // The active cache/state has already been synchronized above.
                 // Free optional idle buffers before committing more live capacity.
-                TrimIdleMemory();
+                TrimIdleMemoryForPressure();
                 newCapacity = ResolveAttentionCacheGrowthCapacity(
                     _kvCacheCapacity, requiredSeqLen, _maxContextLength, KvCacheBytesPerToken,
                     GetCacheMemorySpareBytes(), geometricGrowth);
             }
 
             DType kvDtype = _kvCacheDtype.ToDType();
+            if (growOnDevice && TryGrowAttentionCacheOnDevice(newCapacity, kvDtype))
+            {
+                _kvCacheCapacity = newCapacity;
+                _kvCacheHostDirty = true;
+                Console.WriteLine($"Expanded Qwen3.5 attention cache to {newCapacity} tokens.");
+                return;
+            }
+            if (growOnDevice)
+                EnsureKvCacheHostSynchronized();
             for (int l = 0; l < TotalLayerCount; l++)
             {
                 if (_isRecurrent[l])
@@ -1195,6 +1219,55 @@ namespace TensorSharp.Models
             _kvCacheCapacity = newCapacity;
             _kvCacheHostDirty = false;
             Console.WriteLine($"Expanded Qwen3.5 attention cache to {newCapacity} tokens.");
+        }
+
+        /// <summary>Grow the active attention cache by copying its committed rows between
+        /// device copies, or uploading them from host bytes a layer has no device copy of.
+        /// The new tensors' host bytes are never written (the cache stays device-
+        /// authoritative). All copies complete before any tensor is replaced, so a failure
+        /// leaves the active cache untouched for the host path.</summary>
+        private bool TryGrowAttentionCacheOnDevice(int newCapacity, DType kvDtype)
+        {
+            int layers = TotalLayerCount;
+            var newK = new Tensor[layers];
+            var newV = new Tensor[layers];
+            bool complete = false;
+            try
+            {
+                for (int l = 0; l < layers; l++)
+                {
+                    if (_isRecurrent[l]) continue;
+                    newK[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, newCapacity, Config.HeadDim);
+                    newV[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, newCapacity, Config.HeadDim);
+                    bool upload = l < Config.NumLayers;
+                    if (!CopyHolderKvTensor(_kvCacheK[l], newK[l], _cacheSeqLen, upload)
+                        || !CopyHolderKvTensor(_kvCacheV[l], newV[l], _cacheSeqLen, upload))
+                        return false;
+                }
+                for (int l = 0; l < layers; l++)
+                {
+                    if (_isRecurrent[l]) continue;
+                    InvalidateTensorDeviceCache(_kvCacheK[l]);
+                    InvalidateTensorDeviceCache(_kvCacheV[l]);
+                    _kvCacheK[l].Dispose();
+                    _kvCacheV[l].Dispose();
+                    _kvCacheK[l] = newK[l];
+                    _kvCacheV[l] = newV[l];
+                }
+                complete = true;
+                return true;
+            }
+            finally
+            {
+                if (!complete)
+                    for (int l = 0; l < layers; l++)
+                        foreach (Tensor t in new[] { newK[l], newV[l] })
+                        {
+                            if (t == null) continue;
+                            InvalidateTensorDeviceCache(t);
+                            t.Dispose();
+                        }
+            }
         }
 
         private void PrecomputeRoPE()
@@ -1279,6 +1352,8 @@ namespace TensorSharp.Models
                 _forwardSw.Reset();
                 return;
             }
+            // A background checkpoint capture may still be reading the active copies.
+            WaitCaptureReads(_kvCacheK, _kvCacheV);
 
             // Reset intentionally discards the current device-resident state. Clear
             // the dirty latches first so dropping the graphs does not copy it back,
@@ -1868,7 +1943,7 @@ namespace TensorSharp.Models
         /// seqLen &lt;= cacheSize) and weight/shape support are re-checked inside
         /// <see cref="TryFullModelVerify"/>, which bails (→ per-op fallback) otherwise.
         /// </summary>
-        private bool CanUsePrefillVerify(int startPos, int seqLen)
+        private bool CanUsePrefillVerify(int startPos, int seqLen, bool singleTokenPrompt = false)
         {
             if (_fvUnsupported) return false;
             // All GGML GPU backends run the whole-model prefill graph. CUDA and
@@ -1881,7 +1956,7 @@ namespace TensorSharp.Models
             if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan
                     && _backend != BackendType.GgmlMetal)
                 return FvBail($"backend {_backend} has no whole-model prefill graph");
-            if (seqLen <= 1) return false;   // decode; TryFullModelDecode's job
+            if (seqLen <= 1 && !singleTokenPrompt) return false;   // decode; TryFullModelDecode's job
             // Vision embeddings must already be spliced into `hidden` before the
             // graph runs; ForwardCore injects them, so a non-empty queue here means
             // this call is upstream of that.
@@ -2264,9 +2339,11 @@ namespace TensorSharp.Models
 
         protected override float[] ForwardRefillCore(int[] tokens)
         {
-            // Prefill runs the recurrent state on the host; re-seed the fused
+            // Prefill runs the recurrent state on the host (on CUDA the verifier takes
+            // a decode-resident state over on the device instead); re-seed the fused
             // decode's device-resident GDN state afterwards.
-            InvalidateFullDecodeState();
+            if (!TryImportDecodeStateToVerifier())
+                InvalidateFullDecodeState();
             if (tokens == null || tokens.Length <= 1)
                 return ForwardCore(tokens);
 
@@ -2442,8 +2519,15 @@ namespace TensorSharp.Models
             // quantized embedding lookup on-device. Do the same for ordinary
             // text-only Metal decode, avoiding a per-token CPU dequantization,
             // Tensor allocation, and hidden-vector upload.
-            int directTokenId = seqLen == 1 ? tokens[0] : -1;
-            if (CanTryDirectTokenDecode(
+            // A one-token prompt tail (a repeated or extended prompt whose cached prefix
+            // stops one short) ahead of a DFlash session runs as a one-row verify: its
+            // recurrent state stays in the verifier's device slices for the speculative
+            // steps, instead of building this holder's decode graph for one token and
+            // then syncing the state it leaves to the host for the drafter.
+            bool singleTokenPrompt = seqLen == 1 && ForwardIsPrompt && HasDFlash
+                && _backend == BackendType.GgmlCuda && _pendingMRoPEPositions == null;
+            int directTokenId = seqLen == 1 && !singleTokenPrompt ? tokens[0] : -1;
+            if (!singleTokenPrompt && CanTryDirectTokenDecode(
                     _backend,
                     IsTensorParallel,
                     seqLen,
@@ -2481,7 +2565,7 @@ namespace TensorSharp.Models
             // as one fused, CUDA-graph-captured GGML graph that outputs LOGITS
             // directly. Collapses ~120-400 per-op dispatches/token + the separate
             // lm_head graph_compute into a single captured replay.
-            if (seqLen == 1 && _pendingMRoPEPositions == null && TryFullModelDecode(hidden, startPos, _logitsBuffer))
+            if (seqLen == 1 && !singleTokenPrompt && _pendingMRoPEPositions == null && TryFullModelDecode(hidden, startPos, _logitsBuffer))
             {
                 // _logitsBuffer holds the final logits; skip the per-op loop + lm head.
                 hidden.Dispose();
@@ -2501,12 +2585,14 @@ namespace TensorSharp.Models
             // Image prompts take this path too: the graph applies MRoPE itself
             // (ggml_rope_multi / IMROPE) from the mropePos+mropeSecs arguments
             // TryFullModelVerify packs. Long prompts chunk via ForwardRefill.
-            if (seqLen > 1 && CanUsePrefillVerify(startPos, seqLen)
-                && TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: _logitsBuffer, nLogitRows: 1))
+            if ((seqLen > 1 || singleTokenPrompt) && CanUsePrefillVerify(startPos, seqLen, singleTokenPrompt)
+                && TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: _logitsBuffer, nLogitRows: 1,
+                    keepDeviceState: true))
             {
-                // _logitsBuffer holds the LAST token's logits; KV + GDN state were
-                // committed (host ring) by the kernel. Re-seed the device-resident
-                // fused-decode GDN state next decode (the per-op convention).
+                // _logitsBuffer holds the LAST token's logits. The chunk's recurrent
+                // state stays in the verifier's device slices (no 151 MB download here
+                // and upload at the next chunk); every reader of the host mirrors -
+                // decode, checkpoint, settle, a holder switch - drains it first.
                 hidden.Dispose();
                 _cacheSeqLen += seqLen;
                 _forwardCount++;
@@ -6450,6 +6536,12 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Qwen35ReleaseAttentionTpGraphs();
                 GgmlBasicOps.Qwen35GdnDropTpGraphs();
             }
+
+            // Layer descriptors retain pointers into this pinned scale table.
+            // Release the pin only after every native graph has been retired.
+            if (_projScaleHandle.IsAllocated)
+                _projScaleHandle.Free();
+            _projScaleTable = null;
 
             // Cached CUDA prefill graphs own pool blocks + pinned tensors; free
             // them before the tensors/caches they reference are torn down.

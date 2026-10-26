@@ -482,6 +482,216 @@ __global__ void finish_kernel(const float * partial, view sinks, bool has_sinks,
     }
 }
 
+// m16n8k16 tensor-core MMA, F16 operands, F32 accumulators (sm_80+).
+__device__ __forceinline__ void mma_f16_16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ uint32_t pack_half2(float low, float high) {
+    const half2 value = __floats2half2_rn(low, high);
+    return *reinterpret_cast<const uint32_t *>(&value);
+}
+
+__device__ __forceinline__ uint32_t load_half2(const half * p) {
+    return *reinterpret_cast<const uint32_t *>(p);
+}
+
+// Copy 16 bytes global -> shared without staging through registers (sm_80+).
+__device__ __forceinline__ void cp_async_16(void * shared, const void * global) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(shared));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(address), "l"(global));
+#else
+    *static_cast<uint4 *>(shared) = *static_cast<const uint4 *>(global);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+#endif
+}
+
+// B fragments of two 8x8 F16 tiles stored row-major (rows = the MMA's k), transposed
+// on the way into registers.
+__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t & b0, uint32_t & b1, const half * row) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(row));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b0), "=r"(b1) : "r"(address));
+#else
+    b0 = b1 = 0;
+    __trap();
+#endif
+}
+
+// Tensor-core flash attention for the vision towers' 64/72-wide heads, without
+// masks. Q arrives F32 and is rounded to F16 here; K and V arrive as F16 (ggml
+// casts them once per layer) - the same 10-bit mantissa the TF32 GEMMs of the
+// decomposed path round all three to. Scores, the online softmax and the output
+// accumulate in F32. One block owns 128 queries of one head (eight warps of 16
+// rows) and copies 64-key K/V tiles to shared memory asynchronously; the quadratic
+// score matrix is never materialized. Head widths pad to a multiple of 16 with zeros.
+template <int WIDTH>
+__global__ __launch_bounds__(256) void vision_mma_kernel(view q, view k, view v, float scale, float * output) {
+    constexpr int PADDED = (WIDTH + 15) / 16 * 16, WARPS = 8, QUERIES = WARPS * 16, KEYS = 64;
+    constexpr int CHUNKS = WIDTH / 8;     // 16-byte chunks per F16 key row
+    // Row stride padded so fragment and ldmatrix accesses of a warp hit distinct banks.
+    constexpr int ROW = PADDED + 8;
+    static_assert(WIDTH % 8 == 0, "K/V rows are copied in 16-byte chunks");
+    __shared__ __align__(16) half queries[QUERIES * ROW];
+    __shared__ __align__(16) half keys[KEYS * ROW];
+    __shared__ __align__(16) half values[KEYS * ROW];
+    const int head = blockIdx.y, batch = blockIdx.z, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31, group = lane >> 2, quad = lane & 3;
+    const int64_t first_query = int64_t(blockIdx.x) * QUERIES, nq = q.ne[1], nk = k.ne[1];
+    const char * key_base = k.data + head * k.nb[2] + batch * k.nb[3];
+    const char * value_base = v.data + head * v.nb[2] + batch * v.nb[3];
+
+    for (int i = tid; i < QUERIES * PADDED; i += WARPS * 32) {
+        const int r = i / PADDED, x = i % PADDED;
+        const int64_t query = first_query + r;
+        queries[r * ROW + x] = __float2half(x < WIDTH && query < nq ? read(q, x, query, head, batch) : 0.0f);
+    }
+    // Padding columns are never copied over: zero them once.
+    if constexpr (PADDED > WIDTH) {
+        for (int i = tid; i < KEYS * (PADDED - WIDTH); i += WARPS * 32) {
+            const int r = i / (PADDED - WIDTH), x = WIDTH + i % (PADDED - WIDTH);
+            keys[r * ROW + x] = values[r * ROW + x] = __float2half(0.0f);
+        }
+    }
+    __syncthreads();
+    uint32_t qa[PADDED / 16][4];
+#pragma unroll
+    for (int kk = 0; kk < PADDED / 16; ++kk) {
+        const half * base = queries + (warp * 16) * ROW + kk * 16 + quad * 2;
+        qa[kk][0] = load_half2(base + group * ROW);
+        qa[kk][1] = load_half2(base + (group + 8) * ROW);
+        qa[kk][2] = load_half2(base + group * ROW + 8);
+        qa[kk][3] = load_half2(base + (group + 8) * ROW + 8);
+    }
+
+    // Rows `group` and `group + 8` of this warp's 16; scores live in the log2 domain.
+    float acc[PADDED / 8][4];
+#pragma unroll
+    for (int n = 0; n < PADDED / 8; ++n)
+        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    float max0 = -CUDART_INF_F, max1 = -CUDART_INF_F, sum0 = 0.0f, sum1 = 0.0f;
+    const float log2_scale = scale * 1.4426950408889634f;
+
+    for (int64_t first_key = 0; first_key < nk; first_key += KEYS) {
+        __syncthreads();
+        for (int i = tid; i < KEYS * CHUNKS; i += WARPS * 32) {
+            const int r = i / CHUNKS, c = i % CHUNKS;
+            const int64_t key = first_key + r;
+            half * kd = keys + r * ROW + c * 8;
+            half * vd = values + r * ROW + c * 8;
+            if (key < nk) {
+                cp_async_16(kd, key_base + key * k.nb[1] + c * 16);
+                cp_async_16(vd, value_base + key * v.nb[1] + c * 16);
+            } else {
+                // Past the last key: finite zeros, so masked probabilities times
+                // V stay exactly zero.
+                *reinterpret_cast<uint4 *>(kd) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4 *>(vd) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        cp_async_wait_all();
+        __syncthreads();
+
+        float s[KEYS / 8][4];
+#pragma unroll
+        for (int j = 0; j < KEYS / 8; ++j) {
+            s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < PADDED / 16; ++kk) {
+                const half * kb = keys + (j * 8 + group) * ROW + kk * 16 + quad * 2;
+                mma_f16_16816(s[j], qa[kk], load_half2(kb), load_half2(kb + 8));
+            }
+        }
+        float tile0 = max0, tile1 = max1;
+#pragma unroll
+        for (int j = 0; j < KEYS / 8; ++j) {
+            const int64_t key = first_key + j * 8 + quad * 2;
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+                s[j][c] = key + (c & 1) < nk ? s[j][c] * log2_scale : -CUDART_INF_F;
+            tile0 = fmaxf(tile0, fmaxf(s[j][0], s[j][1]));
+            tile1 = fmaxf(tile1, fmaxf(s[j][2], s[j][3]));
+        }
+#pragma unroll
+        for (int offset = 1; offset < 4; offset <<= 1) {
+            tile0 = fmaxf(tile0, __shfl_xor_sync(0xffffffffu, tile0, offset));
+            tile1 = fmaxf(tile1, __shfl_xor_sync(0xffffffffu, tile1, offset));
+        }
+        // The first tile always holds a key, so tile maxima are finite.
+        const float correction0 = exp2f(max0 - tile0), correction1 = exp2f(max1 - tile1);
+        max0 = tile0;
+        max1 = tile1;
+        sum0 *= correction0;
+        sum1 *= correction1;
+#pragma unroll
+        for (int n = 0; n < PADDED / 8; ++n) {
+            acc[n][0] *= correction0;
+            acc[n][1] *= correction0;
+            acc[n][2] *= correction1;
+            acc[n][3] *= correction1;
+        }
+#pragma unroll
+        for (int j = 0; j < KEYS / 8; ++j) {
+            s[j][0] = exp2f(s[j][0] - max0);
+            s[j][1] = exp2f(s[j][1] - max0);
+            s[j][2] = exp2f(s[j][2] - max1);
+            s[j][3] = exp2f(s[j][3] - max1);
+            sum0 += s[j][0] + s[j][1];
+            sum1 += s[j][2] + s[j][3];
+        }
+#pragma unroll
+        for (int kk = 0; kk < KEYS / 16; ++kk) {
+            // The score accumulators of two adjacent 8-key tiles are exactly the
+            // A-operand fragment of the 16-key slice they cover.
+            const uint32_t pa[4] = {
+                pack_half2(s[2 * kk][0], s[2 * kk][1]), pack_half2(s[2 * kk][2], s[2 * kk][3]),
+                pack_half2(s[2 * kk + 1][0], s[2 * kk + 1][1]), pack_half2(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+            const half * vrow = values + (kk * 16 + (lane & 15)) * ROW;
+#pragma unroll
+            for (int n = 0; n < PADDED / 8; ++n) {
+                uint32_t b0, b1;
+                ldmatrix_x2_trans(b0, b1, vrow + n * 8);
+                mma_f16_16816(acc[n], pa, b0, b1);
+            }
+        }
+    }
+#pragma unroll
+    for (int offset = 1; offset < 4; offset <<= 1) {
+        sum0 += __shfl_xor_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_xor_sync(0xffffffffu, sum1, offset);
+    }
+    const float inverse0 = 1.0f / sum0, inverse1 = 1.0f / sum1;
+#pragma unroll
+    for (int half_row = 0; half_row < 2; ++half_row) {
+        const int64_t query = first_query + warp * 16 + group + half_row * 8;
+        if (query >= nq)
+            continue;
+        const float inverse = half_row ? inverse1 : inverse0;
+        float * out = output + (head + q.ne[2] * (query + q.ne[1] * batch)) * WIDTH;
+#pragma unroll
+        for (int n = 0; n < PADDED / 8; ++n) {
+            const int x = n * 8 + quad * 2;
+            if (x < WIDTH)
+                out[x] = acc[n][half_row * 2] * inverse;
+            if (x + 1 < WIDTH)
+                out[x + 1] = acc[n][half_row * 2 + 1] * inverse;
+        }
+    }
+}
+
 __global__ void softmax_kernel(view scores, view mask, view sinks, bool masked, bool has_sinks, float scale,
                                float * output) {
     constexpr int THREADS = 256;
@@ -541,6 +751,18 @@ void tsg_attention_cuda_compute(ggml_tensor * dst, ggml_backend_t backend) {
             vision_kernel<64><<<blocks, 128, 0, stream>>>(q, k, v, desc.f0, static_cast<float *>(dst->data));
         else
             vision_kernel<72><<<blocks, 128, 0, stream>>>(q, k, v, desc.f0, static_cast<float *>(dst->data));
+    } else if (desc.kind == TSG_ATTN_VISION_MMA) {
+        const auto q = tensor_view(dst->src[0]), k = tensor_view(dst->src[1]), v = tensor_view(dst->src[2]);
+        GGML_ASSERT((q.ne[0] == 64 || q.ne[0] == 72) && (q.ne[1] + 127) / 128 <= INT_MAX && q.ne[2] <= 65535 && q.ne[3] <= 65535);
+        // K/V rows are copied in 16-byte chunks straight from their F16 tensors.
+        GGML_ASSERT(k.type == GGML_TYPE_F16 && v.type == GGML_TYPE_F16 && k.nb[0] == 2 && v.nb[0] == 2);
+        GGML_ASSERT(((uintptr_t(k.data) | uintptr_t(v.data) | k.nb[1] | v.nb[1] | k.nb[2] | v.nb[2] | k.nb[3] | v.nb[3]) & 15) == 0);
+        const dim3 blocks(unsigned((q.ne[1] + 127) / 128), unsigned(q.ne[2]), unsigned(q.ne[3]));
+        if (q.ne[0] == 64)
+            vision_mma_kernel<64><<<blocks, 256, 0, stream>>>(q, k, v, desc.f0, static_cast<float *>(dst->data));
+        else
+            vision_mma_kernel<72><<<blocks, 256, 0, stream>>>(q, k, v, desc.f0, static_cast<float *>(dst->data));
+        CUDA_CHECK(cudaGetLastError());
     } else if (desc.kind == TSG_ATTN_MASK_COMPACT) {
         const int64_t rows = ggml_nelements(dst) / dst->ne[0];
         GGML_ASSERT(rows <= INT_MAX);
@@ -634,4 +856,13 @@ void tsg_attention_cuda_compute(ggml_tensor * dst, ggml_backend_t backend) {
         std::fflush(stderr);
     }
     CUDA_CHECK(launch_status);
+}
+
+bool tsg_vision_mma_supported(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend))
+        return false;
+    const auto * context = static_cast<const ggml_backend_cuda_context *>(backend->context);
+    int major = 0;
+    return cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, context->device) == cudaSuccess
+        && major >= 8;
 }

@@ -73,7 +73,7 @@ internal sealed class PrefixTreeOptions
     public IPayloadValidator? PayloadValidator { get; init; }          // null = no model calls (tests, benches)
     public Func<ResourceClass, long>? QuerySpareBytes { get; init; }   // −1 = unknown
     public ResourceVector OptionCapBytes { get; init; }                // 0 = auto; no env var feeds it (tests, RadixTreeBench)
-    public long HostRamBytes { get; init; }                            // auto HostKv cap = 25%; 0 = unknown
+    public long HostRamBytes { get; init; }                            // auto HostKv cap = 50%; 0 = unknown
     public long PoolPagesCap { get; init; }                            // BlockPool.NumBlocks; 0 = unbounded
     public long ScopeIdleMs { get; init; } = 600_000;
     public Func<long>? ClockMs { get; init; }
@@ -1469,10 +1469,14 @@ internal sealed class PrefixTree
                 if (a is null && b is null) break;
                 if (a is not null && (b is null || a.LastAccess <= b.LastAccess))
                 {
+                    if (s_capDebug)
+                        Console.Error.WriteLine($"[prefix-evict] leaf depth={a.Depth} key={a.EndState?.Key} access={a.LastAccess} tick={_tick} {cls}");
                     freed += DeleteLeafCascade(a, why)[cls];
                 }
                 else
                 {
+                    if (s_capDebug)
+                        Console.Error.WriteLine($"[prefix-evict] state depth={b!.Depth} key={b.EndState?.Key} access={b.LastAccess} tick={_tick} {cls}");
                     freed += DetachEndState(b!, why)[cls];
                     CollectFrom(b!);
                 }
@@ -1528,7 +1532,12 @@ internal sealed class PrefixTree
             long spare = _options.QuerySpareBytes?.Invoke(c) ?? -1;
             if (spare >= 0) v[c] = Math.Max(1, spare / 2);
         }
-        if (v.HostKv <= 0 && _options.HostRamBytes > 0) v.HostKv = Math.Max(1, _options.HostRamBytes / 4);
+        // Half the memory the runtime reports available. The effective cap is
+        // still bounded by measured spare memory (EffectiveCap), so this only
+        // decides how much of that headroom retained conversations may use: at a
+        // quarter, a 62 GB container capped them at 11 GB with 20 GB still spare,
+        // and four concurrent conversations evicted each other's last turn.
+        if (v.HostKv <= 0 && _options.HostRamBytes > 0) v.HostKv = Math.Max(1, _options.HostRamBytes / 2);
         _optionCap = v;
     }
 
@@ -1575,10 +1584,18 @@ internal sealed class PrefixTree
             var c = (ResourceClass)i;
             long cap = EffectiveCap(c);
             if (_cached[c] > cap)
+            {
+                if (s_capDebug)
+                    Console.Error.WriteLine($"[prefix-cap] {c} cached={_cached[c] >> 20}MiB cap={cap >> 20}MiB " +
+                        $"option={AbsoluteCap(c) >> 20}MiB spare={(_options.QuerySpareBytes?.Invoke(c) ?? -1) >> 20}MiB " +
+                        $"reserve={_runningReserve[c] >> 20}MiB");
                 ok &= Evict(c, _cached[c] - cap, why, ceiling);
+            }
         }
         return ok;
     }
+
+    private static readonly bool s_capDebug = Environment.GetEnvironmentVariable("TS_PREFIX_RELEASE_DEBUG") == "1";
 
     /// <summary>Count sub-caps (DEC-20): scoped end states, public end states, native slots. Oldest first, ceiling ScopeNewest.</summary>
     internal bool EnforceCountSubCaps(RadixNode? requestedPublicState = null)
@@ -1648,6 +1665,8 @@ internal sealed class PrefixTree
                 }
             }
             if (victim is null) return false;
+            if (s_capDebug)
+                Console.Error.WriteLine($"[prefix-count] evicting {victim.Depth} tokens: scoped={_scopedEndStates} public={_publicEndStates}");
             DetachEndState(victim, ReleaseReason.Evicted);
             CollectFrom(victim);
             Counters.Evictions++;

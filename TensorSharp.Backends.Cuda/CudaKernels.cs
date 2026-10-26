@@ -49,6 +49,9 @@ namespace TensorSharp.Cuda
         // head_dim -> ts_vision_attention_d<D>_f32 (bidirectional flash attention
         // for vision encoders). Only the instantiated head dims are present.
         private readonly System.Collections.Generic.Dictionary<int, IntPtr> visionAttentionF32 = new();
+        // Tensor-core variants (sm_80+) and the f16 conversion they read from.
+        private readonly System.Collections.Generic.Dictionary<int, IntPtr> visionAttentionMma = new();
+        private IntPtr visionPadF16;
         // Wan video direct-backend kernels (optional: absent from PTX built before
         // they existed; callers must check the Has* accessors).
         private readonly System.Collections.Generic.Dictionary<int, IntPtr> wanAttentionF32 = new();
@@ -203,6 +206,23 @@ namespace TensorSharp.Cuda
             {
                 try { visionAttentionF32[headDim] = module.GetFunction($"ts_vision_attention_d{headDim}_f32"); }
                 catch { missingOptional.Add($"ts_vision_attention_d{headDim}_f32"); }
+            }
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            CudaDriverApi.cuDeviceGetAttribute(out int ccMajor, 75 /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR */, device);
+            if (ccMajor >= 8)
+            {
+                visionPadF16 = GetOptionalFunction(module, "ts_vision_pad_f16", missingOptional);
+                foreach (int headDim in new[] { 64, 72, 80, 96, 112, 128 })
+                {
+                    try
+                    {
+                        IntPtr f = module.GetFunction($"ts_vision_attention_mma_d{headDim}");
+                        CudaDriverApi.cuFuncSetAttribute(f, 8 /* CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES */,
+                            (int)VisionAttentionMmaSmem(headDim)).ThrowOnError();
+                        visionAttentionMma[headDim] = f;
+                    }
+                    catch { missingOptional.Add($"ts_vision_attention_mma_d{headDim}"); }
+                }
             }
             foreach (int headDim in new[] { 64, 128 })
             {
@@ -885,6 +905,35 @@ namespace TensorSharp.Cuda
             const int threads = 128; // must match TS_VISION_ATTN_THREADS
             uint qBlocks = (uint)((seq + threads - 1) / threads);
             Launch(visionAttentionF32[headDim], qBlocks, (uint)numHeads, 1, threads, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>Whether the tensor-core vision attention serves this head dim.</summary>
+        public bool HasVisionAttentionMma(int headDim) => visionPadF16 != IntPtr.Zero && visionAttentionMma.ContainsKey(headDim);
+
+        /// <summary>Head dim the tensor-core vision attention pads to (a multiple of 16).</summary>
+        public static int VisionAttentionPaddedDim(int headDim) => (headDim + 15) / 16 * 16;
+
+        // Two stages of K and V tiles: 64 keys of padded dim + 8 halves each.
+        private static uint VisionAttentionMmaSmem(int headDim) => (uint)(2 * 2 * 64 * (VisionAttentionPaddedDim(headDim) + 8) * 2);
+
+        /// <summary>[seq, heads, d] F32 -> [heads, seq, dp] f16, zero padded.</summary>
+        public void LaunchVisionPadF16(IntPtr src, int seq, int heads, int d, int dp, IntPtr dst, IntPtr stream)
+        {
+            IntPtr a0 = src, a5 = dst; int a1 = seq, a2 = heads, a3 = d, a4 = dp;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            long n = (long)heads * seq * dp;
+            Launch(visionPadF16, (uint)Math.Min((n + 255) / 256, 65535), 1, 1, 256, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>Bidirectional attention on the f16 tensor cores over padded f16 q/k/v
+        /// [heads, seq, dp]; output F32 [seq, heads, headDim].</summary>
+        public void LaunchVisionAttentionMma(IntPtr q16, IntPtr k16, IntPtr v16, IntPtr output, int numHeads, int seq, int headDim,
+            float scale, IntPtr stream)
+        {
+            IntPtr a0 = q16, a1 = k16, a2 = v16, a3 = output; int a4 = numHeads, a5 = seq; float a6 = scale;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6 };
+            Launch(visionAttentionMma[headDim], (uint)((seq + 63) / 64), (uint)numHeads, 1, 128, 1, 1,
+                VisionAttentionMmaSmem(headDim), stream, args);
         }
 
         private static IntPtr GetOptionalFunction(CudaModule module, string name, System.Collections.Generic.List<string> missing)

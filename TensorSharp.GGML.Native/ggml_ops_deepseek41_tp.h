@@ -14,6 +14,14 @@
 
 namespace tsg_dsv41_tp
 {
+// Reuses TensorSharp's existing cross-node collective transport. Each node
+// first assembles its disjoint local strips in an otherwise zero F32 buffer;
+// summing those buffers reconstructs the exact global tensor.
+// (data=nullptr, count=-1) means terminal rank failure: abort the existing
+// transport to release peers already waiting in a collective, and return false.
+// Callbacks must never throw. The first native failure remains authoritative.
+using cross_node_all_reduce = bool (*)(void * user, float * data, int count);
+
 struct source
 {
     std::string path;
@@ -48,7 +56,9 @@ public:
     // devices are accepted for the independent numerical regression test.
     // Sequential pread warms only the current layer before its strided copies.
     // Zero preserves direct reads; the native loader supplies its warm policy.
-    executor(const std::vector<ggml_backend_dev_t> & devices, int used_experts, int load_threads = 16);
+    executor(const std::vector<ggml_backend_dev_t> & devices, int used_experts, int load_threads = 16,
+             int global_ranks = 0, int rank_offset = 0,
+             cross_node_all_reduce cross_node = nullptr, void * cross_node_user = nullptr);
     ~executor();
     executor(const executor &) = delete;
     executor & operator=(const executor &) = delete;

@@ -39,6 +39,8 @@ namespace TensorSharp.Models
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
         {
             if (ctx == null) throw new ArgumentNullException(nameof(ctx));
+            if (!BatchedForwardAvailable)
+                throw new NotSupportedException("Layer-split models use the serialized distributed forward protocol.");
             if (IsTensorParallel)
                 return ForwardBatchTP(ctx);
 

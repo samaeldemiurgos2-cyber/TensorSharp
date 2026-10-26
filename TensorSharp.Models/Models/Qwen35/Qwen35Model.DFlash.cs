@@ -100,10 +100,16 @@ namespace TensorSharp.Models
         /// anchor's own prediction, which DFlash discards).</summary>
         public int DraftBlockSize => HasDFlash ? _dflash.MaxDraftTokens : 0;
 
+        /// <summary>The DFlash ring: older prompt rows are overwritten before any draft.</summary>
+        public int DraftContextRows => HasDFlash && DFlashRingRows > 0 ? DFlashRingRows : int.MaxValue;
+
         /// <summary>One whole-block draft. See <c>ModelBase.DFlashPropose</c>.</summary>
         public int DraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
         {
-            EnterSpecSession();
+            // A batched step drafts beside a verify that reads the holders directly;
+            // entering the single-sequence session would drop every decode graph.
+            if (!_batchedSpecScope)
+                EnterSpecSession();
             return DFlashPropose(lastToken, hPrev, position, draftOut, confOut);
         }
 
@@ -164,10 +170,13 @@ namespace TensorSharp.Models
                 logitRows = 1;
             }
 
+            // A last-row-only call is a prompt chunk or a rollback re-forward: neither is
+            // rolled back again, so its recurrent state may stay on the device.
             if (!TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: logitTarget,
                     nLogitRows: logitRows, rowOffset: 0,
                     captureData: wantCapture ? _dflashCaptureScratch : null,
-                    captureLayers: wantCapture ? _dflash.TargetLayerIds : null))
+                    captureLayers: wantCapture ? _dflash.TargetLayerIds : null,
+                    keepDeviceState: !allLogitsRows))
             {
                 return false;
             }

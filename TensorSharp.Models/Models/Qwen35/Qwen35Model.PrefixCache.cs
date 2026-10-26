@@ -20,6 +20,10 @@ namespace TensorSharp.Models
 {
     public partial class Qwen35Model : IHolderPrefixCacheModel, IPrefixCacheModelDiagnostics
     {
+        // TS_PREFIX_RELEASE_DEBUG=1: log released payloads and holders that could not be settled.
+        private static readonly bool PrefixReleaseDebug =
+            Environment.GetEnvironmentVariable("TS_PREFIX_RELEASE_DEBUG") == "1";
+
         // Set by AttachPrefixCache: the prefix cache owns this model's reuse state.
         private IPrefixPayloadSink _prefixCacheSink;
         // >0 while a batched release has already reset the decode graphs.
@@ -58,7 +62,33 @@ namespace TensorSharp.Models
 
         public void DetachPrefixCache() => _prefixCacheSink = null;
 
-        public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
+        /// <summary>A holder's recurrent state (delta tensors, conv rings and scratch) is host
+        /// memory; its device copies are charged as <see cref="ResourceClass.DeviceKv"/> by
+        /// <see cref="MeasureHolderFootprint"/>. Measuring <see cref="ResourceClass.StateSnapshot"/>
+        /// against GPU headroom evicted retained conversations whenever concurrent requests
+        /// filled the device. DeviceKv also counts the K/V device copies of idle retained
+        /// holders: a clone demotes those to host memory before allocating
+        /// (EnsureDeviceRetainHeadroom), so evicting payloads for the same room loses prefixes.</summary>
+        public long QuerySpareBytes(ResourceClass cls)
+        {
+            if (cls == ResourceClass.StateSnapshot && IsGgmlBackend && _backend != BackendType.GgmlMetal)
+                return QueryPrefixCacheSpareBytes(ResourceClass.HostKv);
+            long spare = QueryPrefixCacheSpareBytes(cls);
+            if (spare < 0 || cls != ResourceClass.DeviceKv)
+                return spare;
+            return spare + DemotableRetainedDeviceBytes();
+        }
+
+        private long DemotableRetainedDeviceBytes()
+        {
+            if (_retainedFusedHolders == null || !DeviceHolderCopiesEnabled)
+                return 0;
+            long bytes = 0;
+            foreach (var holder in _retainedFusedHolders.Values)
+                if (!holder.Retired && !holder.ArenaStateResident && holder.DeviceMirrored && CanCopyHolderKvOnDevice(holder))
+                    bytes += HolderKvBytes(holder, holder.KvCapacity);
+            return bytes;
+        }
 
         // ---------------------------------------------------------------- end states
 
@@ -102,13 +132,30 @@ namespace TensorSharp.Models
             // MLX never sets those flags (its holders' K/V and GDN caches are the only
             // copies), so a flagged holder there has nothing this could settle.
             if (!IsGgmlBackend || IsTensorParallel || _isRecurrent == null) return false;
+            // A CUDA clone copies K/V between device copies, so device-authoritative K/V
+            // needs no download; only device-held recurrent state must reach the host.
+            bool kvOnDevice = CanCopyHolderKvOnDevice(holder);
+            if (kvOnDevice && !(holder.GdnHostDirty || holder.ArenaStateResident || holder.FdStateResident))
+                return true;
+            // The active cache keeps its verify state on the device across the visit.
+            SettleVerifyStateOnDevice();
             Qwen35KvCacheHolder previous = SnapshotActiveCache();
             LoadCacheHolder(holder);
             try
             {
-                EnsureKvCacheHostSynchronized();
+                if (!kvOnDevice) EnsureKvCacheHostSynchronized();
                 EnsureFusedDecodeStateHostSynchronized();
                 DrainDeviceRecurrentState();
+                // An arena flush writes K/V to the host and drops the device copies.
+                if (kvOnDevice && !CanCopyHolderKvOnDevice(SnapshotActiveCache()))
+                    EnsureKvCacheHostSynchronized();
+                // Device-newer recurrent state lives in the fused-decode mirrors, an arena
+                // slot or the verify owner's slices, all settled above. A holder retained
+                // after its last verify kept the dirty flag it was snapshotted with, while
+                // the next holder switch drained that verify state into its host bytes;
+                // with none of the three left, those host bytes are current.
+                if (_gdnStateHostDirty && !_fdStateResident && !_arenaStateResident && !_fvDeviceStateCurrent)
+                    _gdnStateHostDirty = false;
                 if (!_gdnStateHostDirty)
                     _fdStateResident = false;
                 holder.KvHostDirty = _kvCacheHostDirty;
@@ -120,7 +167,12 @@ namespace TensorSharp.Models
             {
                 LoadCacheHolder(previous);
             }
-            return !(holder.KvHostDirty || holder.GdnHostDirty || holder.ArenaStateResident || holder.FdStateResident);
+            bool settled = !(holder.GdnHostDirty || holder.ArenaStateResident || holder.FdStateResident)
+                && (!holder.KvHostDirty || CanCopyHolderKvOnDevice(holder));
+            if (!settled && PrefixReleaseDebug)
+                Console.Error.WriteLine($"[prefix-settle] {holder.CacheSeqLen} tokens unsettled: kv={holder.KvHostDirty} gdn={holder.GdnHostDirty} " +
+                    $"arena={holder.ArenaStateResident} fd={holder.FdStateResident} fdSlot={_fdGdnSlot != null} kvOnDevice={kvOnDevice}");
+            return settled;
         }
 
         /// <summary>Host bytes as <see cref="IdleHolderBytes"/> counts them, split into attention K/V
@@ -132,25 +184,40 @@ namespace TensorSharp.Models
             return MeasureHolderFootprint(holder);
         }
 
-        private static PayloadFootprint MeasureHolderFootprint(Qwen35KvCacheHolder holder)
+        private PayloadFootprint MeasureHolderFootprint(Qwen35KvCacheHolder holder)
         {
             MeasureHolder(holder, out long kvBytes, out long stateBytes, out long deviceBytes);
             var vector = new ResourceVector
             {
                 HostKv = kvBytes,
                 StateSnapshot = stateBytes,
-                DeviceKv = holder.DeviceMirrored ? deviceBytes : 0,
+                DeviceKv = holder.DeviceMirrored ? PinnedDeviceBytes(holder, kvBytes, deviceBytes) : 0,
             };
             return new PayloadFootprint(holder.CacheSeqLen, holder.KvCapacity, vector, PositionDelta: 0);
         }
 
+        /// <summary>The device bytes of a retained holder that only eviction can free. With device
+        /// holder copies, idle K/V device copies are demoted to host memory under pressure
+        /// (<see cref="EnsureDeviceRetainHeadroom"/>) instead, so they are not charged; an
+        /// arena-resident holder and device-only recurrent state still are.</summary>
+        private long PinnedDeviceBytes(Qwen35KvCacheHolder holder, long kvBytes, long deviceBytes)
+        {
+            if (!DeviceHolderCopiesEnabled || holder.ArenaStateResident)
+                return deviceBytes;
+            return holder.FdStateResident || holder.GdnHostDirty ? Math.Max(0, deviceBytes - kvBytes) : 0;
+        }
+
         /// <summary>What <see cref="DeepCopyHolder"/> allocates: attention rows sized to what the source
-        /// holds plus a padded window, and a full set of recurrent state.</summary>
+        /// holds plus a padded window, and a full set of recurrent state. This is a conservative
+        /// allocation bound: an exact-capacity idle holder can satisfy an active clone without
+        /// allocating again, but a budget check must remain safe if pressure trims that pool.</summary>
         public ResourceVector EstimateCloneBytes(string payloadKey, int targetTokens)
+            => EstimateCloneBytes(payloadKey, targetTokens, 0);
+
+        public ResourceVector EstimateCloneBytes(string payloadKey, int targetTokens, int requiredContextTokens)
         {
             if (!TryGetRetained(payloadKey, out var source)) return default;
-            int rows = Math.Max(0, Math.Min(source.CacheSeqLen, source.KvCapacity));
-            int cap = Math.Max(1, Math.Min(source.KvCapacity, CacheCapacityFor(rows)));
+            int cap = CloneCapacity(source, requiredContextTokens);
             long kv = 0;
             var seen = new HashSet<Storage>();
             foreach (Tensor[] set in new[] { source.K, source.V })
@@ -163,12 +230,43 @@ namespace TensorSharp.Models
             return new ResourceVector { HostKv = kv, StateSnapshot = state };
         }
 
+        public int ResolveCloneReservationTokens(string payloadKey, int requiredContextTokens)
+        {
+            if (!TryGetRetained(payloadKey, out var source) || requiredContextTokens <= 0) return 0;
+            int compact = CloneCapacity(source, 0);
+            // A fresh clone has no resident allocation to credit against the budget.
+            // Leave the same half-spare scratch allowance as PrepareForPrefill and
+            // freeze this result before the coordinator estimates/evicts/materializes.
+            long? spare = GetCacheMemorySpareBytes();
+            int requested = Math.Min(requiredContextTokens, _maxContextLength);
+            if (spare.HasValue)
+                requested = ResolvePrefillReservationLength(spare.Value, KvCacheBytesPerToken,
+                    requested, compact, CacheCapacityAlignment);
+            return CloneCapacity(source, requested);
+        }
+
+        private int CloneCapacity(Qwen35KvCacheHolder source, int requiredContextTokens)
+        {
+            int rows = Math.Max(0, Math.Min(source.CacheSeqLen, source.KvCapacity));
+            int compact = Math.Max(1, Math.Min(source.KvCapacity, CacheCapacityFor(rows)));
+            if (requiredContextTokens <= compact) return compact;
+            return ResolveAttentionCacheGrowthCapacity(compact, Math.Min(requiredContextTokens, _maxContextLength),
+                _maxContextLength, KvCacheBytesPerToken, null, geometricGrowth: false);
+        }
+
         /// <summary>The batched <see cref="DiscardRetainedCache"/> (DEC-24): recycle into the holder pool by
         /// <see cref="RecycleHolder"/>'s rules, and reset the decode graphs at most once for the whole batch,
         /// before its first disposal. Invalidation, pressure and reset dispose.</summary>
         public void DiscardRetainedCaches(ReadOnlySpan<string> payloadKeys, ReleaseReason reason)
         {
             if (_retainedFusedHolders == null || payloadKeys.IsEmpty) return;
+            if (PrefixReleaseDebug)
+            {
+                var described = new List<string>();
+                foreach (string key in payloadKeys)
+                    described.Add(key != null && _retainedFusedHolders.TryGetValue(key, out var h) ? $"{h.CacheSeqLen}" : "?");
+                Console.Error.WriteLine($"[prefix-release] reason={reason} tokens=[{string.Join(",", described)}] retained={_retainedFusedHolders.Count}");
+            }
             List<Qwen35KvCacheHolder> released = null;
             foreach (string key in payloadKeys)
             {
@@ -237,7 +335,7 @@ namespace TensorSharp.Models
                     holder.Retired = false;
                 }
                 if (trimPool)
-                    TrimIdleMemory();
+                    TrimIdleMemoryForPressure();
             }
             finally
             {

@@ -88,13 +88,14 @@ public class DeepSeek41ArchitectureTests : IDisposable
     }
 
     [Fact]
-    public void DescriptorIsIndependentAndDeclaresLayerSplit()
+    public void DescriptorIsIndependentAndDeclaresTensorParallelismWithExplicitLayerSplit()
     {
         Assert.True(ModelArchitectureRegistry.TryGet("deepseek41", out var v41));
         Assert.True(ModelArchitectureRegistry.TryGet("deepseek4", out var v4));
         Assert.NotSame(v4, v41);
-        Assert.Equal(MultiGpuMode.LayerSplit, v41.MultiGpu);
-        Assert.Contains("not implemented", v41.MultiGpuLimitation);
+        Assert.Equal(MultiGpuMode.TensorParallel, v41.MultiGpu);
+        Assert.True(v41.SupportsLayerSplit);
+        Assert.Contains("attention", v41.MultiGpuLimitation);
         TensorSharp.ITensorParallelGroup group = null;
         Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(v41, BackendType.GgmlCuda, 1, ref group, out int split, 4));
         Assert.Equal(4, split);

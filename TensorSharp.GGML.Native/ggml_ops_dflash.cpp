@@ -66,6 +66,57 @@ using namespace tsg;
 
 namespace
 {
+    // Packed ABI table shared with ModelBase.DFlash.Fused: fc, embedding,
+    // LM head, selector hidden/predecessor/successor; then Q,K,V,O,gate,up,down,
+    // attention-conv and FFN-conv for each layer. These are quantization scales,
+    // independent of model-level embedding/logit transforms.
+    std::uint64_t df_scale_signature(const float* scales, int count)
+    {
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (int i = 0; i < count; ++i) {
+            std::uint32_t bits;
+            std::memcpy(&bits, scales + i, sizeof(bits));
+            hash = (hash ^ bits) * 1099511628211ULL;
+        }
+        return scales == nullptr ? 0 : hash;
+    }
+
+    ggml_tensor* df_scaled(ggml_context* ctx, ggml_tensor* x, const float* scales, int index)
+    {
+        return scales == nullptr || scales[index] == 1.f ? x : ggml_scale(ctx, x, scales[index]);
+    }
+
+    // Persistent draft graphs are planned by a private gallocr so activations share
+    // storage: allocating every intermediate separately kept a full F32 copy of the
+    // ring (ring + block keys, K and V) for every layer - ~100 MB per single-lane
+    // graph and ~340 MB per four-lane graph, enough to exhaust the device once each
+    // request drafted over its own ring. Inputs, uploaded leaves and the outputs the
+    // caller reads after compute keep their own storage.
+    bool df_alloc_persistent(ggml_context* ctx, ggml_cgraph* graph, ggml_gallocr_t& galloc)
+    {
+        for (ggml_tensor* t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t))
+        {
+            if (t->op == GGML_OP_NONE && t->view_src == nullptr && t->data == nullptr)
+            {
+                ggml_set_input(t);
+                ggml_set_output(t);
+            }
+            if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0)
+            {
+                ggml_tensor* root = t;
+                while (root->view_src != nullptr) root = root->view_src;
+                ggml_set_output(root);
+            }
+        }
+        galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+        if (galloc == nullptr || !ggml_gallocr_alloc_graph(galloc, graph))
+        {
+            if (galloc != nullptr) { ggml_gallocr_free(galloc); galloc = nullptr; }
+            return false;
+        }
+        return true;
+    }
+
     struct DfLayer
     {
         ggml_tensor* attn_norm_w = nullptr;
@@ -112,9 +163,12 @@ namespace
         const void* sig_ring = nullptr;
         int n_rows = 0;
         int out_count = 0;
+        std::uint64_t scale_signature = 0;
+        ggml_gallocr_t galloc = nullptr;     // draft graphs: storage planned by a private gallocr
 
         void reset()
         {
+            if (galloc != nullptr) { ggml_gallocr_free(galloc); galloc = nullptr; }
             if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
@@ -122,30 +176,34 @@ namespace
             out_s0 = out_scores = out_cand = nullptr;
             sig = sig_ring = nullptr;
             n_rows = out_count = 0;
+            scale_signature = 0;
         }
     };
 
-    constexpr int kDfMaxCaches = 8;
+    // Each request speculates over its own pooled ring (ModelBase.DFlash.Rings.cs),
+    // and every ring has one draft graph plus one inject graph per row count the
+    // executor commits (1 .. window). Eight entries thrashed with two rings.
+    constexpr int kDfMaxCaches = 64;
     struct DfCachePool
     {
         DfCache entries[kDfMaxCaches];
         std::uint64_t used[kDfMaxCaches] = {};
         std::uint64_t clock = 0;
 
-        DfCache* find(const void* sig, const void* ring, int n_rows)
+        DfCache* find(const void* sig, const void* ring, int n_rows, std::uint64_t scale_sig)
         {
             for (int i = 0; i < kDfMaxCaches; i++)
                 if (entries[i].valid && entries[i].sig == sig && entries[i].sig_ring == ring
-                    && entries[i].n_rows == n_rows)
+                    && entries[i].n_rows == n_rows && entries[i].scale_signature == scale_sig)
                 { used[i] = ++clock; return &entries[i]; }
             return nullptr;
         }
 
-        DfCache& claim(const void* sig, const void* ring, int n_rows)
+        DfCache& claim(const void* sig, const void* ring, int n_rows, std::uint64_t scale_sig)
         {
             for (int i = 0; i < kDfMaxCaches; i++)
                 if (entries[i].valid && entries[i].sig == sig && entries[i].sig_ring == ring
-                    && entries[i].n_rows == n_rows)
+                    && entries[i].n_rows == n_rows && entries[i].scale_signature == scale_sig)
                 { entries[i].reset(); used[i] = ++clock; return entries[i]; }
             for (int i = 0; i < kDfMaxCaches; i++)
                 if (!entries[i].valid) { entries[i].reset(); used[i] = ++clock; return entries[i]; }
@@ -254,7 +312,7 @@ namespace
 // PASS A + B: encode the target's per-layer residual features and inject the
 // resulting K/V into the drafter's ring.
 // ---------------------------------------------------------------------------
-TSG_EXPORT int TSGgml_DFlashInject(
+static int df_inject(
     const float* feat_rows, int feature_size, int n_rows,
     const std::int64_t* ring_rows_idx,          // ring slot per row (position % ring_rows)
     const int* positions,                        // absolute position per row (for RoPE)
@@ -266,11 +324,16 @@ TSG_EXPORT int TSGgml_DFlashInject(
     void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
     void** k_norm_arr,
     void** ring_k_arr, void** ring_v_arr,
-    int ring_dtype)
+    int ring_dtype,
+    const float* scales, int scale_count)
 {
     try
     {
         if (!ensure_backend()) return 0;
+        if ((scales == nullptr && scale_count != 0) ||
+            (scales != nullptr && (num_layers <= 0 || scale_count != 6 + 9 * num_layers)))
+        { set_last_error("DFlash: invalid sidecar scale table."); return 0; }
+        const std::uint64_t scale_sig = df_scale_signature(scales, scale_count);
         if (n_rows <= 0 || num_layers <= 0) { set_last_error("DFlash inject: invalid arguments."); return 0; }
 
         const void* sig = k_arr[0];
@@ -282,7 +345,7 @@ TSG_EXPORT int TSGgml_DFlashInject(
             g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN ||
             g_backend_type == BACKEND_TYPE_METAL;
 
-        DfCache* dc = can_persist ? df_inject_pool().find(sig, sig_ring, n_rows) : nullptr;
+        DfCache* dc = can_persist ? df_inject_pool().find(sig, sig_ring, n_rows, scale_sig) : nullptr;
         if (dc != nullptr && dc->graph != nullptr)
         {
             host_read_barrier();
@@ -301,7 +364,7 @@ TSG_EXPORT int TSGgml_DFlashInject(
             return 1;
         }
 
-        DfCache* slot = can_persist ? &df_inject_pool().claim(sig, sig_ring, n_rows) : nullptr;
+        DfCache* slot = can_persist ? &df_inject_pool().claim(sig, sig_ring, n_rows, scale_sig) : nullptr;
 
         const std::size_t ctx_size = 32 * 1024 * 1024;
         PooledContextHandle pooled;
@@ -327,7 +390,7 @@ TSG_EXPORT int TSGgml_DFlashInject(
         ggml_tensor* enc_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
 
         // g = rmsnorm(fc @ feat) * enc_output_norm
-        ggml_tensor* g = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_mul_mat(ctx, fc_t, feat), eps), enc_norm_t);
+        ggml_tensor* g = ggml_mul(ctx, ggml_rms_norm(ctx, df_scaled(ctx, ggml_mul_mat(ctx, fc_t, feat), scales, 0), eps), enc_norm_t);
 
         std::vector<DfLayer> layers(num_layers);
         for (int l = 0; l < num_layers; l++)
@@ -339,8 +402,8 @@ TSG_EXPORT int TSGgml_DFlashInject(
             lt.ring_k = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(ring_dtype), head_dim, ring_rows, num_kv_heads);
             lt.ring_v = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(ring_dtype), head_dim, ring_rows, num_kv_heads);
 
-            ggml_tensor* k = ggml_mul_mat(ctx, lt.k_w, g);                 // [kv_dim, n]
-            ggml_tensor* v = ggml_mul_mat(ctx, lt.v_w, g);
+            ggml_tensor* k = df_scaled(ctx, ggml_mul_mat(ctx, lt.k_w, g), scales, 6 + 9 * l + 1);                 // [kv_dim, n]
+            ggml_tensor* v = df_scaled(ctx, ggml_mul_mat(ctx, lt.v_w, g), scales, 6 + 9 * l + 2);
             ggml_tensor* k3 = ggml_reshape_3d(ctx, k, head_dim, num_kv_heads, n_rows);
             ggml_tensor* v3 = ggml_reshape_3d(ctx, v, head_dim, num_kv_heads, n_rows);
             k3 = ggml_mul(ctx, ggml_rms_norm(ctx, k3, eps), lt.k_norm_w);
@@ -424,6 +487,7 @@ TSG_EXPORT int TSGgml_DFlashInject(
             slot->in_main = feat; slot->pos = pos_t; slot->kv_index = idx_t;
             slot->sig = sig; slot->sig_ring = sig_ring; slot->n_rows = n_rows;
             slot->valid = true;
+            slot->scale_signature = scale_sig;
         }
         clear_last_error();
         return 1;
@@ -433,9 +497,247 @@ TSG_EXPORT int TSGgml_DFlashInject(
 }
 
 // ---------------------------------------------------------------------------
+// PASS A + B for several rings at once. A batched speculative step commits every
+// lane's accepted rows and then carries each lane's last row into its draft; one
+// inject per lane cost a graph launch and a stream sync each, eight per step at
+// four lanes. Here every lane's rows go through one encode and each lane's K/V
+// rows land in its own ring.
+//
+// Lanes are padded to `max_rows` rows. `gather` maps every padded row to one of
+// the `total_rows` compact feature rows the caller uploads; a lane's padding
+// repeats its last row (feature, slot and position alike), so the extra set_rows
+// writes store the bytes that slot receives anyway. Rows are independent through
+// the encode (per-column matmuls, per-row norms, per-row RoPE), so each lane's
+// K/V match a per-lane inject up to the GEMM kernel the batch size selects.
+// CUDA only; the graph is cached per (weights, rings, max_rows, lanes).
+// ---------------------------------------------------------------------------
+namespace
+{
+    struct DfInjectBatchCache
+    {
+        bool valid = false;
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_cgraph* graph = nullptr;
+        ggml_tensor* feat = nullptr;
+        ggml_tensor* gather = nullptr;
+        ggml_tensor* pos = nullptr;
+        ggml_tensor* kv_index = nullptr;
+        const void* sig = nullptr;
+        std::vector<const void*> rings;
+        int max_rows = 0, lanes = 0;
+        std::uint64_t scale_signature = 0;
+        std::uint64_t lru = 0;
+
+        void reset()
+        {
+            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
+            graph = nullptr; valid = false;
+            feat = gather = pos = kv_index = nullptr;
+            sig = nullptr; rings.clear(); max_rows = lanes = 0; scale_signature = 0;
+        }
+    };
+    // One graph per padded row count (1 for the carried rows, 1..window at commit)
+    // for the current lane set, plus room for the lane set to change.
+    constexpr int kDfInjectBatchCaches = 24;
+    struct DfInjectBatchPool
+    {
+        DfInjectBatchCache entries[kDfInjectBatchCaches];
+        std::uint64_t clock = 0;
+    };
+    DfInjectBatchPool g_df_inject_batch_pools[tsg::TSG_MAX_DEVICES];
+    inline DfInjectBatchPool& df_inject_batch_pool() { return g_df_inject_batch_pools[tsg::g_active_rank]; }
+}
+
+static int df_inject_batched(
+    int n_lanes, int max_rows, int total_rows,
+    const float* feat_rows, int feature_size,     // [total_rows, feature_size], compact
+    const std::int32_t* gather,                   // [n_lanes * max_rows] -> compact row
+    const std::int64_t* ring_rows_idx,            // [n_lanes * max_rows] ring slot per padded row
+    const int* positions,                         // [n_lanes * max_rows] absolute position per padded row
+    int num_layers, int hidden_size, int head_dim, int num_kv_heads, int ring_rows,
+    float eps, float rope_base, float rope_freq_scale,
+    const void* fc_data, int fc_type, std::int64_t fc_ne0, std::int64_t fc_ne1, std::int64_t fc_bytes,
+    const void* enc_norm_data,
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
+    void** k_norm_arr,
+    void** ring_k_arr, void** ring_v_arr,         // [n_lanes * num_layers], lane-major
+    int ring_dtype,
+    const float* scales, int scale_count)
+{
+    try
+    {
+        if (!ensure_backend()) return 0;
+        if (g_backend_type != BACKEND_TYPE_CUDA)
+        { set_last_error("DFlash batched inject: requires CUDA."); return 0; }
+        if ((scales == nullptr && scale_count != 0) ||
+            (scales != nullptr && (num_layers <= 0 || scale_count != 6 + 9 * num_layers)))
+        { set_last_error("DFlash: invalid sidecar scale table."); return 0; }
+        const int L = n_lanes;
+        const int R = max_rows;
+        const int nr = L * R;
+        if (L < 1 || R < 1 || num_layers <= 0 || total_rows < 1 || total_rows > nr
+            || feat_rows == nullptr || gather == nullptr || ring_rows_idx == nullptr || positions == nullptr)
+        { set_last_error("DFlash batched inject: invalid arguments."); return 0; }
+        for (int i = 0; i < nr; i++)
+            if (gather[i] < 0 || gather[i] >= total_rows || ring_rows_idx[i] < 0 || ring_rows_idx[i] >= ring_rows)
+            { set_last_error("DFlash batched inject: row index out of range."); return 0; }
+        const std::uint64_t scale_sig = df_scale_signature(scales, scale_count);
+
+        const void* sig = k_arr[0];
+        std::vector<const void*> rings(ring_k_arr, ring_k_arr + static_cast<std::size_t>(L) * num_layers);
+        DfInjectBatchPool& pool = df_inject_batch_pool();
+        DfInjectBatchCache* dc = nullptr;
+        for (auto& e : pool.entries)
+            if (e.valid && e.sig == sig && e.max_rows == R && e.lanes == L && e.scale_signature == scale_sig && e.rings == rings)
+            { dc = &e; break; }
+
+        auto run = [&](DfInjectBatchCache& c) {
+            decode_input_set_async(c.feat, feat_rows, static_cast<std::size_t>(feature_size) * total_rows * sizeof(float));
+            decode_input_set_async(c.gather, gather, static_cast<std::size_t>(nr) * sizeof(std::int32_t));
+            decode_input_set_async(c.pos, positions, static_cast<std::size_t>(nr) * sizeof(std::int32_t));
+            decode_input_set_async(c.kv_index, ring_rows_idx, static_cast<std::size_t>(nr) * sizeof(std::int64_t));
+            return tsg::graph_compute_profiled(g_backend, c.graph, "dflash batched inject") == GGML_STATUS_SUCCESS;
+        };
+
+        host_read_barrier();
+        if (dc != nullptr)
+        {
+            dc->lru = ++pool.clock;
+            if (!run(*dc))
+            {
+                set_last_error("DFlash batched inject: cached graph execution failed.");
+                dc->reset();
+                return 0;
+            }
+            clear_last_error();
+            return 1;
+        }
+
+        DfInjectBatchCache* slot = nullptr;
+        for (auto& e : pool.entries)
+            if (!e.valid) { slot = &e; break; }
+        if (slot == nullptr)
+        {
+            slot = &pool.entries[0];
+            for (auto& e : pool.entries)
+                if (e.lru < slot->lru) slot = &e;
+        }
+        slot->reset();
+
+        ggml_init_params ip = { 32 * 1024 * 1024, nullptr, /*no_alloc=*/true };
+        ggml_context* ctx = ggml_init(ip);
+        if (ctx == nullptr) { set_last_error("DFlash batched inject: failed to init context."); return 0; }
+
+        ggml_tensor* feat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, feature_size, nr);
+        ggml_tensor* gather_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nr);
+        ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nr);
+        ggml_tensor* idx_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nr);
+        ggml_set_input(feat); ggml_set_input(gather_t); ggml_set_input(pos_t); ggml_set_input(idx_t);
+
+        ggml_tensor* fc_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(fc_type), fc_ne0, fc_ne1);
+        ggml_tensor* enc_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+
+        // Only the first total_rows rows of `feat` are uploaded; the gather reads nothing else.
+        ggml_tensor* x = ggml_get_rows(ctx, feat, gather_t);                                   // [F, nr]
+        ggml_tensor* g = ggml_mul(ctx, ggml_rms_norm(ctx, df_scaled(ctx, ggml_mul_mat(ctx, fc_t, x), scales, 0), eps), enc_norm_t);
+
+        std::vector<DfLayer> layers(num_layers);
+        std::vector<ggml_tensor*> ring_k(static_cast<std::size_t>(L) * num_layers);
+        std::vector<ggml_tensor*> ring_v(static_cast<std::size_t>(L) * num_layers);
+        std::vector<ggml_tensor*> writes;
+        writes.reserve(static_cast<std::size_t>(L) * num_layers * 2);
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            lt.k_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(k_type_arr[l]), k_ne0_arr[l], k_ne1_arr[l]);
+            lt.v_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(v_type_arr[l]), v_ne0_arr[l], v_ne1_arr[l]);
+            lt.k_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+
+            ggml_tensor* k = df_scaled(ctx, ggml_mul_mat(ctx, lt.k_w, g), scales, 6 + 9 * l + 1);   // [kv_dim, nr]
+            ggml_tensor* v = df_scaled(ctx, ggml_mul_mat(ctx, lt.v_w, g), scales, 6 + 9 * l + 2);
+            ggml_tensor* k3 = ggml_reshape_3d(ctx, k, head_dim, num_kv_heads, nr);
+            ggml_tensor* v3 = ggml_reshape_3d(ctx, v, head_dim, num_kv_heads, nr);
+            k3 = ggml_mul(ctx, ggml_rms_norm(ctx, k3, eps), lt.k_norm_w);
+            k3 = ggml_rope_ext(ctx, k3, pos_t, nullptr, head_dim, /*mode=*/2, 0,
+                               rope_base, rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+            // [hd, kv_heads, R, L] -> [hd, R, kv_heads, L]: each lane's rows contiguous.
+            ggml_tensor* kw = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, k3, head_dim, num_kv_heads, R, L), 0, 2, 1, 3));
+            ggml_tensor* vw = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, v3, head_dim, num_kv_heads, R, L), 0, 2, 1, 3));
+            for (int lane = 0; lane < L; lane++)
+            {
+                const std::size_t ix = static_cast<std::size_t>(lane) * num_layers + l;
+                ring_k[ix] = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(ring_dtype), head_dim, ring_rows, num_kv_heads);
+                ring_v[ix] = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(ring_dtype), head_dim, ring_rows, num_kv_heads);
+                ggml_tensor* kl = ggml_view_3d(ctx, kw, head_dim, R, num_kv_heads, kw->nb[1], kw->nb[2],
+                                               static_cast<std::size_t>(lane) * kw->nb[3]);
+                ggml_tensor* vl = ggml_view_3d(ctx, vw, head_dim, R, num_kv_heads, vw->nb[1], vw->nb[2],
+                                               static_cast<std::size_t>(lane) * vw->nb[3]);
+                ggml_tensor* il = ggml_view_1d(ctx, idx_t, R, static_cast<std::size_t>(lane) * R * sizeof(std::int64_t));
+                writes.push_back(ggml_set_rows(ctx, ring_k[ix], kl, il));
+                writes.push_back(ggml_set_rows(ctx, ring_v[ix], vl, il));
+            }
+        }
+
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, static_cast<std::size_t>(num_layers) * (64 + 8 * L) + 256, false);
+        for (ggml_tensor* w : writes)
+            ggml_build_forward_expand(graph, w);
+
+        DfBinder binder;
+        binder.dev = ggml_backend_get_device(g_backend);
+        binder.bind(fc_t, const_cast<void*>(fc_data), static_cast<std::size_t>(fc_bytes), true);
+        binder.bind(enc_norm_t, const_cast<void*>(enc_norm_data),
+                    static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+        const std::size_t ring_bytes = kv_cache_bytes(num_kv_heads, ring_rows, head_dim, ring_dtype);
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            binder.bind(lt.k_w, k_arr[l], static_cast<std::size_t>(k_bytes_arr[l]), true);
+            binder.bind(lt.v_w, v_arr[l], static_cast<std::size_t>(v_bytes_arr[l]), true);
+            binder.bind(lt.k_norm_w, k_norm_arr[l], static_cast<std::size_t>(head_dim) * sizeof(float), true);
+            for (int lane = 0; lane < L; lane++)
+            {
+                const std::size_t ix = static_cast<std::size_t>(lane) * num_layers + l;
+                binder.bind(ring_k[ix], ring_k_arr[ix], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                binder.bind(ring_v[ix], ring_v_arr[ix], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            }
+        }
+
+        ggml_backend_buffer_t persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+        if (persist_buf == nullptr)
+        {
+            set_last_error("DFlash batched inject: failed to allocate persist buffer.");
+            ggml_free(ctx);
+            return 0;
+        }
+        binder.flush();
+
+        slot->ctx = ctx; slot->buffer = persist_buf; slot->graph = graph;
+        slot->feat = feat; slot->gather = gather_t; slot->pos = pos_t; slot->kv_index = idx_t;
+        slot->sig = sig; slot->rings = std::move(rings);
+        slot->max_rows = R; slot->lanes = L;
+        slot->scale_signature = scale_sig;
+        slot->lru = ++pool.clock;
+        slot->valid = true;
+        if (!run(*slot))
+        {
+            set_last_error("DFlash batched inject: graph execution failed.");
+            slot->reset();
+            return 0;
+        }
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in DFlash batched inject."); return 0; }
+}
+
+// ---------------------------------------------------------------------------
 // PASS C: the block draft.
 // ---------------------------------------------------------------------------
-TSG_EXPORT int TSGgml_DFlashDraftBlock(
+static int df_draft_block(
     const int* block_ids, int block_len, const int* positions,
     int num_layers, int hidden_size, int head_dim, int num_heads, int num_kv_heads, int ring_rows,
     float eps, float rope_base, float rope_freq_scale, float kq_scale,
@@ -469,11 +771,16 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
     const void* sel_hidden_data, int sel_hidden_type, std::int64_t sel_hidden_ne0, std::int64_t sel_hidden_ne1, std::int64_t sel_hidden_bytes,
     const void* sel_pred_data, int sel_pred_type, std::int64_t sel_pred_ne0, std::int64_t sel_pred_ne1, std::int64_t sel_pred_bytes,
     const void* sel_succ_data, int sel_succ_type, std::int64_t sel_succ_ne0, std::int64_t sel_succ_ne1, std::int64_t sel_succ_bytes,
-    float* sel_scores_out, int* sel_cand_out)
+    float* sel_scores_out, int* sel_cand_out,
+    const float* scales, int scale_count)
 {
     try
     {
         if (!ensure_backend()) return 0;
+        if ((scales == nullptr && scale_count != 0) ||
+            (scales != nullptr && (num_layers <= 0 || scale_count != 6 + 9 * num_layers)))
+        { set_last_error("DFlash: invalid sidecar scale table."); return 0; }
+        const std::uint64_t scale_sig = df_scale_signature(scales, scale_count);
         if (block_len <= 0 || num_layers <= 0 || ids_out == nullptr || conf_out == nullptr)
         { set_last_error("DFlash draft: invalid arguments."); return 0; }
 
@@ -540,7 +847,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
                 row[ring_rows + j] = vis;
         }
 
-        DfCache* dc = can_persist ? df_draft_pool().find(sig, sig_ring, b) : nullptr;
+        DfCache* dc = can_persist ? df_draft_pool().find(sig, sig_ring, b, scale_sig) : nullptr;
         if (dc != nullptr && dc->graph != nullptr && dc->out_count == out_count)
         {
             host_read_barrier();
@@ -581,7 +888,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             return 1;
         }
 
-        DfCache* slot = can_persist ? &df_draft_pool().claim(sig, sig_ring, b) : nullptr;
+        DfCache* slot = can_persist ? &df_draft_pool().claim(sig, sig_ring, b, scale_sig) : nullptr;
 
         const std::size_t ctx_size = 32 * 1024 * 1024;
         PooledContextHandle pooled;
@@ -640,7 +947,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
 
         // llama.cpp's dflash graph feeds build_inp_embd straight in: no embedding
         // scale and (unlike the Muse-Glimmer trunk) no weightless input RMSNorm.
-        ggml_tensor* inpL = ggml_get_rows(ctx, tok_t, ids_t);              // [hidden, b]
+        ggml_tensor* inpL = df_scaled(ctx, ggml_get_rows(ctx, tok_t, ids_t), scales, 1);              // [hidden, b]
 
         std::vector<DfLayer> layers(num_layers);
         for (int l = 0; l < num_layers; l++)
@@ -682,15 +989,15 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             ggml_tensor* attn_conv_coef = nullptr;
             if (use_conv)
             {
-                attn_conv_coef = ggml_mul_mat(ctx, lt.attn_conv_proj, h);   // [2*taps*G, b]
+                attn_conv_coef = df_scaled(ctx, ggml_mul_mat(ctx, lt.attn_conv_proj, h), scales, 6 + 9 * l + 7);   // [2*taps*G, b]
                 h = df_grouped_conv(ctx, h, attn_conv_coef, lt.attn_conv_base, /*side=*/0,
                                     conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
                                     conv_shift.data(), conv_mask.data());
             }
 
-            ggml_tensor* q = ggml_mul_mat(ctx, lt.q_w, h);
-            ggml_tensor* k = ggml_mul_mat(ctx, lt.k_w, h);
-            ggml_tensor* v = ggml_mul_mat(ctx, lt.v_w, h);
+            ggml_tensor* q = df_scaled(ctx, ggml_mul_mat(ctx, lt.q_w, h), scales, 6 + 9 * l + 0);
+            ggml_tensor* k = df_scaled(ctx, ggml_mul_mat(ctx, lt.k_w, h), scales, 6 + 9 * l + 1);
+            ggml_tensor* v = df_scaled(ctx, ggml_mul_mat(ctx, lt.v_w, h), scales, 6 + 9 * l + 2);
 
             ggml_tensor* q3 = ggml_reshape_3d(ctx, q, head_dim, num_heads, b);
             ggml_tensor* k3 = ggml_reshape_3d(ctx, k, head_dim, num_kv_heads, b);
@@ -715,7 +1022,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
                 kq_scale, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
             attn_flat = ggml_reshape_2d(ctx, fa, q_dim, b);
 
-            ggml_tensor* attn_out = ggml_mul_mat(ctx, lt.o_w, attn_flat);
+            ggml_tensor* attn_out = df_scaled(ctx, ggml_mul_mat(ctx, lt.o_w, attn_flat), scales, 6 + 9 * l + 3);
             if (use_conv)
             {
                 attn_out = df_grouped_conv(ctx, attn_out, attn_conv_coef, lt.attn_conv_base, /*side=*/1,
@@ -728,15 +1035,15 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             ggml_tensor* ffn_conv_coef = nullptr;
             if (use_conv)
             {
-                ffn_conv_coef = ggml_mul_mat(ctx, lt.ffn_conv_proj, fh);
+                ffn_conv_coef = df_scaled(ctx, ggml_mul_mat(ctx, lt.ffn_conv_proj, fh), scales, 6 + 9 * l + 8);
                 fh = df_grouped_conv(ctx, fh, ffn_conv_coef, lt.ffn_conv_base, /*side=*/0,
                                      conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
                                      conv_shift.data(), conv_mask.data());
             }
-            ggml_tensor* gate = ggml_mul_mat(ctx, lt.gate_w, fh);
-            ggml_tensor* up   = ggml_mul_mat(ctx, lt.up_w, fh);
+            ggml_tensor* gate = df_scaled(ctx, ggml_mul_mat(ctx, lt.gate_w, fh), scales, 6 + 9 * l + 4);
+            ggml_tensor* up   = df_scaled(ctx, ggml_mul_mat(ctx, lt.up_w, fh), scales, 6 + 9 * l + 5);
             ggml_tensor* act  = ggml_mul(ctx, ggml_silu(ctx, gate), up);
-            ggml_tensor* down = ggml_mul_mat(ctx, lt.down_w, act);
+            ggml_tensor* down = df_scaled(ctx, ggml_mul_mat(ctx, lt.down_w, act), scales, 6 + 9 * l + 6);
             if (use_conv)
             {
                 down = df_grouped_conv(ctx, down, ffn_conv_coef, lt.ffn_conv_base, /*side=*/1,
@@ -756,7 +1063,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             // Only the gamma PROPOSAL rows reach the head; row 0 is the anchor's
             // own prediction, which the selector never consumes.
             ggml_tensor* pred_h = ggml_view_2d(ctx, cur, hidden_size, gamma, cur->nb[1], cur->nb[1]);
-            ggml_tensor* sel_logits = ggml_mul_mat(ctx, lm_head_t, pred_h);        // [vocab, gamma]
+            ggml_tensor* sel_logits = df_scaled(ctx, ggml_mul_mat(ctx, lm_head_t, pred_h), scales, 2);        // [vocab, gamma]
             sel_cand = ggml_top_k(ctx, sel_logits, sel_top_k);                     // [k, gamma] I32
             if (!backend_supports_op(sel_cand))
             {
@@ -784,15 +1091,15 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
                     sel_logit_softcap);
             }
 
-            ggml_tensor* ph = ggml_mul_mat(ctx, sel_hidden_t, pred_h);             // [r, gamma]
+            ggml_tensor* ph = df_scaled(ctx, ggml_mul_mat(ctx, sel_hidden_t, pred_h), scales, 3);             // [r, gamma]
             ggml_tensor* cand_flat = ggml_reshape_1d(ctx, sel_cand, static_cast<std::int64_t>(sel_top_k) * gamma);
-            ggml_tensor* keys = ggml_get_rows(ctx, sel_succ_t, cand_flat);         // [r, k*gamma]
+            ggml_tensor* keys = df_scaled(ctx, ggml_get_rows(ctx, sel_succ_t, cand_flat), scales, 5);         // [r, k*gamma]
             ggml_tensor* keys3 = ggml_reshape_3d(ctx, keys, sel_rank, sel_top_k, gamma);
 
             // Position 0's predecessor is the verified anchor, which is block_ids[0]
             // - the same tensor the embedding lookup already reads.
             ggml_tensor* anchor_id = ggml_view_1d(ctx, ids_t, 1, 0);
-            ggml_tensor* a0 = ggml_get_rows(ctx, sel_pred_t, anchor_id);           // [r, 1]
+            ggml_tensor* a0 = df_scaled(ctx, ggml_get_rows(ctx, sel_pred_t, anchor_id), scales, 4);           // [r, 1]
             ggml_tensor* ph0 = ggml_view_2d(ctx, ph, sel_rank, 1, ph->nb[1], 0);
             ggml_tensor* m0 = ggml_mul(ctx, a0, ph0);                              // [r, 1]
             ggml_tensor* keys0 = ggml_view_2d(ctx, keys3, sel_rank, sel_top_k, keys3->nb[1], 0);
@@ -806,7 +1113,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
                 // predecessor ids are the same tensor shifted by one slot.
                 ggml_tensor* prev_flat = ggml_view_1d(ctx, sel_cand,
                     static_cast<std::int64_t>(sel_top_k) * (gamma - 1), 0);
-                ggml_tensor* preds = ggml_get_rows(ctx, sel_pred_t, prev_flat);
+                ggml_tensor* preds = df_scaled(ctx, ggml_get_rows(ctx, sel_pred_t, prev_flat), scales, 4);
                 ggml_tensor* preds3 = ggml_reshape_3d(ctx, preds, sel_rank, sel_top_k, gamma - 1);
                 ggml_tensor* ph_rest = ggml_view_3d(ctx, ph, sel_rank, 1, gamma - 1,
                                                     ph->nb[1], ph->nb[1], ph->nb[1]);
@@ -825,7 +1132,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
 
         // The TARGET's LM head, with NEITHER logit_scale NOR the tanh softcap:
         // llama.cpp's dflash graph ends at build_lora_mm(output, cur).
-        ggml_tensor* logits = use_selector ? nullptr : ggml_mul_mat(ctx, lm_head_t, cur);        // [vocab, b]
+        ggml_tensor* logits = use_selector ? nullptr : df_scaled(ctx, ggml_mul_mat(ctx, lm_head_t, cur), scales, 2);        // [vocab, b]
         // Softmax on device: argmax is invariant under it, and the winning
         // probability IS the confidence the executor multiplies cumulatively.
         ggml_tensor* probs = use_selector ? nullptr : ggml_soft_max(ctx, logits);
@@ -918,11 +1225,10 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
         // other backends).
         optimize_graph_for_metal(ctx, graph);
 
-        ggml_backend_buffer_t persist_buf = nullptr;
+        ggml_gallocr_t persist_galloc = nullptr;
         if (can_persist)
         {
-            persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
-            if (persist_buf == nullptr)
+            if (!df_alloc_persistent(ctx, graph, persist_galloc))
             {
                 set_last_error("DFlash draft: failed to allocate persist buffer.");
                 ggml_free(ctx);
@@ -955,7 +1261,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
         if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
         {
             set_last_error("DFlash draft: graph execution failed.");
-            if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
+            if (can_persist) { ggml_gallocr_free(persist_galloc); ggml_free(ctx); }
             return 0;
         }
         // See the replay path above: Metal must drain before reading the ids.
@@ -984,12 +1290,13 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
 
         if (can_persist && slot != nullptr)
         {
-            slot->ctx = ctx; slot->buffer = persist_buf; slot->graph = graph;
+            slot->ctx = ctx; slot->galloc = persist_galloc; slot->graph = graph;
             slot->in_main = ids_t; slot->pos = pos_t; slot->mask = mask_t;
             slot->out = out; slot->out_conf = out_conf;
             slot->out_s0 = sel_s0; slot->out_scores = sel_scores; slot->out_cand = sel_cand;
             slot->sig = sig; slot->sig_ring = sig_ring; slot->n_rows = b; slot->out_count = out_count;
             slot->valid = true;
+            slot->scale_signature = scale_sig;
         }
         clear_last_error();
         return 1;
@@ -998,8 +1305,760 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
     catch (...) { set_last_error("Unknown error in DFlash draft."); return 0; }
 }
 
+// ---------------------------------------------------------------------------
+// PASS C for SEVERAL sequences at once: one graph drafts a block for each of
+// n_lanes sequences, each attending to its own ring. The batched speculative
+// verify (ggml_ops_qwen35_batched_verify.cpp) serves every decoding request in
+// one trunk forward; drafting those requests one graph at a time then cost
+// 2.7 ms per request per step - 10.8 of a 37 ms four-request step - mostly the
+// drafter's and LM head's weight sweep repeated per request. Here projections,
+// FFNs, the LM head and the selector run once over every lane's block.
+//
+// Inputs and outputs are lane-major: block_ids/positions [n_lanes * b],
+// ring_slot_pos [n_lanes * ring_rows], ring_k/v_arr [n_lanes * num_layers];
+// ids/conf [n_lanes * b]; selector scores [n_lanes * (k + k*k*(b-2))] and
+// candidates [n_lanes * k * (b-1)], each lane's block laid out exactly as the
+// single-lane graph returns it.
+// ---------------------------------------------------------------------------
+namespace
+{
+    struct DfBatchCache
+    {
+        bool valid = false;
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_cgraph* graph = nullptr;
+        ggml_tensor* ids = nullptr;
+        ggml_tensor* pos = nullptr;
+        ggml_tensor* mask = nullptr;
+        ggml_tensor* anchors = nullptr;
+        ggml_tensor* out = nullptr;
+        ggml_tensor* out_conf = nullptr;
+        ggml_tensor* out_s0 = nullptr;
+        ggml_tensor* out_scores = nullptr;
+        ggml_tensor* out_cand = nullptr;
+        const void* sig = nullptr;
+        std::vector<const void*> rings;
+        int b = 0, lanes = 0;
+        std::uint64_t scale_signature = 0;
+        std::uint64_t lru = 0;
+        ggml_gallocr_t galloc = nullptr;
+
+        void reset()
+        {
+            if (galloc != nullptr) { ggml_gallocr_free(galloc); galloc = nullptr; }
+            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
+            graph = nullptr; valid = false;
+            ids = pos = mask = anchors = out = out_conf = out_s0 = out_scores = out_cand = nullptr;
+            sig = nullptr; rings.clear(); b = lanes = 0; scale_signature = 0;
+        }
+    };
+    constexpr int kDfBatchCaches = 2;
+    struct DfBatchPool
+    {
+        DfBatchCache entries[kDfBatchCaches];
+        std::uint64_t clock = 0;
+    };
+    DfBatchPool g_df_batch_pools[tsg::TSG_MAX_DEVICES];
+    inline DfBatchPool& df_batch_pool() { return g_df_batch_pools[tsg::g_active_rank]; }
+}
+
+TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
+    int n_lanes, const int* block_ids, int block_len, const int* positions,
+    int num_layers, int hidden_size, int head_dim, int num_heads, int num_kv_heads, int ring_rows,
+    float eps, float rope_base, float rope_freq_scale, float kq_scale,
+    const int* ring_slot_pos, int sliding_window,
+    void** attn_norm_arr,
+    void** q_arr, int* q_type_arr, std::int64_t* q_ne0_arr, std::int64_t* q_ne1_arr, std::int64_t* q_bytes_arr,
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
+    void** q_norm_arr, void** k_norm_arr,
+    void** o_arr, int* o_type_arr, std::int64_t* o_ne0_arr, std::int64_t* o_ne1_arr, std::int64_t* o_bytes_arr,
+    void** ffn_norm_arr,
+    void** gate_arr, int* gate_type_arr, std::int64_t* gate_ne0_arr, std::int64_t* gate_ne1_arr, std::int64_t* gate_bytes_arr,
+    void** up_arr, int* up_type_arr, std::int64_t* up_ne0_arr, std::int64_t* up_ne1_arr, std::int64_t* up_bytes_arr,
+    void** down_arr, int* down_type_arr, std::int64_t* down_ne0_arr, std::int64_t* down_ne1_arr, std::int64_t* down_bytes_arr,
+    void** ring_k_arr, void** ring_v_arr, int ring_dtype,
+    const void* out_norm_data,
+    const void* tok_embd_data, int tok_embd_type, std::int64_t tok_embd_ne0, std::int64_t tok_embd_ne1, std::int64_t tok_embd_bytes,
+    const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
+    int vocab_size, int* ids_out, float* conf_out,
+    int conv_taps, int conv_group_size, int conv_num_groups,
+    void** attn_conv_base_arr,
+    void** attn_conv_proj_arr, int* attn_conv_proj_type_arr,
+    std::int64_t* attn_conv_proj_ne0_arr, std::int64_t* attn_conv_proj_ne1_arr, std::int64_t* attn_conv_proj_bytes_arr,
+    void** ffn_conv_base_arr,
+    void** ffn_conv_proj_arr, int* ffn_conv_proj_type_arr,
+    std::int64_t* ffn_conv_proj_ne0_arr, std::int64_t* ffn_conv_proj_ne1_arr, std::int64_t* ffn_conv_proj_bytes_arr,
+    int sel_rank, int sel_top_k, float sel_logit_scale, float sel_logit_softcap,
+    const void* sel_hidden_data, int sel_hidden_type, std::int64_t sel_hidden_ne0, std::int64_t sel_hidden_ne1, std::int64_t sel_hidden_bytes,
+    const void* sel_pred_data, int sel_pred_type, std::int64_t sel_pred_ne0, std::int64_t sel_pred_ne1, std::int64_t sel_pred_bytes,
+    const void* sel_succ_data, int sel_succ_type, std::int64_t sel_succ_ne0, std::int64_t sel_succ_ne1, std::int64_t sel_succ_bytes,
+    float* sel_scores_out, int* sel_cand_out,
+    const float* scales, int scale_count)
+{
+    try
+    {
+        if (!ensure_backend()) return 0;
+        if (g_backend_type != BACKEND_TYPE_CUDA)
+        { set_last_error("DFlash batched draft: requires CUDA."); return 0; }
+        if ((scales == nullptr && scale_count != 0) ||
+            (scales != nullptr && (num_layers <= 0 || scale_count != 6 + 9 * num_layers)))
+        { set_last_error("DFlash: invalid sidecar scale table."); return 0; }
+        const std::uint64_t scale_sig = df_scale_signature(scales, scale_count);
+        if (n_lanes < 1 || block_len <= 0 || num_layers <= 0 || ids_out == nullptr || conf_out == nullptr)
+        { set_last_error("DFlash batched draft: invalid arguments."); return 0; }
+
+        const int L = n_lanes;
+        const int b = block_len;
+        const int nb = L * b;
+        const int kv_len = ring_rows + b;
+        const int q_dim = num_heads * head_dim;
+        const bool use_conv = conv_taps > 0 && conv_group_size > 0 && conv_num_groups > 0
+            && attn_conv_base_arr != nullptr && attn_conv_proj_arr != nullptr
+            && ffn_conv_base_arr != nullptr && ffn_conv_proj_arr != nullptr;
+        const bool use_selector = sel_rank > 0 && sel_top_k > 0
+            && sel_hidden_data != nullptr && sel_pred_data != nullptr && sel_succ_data != nullptr
+            && sel_scores_out != nullptr && sel_cand_out != nullptr;
+        const int gamma = b - 1;
+        const int k = sel_top_k;
+        if (use_selector && (gamma < 1 || k > vocab_size))
+        { set_last_error("DFlash batched draft: selector needs a proposal row and top_k <= vocab."); return 0; }
+        if (use_conv && conv_taps > b)
+        { set_last_error("DFlash batched draft: conv_kernel_size exceeds the block width."); return 0; }
+        const std::size_t lane_scores = use_selector
+            ? static_cast<std::size_t>(k) + static_cast<std::size_t>(k) * k * (gamma - 1) : 0;
+
+        // Per-lane masks, exactly the single-lane rule (see df_draft_block).
+        std::vector<ggml_fp16_t> mask_data(static_cast<std::size_t>(kv_len) * b * L,
+                                           ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+        const ggml_fp16_t vis = static_cast<ggml_fp16_t>(0);
+        std::vector<std::int32_t> anchors(L);
+        for (int lane = 0; lane < L; lane++)
+        {
+            const int* lpos = positions + static_cast<std::size_t>(lane) * b;
+            const int* slots = ring_slot_pos + static_cast<std::size_t>(lane) * ring_rows;
+            const int anchor_pos = lpos[0];
+            anchors[lane] = block_ids[static_cast<std::size_t>(lane) * b];
+            for (int i = 0; i < b; i++)
+            {
+                const int qp = lpos[i];
+                ggml_fp16_t* row = &mask_data[(static_cast<std::size_t>(lane) * b + i) * kv_len];
+                for (int s = 0; s < ring_rows; s++)
+                {
+                    const int p = slots[s];
+                    if (p < 0 || p >= anchor_pos) continue;
+                    if (sliding_window > 0 && qp - p >= sliding_window) continue;
+                    row[s] = vis;
+                }
+                for (int j = 0; j < b; j++)
+                    row[ring_rows + j] = vis;
+            }
+        }
+
+        const void* sig = attn_norm_arr[0];
+        std::vector<const void*> rings(ring_k_arr, ring_k_arr + static_cast<std::size_t>(L) * num_layers);
+        DfBatchPool& pool = df_batch_pool();
+        DfBatchCache* dc = nullptr;
+        for (auto& e : pool.entries)
+            if (e.valid && e.sig == sig && e.b == b && e.lanes == L && e.scale_signature == scale_sig && e.rings == rings)
+            { dc = &e; break; }
+
+        auto download = [&](DfBatchCache& c) {
+            if (use_selector)
+            {
+                ggml_backend_tensor_get(c.out_cand, sel_cand_out, 0,
+                    static_cast<std::size_t>(k) * gamma * L * sizeof(std::int32_t));
+                std::vector<float> s0(static_cast<std::size_t>(k) * L);
+                ggml_backend_tensor_get(c.out_s0, s0.data(), 0, s0.size() * sizeof(float));
+                std::vector<float> rest(c.out_scores != nullptr ? static_cast<std::size_t>(k) * k * (gamma - 1) * L : 0);
+                if (c.out_scores != nullptr)
+                    finalize_compute_with_download(c.out_scores, rest.data(), rest.size() * sizeof(float));
+                host_read_barrier();
+                for (int lane = 0; lane < L; lane++)
+                {
+                    float* dst = sel_scores_out + static_cast<std::size_t>(lane) * lane_scores;
+                    std::memcpy(dst, s0.data() + static_cast<std::size_t>(lane) * k, static_cast<std::size_t>(k) * sizeof(float));
+                    if (!rest.empty())
+                        std::memcpy(dst + k, rest.data() + static_cast<std::size_t>(lane) * k * k * (gamma - 1),
+                            static_cast<std::size_t>(k) * k * (gamma - 1) * sizeof(float));
+                }
+            }
+            else
+            {
+                ggml_backend_tensor_get(c.out, ids_out, 0, static_cast<std::size_t>(nb) * sizeof(std::int32_t));
+                finalize_compute_with_download(c.out_conf, conf_out, static_cast<std::size_t>(nb) * sizeof(float));
+                host_read_barrier();
+            }
+        };
+
+        if (dc != nullptr)
+        {
+            dc->lru = ++pool.clock;
+            host_read_barrier();
+            decode_input_set_async(dc->ids, block_ids, static_cast<std::size_t>(nb) * sizeof(std::int32_t));
+            decode_input_set_async(dc->pos, positions, static_cast<std::size_t>(nb) * sizeof(std::int32_t));
+            decode_input_set_async(dc->mask, mask_data.data(), mask_data.size() * sizeof(ggml_fp16_t));
+            if (dc->anchors != nullptr)
+                decode_input_set_async(dc->anchors, anchors.data(), anchors.size() * sizeof(std::int32_t));
+            if (tsg::graph_compute_profiled(g_backend, dc->graph, "dflash batched draft") != GGML_STATUS_SUCCESS)
+            {
+                set_last_error("DFlash batched draft: cached graph execution failed.");
+                dc->reset();
+                return 0;
+            }
+            download(*dc);
+            clear_last_error();
+            return 1;
+        }
+
+        DfBatchCache* slot = nullptr;
+        for (auto& e : pool.entries)
+            if (!e.valid) { slot = &e; break; }
+        if (slot == nullptr)
+        {
+            slot = &pool.entries[0];
+            for (auto& e : pool.entries)
+                if (e.lru < slot->lru) slot = &e;
+        }
+        slot->reset();
+
+        const std::size_t ctx_size = 64 * 1024 * 1024;
+        ggml_init_params ip = { ctx_size, nullptr, /*no_alloc=*/true };
+        ggml_context* ctx = ggml_init(ip);
+        if (ctx == nullptr) { set_last_error("DFlash batched draft: failed to init context."); return 0; }
+        auto fail = [&](const char* msg) { set_last_error(msg); ggml_free(ctx); return 0; };
+
+        ggml_tensor* ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+        ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+        ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_len, b, 1, L);
+        ggml_set_input(ids_t); ggml_set_input(pos_t); ggml_set_input(mask_t);
+        ggml_tensor* anchors_t = nullptr;
+        if (use_selector)
+        {
+            anchors_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+            ggml_set_input(anchors_t);
+        }
+
+        // The convolution's shift/mask never cross a lane: row r of lane l reads
+        // row r - tap of the same lane, masked off for its first `tap` rows.
+        std::vector<ggml_tensor*> conv_shift(use_conv ? conv_taps : 0, nullptr);
+        std::vector<ggml_tensor*> conv_mask(use_conv ? conv_taps : 0, nullptr);
+        std::vector<std::vector<std::int32_t>> conv_shift_data(use_conv ? conv_taps : 0);
+        std::vector<std::vector<float>> conv_mask_data(use_conv ? conv_taps : 0);
+        for (int tap = 1; tap < (use_conv ? conv_taps : 0); tap++)
+        {
+            conv_shift[tap] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+            conv_mask[tap] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, nb);
+            ggml_set_input(conv_shift[tap]);
+            ggml_set_input(conv_mask[tap]);
+            conv_shift_data[tap].resize(nb);
+            conv_mask_data[tap].resize(nb);
+            for (int lane = 0; lane < L; lane++)
+                for (int r = 0; r < b; r++)
+                {
+                    conv_shift_data[tap][lane * b + r] = lane * b + (r >= tap ? r - tap : 0);
+                    conv_mask_data[tap][lane * b + r] = r >= tap ? 1.0f : 0.0f;
+                }
+        }
+
+        ggml_tensor* tok_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(tok_embd_type), tok_embd_ne0, tok_embd_ne1);
+        ggml_tensor* out_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+        ggml_tensor* lm_head_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(lm_head_type), lm_head_ne0, lm_head_ne1);
+        ggml_tensor* sel_hidden_t = nullptr;
+        ggml_tensor* sel_pred_t = nullptr;
+        ggml_tensor* sel_succ_t = nullptr;
+        if (use_selector)
+        {
+            sel_hidden_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(sel_hidden_type), sel_hidden_ne0, sel_hidden_ne1);
+            sel_pred_t   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(sel_pred_type),   sel_pred_ne0,   sel_pred_ne1);
+            sel_succ_t   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(sel_succ_type),   sel_succ_ne0,   sel_succ_ne1);
+        }
+
+        ggml_tensor* inpL = df_scaled(ctx, ggml_get_rows(ctx, tok_t, ids_t), scales, 1);   // [hidden, nb]
+
+        std::vector<DfLayer> layers(num_layers);
+        // ring_k/v per (lane, layer): [hd, ring_rows, kv_heads]
+        std::vector<ggml_tensor*> ring_k(static_cast<std::size_t>(L) * num_layers);
+        std::vector<ggml_tensor*> ring_v(static_cast<std::size_t>(L) * num_layers);
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            lt.attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            lt.ffn_norm_w  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            lt.q_norm_w    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+            lt.k_norm_w    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+            lt.q_w    = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(q_type_arr[l]),    q_ne0_arr[l],    q_ne1_arr[l]);
+            lt.k_w    = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(k_type_arr[l]),    k_ne0_arr[l],    k_ne1_arr[l]);
+            lt.v_w    = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(v_type_arr[l]),    v_ne0_arr[l],    v_ne1_arr[l]);
+            lt.o_w    = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(o_type_arr[l]),    o_ne0_arr[l],    o_ne1_arr[l]);
+            lt.gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(gate_type_arr[l]), gate_ne0_arr[l], gate_ne1_arr[l]);
+            lt.up_w   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(up_type_arr[l]),   up_ne0_arr[l],   up_ne1_arr[l]);
+            lt.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type_arr[l]), down_ne0_arr[l], down_ne1_arr[l]);
+            for (int lane = 0; lane < L; lane++)
+            {
+                const std::size_t ix = static_cast<std::size_t>(lane) * num_layers + l;
+                ring_k[ix] = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(ring_dtype), head_dim, ring_rows, num_kv_heads);
+                ring_v[ix] = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(ring_dtype), head_dim, ring_rows, num_kv_heads);
+            }
+            if (use_conv)
+            {
+                lt.attn_conv_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, conv_taps, 2);
+                lt.ffn_conv_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, conv_taps, 2);
+                lt.attn_conv_proj = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(attn_conv_proj_type_arr[l]),
+                                                       attn_conv_proj_ne0_arr[l], attn_conv_proj_ne1_arr[l]);
+                lt.ffn_conv_proj = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ffn_conv_proj_type_arr[l]),
+                                                      ffn_conv_proj_ne0_arr[l], ffn_conv_proj_ne1_arr[l]);
+            }
+        }
+
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            ggml_tensor* h = ggml_mul(ctx, ggml_rms_norm(ctx, inpL, eps), lt.attn_norm_w);
+            ggml_tensor* attn_conv_coef = nullptr;
+            if (use_conv)
+            {
+                attn_conv_coef = df_scaled(ctx, ggml_mul_mat(ctx, lt.attn_conv_proj, h), scales, 6 + 9 * l + 7);
+                h = df_grouped_conv(ctx, h, attn_conv_coef, lt.attn_conv_base, /*side=*/0,
+                                    conv_taps, conv_num_groups, conv_group_size, hidden_size, nb,
+                                    conv_shift.data(), conv_mask.data());
+            }
+            ggml_tensor* q = df_scaled(ctx, ggml_mul_mat(ctx, lt.q_w, h), scales, 6 + 9 * l + 0);
+            ggml_tensor* kk = df_scaled(ctx, ggml_mul_mat(ctx, lt.k_w, h), scales, 6 + 9 * l + 1);
+            ggml_tensor* v = df_scaled(ctx, ggml_mul_mat(ctx, lt.v_w, h), scales, 6 + 9 * l + 2);
+            ggml_tensor* q3 = ggml_reshape_3d(ctx, q, head_dim, num_heads, nb);
+            ggml_tensor* k3 = ggml_reshape_3d(ctx, kk, head_dim, num_kv_heads, nb);
+            ggml_tensor* v3 = ggml_reshape_3d(ctx, v, head_dim, num_kv_heads, nb);
+            q3 = ggml_mul(ctx, ggml_rms_norm(ctx, q3, eps), lt.q_norm_w);
+            k3 = ggml_mul(ctx, ggml_rms_norm(ctx, k3, eps), lt.k_norm_w);
+            q3 = ggml_rope_ext(ctx, q3, pos_t, nullptr, head_dim, /*NeoX=*/2, 0,
+                               rope_base, rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+            k3 = ggml_rope_ext(ctx, k3, pos_t, nullptr, head_dim, /*NeoX=*/2, 0,
+                               rope_base, rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            ggml_tensor* attn_all = nullptr;
+            for (int lane = 0; lane < L; lane++)
+            {
+                const std::size_t ix = static_cast<std::size_t>(lane) * num_layers + l;
+                ggml_tensor* kl = ggml_view_3d(ctx, k3, head_dim, num_kv_heads, b, k3->nb[1], k3->nb[2],
+                    static_cast<std::size_t>(lane) * b * k3->nb[2]);
+                ggml_tensor* vl = ggml_view_3d(ctx, v3, head_dim, num_kv_heads, b, v3->nb[1], v3->nb[2],
+                    static_cast<std::size_t>(lane) * b * v3->nb[2]);
+                ggml_tensor* kb = ggml_cont(ctx, ggml_permute(ctx, kl, 0, 2, 1, 3));   // [hd, b, kv_heads]
+                ggml_tensor* vb = ggml_cont(ctx, ggml_permute(ctx, vl, 0, 2, 1, 3));
+                ggml_tensor* kcat = ggml_concat(ctx, ring_k[ix], kb, 1);
+                ggml_tensor* vcat = ggml_concat(ctx, ring_v[ix], vb, 1);
+                ggml_tensor* ql = ggml_view_3d(ctx, q3, head_dim, num_heads, b, q3->nb[1], q3->nb[2],
+                    static_cast<std::size_t>(lane) * b * q3->nb[2]);
+                ggml_tensor* qa = ggml_permute(ctx, ql, 0, 2, 1, 3);                    // [hd, b, heads]
+                ggml_tensor* ml = ggml_view_2d(ctx, mask_t, kv_len, b, mask_t->nb[1],
+                    static_cast<std::size_t>(lane) * mask_t->nb[3]);
+                ggml_tensor* fa = flash_attn_ext_guarded(ctx, "DFlash batched draft", qa, kcat, vcat, ml,
+                    kq_scale, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
+                ggml_tensor* attn_l = ggml_reshape_2d(ctx, fa, q_dim, b);
+                attn_all = attn_all == nullptr ? attn_l : ggml_concat(ctx, attn_all, attn_l, 1);
+            }
+
+            ggml_tensor* attn_out = df_scaled(ctx, ggml_mul_mat(ctx, lt.o_w, attn_all), scales, 6 + 9 * l + 3);
+            if (use_conv)
+            {
+                attn_out = df_grouped_conv(ctx, attn_out, attn_conv_coef, lt.attn_conv_base, /*side=*/1,
+                                           conv_taps, conv_num_groups, conv_group_size, hidden_size, nb,
+                                           conv_shift.data(), conv_mask.data());
+            }
+            ggml_tensor* ffn_inp = ggml_add(ctx, attn_out, inpL);
+            ggml_tensor* fh = ggml_mul(ctx, ggml_rms_norm(ctx, ffn_inp, eps), lt.ffn_norm_w);
+            ggml_tensor* ffn_conv_coef = nullptr;
+            if (use_conv)
+            {
+                ffn_conv_coef = df_scaled(ctx, ggml_mul_mat(ctx, lt.ffn_conv_proj, fh), scales, 6 + 9 * l + 8);
+                fh = df_grouped_conv(ctx, fh, ffn_conv_coef, lt.ffn_conv_base, /*side=*/0,
+                                     conv_taps, conv_num_groups, conv_group_size, hidden_size, nb,
+                                     conv_shift.data(), conv_mask.data());
+            }
+            ggml_tensor* gate = df_scaled(ctx, ggml_mul_mat(ctx, lt.gate_w, fh), scales, 6 + 9 * l + 4);
+            ggml_tensor* up   = df_scaled(ctx, ggml_mul_mat(ctx, lt.up_w, fh), scales, 6 + 9 * l + 5);
+            ggml_tensor* act  = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+            ggml_tensor* down = df_scaled(ctx, ggml_mul_mat(ctx, lt.down_w, act), scales, 6 + 9 * l + 6);
+            if (use_conv)
+            {
+                down = df_grouped_conv(ctx, down, ffn_conv_coef, lt.ffn_conv_base, /*side=*/1,
+                                       conv_taps, conv_num_groups, conv_group_size, hidden_size, nb,
+                                       conv_shift.data(), conv_mask.data());
+            }
+            inpL = ggml_add(ctx, down, ffn_inp);
+        }
+
+        ggml_tensor* cur = ggml_mul(ctx, ggml_rms_norm(ctx, inpL, eps), out_norm_t);   // [hidden, nb]
+
+        ggml_tensor* sel_s0 = nullptr;
+        ggml_tensor* sel_scores = nullptr;
+        ggml_tensor* sel_cand = nullptr;
+        ggml_tensor* out = nullptr;
+        ggml_tensor* out_conf = nullptr;
+        ggml_tensor* out_node = nullptr;
+        ggml_tensor* conf_node = nullptr;
+        if (use_selector)
+        {
+            // Columns are lane-major (lane * gamma + e): each lane's proposal rows 1..b-1.
+            ggml_tensor* pred_h = ggml_reshape_2d(ctx, ggml_cont(ctx,
+                ggml_view_3d(ctx, cur, hidden_size, gamma, L, cur->nb[1], static_cast<std::size_t>(b) * cur->nb[1], cur->nb[1])),
+                hidden_size, static_cast<std::int64_t>(gamma) * L);
+            const std::int64_t gl = static_cast<std::int64_t>(gamma) * L;
+            ggml_tensor* sel_logits = df_scaled(ctx, ggml_mul_mat(ctx, lm_head_t, pred_h), scales, 2);    // [vocab, gamma*L]
+            sel_cand = ggml_top_k(ctx, sel_logits, k);                                                   // [k, gamma*L]
+            if (!backend_supports_op(sel_cand))
+                return fail("DFlash batched draft: this backend has no top-k over the vocabulary.");
+            ggml_set_output(sel_cand);
+            ggml_tensor* logits3 = ggml_reshape_3d(ctx, sel_logits, 1, vocab_size, gl);
+            ggml_tensor* unary = ggml_get_rows(ctx, logits3, sel_cand);                                  // [1, k, gamma*L]
+            ggml_tensor* unary_kg = ggml_reshape_3d(ctx, unary, k, 1, gl);
+            if (sel_logit_scale != 1.0f)
+                unary_kg = ggml_scale(ctx, unary_kg, sel_logit_scale);
+            if (sel_logit_softcap > 0.0f)
+                unary_kg = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, unary_kg, 1.0f / sel_logit_softcap)), sel_logit_softcap);
+
+            ggml_tensor* ph = df_scaled(ctx, ggml_mul_mat(ctx, sel_hidden_t, pred_h), scales, 3);         // [r, gamma*L]
+            ggml_tensor* cand_flat = ggml_reshape_1d(ctx, sel_cand, static_cast<std::int64_t>(k) * gl);
+            ggml_tensor* keys = df_scaled(ctx, ggml_get_rows(ctx, sel_succ_t, cand_flat), scales, 5);     // [r, k*gamma*L]
+            ggml_tensor* keys3 = ggml_reshape_3d(ctx, keys, sel_rank, k, gl);
+
+            // Position 0 of each lane: its predecessor is that lane's anchor.
+            ggml_tensor* a0 = df_scaled(ctx, ggml_get_rows(ctx, sel_pred_t, anchors_t), scales, 4);       // [r, L]
+            ggml_tensor* ph0 = ggml_cont(ctx, ggml_view_2d(ctx, ph, sel_rank, L, static_cast<std::size_t>(gamma) * ph->nb[1], 0));
+            ggml_tensor* m0 = ggml_reshape_3d(ctx, ggml_mul(ctx, a0, ph0), sel_rank, 1, L);
+            ggml_tensor* keys0 = ggml_cont(ctx, ggml_view_3d(ctx, keys3, sel_rank, k, L,
+                keys3->nb[1], static_cast<std::size_t>(gamma) * keys3->nb[2], 0));                     // [r, k, L]
+            ggml_tensor* u0 = ggml_cont(ctx, ggml_view_3d(ctx, unary_kg, k, 1, L,
+                unary_kg->nb[1], static_cast<std::size_t>(gamma) * unary_kg->nb[2], 0));               // [k, 1, L]
+            sel_s0 = ggml_add(ctx, ggml_mul_mat(ctx, keys0, m0), u0);                                    // [k, 1, L]
+            ggml_set_output(sel_s0);
+
+            if (gamma > 1)
+            {
+                const std::int64_t rl = static_cast<std::int64_t>(gamma - 1) * L;
+                // Predecessors of positions 1..gamma-1 are positions 0..gamma-2 of the same lane.
+                ggml_tensor* prev = ggml_cont(ctx, ggml_view_3d(ctx, sel_cand, k, gamma - 1, L,
+                    sel_cand->nb[1], static_cast<std::size_t>(gamma) * sel_cand->nb[1], 0));
+                ggml_tensor* preds = df_scaled(ctx, ggml_get_rows(ctx, sel_pred_t,
+                    ggml_reshape_1d(ctx, prev, static_cast<std::int64_t>(k) * rl)), scales, 4);
+                ggml_tensor* preds3 = ggml_reshape_3d(ctx, preds, sel_rank, k, rl);
+                ggml_tensor* ph_rest = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_3d(ctx, ph, sel_rank, gamma - 1, L,
+                    ph->nb[1], static_cast<std::size_t>(gamma) * ph->nb[1], ph->nb[1])), sel_rank, 1, rl);
+                ggml_tensor* m = ggml_mul(ctx, preds3, ph_rest);                                         // [r, k, rl]
+                ggml_tensor* keys_rest = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_4d(ctx, keys3, sel_rank, k, gamma - 1, L,
+                    keys3->nb[1], keys3->nb[2], static_cast<std::size_t>(gamma) * keys3->nb[2], keys3->nb[2])), sel_rank, k, rl);
+                sel_scores = ggml_mul_mat(ctx, keys_rest, m);                                            // [k, k, rl]
+                ggml_tensor* u_rest = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_view_4d(ctx, unary_kg, k, 1, gamma - 1, L,
+                    unary_kg->nb[1], unary_kg->nb[2], static_cast<std::size_t>(gamma) * unary_kg->nb[2], unary_kg->nb[2])), k, 1, rl);
+                sel_scores = ggml_add(ctx, sel_scores, u_rest);
+                ggml_set_output(sel_scores);
+            }
+        }
+        else
+        {
+            ggml_tensor* logits = df_scaled(ctx, ggml_mul_mat(ctx, lm_head_t, cur), scales, 2);          // [vocab, nb]
+            ggml_tensor* probs = ggml_soft_max(ctx, logits);
+            ggml_tensor* am = ggml_argmax(ctx, probs);
+            ggml_tensor* am2 = ggml_reshape_2d(ctx, am, 1, nb);
+            ggml_tensor* pr3 = ggml_reshape_3d(ctx, probs, 1, vocab_size, nb);
+            ggml_tensor* mp = ggml_get_rows(ctx, pr3, am2);
+            out = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+            out_conf = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nb);
+            out_node = ggml_cpy(ctx, am, out);
+            conf_node = ggml_cpy(ctx, ggml_reshape_1d(ctx, mp, nb), out_conf);
+            ggml_set_output(out_node);
+            ggml_set_output(conf_node);
+        }
+
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx,
+            static_cast<std::size_t>(num_layers) * (256 + 32 * static_cast<std::size_t>(L)) + 2048, false);
+        if (use_selector)
+        {
+            ggml_build_forward_expand(graph, sel_cand);
+            ggml_build_forward_expand(graph, sel_s0);
+            if (sel_scores != nullptr)
+                ggml_build_forward_expand(graph, sel_scores);
+        }
+        else
+        {
+            ggml_build_forward_expand(graph, out_node);
+            ggml_build_forward_expand(graph, conf_node);
+        }
+
+        DfBinder binder;
+        binder.dev = ggml_backend_get_device(g_backend);
+        const std::size_t norm_bytes = static_cast<std::size_t>(hidden_size) * sizeof(float);
+        const std::size_t head_norm_bytes = static_cast<std::size_t>(head_dim) * sizeof(float);
+        const std::size_t ring_bytes = kv_cache_bytes(num_kv_heads, ring_rows, head_dim, ring_dtype);
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            binder.bind(lt.q_w,    q_arr[l],    static_cast<std::size_t>(q_bytes_arr[l]), true);
+            binder.bind(lt.k_w,    k_arr[l],    static_cast<std::size_t>(k_bytes_arr[l]), true);
+            binder.bind(lt.v_w,    v_arr[l],    static_cast<std::size_t>(v_bytes_arr[l]), true);
+            binder.bind(lt.o_w,    o_arr[l],    static_cast<std::size_t>(o_bytes_arr[l]), true);
+            binder.bind(lt.gate_w, gate_arr[l], static_cast<std::size_t>(gate_bytes_arr[l]), true);
+            binder.bind(lt.up_w,   up_arr[l],   static_cast<std::size_t>(up_bytes_arr[l]), true);
+            binder.bind(lt.down_w, down_arr[l], static_cast<std::size_t>(down_bytes_arr[l]), true);
+            binder.bind(lt.attn_norm_w, attn_norm_arr[l], norm_bytes, true);
+            binder.bind(lt.ffn_norm_w,  ffn_norm_arr[l],  norm_bytes, true);
+            binder.bind(lt.q_norm_w,    q_norm_arr[l],    head_norm_bytes, true);
+            binder.bind(lt.k_norm_w,    k_norm_arr[l],    head_norm_bytes, true);
+            for (int lane = 0; lane < L; lane++)
+            {
+                const std::size_t ix = static_cast<std::size_t>(lane) * num_layers + l;
+                binder.bind(ring_k[ix], ring_k_arr[ix], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                binder.bind(ring_v[ix], ring_v_arr[ix], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            }
+            if (use_conv)
+            {
+                const std::size_t conv_base_bytes =
+                    2u * static_cast<std::size_t>(conv_taps) * hidden_size * sizeof(float);
+                binder.bind(lt.attn_conv_base, attn_conv_base_arr[l], conv_base_bytes, true);
+                binder.bind(lt.ffn_conv_base, ffn_conv_base_arr[l], conv_base_bytes, true);
+                binder.bind(lt.attn_conv_proj, attn_conv_proj_arr[l],
+                            static_cast<std::size_t>(attn_conv_proj_bytes_arr[l]), true);
+                binder.bind(lt.ffn_conv_proj, ffn_conv_proj_arr[l],
+                            static_cast<std::size_t>(ffn_conv_proj_bytes_arr[l]), true);
+            }
+        }
+        if (use_selector)
+        {
+            binder.bind(sel_hidden_t, const_cast<void*>(sel_hidden_data), static_cast<std::size_t>(sel_hidden_bytes), true);
+            binder.bind(sel_pred_t, const_cast<void*>(sel_pred_data), static_cast<std::size_t>(sel_pred_bytes), true);
+            binder.bind(sel_succ_t, const_cast<void*>(sel_succ_data), static_cast<std::size_t>(sel_succ_bytes), true);
+        }
+        binder.bind(out_norm_t, const_cast<void*>(out_norm_data), norm_bytes, true);
+        binder.bind(tok_t, const_cast<void*>(tok_embd_data), static_cast<std::size_t>(tok_embd_bytes), true);
+        binder.bind(lm_head_t, const_cast<void*>(lm_head_data), static_cast<std::size_t>(lm_head_bytes), true);
+
+        ggml_gallocr_t persist_galloc = nullptr;
+        if (!df_alloc_persistent(ctx, graph, persist_galloc))
+            return fail("DFlash batched draft: failed to allocate persist buffer.");
+
+        host_read_barrier();
+        binder.flush();
+        for (int tap = 1; tap < (use_conv ? conv_taps : 0); tap++)
+        {
+            ggml_backend_tensor_set(conv_shift[tap], conv_shift_data[tap].data(), 0, static_cast<std::size_t>(nb) * sizeof(std::int32_t));
+            ggml_backend_tensor_set(conv_mask[tap], conv_mask_data[tap].data(), 0, static_cast<std::size_t>(nb) * sizeof(float));
+        }
+        slot->ctx = ctx; slot->galloc = persist_galloc; slot->graph = graph;
+        slot->ids = ids_t; slot->pos = pos_t; slot->mask = mask_t; slot->anchors = anchors_t;
+        slot->out = out; slot->out_conf = out_conf;
+        slot->out_s0 = sel_s0; slot->out_scores = sel_scores; slot->out_cand = sel_cand;
+        slot->sig = sig; slot->rings = rings; slot->b = b; slot->lanes = L;
+        slot->scale_signature = scale_sig;
+        slot->lru = ++pool.clock;
+        slot->valid = true;
+
+        ggml_backend_tensor_set(ids_t, block_ids, 0, static_cast<std::size_t>(nb) * sizeof(std::int32_t));
+        ggml_backend_tensor_set(pos_t, positions, 0, static_cast<std::size_t>(nb) * sizeof(std::int32_t));
+        ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+        if (anchors_t != nullptr)
+            ggml_backend_tensor_set(anchors_t, anchors.data(), 0, anchors.size() * sizeof(std::int32_t));
+        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("DFlash batched draft: graph execution failed.");
+            slot->reset();
+            return 0;
+        }
+        download(*slot);
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in DFlash batched draft."); return 0; }
+}
+
 TSG_EXPORT void TSGgml_DFlashResetCaches()
 {
     for (auto& p : g_df_inject_pools) p.reset_all();
     for (auto& p : g_df_draft_pools)  p.reset_all();
+    for (auto& p : g_df_batch_pools)
+        for (auto& e : p.entries) e.reset();
+    for (auto& p : g_df_inject_batch_pools)
+        for (auto& e : p.entries) e.reset();
+}
+
+// Preserve the unscaled ABI for older callers. Scaled graphs have distinct
+// cache identities even when their weights and ring pointers are shared.
+TSG_EXPORT int TSGgml_DFlashInject(
+    const float* feat_rows, int feature_size, int n_rows,
+    const std::int64_t* ring_rows_idx,          // ring slot per row (position % ring_rows)
+    const int* positions,                        // absolute position per row (for RoPE)
+    int num_layers, int hidden_size, int head_dim, int num_kv_heads, int ring_rows,
+    float eps, float rope_base, float rope_freq_scale,
+    const void* fc_data, int fc_type, std::int64_t fc_ne0, std::int64_t fc_ne1, std::int64_t fc_bytes,
+    const void* enc_norm_data,
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
+    void** k_norm_arr,
+    void** ring_k_arr, void** ring_v_arr,
+    int ring_dtype)
+{
+    return df_inject(
+        feat_rows, feature_size, n_rows, ring_rows_idx, positions, num_layers, hidden_size, head_dim,
+        num_kv_heads, ring_rows, eps, rope_base, rope_freq_scale, fc_data, fc_type, fc_ne0, fc_ne1, fc_bytes,
+        enc_norm_data, k_arr, k_type_arr, k_ne0_arr, k_ne1_arr, k_bytes_arr, v_arr, v_type_arr, v_ne0_arr,
+        v_ne1_arr, v_bytes_arr, k_norm_arr, ring_k_arr, ring_v_arr, ring_dtype, nullptr, 0);
+}
+
+TSG_EXPORT int TSGgml_DFlashInjectScaled(
+    const float* feat_rows, int feature_size, int n_rows,
+    const std::int64_t* ring_rows_idx,          // ring slot per row (position % ring_rows)
+    const int* positions,                        // absolute position per row (for RoPE)
+    int num_layers, int hidden_size, int head_dim, int num_kv_heads, int ring_rows,
+    float eps, float rope_base, float rope_freq_scale,
+    const void* fc_data, int fc_type, std::int64_t fc_ne0, std::int64_t fc_ne1, std::int64_t fc_bytes,
+    const void* enc_norm_data,
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
+    void** k_norm_arr,
+    void** ring_k_arr, void** ring_v_arr,
+    int ring_dtype,
+    const float* scales, int scale_count)
+{
+    return df_inject(
+        feat_rows, feature_size, n_rows, ring_rows_idx, positions, num_layers, hidden_size, head_dim,
+        num_kv_heads, ring_rows, eps, rope_base, rope_freq_scale, fc_data, fc_type, fc_ne0, fc_ne1, fc_bytes,
+        enc_norm_data, k_arr, k_type_arr, k_ne0_arr, k_ne1_arr, k_bytes_arr, v_arr, v_type_arr, v_ne0_arr,
+        v_ne1_arr, v_bytes_arr, k_norm_arr, ring_k_arr, ring_v_arr, ring_dtype, scales, scale_count);
+}
+
+TSG_EXPORT int TSGgml_DFlashInjectBatched(
+    int n_lanes, int max_rows, int total_rows,
+    const float* feat_rows, int feature_size,
+    const std::int32_t* gather, const std::int64_t* ring_rows_idx, const int* positions,
+    int num_layers, int hidden_size, int head_dim, int num_kv_heads, int ring_rows,
+    float eps, float rope_base, float rope_freq_scale,
+    const void* fc_data, int fc_type, std::int64_t fc_ne0, std::int64_t fc_ne1, std::int64_t fc_bytes,
+    const void* enc_norm_data,
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
+    void** k_norm_arr,
+    void** ring_k_arr, void** ring_v_arr,
+    int ring_dtype,
+    const float* scales, int scale_count)
+{
+    return df_inject_batched(
+        n_lanes, max_rows, total_rows, feat_rows, feature_size, gather, ring_rows_idx, positions,
+        num_layers, hidden_size, head_dim, num_kv_heads, ring_rows, eps, rope_base, rope_freq_scale,
+        fc_data, fc_type, fc_ne0, fc_ne1, fc_bytes, enc_norm_data,
+        k_arr, k_type_arr, k_ne0_arr, k_ne1_arr, k_bytes_arr, v_arr, v_type_arr, v_ne0_arr, v_ne1_arr, v_bytes_arr,
+        k_norm_arr, ring_k_arr, ring_v_arr, ring_dtype, scales, scale_count);
+}
+
+TSG_EXPORT int TSGgml_DFlashDraftBlock(
+    const int* block_ids, int block_len, const int* positions,
+    int num_layers, int hidden_size, int head_dim, int num_heads, int num_kv_heads, int ring_rows,
+    float eps, float rope_base, float rope_freq_scale, float kq_scale,
+    // ring slot -> absolute position, or -1 when the slot is not live
+    const int* ring_slot_pos, int sliding_window,
+    void** attn_norm_arr,
+    void** q_arr, int* q_type_arr, std::int64_t* q_ne0_arr, std::int64_t* q_ne1_arr, std::int64_t* q_bytes_arr,
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
+    void** q_norm_arr, void** k_norm_arr,
+    void** o_arr, int* o_type_arr, std::int64_t* o_ne0_arr, std::int64_t* o_ne1_arr, std::int64_t* o_bytes_arr,
+    void** ffn_norm_arr,
+    void** gate_arr, int* gate_type_arr, std::int64_t* gate_ne0_arr, std::int64_t* gate_ne1_arr, std::int64_t* gate_bytes_arr,
+    void** up_arr, int* up_type_arr, std::int64_t* up_ne0_arr, std::int64_t* up_ne1_arr, std::int64_t* up_bytes_arr,
+    void** down_arr, int* down_type_arr, std::int64_t* down_ne0_arr, std::int64_t* down_ne1_arr, std::int64_t* down_bytes_arr,
+    void** ring_k_arr, void** ring_v_arr, int ring_dtype,
+    const void* out_norm_data,
+    const void* tok_embd_data, int tok_embd_type, std::int64_t tok_embd_ne0, std::int64_t tok_embd_ne1, std::int64_t tok_embd_bytes,
+    const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
+    int vocab_size, int* ids_out, float* conf_out,
+    // ---- DFlash2 grouped dynamic convolution (conv_taps == 0 disables) ----
+    int conv_taps, int conv_group_size, int conv_num_groups,
+    void** attn_conv_base_arr,
+    void** attn_conv_proj_arr, int* attn_conv_proj_type_arr,
+    std::int64_t* attn_conv_proj_ne0_arr, std::int64_t* attn_conv_proj_ne1_arr, std::int64_t* attn_conv_proj_bytes_arr,
+    void** ffn_conv_base_arr,
+    void** ffn_conv_proj_arr, int* ffn_conv_proj_type_arr,
+    std::int64_t* ffn_conv_proj_ne0_arr, std::int64_t* ffn_conv_proj_ne1_arr, std::int64_t* ffn_conv_proj_bytes_arr,
+    // ---- DFlash2 candidate selector (sel_rank == 0 disables) ----
+    int sel_rank, int sel_top_k, float sel_logit_scale, float sel_logit_softcap,
+    const void* sel_hidden_data, int sel_hidden_type, std::int64_t sel_hidden_ne0, std::int64_t sel_hidden_ne1, std::int64_t sel_hidden_bytes,
+    const void* sel_pred_data, int sel_pred_type, std::int64_t sel_pred_ne0, std::int64_t sel_pred_ne1, std::int64_t sel_pred_bytes,
+    const void* sel_succ_data, int sel_succ_type, std::int64_t sel_succ_ne0, std::int64_t sel_succ_ne1, std::int64_t sel_succ_bytes,
+    float* sel_scores_out, int* sel_cand_out)
+{
+    return df_draft_block(
+        block_ids, block_len, positions, num_layers, hidden_size, head_dim, num_heads, num_kv_heads, ring_rows,
+        eps, rope_base, rope_freq_scale, kq_scale, ring_slot_pos, sliding_window, attn_norm_arr, q_arr,
+        q_type_arr, q_ne0_arr, q_ne1_arr, q_bytes_arr, k_arr, k_type_arr, k_ne0_arr, k_ne1_arr, k_bytes_arr,
+        v_arr, v_type_arr, v_ne0_arr, v_ne1_arr, v_bytes_arr, q_norm_arr, k_norm_arr, o_arr, o_type_arr,
+        o_ne0_arr, o_ne1_arr, o_bytes_arr, ffn_norm_arr, gate_arr, gate_type_arr, gate_ne0_arr, gate_ne1_arr,
+        gate_bytes_arr, up_arr, up_type_arr, up_ne0_arr, up_ne1_arr, up_bytes_arr, down_arr, down_type_arr,
+        down_ne0_arr, down_ne1_arr, down_bytes_arr, ring_k_arr, ring_v_arr, ring_dtype, out_norm_data,
+        tok_embd_data, tok_embd_type, tok_embd_ne0, tok_embd_ne1, tok_embd_bytes, lm_head_data, lm_head_type,
+        lm_head_ne0, lm_head_ne1, lm_head_bytes, vocab_size, ids_out, conf_out, conv_taps, conv_group_size,
+        conv_num_groups, attn_conv_base_arr, attn_conv_proj_arr, attn_conv_proj_type_arr,
+        attn_conv_proj_ne0_arr, attn_conv_proj_ne1_arr, attn_conv_proj_bytes_arr, ffn_conv_base_arr,
+        ffn_conv_proj_arr, ffn_conv_proj_type_arr, ffn_conv_proj_ne0_arr, ffn_conv_proj_ne1_arr,
+        ffn_conv_proj_bytes_arr, sel_rank, sel_top_k, sel_logit_scale, sel_logit_softcap, sel_hidden_data,
+        sel_hidden_type, sel_hidden_ne0, sel_hidden_ne1, sel_hidden_bytes, sel_pred_data, sel_pred_type,
+        sel_pred_ne0, sel_pred_ne1, sel_pred_bytes, sel_succ_data, sel_succ_type, sel_succ_ne0, sel_succ_ne1,
+        sel_succ_bytes, sel_scores_out, sel_cand_out, nullptr, 0);
+}
+
+TSG_EXPORT int TSGgml_DFlashDraftBlockScaled(
+    const int* block_ids, int block_len, const int* positions,
+    int num_layers, int hidden_size, int head_dim, int num_heads, int num_kv_heads, int ring_rows,
+    float eps, float rope_base, float rope_freq_scale, float kq_scale,
+    // ring slot -> absolute position, or -1 when the slot is not live
+    const int* ring_slot_pos, int sliding_window,
+    void** attn_norm_arr,
+    void** q_arr, int* q_type_arr, std::int64_t* q_ne0_arr, std::int64_t* q_ne1_arr, std::int64_t* q_bytes_arr,
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
+    void** q_norm_arr, void** k_norm_arr,
+    void** o_arr, int* o_type_arr, std::int64_t* o_ne0_arr, std::int64_t* o_ne1_arr, std::int64_t* o_bytes_arr,
+    void** ffn_norm_arr,
+    void** gate_arr, int* gate_type_arr, std::int64_t* gate_ne0_arr, std::int64_t* gate_ne1_arr, std::int64_t* gate_bytes_arr,
+    void** up_arr, int* up_type_arr, std::int64_t* up_ne0_arr, std::int64_t* up_ne1_arr, std::int64_t* up_bytes_arr,
+    void** down_arr, int* down_type_arr, std::int64_t* down_ne0_arr, std::int64_t* down_ne1_arr, std::int64_t* down_bytes_arr,
+    void** ring_k_arr, void** ring_v_arr, int ring_dtype,
+    const void* out_norm_data,
+    const void* tok_embd_data, int tok_embd_type, std::int64_t tok_embd_ne0, std::int64_t tok_embd_ne1, std::int64_t tok_embd_bytes,
+    const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
+    int vocab_size, int* ids_out, float* conf_out,
+    // ---- DFlash2 grouped dynamic convolution (conv_taps == 0 disables) ----
+    int conv_taps, int conv_group_size, int conv_num_groups,
+    void** attn_conv_base_arr,
+    void** attn_conv_proj_arr, int* attn_conv_proj_type_arr,
+    std::int64_t* attn_conv_proj_ne0_arr, std::int64_t* attn_conv_proj_ne1_arr, std::int64_t* attn_conv_proj_bytes_arr,
+    void** ffn_conv_base_arr,
+    void** ffn_conv_proj_arr, int* ffn_conv_proj_type_arr,
+    std::int64_t* ffn_conv_proj_ne0_arr, std::int64_t* ffn_conv_proj_ne1_arr, std::int64_t* ffn_conv_proj_bytes_arr,
+    // ---- DFlash2 candidate selector (sel_rank == 0 disables) ----
+    int sel_rank, int sel_top_k, float sel_logit_scale, float sel_logit_softcap,
+    const void* sel_hidden_data, int sel_hidden_type, std::int64_t sel_hidden_ne0, std::int64_t sel_hidden_ne1, std::int64_t sel_hidden_bytes,
+    const void* sel_pred_data, int sel_pred_type, std::int64_t sel_pred_ne0, std::int64_t sel_pred_ne1, std::int64_t sel_pred_bytes,
+    const void* sel_succ_data, int sel_succ_type, std::int64_t sel_succ_ne0, std::int64_t sel_succ_ne1, std::int64_t sel_succ_bytes,
+    float* sel_scores_out, int* sel_cand_out,
+    const float* scales, int scale_count)
+{
+    return df_draft_block(
+        block_ids, block_len, positions, num_layers, hidden_size, head_dim, num_heads, num_kv_heads, ring_rows,
+        eps, rope_base, rope_freq_scale, kq_scale, ring_slot_pos, sliding_window, attn_norm_arr, q_arr,
+        q_type_arr, q_ne0_arr, q_ne1_arr, q_bytes_arr, k_arr, k_type_arr, k_ne0_arr, k_ne1_arr, k_bytes_arr,
+        v_arr, v_type_arr, v_ne0_arr, v_ne1_arr, v_bytes_arr, q_norm_arr, k_norm_arr, o_arr, o_type_arr,
+        o_ne0_arr, o_ne1_arr, o_bytes_arr, ffn_norm_arr, gate_arr, gate_type_arr, gate_ne0_arr, gate_ne1_arr,
+        gate_bytes_arr, up_arr, up_type_arr, up_ne0_arr, up_ne1_arr, up_bytes_arr, down_arr, down_type_arr,
+        down_ne0_arr, down_ne1_arr, down_bytes_arr, ring_k_arr, ring_v_arr, ring_dtype, out_norm_data,
+        tok_embd_data, tok_embd_type, tok_embd_ne0, tok_embd_ne1, tok_embd_bytes, lm_head_data, lm_head_type,
+        lm_head_ne0, lm_head_ne1, lm_head_bytes, vocab_size, ids_out, conf_out, conv_taps, conv_group_size,
+        conv_num_groups, attn_conv_base_arr, attn_conv_proj_arr, attn_conv_proj_type_arr,
+        attn_conv_proj_ne0_arr, attn_conv_proj_ne1_arr, attn_conv_proj_bytes_arr, ffn_conv_base_arr,
+        ffn_conv_proj_arr, ffn_conv_proj_type_arr, ffn_conv_proj_ne0_arr, ffn_conv_proj_ne1_arr,
+        ffn_conv_proj_bytes_arr, sel_rank, sel_top_k, sel_logit_scale, sel_logit_softcap, sel_hidden_data,
+        sel_hidden_type, sel_hidden_ne0, sel_hidden_ne1, sel_hidden_bytes, sel_pred_data, sel_pred_type,
+        sel_pred_ne0, sel_pred_ne1, sel_pred_bytes, sel_succ_data, sel_succ_type, sel_succ_ne0, sel_succ_ne1,
+        sel_succ_bytes, sel_scores_out, sel_cand_out, scales, scale_count);
 }

@@ -24,6 +24,13 @@ extern "C" ggml_tensor * tsg_attention_f32_sparse(ggml_context *, ggml_tensor * 
 extern "C" ggml_tensor * tsg_vision_attention_f32(ggml_context *, ggml_tensor * q,
     ggml_tensor * k, ggml_tensor * v, float scale);
 
+// The same contract on tensor cores (CUDA sm_80+): Q/K/V operands are rounded to
+// F16 (K and V by a ggml cast this adds), scores, softmax and output accumulate
+// in F32. The CPU callback is the double-precision reference of
+// tsg_vision_attention_f32.
+extern "C" ggml_tensor * tsg_vision_attention_mma(ggml_context *, ggml_tensor * q,
+    ggml_tensor * k, ggml_tensor * v, float scale);
+
 // Place the complete owned subgraph, including the shared in-place output
 // allocation, on one scheduler backend. Existing input producers keep their
 // placement and the scheduler transfers their required views normally.
@@ -36,4 +43,6 @@ extern "C" ggml_tensor * tsg_attention_f32_on_backend(ggml_context *, ggml_backe
 
 #ifdef TSG_GGML_USE_CUDA
 void tsg_attention_cuda_compute(ggml_tensor *, ggml_backend_t);
+// True when the backend's device has the tensor cores tsg_vision_attention_mma needs.
+bool tsg_vision_mma_supported(ggml_backend_t);
 #endif

@@ -42,10 +42,14 @@ REQUIRED_FILES = (
     "webui/index.html",
 )
 CUDA_FILES = (
-    "cudart64_12.dll",
-    "cublas64_12.dll",
-    "cublasLt64_12.dll",
+    "cudart64_13.dll",
+    "cublas64_13.dll",
+    "cublasLt64_13.dll",
     "cuda_kernels/tensorsharp_kernels.ptx",
+    # SASS for the release GPUs: a CUDA 13 driver older than the 13.4 toolkit
+    # cannot JIT the PTX alone. The sidecar pairs the fatbin with that PTX.
+    "cuda_kernels/tensorsharp_kernels.fatbin",
+    "cuda_kernels/tensorsharp_kernels.fatbin.sha256",
 )
 VERSION_PATTERN = re.compile(
     r"([0-9]+)\.([0-9]+)\.([0-9]+)"

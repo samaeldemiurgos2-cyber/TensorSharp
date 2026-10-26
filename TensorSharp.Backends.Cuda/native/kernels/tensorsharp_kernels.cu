@@ -2016,6 +2016,227 @@ TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d96_f32, 96)
 TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d112_f32, 112)
 TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d128_f32, 128)
 
+// ---------------------------------------------------------------------------
+// The same bidirectional attention on the f16 tensor cores (sm_80+). q/k/v are first converted
+// once into f16 [heads][seq][DP] with the head dim zero-padded to DP (a multiple of 16; 72 -> 80);
+// a block then takes one head x 64 queries (4 warps of 16 rows) and streams keys in tiles of 64
+// through a two-stage cp.async pipeline - the FlashAttention-2 schedule, scores, online softmax
+// and accumulators in F32 (mma.m16n8k16). Output F32 [seq][heads][D] as the scalar kernels.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void ts_vision_pad_f16(
+    const float* __restrict__ src, int seq, int heads, int d, int dp, half* __restrict__ dst)
+{
+    const long long n = (long long)heads * seq * dp;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+    {
+        const int c = (int)(i % dp);
+        const long long hs = i / dp;
+        const int pos = (int)(hs % seq), h = (int)(hs / seq);
+        dst[i] = __float2half_rn(c < d ? src[((long long)pos * heads + h) * d + c] : 0.0f);
+    }
+}
+
+__device__ __forceinline__ uint32_t ts_va_smem(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+
+__device__ __forceinline__ void ts_va_cp16(void* dst, const void* src, bool valid)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(ts_va_smem(dst)), "l"(src), "r"(valid ? 16 : 0));
+#endif
+}
+
+__device__ __forceinline__ void ts_va_mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+}
+
+__device__ __forceinline__ uint32_t ts_va_h2(float lo, float hi)
+{
+    const half2 v = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+
+template <int D>
+__device__ __forceinline__ void ts_vision_attention_mma_body(
+    const half* __restrict__ q16, const half* __restrict__ k16, const half* __restrict__ v16,
+    float* __restrict__ out, int heads, int seq, float scale)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int DP = (D + 15) / 16 * 16, ROW = DP + 8, KT = 64, CH = DP / 8;
+    extern __shared__ __align__(16) unsigned char ts_va_smem_raw[];
+    half* ks = (half*)ts_va_smem_raw;   // [2][KT][ROW]
+    half* vs = ks + 2 * KT * ROW;       // [2][KT][ROW]
+    const int head = blockIdx.y, q0 = blockIdx.x * 64;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, qd = lane & 3;
+    const half* qh = q16 + (size_t)head * seq * DP;
+    const half* kh = k16 + (size_t)head * seq * DP;
+    const half* vh = v16 + (size_t)head * seq * DP;
+    const int r0 = q0 + warp * 16 + g, r1 = r0 + 8;
+
+    uint32_t qa[DP / 16][4];
+#pragma unroll
+    for (int kk = 0; kk < DP / 16; ++kk)
+    {
+        const int c = kk * 16 + qd * 2;
+        qa[kk][0] = r0 < seq ? *(const uint32_t*)(qh + (size_t)r0 * DP + c) : 0u;
+        qa[kk][1] = r1 < seq ? *(const uint32_t*)(qh + (size_t)r1 * DP + c) : 0u;
+        qa[kk][2] = r0 < seq ? *(const uint32_t*)(qh + (size_t)r0 * DP + c + 8) : 0u;
+        qa[kk][3] = r1 < seq ? *(const uint32_t*)(qh + (size_t)r1 * DP + c + 8) : 0u;
+    }
+    float acc[DP / 8][4];
+#pragma unroll
+    for (int n = 0; n < DP / 8; ++n)
+        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    const float log2Scale = scale * 1.4426950408889634f;
+
+    auto loadTile = [&](int stage, int k0)
+    {
+        half* kd = ks + stage * KT * ROW;
+        half* vd = vs + stage * KT * ROW;
+        for (int i = threadIdx.x; i < KT * CH; i += blockDim.x)
+        {
+            const int key = i / CH, c = (i % CH) * 8;
+            const bool ok = k0 + key < seq;
+            const size_t src = (size_t)(ok ? k0 + key : 0) * DP + c;
+            ts_va_cp16(kd + key * ROW + c, kh + src, ok);
+            ts_va_cp16(vd + key * ROW + c, vh + src, ok);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    const int tiles = (seq + KT - 1) / KT;
+    loadTile(0, 0);
+    for (int t = 0; t < tiles; ++t)
+    {
+        if (t + 1 < tiles)
+        {
+            loadTile((t + 1) & 1, (t + 1) * KT);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        }
+        else
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+        const half* kt = ks + (t & 1) * KT * ROW;
+        const half* vt = vs + (t & 1) * KT * ROW;
+        float sc[KT / 8][4];
+#pragma unroll
+        for (int j = 0; j < KT / 8; ++j)
+        {
+            sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.0f;
+            const half* kb = kt + (j * 8 + g) * ROW + qd * 2;
+#pragma unroll
+            for (int kk = 0; kk < DP / 16; ++kk)
+                ts_va_mma(sc[j], qa[kk], *(const uint32_t*)(kb + kk * 16), *(const uint32_t*)(kb + kk * 16 + 8));
+        }
+        const int k0 = t * KT;
+        float t0 = m0, t1 = m1;
+#pragma unroll
+        for (int j = 0; j < KT / 8; ++j)
+        {
+            const int key = k0 + j * 8 + qd * 2;
+            sc[j][0] = key < seq ? sc[j][0] * log2Scale : -INFINITY;
+            sc[j][1] = key + 1 < seq ? sc[j][1] * log2Scale : -INFINITY;
+            sc[j][2] = key < seq ? sc[j][2] * log2Scale : -INFINITY;
+            sc[j][3] = key + 1 < seq ? sc[j][3] * log2Scale : -INFINITY;
+            t0 = fmaxf(t0, fmaxf(sc[j][0], sc[j][1]));
+            t1 = fmaxf(t1, fmaxf(sc[j][2], sc[j][3]));
+        }
+#pragma unroll
+        for (int off = 1; off < 4; off <<= 1)
+        {
+            t0 = fmaxf(t0, __shfl_xor_sync(0xffffffff, t0, off));
+            t1 = fmaxf(t1, __shfl_xor_sync(0xffffffff, t1, off));
+        }
+        const float c0 = t0 == -INFINITY ? 1.0f : exp2f(m0 - t0);
+        const float c1 = t1 == -INFINITY ? 1.0f : exp2f(m1 - t1);
+        m0 = t0;
+        m1 = t1;
+        l0 *= c0;
+        l1 *= c1;
+#pragma unroll
+        for (int n = 0; n < DP / 8; ++n)
+        {
+            acc[n][0] *= c0; acc[n][1] *= c0;
+            acc[n][2] *= c1; acc[n][3] *= c1;
+        }
+#pragma unroll
+        for (int j = 0; j < KT / 8; ++j)
+        {
+            sc[j][0] = t0 == -INFINITY ? 0.0f : exp2f(sc[j][0] - t0);
+            sc[j][1] = t0 == -INFINITY ? 0.0f : exp2f(sc[j][1] - t0);
+            sc[j][2] = t1 == -INFINITY ? 0.0f : exp2f(sc[j][2] - t1);
+            sc[j][3] = t1 == -INFINITY ? 0.0f : exp2f(sc[j][3] - t1);
+            l0 += sc[j][0] + sc[j][1];
+            l1 += sc[j][2] + sc[j][3];
+        }
+#pragma unroll
+        for (int kk = 0; kk < KT / 16; ++kk)
+        {
+            const uint32_t pa[4] = {
+                ts_va_h2(sc[2 * kk][0], sc[2 * kk][1]), ts_va_h2(sc[2 * kk][2], sc[2 * kk][3]),
+                ts_va_h2(sc[2 * kk + 1][0], sc[2 * kk + 1][1]), ts_va_h2(sc[2 * kk + 1][2], sc[2 * kk + 1][3]) };
+            const half* vrow = vt + (kk * 16 + (lane & 15)) * ROW;
+#pragma unroll
+            for (int n = 0; n < DP / 8; ++n)
+            {
+                uint32_t b0, b1;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(b0), "=r"(b1) : "r"(ts_va_smem(vrow + n * 8)));
+                ts_va_mma(acc[n], pa, b0, b1);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1)
+    {
+        l0 += __shfl_xor_sync(0xffffffff, l0, off);
+        l1 += __shfl_xor_sync(0xffffffff, l1, off);
+    }
+#pragma unroll
+    for (int hh = 0; hh < 2; ++hh)
+    {
+        const int r = hh ? r1 : r0;
+        if (r >= seq)
+            continue;
+        const float l = hh ? l1 : l0;
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        float* o = out + ((size_t)r * heads + head) * D;
+#pragma unroll
+        for (int n = 0; n < DP / 8; ++n)
+        {
+            const int c = n * 8 + qd * 2;
+            if (c < D)
+                o[c] = acc[n][hh * 2] * inv;
+            if (c + 1 < D)
+                o[c + 1] = acc[n][hh * 2 + 1] * inv;
+        }
+    }
+#else
+    __trap();
+#endif
+}
+
+#define TS_VISION_ATTENTION_MMA_KERNEL(NAME, D)                                   \
+    extern "C" __global__ __launch_bounds__(128) void NAME(                      \
+        const half* __restrict__ q16, const half* __restrict__ k16,              \
+        const half* __restrict__ v16, float* __restrict__ output,                \
+        int num_heads, int seq, float scale)                                     \
+    {                                                                            \
+        ts_vision_attention_mma_body<D>(q16, k16, v16, output, num_heads, seq, scale); \
+    }
+
+TS_VISION_ATTENTION_MMA_KERNEL(ts_vision_attention_mma_d64, 64)
+TS_VISION_ATTENTION_MMA_KERNEL(ts_vision_attention_mma_d72, 72)
+TS_VISION_ATTENTION_MMA_KERNEL(ts_vision_attention_mma_d80, 80)
+TS_VISION_ATTENTION_MMA_KERNEL(ts_vision_attention_mma_d96, 96)
+TS_VISION_ATTENTION_MMA_KERNEL(ts_vision_attention_mma_d112, 112)
+TS_VISION_ATTENTION_MMA_KERNEL(ts_vision_attention_mma_d128, 128)
+
 extern "C" __global__ void ts_scaled_dot_product_attention_f32(
     const float* query,
     const float* key,

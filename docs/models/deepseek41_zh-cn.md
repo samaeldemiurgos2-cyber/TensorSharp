@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash（`deepseek41`）
 
-> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。下面的历史命令与测量早于这项默认值变更；多 GPU 启动请加 `--layer-split N`。按层切分仅限单节点。
+> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。在 `ggml_cuda` 上再加 `--tp-node-id` 与 `--tp-peers` 可跨节点运行，N 为每个节点的本地 GPU 数。配置及限制见[多节点推理](../multi-node-inference.md)（英文）。下面的历史测量保留原有拓扑，不构成新增分布式按层切分路径的验证。
 
 [← 返回模型索引](README_zh-cn.md) | [English](deepseek41.md)
 
@@ -103,7 +103,7 @@ Q2_K-Q5。每次新验证都须记录 revision 与全部分片哈希。
 ## Unsloth 的 DeepSeek-V4.1-Flash-1017 GGUF
 
 [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/60ad3651641b5c97679c807e064ab1d7a3ca1455)
-为 llama.cpp 打包了 1017 检查点。TensorSharp 按发布原样加载这些文件；它们与上文布局
+为 llama.cpp 打包了 1017 检查点。TensorSharp 按发布原样加载本轮已验证的 `UD-IQ2_XXS` 文件；其布局与上文
 有四处不同，均由加载器处理：
 
 - Engram 表是一个张量 `per_layer_token_embd.weight`（Q5_K，独占一个分片），由
@@ -117,6 +117,10 @@ Q2_K-Q5。每次新验证都须记录 revision 与全部分片哈希。
 - 视觉塔以 llama.cpp 的 `mmproj-BF16.gguf` / `mmproj-F16.gguf`（`clip`，projector
   `deepseek41v`）发布，`--mmproj` 可直接加载；图像 token 的路由偏置取自文本分片
   （`blk.N.exp_probs_b_vl.bias`）。
+
+本轮已完成的加载与分布式对照覆盖 `UD-IQ2_XXS`，其他量化版本需要单独验证。修订 `60ad3651…` 的
+`UD-Q4_K_XL` 含 Engram 类型 43，测试所用未修改的 ggml `3612c0af…` 不支持该类型，
+实际加载失败；详见[验证报告](../deepseek41_validation.md)。
 
 每次调用只传一个 `--include` 模式（`hf` 2.2.0 在一次调用中给多个模式时只匹配到了
 根目录文件）：
@@ -401,7 +405,16 @@ TensorSharp 默认按可用显存分配整层。用 `CUDA_VISIBLE_DEVICES` 精�
 选中的 GPU 上并发执行。先按 F32 精度拼接完整 SwiGLU 激活，再计算 down 的各输出行，最后
 拼接互不重叠的输出。这保留完整的点积归约次序，避免舍入差异被后续激活量化放大。量化块从不被
 切开，不均匀的条带在各层之间轮换以平衡存储。注意力、共享专家与各类 cache 仍保持按层
-放置。这是一份部分实现的张量并行：它不切分注意力，也不支持分布式张量并行组。
+放置。该张量并行路径不切分注意力；在 `ggml_cuda` 上可通过现有的
+`--tp-node-id` / `--tp-peers` 分布式组跨节点切分路由专家。
+`--tp N` 表示每个节点的 GPU 数量，各节点必须相同（1–8），全局支持 2–16 个 rank。
+该范围是执行器容量，仍受 GGUF 量化块形状限制：2304 宽的 K 量化 down 行只有九个
+256 元素块，超过九个全局 rank 无法形成非空分片，因此两节点各八卡的布局会被拒绝。
+已完成的跨节点 fixture 验证覆盖两节点各一张或两张 GPU。
+跨节点模式每个 GPU 驻留 MoE 层进行两次 F32 激活与输出行拼接，网络延迟会影响解码速度。
+分布式请求使用一个镜像序列并串行执行，不支持序列槽、前缀保留/截断、视觉或 DSpark，
+也不能与 `--layer-split` 合用。请参阅[英文部署说明](deepseek41.md#distributed-routed-moe-tensor-parallelism)
+与[固定 token 验证流程](../../eng/validation/DeepSeek41DistributedProbe/README.md)。
 
 在 `ggml_cuda` 上，路由专家的交换驻留在设备侧（`ggml_ops_deepseek41_tp_cuda.cu`）。每个 TP
 层在本层 GPU 上是一个 launch 节点和一个 gather 节点：launch 暂存本层激活并下发到每个
@@ -1181,7 +1194,8 @@ V4.1 没有发布任何委派相关的实测结果。
   它具有针对内核/槽位的约束，但没有独立的完整检查点数值门禁——两者都是正确性与可移植性通道，而不是服务通道。`mlx` 会在读取权重
   之前失败，而不会把 V4.1 的权重塞进并未实现它的计算图。
 - 默认只使用一张 GPU。`--layer-split N` 选择整层放置；`--tp N` 启用 routed-MoE 张量并行，
-  使用 F32 激活与输出拼接。注意力张量并行与分布式组尚未实现。
+  使用 F32 激活与输出拼接。`ggml_cuda` 的现有分布式组支持跨节点路由专家 TP，
+  注意力不切分。分布式模式使用单个镜像序列，不支持槽、前缀保留/截断、视觉或 DSpark。
 - 并发请求拥有隔离的序列槽位。在带 CUDA 融合后端的原生执行器上（`--backend ggml_cuda`），
   它们的 decode 步作为一张按 token 批处理的计算图执行（见[token 批量 decode](#token-批量-decode)）。
   `--backend ggml_cpu`、`TS_DSV4_FUSED=0`、加载了 DSpark 草稿器或设置

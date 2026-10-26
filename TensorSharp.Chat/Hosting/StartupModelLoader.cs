@@ -67,7 +67,7 @@ namespace TensorSharp.Server.Hosting
             // restore from.
             AttachPrefixCheckpointStore(options, modelService, logger);
 
-            modelService.LoadModel(options.StartupModelPath, options.StartupMmProjPath, startupBackend);
+            modelService.LoadStartupModel(options.StartupModelPath, options.StartupMmProjPath, startupBackend);
 
             // An explicit --draft-model that couldn't be activated (missing,
             // wrong architecture, an incompatible/incomplete draft) used to be

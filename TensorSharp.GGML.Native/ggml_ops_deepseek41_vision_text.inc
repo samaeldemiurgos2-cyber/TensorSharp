@@ -7,6 +7,8 @@ TSG_EXPORT int TSGgml_Dsv41AttachVision(void * text_handle, void * vision_handle
     auto & m = *static_cast<tsg_dsv4::dsv4_model *>(text_handle);
     try
     {
+        if (m.pipeline.active())
+            throw std::runtime_error("Distributed layer split currently mirrors text operations only");
         auto encoder = tsg_dsv41_vision::from_handle(vision_handle);
         if (!m.hp.v41 || !encoder || m.vision)
             throw std::runtime_error("V4.1 vision requires a V4.1 model without an existing companion");

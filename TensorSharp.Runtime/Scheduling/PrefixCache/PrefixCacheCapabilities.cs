@@ -52,6 +52,15 @@ public sealed record PrefixCacheCapabilities
 
     // Media and positions
     public bool ReuseAcrossMediaSpan { get; init; }                  // = IModelArchitecture.SupportsReuseAcrossMediaSpan (Phase 0)
+    // A prompt with media also gets the text-style automatic checkpoint at its tail, besides the one
+    // before its newest media span: for a family whose checkpoint shares the media's K/V instead of
+    // copying it, so the same image asked again (or a history that keeps it) resumes past it.
+    public bool CheckpointPromptTailWithMedia { get; init; }
+
+    // End states and checkpoints cost little and their footprints report their bytes: the count
+    // caps (retained end states, public checkpoints) give way to the byte budgets unless the
+    // operator sets them, since a count tuned for whole-cache copies evicts states that still fit.
+    public bool CountCapsByBytes { get; init; }
     public int MmReuseMinTokens { get; init; }                       // DEC-12
 
     // Persistence and threading

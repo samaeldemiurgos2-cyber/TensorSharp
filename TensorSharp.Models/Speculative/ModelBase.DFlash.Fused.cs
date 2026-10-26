@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models
@@ -62,6 +63,11 @@ namespace TensorSharp.Models
 
             public int RingRows;
 
+            // Native packed scale table: fc/embedding/head/selector H/P/S,
+            // then Q/K/V/O/gate/up/down/attention-conv/FFN-conv per layer.
+            // Null preserves the existing unscaled ABI and graph.
+            public float[] Scales;
+
             /// <summary>DFlash2 grouped convolution: per layer, the static base
             /// kernel [hidden, taps, 2] and the projection that produces both taps
             /// from the sublayer input. Null on a first-generation drafter.</summary>
@@ -88,6 +94,11 @@ namespace TensorSharp.Models
         /// which position (and which slots were never written).</summary>
         private int _dflashRingFilled;
 
+        /// <summary>First position of the contiguous run of rows the ring holds for
+        /// its current sequence; rows below it (never written, or written for another
+        /// sequence) are not context. See <see cref="NoteDFlashRingWrite"/>.</summary>
+        private int _dflashRingValidFrom;
+
         /// <summary>Set when the fused kernels have written the ring on the device, so
         /// the host mirror is behind.</summary>
         private bool _dflashRingHostStale;
@@ -98,6 +109,7 @@ namespace TensorSharp.Models
         /// </summary>
         private void EnsureDFlashRingHostSynchronized()
         {
+            FlushDeferredDFlashInjects();
             if (!_dflashRingHostStale || _dflashRingK == null)
                 return;
             for (int l = 0; l < _dflash.NumLayers; l++)
@@ -164,7 +176,9 @@ namespace TensorSharp.Models
                 DownNe0 = new long[n], DownNe1 = new long[n], DownBytes = new long[n],
                 RingK = new IntPtr[n], RingV = new IntPtr[n],
                 RingRows = _dflashRingRows,
+                Scales = new float[6 + n * 9],
             };
+            Array.Fill(a.Scales, 1f);
             if (cfg.HasConv)
             {
                 a.AttnConvBase = new IntPtr[n]; a.FfnConvBase = new IntPtr[n];
@@ -205,6 +219,15 @@ namespace TensorSharp.Models
                 a.Up[l] = up.CacheKey; a.UpType[l] = up.GgmlType; a.UpNe0[l] = up.Ne0; a.UpNe1[l] = up.Ne1; a.UpBytes[l] = up.RawBytes;
                 a.Down[l] = down.CacheKey; a.DownType[l] = down.GgmlType; a.DownNe0[l] = down.Ne0; a.DownNe1[l] = down.Ne1; a.DownBytes[l] = down.RawBytes;
 
+                int scaleOffset = 6 + l * 9;
+                a.Scales[scaleOffset] = q.Scale;
+                a.Scales[scaleOffset + 1] = k.Scale;
+                a.Scales[scaleOffset + 2] = v.Scale;
+                a.Scales[scaleOffset + 3] = o.Scale;
+                a.Scales[scaleOffset + 4] = gate.Scale;
+                a.Scales[scaleOffset + 5] = up.Scale;
+                a.Scales[scaleOffset + 6] = down.Scale;
+
                 a.RingK[l] = TensorComputePrimitives.GetStoragePointer(_dflashRingK[l]);
                 a.RingV[l] = TensorComputePrimitives.GetStoragePointer(_dflashRingV[l]);
 
@@ -220,6 +243,8 @@ namespace TensorSharp.Models
                     Console.WriteLine($"  DFlash fused drafter disabled: layer {l} is missing a conv base kernel.");
                     return;
                 }
+                a.Scales[scaleOffset + 7] = acp.Scale;
+                a.Scales[scaleOffset + 8] = fcp.Scale;
                 a.AttnConvBase[l] = (IntPtr)GetFloatPtr(acb);
                 a.FfnConvBase[l] = (IntPtr)GetFloatPtr(fcb);
                 a.AttnConvProj[l] = acp.CacheKey; a.AttnConvProjType[l] = acp.GgmlType;
@@ -234,6 +259,7 @@ namespace TensorSharp.Models
                 Console.WriteLine("  DFlash fused drafter disabled: the encoder projection is not quantized.");
                 return;
             }
+            a.Scales[0] = fc.Scale;
             a.Fc = fc.CacheKey; a.FcType = fc.GgmlType; a.FcNe0 = fc.Ne0; a.FcNe1 = fc.Ne1; a.FcBytes = fc.RawBytes;
 
             if (!_weights.TryGetValue(DFlashConfig.WeightPrefix + "enc.output_norm.weight", out var encNorm)
@@ -253,6 +279,8 @@ namespace TensorSharp.Models
                 Console.WriteLine("  DFlash fused drafter disabled: the target embedding/LM head is not quantized.");
                 return;
             }
+            a.Scales[1] = tok.Scale;
+            a.Scales[2] = head.Scale;
             a.TokEmbd = tok.CacheKey; a.TokEmbdType = tok.GgmlType; a.TokEmbdNe0 = tok.Ne0; a.TokEmbdNe1 = tok.Ne1; a.TokEmbdBytes = tok.RawBytes;
             a.LmHead = head.CacheKey; a.LmHeadType = head.GgmlType; a.LmHeadNe0 = head.Ne0; a.LmHeadNe1 = head.Ne1; a.LmHeadBytes = head.RawBytes;
 
@@ -265,6 +293,9 @@ namespace TensorSharp.Models
                     Console.WriteLine("  DFlash fused drafter disabled: a selector table is not quantized.");
                     return;
                 }
+                a.Scales[3] = selH.Scale;
+                a.Scales[4] = selP.Scale;
+                a.Scales[5] = selS.Scale;
                 a.SelHidden = selH.CacheKey; a.SelHiddenType = selH.GgmlType;
                 a.SelHiddenNe0 = selH.Ne0; a.SelHiddenNe1 = selH.Ne1; a.SelHiddenBytes = selH.RawBytes;
                 a.SelPred = selP.CacheKey; a.SelPredType = selP.GgmlType;
@@ -273,6 +304,8 @@ namespace TensorSharp.Models
                 a.SelSuccNe0 = selS.Ne0; a.SelSuccNe1 = selS.Ne1; a.SelSuccBytes = selS.RawBytes;
             }
 
+            if (Array.TrueForAll(a.Scales, scale => scale == 1f))
+                a.Scales = null;
             _dflashArrays = a;
             Console.WriteLine($"  DFlash fused drafter armed ({n} draft layers, ring {a.RingRows} rows, "
                 + (cfg.HasSelector ? "on-device lattice" : "on-device top-1")
@@ -297,6 +330,22 @@ namespace TensorSharp.Models
             if (_dflashArrays != null)
                 GgmlBasicOps.DFlashResetCaches();
             _dflashRingFilled = 0;
+            _dflashRingValidFrom = 0;
+        }
+
+        /// <summary>
+        /// Record a ring write of <paramref name="n"/> rows from <paramref name="startPos"/>.
+        /// The frontier is an ASSIGNMENT (see DFlashInjectKv). The valid run restarts at
+        /// a write that jumps past the frontier or lands below the run: a fused holder
+        /// arms mid-sequence with an empty ring, and the slots under its first write's
+        /// frontier hold zeros or another sequence's rows at colliding positions, which
+        /// the slot map used to label as live context.
+        /// </summary>
+        private void NoteDFlashRingWrite(int startPos, int n)
+        {
+            if (startPos > _dflashRingFilled || startPos < _dflashRingValidFrom)
+                _dflashRingValidFrom = startPos;
+            _dflashRingFilled = startPos + n;
         }
 
         /// <summary>
@@ -313,7 +362,7 @@ namespace TensorSharp.Models
             var map = _dflashRingSlotPos;
             for (int i = 0; i < rows; i++)
                 map[i] = -1;
-            int lo = Math.Max(0, _dflashRingFilled - rows);
+            int lo = Math.Max(Math.Max(0, _dflashRingFilled - rows), _dflashRingValidFrom);
             for (int p = lo; p < _dflashRingFilled; p++)
                 map[p % rows] = p;
             return map;
@@ -330,19 +379,32 @@ namespace TensorSharp.Models
             if (a == null)
                 return false;
 
-            var cfg = _dflash;
-            int feat = cfg.FeatureSize;
-
             // The ring drops rows older than its capacity, so only the last min(n, rows)
             // survive; writing the earlier ones would just be overwritten in place.
             int keep = Math.Min(n, _dflashRingRows);
             int skip = n - keep;
 
+            if (_dflashDeferInjects)
+                DeferDFlashInject(hRows, rowOffset + skip, keep, startPos + skip, a);
+            else if (!RunFusedDFlashInject(a, hRows, rowOffset + skip, keep, startPos + skip, a.RingK, a.RingV))
+                return false;
+
+            // See DFlashInjectKv: the frontier must be able to move backwards.
+            NoteDFlashRingWrite(startPos + skip, keep);
+            _dflashRingHostStale = true;
+            return true;
+        }
+
+        private bool RunFusedDFlashInject(DFlashArrays a, float[] hRows, int rowOffset, int keep, int firstPos,
+            IntPtr[] ringK, IntPtr[] ringV)
+        {
+            var cfg = _dflash;
+            int feat = cfg.FeatureSize;
             float[] rows = hRows;
-            if (rowOffset + skip != 0)
+            if (rowOffset != 0)
             {
                 rows = new float[(long)keep * feat];
-                Array.Copy(hRows, (long)(rowOffset + skip) * feat, rows, 0, (long)keep * feat);
+                Array.Copy(hRows, (long)rowOffset * feat, rows, 0, (long)keep * feat);
             }
 
             if (_dflashInjectIdx == null || _dflashInjectIdx.Length < keep)
@@ -352,26 +414,145 @@ namespace TensorSharp.Models
             }
             for (int i = 0; i < keep; i++)
             {
-                int p = startPos + skip + i;
+                int p = firstPos + i;
                 _dflashInjectIdx[i] = p % _dflashRingRows;
                 _dflashInjectPos[i] = p;
             }
 
-            bool ok = GgmlBasicOps.DFlashInject(
+            return GgmlBasicOps.DFlashInject(
                 rows, feat, keep, _dflashInjectIdx, _dflashInjectPos,
                 cfg.NumLayers, cfg.HiddenSize, cfg.HeadDim, cfg.NumKVHeads, _dflashRingRows,
                 cfg.Eps, cfg.RopeBase, 1f,
                 a.Fc, a.FcType, a.FcNe0, a.FcNe1, a.FcBytes, a.EncNorm,
                 a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
                 a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
-                a.KNorm, a.RingK, a.RingV, GgmlTypeF32);
-            if (!ok)
-                return false;
+                a.KNorm, ringK, ringV, GgmlTypeF32, a.Scales);
+        }
 
-            // See DFlashInjectKv: the frontier must be able to move backwards.
-            _dflashRingFilled = startPos + n;
-            _dflashRingHostStale = true;
-            return true;
+        // ---- Deferred ring injects (batched speculation) ----
+
+        /// <summary>A ring write waiting for <see cref="FlushDeferredDFlashInjects"/>: rows
+        /// [FirstRow, FirstRow + Count) of the pending feature buffer, at positions from
+        /// StartPos, into the ring whose layer pointers were bound when it was recorded.</summary>
+        private readonly struct PendingDFlashInject
+        {
+            public PendingDFlashInject(int firstRow, int count, int startPos, IntPtr[] ringK, IntPtr[] ringV)
+            {
+                FirstRow = firstRow; Count = count; StartPos = startPos; RingK = ringK; RingV = ringV;
+            }
+            public int FirstRow { get; }
+            public int Count { get; }
+            public int StartPos { get; }
+            public IntPtr[] RingK { get; }
+            public IntPtr[] RingV { get; }
+        }
+
+        private bool _dflashDeferInjects;
+        private readonly List<PendingDFlashInject> _dflashPendingInjects = new();
+        private float[] _dflashPendingRows = Array.Empty<float>();
+        private int _dflashPendingRowCount;
+        private bool _dflashDeferredInjectFailureLogged;
+
+        /// <summary>
+        /// Queue fused ring injects until <see cref="EndDeferredDFlashInjects"/> (or the next
+        /// draft): a batched speculative step injects every lane's accepted rows at commit
+        /// and every lane's carried row before its draft, and one graph for all lanes
+        /// replaces a launch and a stream sync per lane. The ring bookkeeping (frontier,
+        /// valid run) still happens at each call; only the device write waits. CUDA only.
+        /// </summary>
+        private protected void BeginDeferredDFlashInjects()
+        {
+            if (s_dflashBatchedInject && _hasDFlash && _backend == BackendType.GgmlCuda)
+                _dflashDeferInjects = true;
+        }
+
+        // TS_DFLASH_BATCHED_INJECT=0 injects lane by lane, as before.
+        private static readonly bool s_dflashBatchedInject =
+            Environment.GetEnvironmentVariable("TS_DFLASH_BATCHED_INJECT") != "0";
+
+        private protected void EndDeferredDFlashInjects()
+        {
+            _dflashDeferInjects = false;
+            FlushDeferredDFlashInjects();
+        }
+
+        private void DeferDFlashInject(float[] hRows, int rowOffset, int keep, int firstPos, DFlashArrays a)
+        {
+            int feat = _dflash.FeatureSize;
+            long need = (long)(_dflashPendingRowCount + keep) * feat;
+            if (_dflashPendingRows.LongLength < need)
+                Array.Resize(ref _dflashPendingRows, (int)Math.Max(need, 2L * _dflashPendingRows.LongLength));
+            Array.Copy(hRows, (long)rowOffset * feat, _dflashPendingRows, (long)_dflashPendingRowCount * feat, (long)keep * feat);
+            _dflashPendingInjects.Add(new PendingDFlashInject(_dflashPendingRowCount, keep, firstPos,
+                (IntPtr[])a.RingK.Clone(), (IntPtr[])a.RingV.Clone()));
+            _dflashPendingRowCount += keep;
+        }
+
+        /// <summary>Write every queued inject: one graph over all of them on CUDA, else (one
+        /// queued, or the batched graph declined) one inject each. Called before anything
+        /// reads a ring.</summary>
+        private void FlushDeferredDFlashInjects()
+        {
+            int lanes = _dflashPendingInjects.Count;
+            if (lanes == 0)
+                return;
+            try
+            {
+                var a = GetDFlashArrays();
+                var cfg = _dflash;
+                int nl = cfg.NumLayers;
+                if (lanes > 1)
+                {
+                    int maxRows = 0;
+                    foreach (var p in _dflashPendingInjects)
+                        maxRows = Math.Max(maxRows, p.Count);
+                    int padded = lanes * maxRows;
+                    var gather = new int[padded];
+                    var idx = new long[padded];
+                    var pos = new int[padded];
+                    var ringK = new IntPtr[lanes * nl];
+                    var ringV = new IntPtr[lanes * nl];
+                    for (int lane = 0; lane < lanes; lane++)
+                    {
+                        var p = _dflashPendingInjects[lane];
+                        for (int r = 0; r < maxRows; r++)
+                        {
+                            // Padding repeats the lane's last row: same bytes into the same slot.
+                            int i = Math.Min(r, p.Count - 1);
+                            gather[lane * maxRows + r] = p.FirstRow + i;
+                            idx[lane * maxRows + r] = (p.StartPos + i) % _dflashRingRows;
+                            pos[lane * maxRows + r] = p.StartPos + i;
+                        }
+                        Array.Copy(p.RingK, 0, ringK, lane * nl, nl);
+                        Array.Copy(p.RingV, 0, ringV, lane * nl, nl);
+                    }
+                    if (GgmlBasicOps.DFlashInjectBatched(lanes, maxRows, _dflashPendingRowCount,
+                            _dflashPendingRows, cfg.FeatureSize, gather, idx, pos,
+                            nl, cfg.HiddenSize, cfg.HeadDim, cfg.NumKVHeads, _dflashRingRows,
+                            cfg.Eps, cfg.RopeBase, 1f,
+                            a.Fc, a.FcType, a.FcNe0, a.FcNe1, a.FcBytes, a.EncNorm,
+                            a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
+                            a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
+                            a.KNorm, ringK, ringV, GgmlTypeF32, a.Scales))
+                        return;
+                }
+                foreach (var p in _dflashPendingInjects)
+                {
+                    if (RunFusedDFlashInject(a, _dflashPendingRows, p.FirstRow, p.Count, p.StartPos, p.RingK, p.RingV)
+                        || _dflashDeferredInjectFailureLogged)
+                        continue;
+                    // The ring keeps stale rows where these belong: drafts get worse until
+                    // they are overwritten, verification keeps the output exact.
+                    _dflashDeferredInjectFailureLogged = true;
+                    Console.Error.WriteLine("[dflash] deferred ring inject failed; drafting continues on stale rows: "
+                        + GgmlBasicOps.LastNativeError());
+                }
+            }
+            finally
+            {
+                _dflashPendingInjects.Clear();
+                _dflashPendingRowCount = 0;
+            }
         }
 
         /// <summary>
@@ -449,7 +630,7 @@ namespace TensorSharp.Models
                 a.SelHidden, a.SelHiddenType, a.SelHiddenNe0, a.SelHiddenNe1, a.SelHiddenBytes,
                 a.SelPred, a.SelPredType, a.SelPredNe0, a.SelPredNe1, a.SelPredBytes,
                 a.SelSucc, a.SelSuccType, a.SelSuccNe0, a.SelSuccNe1, a.SelSuccBytes,
-                cfg.HasSelector ? _dflashSelScores : null, cfg.HasSelector ? _dflashSelCand : null);
+                cfg.HasSelector ? _dflashSelScores : null, cfg.HasSelector ? _dflashSelCand : null, a.Scales);
             if (!ok)
                 return -1;
 
@@ -469,6 +650,118 @@ namespace TensorSharp.Models
 
         private float[] _dflashSelScores;
         private int[] _dflashSelCand;
+
+        /// <summary>
+        /// One block draft for each of several requests in a single graph, every
+        /// request on its own ring (see <see cref="TryFusedDFlashDraftBlock"/> for the
+        /// single-request pass this mirrors row for row). <paramref name="hPrev"/>[i]
+        /// is request i's carried feature row and <paramref name="positions"/>[i] its
+        /// anchor position. Fills each lane's full proposal block (b - 1 tokens) and
+        /// returns false, with nothing drafted, when the batched graph is unavailable.
+        /// </summary>
+        private protected bool TryFusedDFlashDraftBatch(IReadOnlyList<string> requestIds, int[] anchors,
+            float[][] hPrev, int[] positions, int[][] draftsOut, float[][] confOut)
+        {
+            var a = GetDFlashArrays();
+            var cfg = _dflash;
+            if (a == null || cfg.MarkovRank > 0 || cfg.HasAttentionSinks || _backend != BackendType.GgmlCuda)
+                return false;
+            int lanes = requestIds.Count;
+            int b = Math.Min(cfg.BlockSize, DFlashBatchDraftWidth + 1);
+            int rows = _dflashRingRows;
+            int nl = cfg.NumLayers;
+            var ids = new int[lanes * b];
+            var pos = new int[lanes * b];
+            var slots = new int[lanes * rows];
+            var ringK = new IntPtr[lanes * nl];
+            var ringV = new IntPtr[lanes * nl];
+            for (int lane = 0; lane < lanes; lane++)
+            {
+                if (positions[lane] <= 0)
+                    return false;
+                BindDFlashRing(requestIds[lane]);
+                // The drafter's own key for the last committed position, as in DFlashPropose.
+                DFlashEncodeAndInject(hPrev[lane], 0, 1, positions[lane] - 1);
+                Array.Copy(BuildRingSlotPositions(), 0, slots, (long)lane * rows, rows);
+                for (int i = 0; i < b; i++)
+                {
+                    ids[lane * b + i] = i == 0 ? anchors[lane] : cfg.MaskTokenId;
+                    pos[lane * b + i] = positions[lane] + i;
+                }
+                for (int l = 0; l < nl; l++)
+                {
+                    ringK[lane * nl + l] = TensorComputePrimitives.GetStoragePointer(_dflashRingK[l]);
+                    ringV[lane * nl + l] = TensorComputePrimitives.GetStoragePointer(_dflashRingV[l]);
+                }
+            }
+
+            // The lanes' carried rows were queued above; write them in one graph.
+            FlushDeferredDFlashInjects();
+
+            int gamma = b - 1;
+            int k = cfg.SelectorTopK;
+            long laneScores = cfg.HasSelector ? (long)k + (long)k * k * Math.Max(0, gamma - 1) : 0;
+            float[] scores = cfg.HasSelector ? new float[lanes * laneScores] : null;
+            int[] cand = cfg.HasSelector ? new int[lanes * gamma * k] : null;
+            var idsOut = new int[lanes * b];
+            var conf = new float[lanes * b];
+            bool ok = GgmlBasicOps.DFlashDraftBlockBatched(
+                lanes, ids, b, pos,
+                cfg.NumLayers, cfg.HiddenSize, cfg.HeadDim, cfg.NumHeads, cfg.NumKVHeads, rows,
+                cfg.Eps, cfg.RopeBase, 1f, 1f / MathF.Sqrt(cfg.HeadDim),
+                slots, cfg.SlidingWindow,
+                a.AttnNorm,
+                a.Q, a.QType, a.QNe0, a.QNe1, a.QBytes,
+                a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
+                a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
+                a.QNorm, a.KNorm,
+                a.O, a.OType, a.ONe0, a.ONe1, a.OBytes,
+                a.FfnNorm,
+                a.Gate, a.GateType, a.GateNe0, a.GateNe1, a.GateBytes,
+                a.Up, a.UpType, a.UpNe0, a.UpNe1, a.UpBytes,
+                a.Down, a.DownType, a.DownNe0, a.DownNe1, a.DownBytes,
+                ringK, ringV, GgmlTypeF32,
+                a.OutNorm,
+                a.TokEmbd, a.TokEmbdType, a.TokEmbdNe0, a.TokEmbdNe1, a.TokEmbdBytes,
+                a.LmHead, a.LmHeadType, a.LmHeadNe0, a.LmHeadNe1, a.LmHeadBytes,
+                Config.VocabSize, idsOut, conf,
+                cfg.HasConv ? cfg.ConvKernelSize : 0, cfg.ConvGroupSize, cfg.ConvNumGroups,
+                a.AttnConvBase, a.AttnConvProj, a.AttnConvProjType, a.AttnConvProjNe0, a.AttnConvProjNe1, a.AttnConvProjBytes,
+                a.FfnConvBase, a.FfnConvProj, a.FfnConvProjType, a.FfnConvProjNe0, a.FfnConvProjNe1, a.FfnConvProjBytes,
+                cfg.HasSelector ? cfg.SelectorRank : 0, cfg.HasSelector ? cfg.SelectorTopK : 0,
+                cfg.LogitScale, cfg.FinalLogitSoftcap,
+                a.SelHidden, a.SelHiddenType, a.SelHiddenNe0, a.SelHiddenNe1, a.SelHiddenBytes,
+                a.SelPred, a.SelPredType, a.SelPredNe0, a.SelPredNe1, a.SelPredBytes,
+                a.SelSucc, a.SelSuccType, a.SelSuccNe0, a.SelSuccNe1, a.SelSuccBytes,
+                scores, cand, a.Scales);
+            if (!ok)
+                return false;
+
+            for (int lane = 0; lane < lanes; lane++)
+            {
+                if (cfg.HasSelector)
+                {
+                    var laneScoreSlice = new float[laneScores];
+                    var laneCand = new int[gamma * k];
+                    Array.Copy(scores, lane * laneScores, laneScoreSlice, 0, laneScores);
+                    Array.Copy(cand, lane * gamma * k, laneCand, 0, gamma * k);
+                    DFlashWalkLattice(gamma, k, laneScoreSlice, laneCand, draftsOut[lane], confOut[lane]);
+                }
+                else
+                {
+                    for (int i = 0; i < gamma; i++)
+                    {
+                        draftsOut[lane][i] = idsOut[lane * b + i + 1];
+                        confOut[lane][i] = conf[lane * b + i + 1];
+                    }
+                }
+            }
+            return true;
+        }
+
+        /// <summary>Drafts a batched block proposes per lane: the trained block minus
+        /// its anchor row, as the single-request draft always runs.</summary>
+        private protected int DFlashBatchDraftWidth => _dflash.MaxDraftTokens;
 
         /// <summary>
         /// The greedy walk through the transition lattice the kernel produced.

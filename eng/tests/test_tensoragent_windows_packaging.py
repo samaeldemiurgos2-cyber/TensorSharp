@@ -75,7 +75,7 @@ class WindowsDesktopPackagingTests(unittest.TestCase):
             wix.payload_manifest(self.publish, "win-x64-cpu")
 
     def test_cuda_must_bundle_runtime_and_ptx(self):
-        with self.assertRaisesRegex(ValueError, "cudart64_12.dll"):
+        with self.assertRaisesRegex(ValueError, "cudart64_13.dll"):
             wix.payload_manifest(self.publish, "win-x64-cuda")
         for name in wix.CUDA_FILES:
             target = self.publish / name

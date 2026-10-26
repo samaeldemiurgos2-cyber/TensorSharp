@@ -42,6 +42,7 @@
 //   output_norm -> output -> *logit_scale -> softcap(20)
 // ---------------------------------------------------------------------------
 
+#include "ggml_ops_cuda_launch_policy.h"
 #include "ggml_ops_internal.h"
 #include "ggml_ops_muse_spark_tp.h"
 #include "dsv4_file_warm.h"
@@ -2770,6 +2771,8 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
 
     // --- backends ---------------------------------------------------------
     const bool cpu_only = backend_name && strcmp(backend_name, "CPU") == 0;
+    if (!cpu_only && !tsg::configure_cuda_launch_policy())
+        throw std::runtime_error("Failed to configure the CUDA launch policy");
     if (!cpu_only && n_gpu_req > MAX_GPUS && tp <= 1)
     {
         tsg::report_load_refusal("[muse-spark] %d GPUs requested; the native executor spans at most %d\n", n_gpu_req, MAX_GPUS);

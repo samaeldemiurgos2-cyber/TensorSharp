@@ -48,6 +48,8 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
+            if (IsDistributedNativeTensorParallel || IsDistributedNativeLayerSplit)
+                throw new NotSupportedException("DeepSeek V4.1 distributed tensor parallelism currently accepts text input; vision embeddings are not mirrored by the distributed control channel.");
             lock (NativeSync)
             {
                 if (_vision != IntPtr.Zero)

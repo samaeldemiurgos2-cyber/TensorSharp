@@ -274,7 +274,7 @@ print(answer["answers"]["legible"]["noul"], answer["answers"]["kind"]["choice"])
 
 解码后的字节以内容寻址的方式写入服务端的上传目录，因此受 `--upload-max-mb`、`--upload-quota-mb` 与
 `--upload-ttl-hours` 管理；跨请求重复发送的同一张图片只存一个文件，其 embedding 只编码一次并被缓存
-（`TS_MM_EMBEDDING_CACHE_MB`，默认 512）。每个软 token span 内部的图像注意力在滑动窗口层上是双向的，
+（`TS_MM_EMBEDDING_CACHE_MB`，默认为主机内存的 1/64，限定在 512-4096 MB）。每个软 token span 内部的图像注意力在滑动窗口层上是双向的，
 在全局层上是因果的；`DIFFUSION_IMAGE_BIDIRECTIONAL=0` 让它在所有层上都变为因果。
 
 ## 文件、文档、视频与音频

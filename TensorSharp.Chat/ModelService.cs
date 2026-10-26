@@ -183,8 +183,16 @@ namespace TensorSharp.Server
         }
 
         public void LoadModel(string modelPath, string mmProjPath, string backendStr)
+            => LoadModelCore(modelPath, mmProjPath, backendStr, startupLoad: false);
+
+        internal void LoadStartupModel(string modelPath, string mmProjPath, string backendStr)
+            => LoadModelCore(modelPath, mmProjPath, backendStr, startupLoad: true);
+
+        private void LoadModelCore(string modelPath, string mmProjPath, string backendStr, bool startupLoad)
         {
             using var jevLease = _jevExecution.BeginChange();
+            if (!_lifecycle.ShouldLoadDistributedModel(modelPath, mmProjPath, backendStr, startupLoad))
+                return;
             // Tear down the per-model engine and the diffusion batch scheduler BEFORE the model is
             // unloaded so their worker threads don't race the model disposal.
             _engineHost.Reset();

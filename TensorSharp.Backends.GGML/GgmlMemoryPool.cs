@@ -30,6 +30,16 @@ namespace TensorSharp.GGML
         private const int CudaMaxPooledBlocks = 8;
         private const int CudaTpMaxPooledBlocks = 128;
         private const long CudaMaxRetainedBlockSize = 8L * 1024 * 1024;
+        private const long HostHugePageMinimumBytes = 32L * 1024 * 1024;
+        // CUDA per-request caches (K/V holders, recurrent state, checkpoints) are
+        // allocated and freed per request, and a fresh anonymous mapping costs a
+        // page fault plus kernel zeroing per 4 KiB on first touch: ~1-2 GB/s, which
+        // made every 150 MB state copy or 700 MB K/V download into a new holder
+        // fault-bound. Freed blocks of any size are kept under a byte budget and
+        // reused best-fit within a small waste margin. Env TS_GGML_HOST_POOL_MB
+        // (0 disables); default min(8 GiB, available RAM / 16).
+        private const long CudaRetainBudgetCapBytes = 8L * 1024 * 1024 * 1024;
+        private const long RetainBudgetMinimumWasteBytes = 2L * 1024 * 1024;
         // Apple Silicon (Metal, integrated GPU, unified memory) and the GGML CPU backend
         // both benefit from short-lived intermediate buffers (KV cache append, attention
         // scores, FFN gate/up etc.) being recycled. Keeping every block ever freed in the
@@ -43,6 +53,10 @@ namespace TensorSharp.GGML
 
         private readonly object _lock = new object();
         private readonly List<PoolBlock> _available = new List<PoolBlock>();
+        // Byte-budgeted retention (CUDA): oldest first, evicted from the front.
+        private readonly List<PoolBlock> _budgeted = new List<PoolBlock>();
+        private readonly long _retainBudgetBytes;
+        private long _budgetedBytes;
         // True size and allocation provenance of every block currently handed
         // out. The best-fit search below can serve a request from a LARGER
         // pooled block, so the byteLength the caller passes back to Free() is a
@@ -61,10 +75,28 @@ namespace TensorSharp.GGML
         private readonly nuint _maxRetainedBlockSize;
         private long _poolHits, _freshAllocations, _systemFrees, _systemFreeFailures;
         private long _retainedBytes, _peakRetainedBytes;
+        private readonly bool _hostHugePageAdviceEnabled;
+        private long _hugePageAdviceRequests, _hugePageAdviceAccepted, _hugePageAdviceFailures, _hugePageAdvisedBytes;
 
         public GgmlMemoryPool(GgmlBackendType backendType)
+            : this(backendType, Environment.GetEnvironmentVariable("TS_GGML_HOST_HUGEPAGES"))
+        {
+        }
+
+        internal GgmlMemoryPool(GgmlBackendType backendType, string hugePagesSetting)
+            : this(backendType, hugePagesSetting, backendType == GgmlBackendType.Cuda
+                ? ResolveRetainBudgetBytes(Environment.GetEnvironmentVariable("TS_GGML_HOST_POOL_MB"),
+                    GC.GetGCMemoryInfo().TotalAvailableMemoryBytes)
+                : 0)
+        {
+        }
+
+        internal GgmlMemoryPool(GgmlBackendType backendType, string hugePagesSetting, long retainBudgetBytes)
         {
             _backendType = backendType;
+            _retainBudgetBytes = Math.Max(0, retainBudgetBytes);
+            _hostHugePageAdviceEnabled = ShouldAdviseHostHugePages(
+                OperatingSystem.IsLinux(), backendType, hugePagesSetting, (nuint)HostHugePageMinimumBytes);
             int systemPageSize = Environment.SystemPageSize;
             _pageSize = IsAppleOS()
                 ? Math.Max(MetalPageSize, systemPageSize)
@@ -87,6 +119,18 @@ namespace TensorSharp.GGML
             }
         }
 
+        internal static long ResolveRetainBudgetBytes(string setting, long availableMemoryBytes)
+        {
+            if (long.TryParse(setting, out long mb) && mb >= 0)
+                return mb * 1024 * 1024;
+            return availableMemoryBytes > 0 ? Math.Min(CudaRetainBudgetCapBytes, availableMemoryBytes / 16) : 0;
+        }
+
+        internal static bool ShouldAdviseHostHugePages(bool isLinux, GgmlBackendType backendType,
+            string setting, nuint mappedBytes)
+            => isLinux && backendType == GgmlBackendType.Cuda && setting == "1"
+                && mappedBytes >= (nuint)HostHugePageMinimumBytes;
+
         // Explicit owner opt-in; constructing a multi-device context alone does
         // not change retention for other models or sequential layer placement.
         internal bool ConfigureCudaTensorParallel(int degree)
@@ -106,12 +150,24 @@ namespace TensorSharp.GGML
         {
             lock (_lock)
                 return new GgmlMemoryPoolStatistics(_poolHits, _freshAllocations, _systemFrees,
-                    _systemFreeFailures, _available.Count, _outstanding.Count, _retainedBytes,
-                    _peakRetainedBytes, _maxPooledBlocks, (long)_maxRetainedBlockSize, _closed);
+                    _systemFreeFailures, _available.Count + _budgeted.Count, _outstanding.Count, _retainedBytes,
+                    _peakRetainedBytes, _maxPooledBlocks, (long)_maxRetainedBlockSize, _closed)
+                {
+                    HugePageAdviceEnabled = _hostHugePageAdviceEnabled,
+                    HugePageAdviceRequests = _hugePageAdviceRequests,
+                    HugePageAdviceAccepted = _hugePageAdviceAccepted,
+                    HugePageAdviceFailures = _hugePageAdviceFailures,
+                    HugePageAdvisedBytes = _hugePageAdvisedBytes,
+                };
         }
 
-        public IntPtr Allocate(long byteLength)
+        public IntPtr Allocate(long byteLength) => AllocateReportingZero(byteLength, out _);
+
+        /// <param name="zeroed">True when the block is a fresh anonymous mapping, which the OS
+        /// hands out zero-filled; a reused pooled block and the heap fallback may hold old bytes.</param>
+        public IntPtr AllocateReportingZero(long byteLength, out bool zeroed)
         {
+            zeroed = false;
             nuint size = (nuint)byteLength;
             nuint alignedSize = AlignSize(size);
 
@@ -144,6 +200,31 @@ namespace TensorSharp.GGML
                     _outstanding[block.Ptr] = block;
                     return block.Ptr;
                 }
+
+                // Budgeted blocks only serve requests they fit closely, so one large
+                // freed buffer is not tied up by a much smaller allocation.
+                nuint waste = (nuint)Math.Max(RetainBudgetMinimumWasteBytes, (long)(alignedSize / 4));
+                for (int i = 0; i < _budgeted.Count; i++)
+                {
+                    nuint blockSize = _budgeted[i].Size;
+                    if (blockSize >= alignedSize && blockSize - alignedSize <= waste && blockSize < bestSize)
+                    {
+                        bestIdx = i;
+                        bestSize = blockSize;
+                        if (blockSize == alignedSize)
+                            break;
+                    }
+                }
+                if (bestIdx >= 0)
+                {
+                    PoolBlock block = _budgeted[bestIdx];
+                    _budgeted.RemoveAt(bestIdx);
+                    _budgetedBytes -= (long)block.Size;
+                    _retainedBytes -= (long)block.Size;
+                    _poolHits++;
+                    _outstanding[block.Ptr] = block;
+                    return block.Ptr;
+                }
             }
 
             PoolBlock fresh = AllocateNew(alignedSize);
@@ -152,6 +233,7 @@ namespace TensorSharp.GGML
                 _freshAllocations++;
                 _outstanding[fresh.Ptr] = fresh;
             }
+            zeroed = fresh.IsVirtual;   // mmap / VirtualAlloc pages are zero-filled
             return fresh.Ptr;
         }
 
@@ -160,9 +242,11 @@ namespace TensorSharp.GGML
             if (ptr == IntPtr.Zero) return;
 
             PoolBlock block;
+            List<PoolBlock> evicted = null;
             lock (_lock)
             {
-                if (!_outstanding.Remove(ptr, out block))
+                bool known = _outstanding.Remove(ptr, out block);
+                if (!known)
                 {
                     // Unknown pointer: not handed out by this pool. Freeing it
                     // with a guessed size/allocator can only corrupt the heap,
@@ -179,9 +263,34 @@ namespace TensorSharp.GGML
                     _peakRetainedBytes = Math.Max(_peakRetainedBytes, _retainedBytes);
                     return;
                 }
+
+                if (!_closed && known && block.IsVirtual && (long)block.Size <= _retainBudgetBytes)
+                {
+                    _budgeted.Add(block);
+                    _budgetedBytes += (long)block.Size;
+                    _retainedBytes += (long)block.Size;
+                    _peakRetainedBytes = Math.Max(_peakRetainedBytes, _retainedBytes);
+                    if (_budgetedBytes <= _retainBudgetBytes)
+                        return;
+                    evicted = new List<PoolBlock>();
+                    while (_budgetedBytes > _retainBudgetBytes && _budgeted.Count > 0)
+                    {
+                        PoolBlock oldest = _budgeted[0];
+                        _budgeted.RemoveAt(0);
+                        _budgetedBytes -= (long)oldest.Size;
+                        _retainedBytes -= (long)oldest.Size;
+                        evicted.Add(oldest);
+                    }
+                }
             }
 
-            ReleaseToSystem(block);
+            if (evicted == null)
+            {
+                ReleaseToSystem(block);
+                return;
+            }
+            foreach (PoolBlock old in evicted)
+                ReleaseToSystem(old);
         }
 
         private bool _closed;
@@ -219,10 +328,13 @@ namespace TensorSharp.GGML
             List<PoolBlock> release;
             lock (_lock)
             {
-                if (_available.Count == 0)
+                if (_available.Count == 0 && _budgeted.Count == 0)
                     return 0;
                 release = new List<PoolBlock>(_available);
+                release.AddRange(_budgeted);
                 _available.Clear();
+                _budgeted.Clear();
+                _budgetedBytes = 0;
                 _retainedBytes = 0;
             }
             long bytes = 0;
@@ -246,10 +358,37 @@ namespace TensorSharp.GGML
             {
                 IntPtr ptr = AllocateVirtual(alignedSize);
                 if (ptr != IntPtr.Zero)
+                {
+                    // Only our own successful Linux anonymous mapping is advised.
+                    // Heap fallbacks and borrowed pointers never reach this path.
+                    if (_hostHugePageAdviceEnabled && alignedSize >= (nuint)HostHugePageMinimumBytes)
+                        AdviseHostHugePages(ptr, alignedSize);
                     return new PoolBlock(ptr, alignedSize, isVirtual: true);
+                }
             }
 
             return new PoolBlock(Marshal.AllocHGlobal((nint)alignedSize), alignedSize, isVirtual: false);
+        }
+
+        private void AdviseHostHugePages(IntPtr ptr, nuint size)
+        {
+            // This is a hint, not MAP_HUGETLB or a forced collapse. A rejected or
+            // unavailable hint must leave a usable ordinary mmap with the same
+            // ownership/munmap extent. Counters avoid per-allocation log spam.
+            bool accepted;
+            try { accepted = UnixMadvise(ptr, size, UnixMadvHugePage) == 0; }
+            catch (DllNotFoundException) { accepted = false; }
+            catch (EntryPointNotFoundException) { accepted = false; }
+            lock (_lock)
+            {
+                _hugePageAdviceRequests++;
+                if (accepted)
+                {
+                    _hugePageAdviceAccepted++;
+                    _hugePageAdvisedBytes += (long)size;
+                }
+                else _hugePageAdviceFailures++;
+            }
         }
 
         private void ReleaseToSystem(in PoolBlock block)
@@ -358,6 +497,7 @@ namespace TensorSharp.GGML
         private const int UnixMapPrivate = 0x02;
         private const int UnixMapAnonymous = 0x20;
         private const int UnixMapAnonMac = 0x1000;
+        private const int UnixMadvHugePage = 14; // Linux MADV_HUGEPAGE; never called on Darwin.
 
         private const uint WindowsMemCommit = 0x1000;
         private const uint WindowsMemReserve = 0x2000;
@@ -376,5 +516,8 @@ namespace TensorSharp.GGML
 
         [LibraryImport("libc", EntryPoint = "munmap", SetLastError = true)]
         private static partial int UnixMunmap(IntPtr addr, nuint length);
+
+        [LibraryImport("libc", EntryPoint = "madvise", SetLastError = true)]
+        private static partial int UnixMadvise(IntPtr addr, nuint length, int advice);
     }
 }

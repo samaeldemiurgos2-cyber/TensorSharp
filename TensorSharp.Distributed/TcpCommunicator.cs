@@ -1,552 +1,572 @@
 using System;
 using System.Buffers.Binary;
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Numerics;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 
 namespace TensorSharp.Distributed
 {
     /// <summary>
-    /// Collective operations over a TCP mesh network. Each node knows its own
-    /// rank and the endpoints of every other node. Connections are established
-    /// once at construction and reused for all subsequent operations.
-    ///
-    /// Wire protocol (per message):
-    ///   [4 bytes] payload length (little-endian int32, excludes this header)
-    ///   [1 byte ] message type
-    ///   [N bytes] payload
-    ///
-    /// AllReduce algorithm (reduce-to-zero + broadcast):
-    ///   1. Every non-zero node sends its partial to node 0
-    ///   2. Node 0 accumulates: sum += partial
-    ///   3. Node 0 broadcasts the reduced result to every other node
-    ///   4. Barrier so all nodes observe the result before proceeding
-    ///
-    /// This mirrors the local <c>CudaP2PCommunicator</c> algorithm and
-    /// preserves the bitwise-determinism invariant: because node 0 sums in
-    /// a fixed rank order, every node receives an identical result.
+    /// Persistent TCP mesh shared by tensor parallelism and layer pipelines.
+    /// Frames contain an int32 little-endian length (including the type byte),
+    /// a type byte, then the payload. Float payloads are lossless little-endian F32.
+    /// Callers must issue operations in matching order. A failed operation closes
+    /// the mesh so peers cannot continue with a partially consumed frame.
     /// </summary>
     public sealed class TcpCommunicator : IDisposable
     {
-        private const byte MsgAllReduceContribute = 0x01;
-        private const byte MsgAllReduceResult     = 0x02;
-        private const byte MsgBarrierAck          = 0x03;
-        private const byte MsgControl             = 0x04;
-        private const byte MsgHeartbeat           = 0x05;
-
-        private readonly int _rank;
-        private readonly int _worldSize;
+        private const byte MsgAllReduceContribute = 1, MsgAllReduceResult = 2,
+            MsgBarrierAck = 3, MsgControl = 4, MsgHeartbeat = 5, MsgTensor = 6, MsgBroadcast = 7;
+        private const int ProtocolMagic = 0x54535032, ProtocolVersion = 2;
+        private const int SmallFrameBytes = 4096, MaxControlBytes = 16 * 1024 * 1024;
+        private readonly int _rank, _worldSize, _ioTimeoutMs, _operationTimeoutMs;
         private readonly TcpListener _listener;
-        private readonly TcpClient[] _peers;   // indexed by remote rank
+        private readonly TcpClient[] _peers;
         private readonly NetworkStream[] _streams;
-        private readonly object _sendLock = new();
-        private bool _disposed;
+        private readonly object[] _sendLocks;
+        private readonly object _operationLock = new();
+        private Timer _heartbeatTimer;
+        private float[] _reduceBuffer = Array.Empty<float>();
+        private Exception _fault;
+        private int _closed, _disposed;
 
-        // Periodic heartbeat keeps the receive timeout from firing while a peer
-        // is legitimately busy (e.g. still loading weights or running a slow
-        // warmup forward pass). The heartbeat interval must be well below the
-        // receive timeout; 15 s works with the 300 s default timeout.
-        private System.Threading.Timer _heartbeatTimer;
-        private const int HeartbeatIntervalMs = 15_000;
+        // Keep the original CLR signature for consumers compiled before timeout
+        // overrides were added; optional parameters alone preserve only source compatibility.
+        public TcpCommunicator(int rank, IPEndPoint[] endpoints)
+            : this(rank, endpoints, null, null)
+        {
+        }
 
-        // Reusable receive buffer to avoid per-call allocation.
-        private byte[] _recvBuffer = Array.Empty<byte>();
-
-        // Reusable send buffer for AllReduce TCP exchanges.
-        private byte[] _allReduceSendBuf = Array.Empty<byte>();
-
-        // The barrier after AllReduce guards against a slow peer that has not
-        // yet entered its matching AllReduce. After the first successful
-        // AllReduce both nodes are proven to be in lockstep, and TCP ordering
-        // guarantees subsequent messages arrive in order, so the barrier is
-        // retired to halve the per-token message count.
-        private bool _barrierRetired;
-
-        // Dedicated I/O thread for AllReduce TCP exchanges. The compute thread
-        // submits a buffer and blocks on _arComplete; the I/O thread performs
-        // the network exchange and signals completion. This decouples TCP
-        // latency from the compute thread's call stack and lets the JIT keep
-        // the hot forward-pass code resident.
-        private Thread _ioThread;
-        private readonly ManualResetEventSlim _arRequest = new(false);
-        private readonly ManualResetEventSlim _arComplete = new(false);
-        private float[] _arBuffer;
-        private int _arLength;
-        private Exception _arError;
-        private volatile bool _ioShutdown;
+        public TcpCommunicator(int rank, IPEndPoint[] endpoints,
+            TimeSpan? connectTimeout = null, TimeSpan? ioTimeout = null)
+            : this(rank, endpoints, connectTimeout, ioTimeout, null)
+        {
+        }
 
         /// <param name="rank">This node's rank (0..worldSize-1).</param>
-        /// <param name="endpoints">
-        /// Endpoints for every node in the group, indexed by rank.
-        /// The entry at <paramref name="rank"/> is the local listen address.
-        /// </param>
-        public TcpCommunicator(int rank, IPEndPoint[] endpoints)
+        /// <param name="endpoints">Listen/connect endpoints indexed by node rank.</param>
+        /// <param name="connectTimeout">Deadline for mesh setup, including inbound
+        /// accepts and handshakes. Defaults to the environment setting.</param>
+        /// <param name="ioTimeout">Read/write timeout; defaults to the environment setting.</param>
+        /// <param name="operationTimeout">Deadline for a complete data frame, including
+        /// heartbeat-only waiting. Defaults to TENSORSHARP_TP_OPERATION_TIMEOUT_SECONDS,
+        /// or the I/O timeout when unset. Idle controls and load barriers are exempt.</param>
+        public TcpCommunicator(int rank, IPEndPoint[] endpoints,
+            TimeSpan? connectTimeout, TimeSpan? ioTimeout, TimeSpan? operationTimeout)
         {
+            ArgumentNullException.ThrowIfNull(endpoints);
+            if (endpoints.Length < 2)
+                throw new ArgumentException("TCP communicator requires at least 2 nodes.", nameof(endpoints));
+            if ((uint)rank >= (uint)endpoints.Length) throw new ArgumentOutOfRangeException(nameof(rank));
+            foreach (var endpoint in endpoints) ArgumentNullException.ThrowIfNull(endpoint);
+            if (!BitConverter.IsLittleEndian)
+                throw new PlatformNotSupportedException("Distributed F32 transport requires a little-endian host.");
             _rank = rank;
             _worldSize = endpoints.Length;
-
-            if (_worldSize < 2)
-                throw new ArgumentException("TCP communicator requires at least 2 nodes.", nameof(endpoints));
-            if ((uint)rank >= (uint)_worldSize)
-                throw new ArgumentOutOfRangeException(nameof(rank));
-
+            _ioTimeoutMs = TimeoutMilliseconds(ioTimeout ?? ResolveTimeout("TENSORSHARP_TP_RECV_TIMEOUT_SECONDS", 300));
+            _operationTimeoutMs = TimeoutMilliseconds(operationTimeout ??
+                (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_OPERATION_TIMEOUT_SECONDS"))
+                    ? TimeSpan.FromMilliseconds(_ioTimeoutMs)
+                    : ResolveTimeout("TENSORSHARP_TP_OPERATION_TIMEOUT_SECONDS", 300)));
+            int connectMs = TimeoutMilliseconds(connectTimeout ?? ResolveTimeout("TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS", 120));
             _peers = new TcpClient[_worldSize];
             _streams = new NetworkStream[_worldSize];
-
-            // Start listening.
+            _sendLocks = new object[_worldSize];
+            for (int r = 0; r < _worldSize; r++) _sendLocks[r] = new object();
             _listener = new TcpListener(endpoints[rank]);
-            _listener.Start();
-
             try
             {
-                // Nodes are typically launched by hand, seconds or minutes apart,
-                // so peers may not be listening yet when we start connecting. Retry
-                // outbound connects (and tolerate the OS not having bound the peer's
-                // listener yet) until a deadline instead of failing on the first
-                // ECONNREFUSED. Override the window with TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS.
-                TimeSpan connectTimeout = ResolveConnectTimeout();
-                DateTime deadline = DateTime.UtcNow + connectTimeout;
-
-                // Lower-ranked node initiates the connection to higher-ranked nodes.
-                // Higher-ranked nodes accept. This gives exactly one connection per pair.
-
-                int recvTimeoutMs = ResolveReceiveTimeoutMs();
-
-                // Initiate outbound connections to higher-ranked peers.
+                _listener.Start();
+                using var deadline = new CancellationTokenSource(connectMs);
+                var expires = DateTime.UtcNow.AddMilliseconds(connectMs);
+                // Exactly one connection per pair, with a bidirectional handshake.
                 for (int r = rank + 1; r < _worldSize; r++)
                 {
-                    var client = ConnectWithRetry(endpoints[r], r, deadline);
+                    var (client, stream) = ConnectWithRetry(endpoints[r], r, expires, deadline.Token);
                     _peers[r] = client;
-                    _streams[r] = client.GetStream();
-                    _streams[r].ReadTimeout = recvTimeoutMs;
-
-                    // Handshake: tell the remote peer our rank so it can
-                    // map this connection to the correct slot.
-                    byte[] rankBytes = new byte[4];
-                    BinaryPrimitives.WriteInt32LittleEndian(rankBytes, rank);
-                    _streams[r].Write(rankBytes, 0, 4);
-                    _streams[r].Flush();
+                    _streams[r] = stream;
                 }
-
-                // Accept inbound connections from lower-ranked peers.
-                // AcceptTcpClient() does not guarantee rank order, so each
-                // inbound connection advertises its rank in a 4-byte header.
-                for (int r = 0; r < rank; r++)
+                for (int accepted = 0; accepted < rank; accepted++)
                 {
-                    var client = _listener.AcceptTcpClient();
-                    client.NoDelay = true;
-                    var stream = client.GetStream();
-                    stream.ReadTimeout = recvTimeoutMs;
-
-                    byte[] rankBytes = ReadExact(stream, 4);
-                    int remoteRank = BinaryPrimitives.ReadInt32LittleEndian(rankBytes);
-                    if (remoteRank < 0 || remoteRank >= _worldSize || remoteRank == rank)
-                        throw new InvalidOperationException(
-                            $"Received invalid rank {remoteRank} during handshake (this node is rank {rank}).");
-                    if (_peers[remoteRank] != null)
-                        throw new InvalidOperationException(
-                            $"Duplicate inbound connection from rank {remoteRank}.");
-
-                    _peers[remoteRank] = client;
-                    _streams[remoteRank] = stream;
+                    var client = _listener.AcceptTcpClientAsync(deadline.Token).AsTask().GetAwaiter().GetResult();
+                    try
+                    {
+                        var stream = Configure(client);
+                        SetHandshakeTimeout(stream, expires);
+                        int remoteRank = ReadHandshake(stream);
+                        if (remoteRank < 0 || remoteRank >= rank || _peers[remoteRank] != null)
+                            throw new InvalidOperationException($"Invalid or duplicate inbound rank {remoteRank} at rank {rank}.");
+                        _peers[remoteRank] = client;
+                        _streams[remoteRank] = stream;
+                        WriteHandshake(stream);
+                        stream.ReadTimeout = stream.WriteTimeout = _ioTimeoutMs;
+                    }
+                    catch { client.Dispose(); throw; }
                 }
+                _listener.Stop();
             }
-            catch
+            catch (OperationCanceledException ex)
             {
                 Dispose();
-                throw;
+                throw new TimeoutException($"Rank {rank} timed out establishing the TCP mesh. Check peer endpoints and TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS.", ex);
             }
-
-            _heartbeatTimer = new System.Threading.Timer(SendHeartbeats, null,
-                HeartbeatIntervalMs, HeartbeatIntervalMs);
-
-            _ioThread = new Thread(IoLoop) { IsBackground = true, Name = $"TP-IO-rank{rank}" };
-            _ioThread.Start();
-
-            Console.WriteLine($"[TcpCommunicator] Rank {rank}/{_worldSize} connected to all peers.");
+            catch { Dispose(); throw; }
+            _heartbeatTimer = new Timer(SendHeartbeats, null, 15_000, 15_000);
+            Console.WriteLine($"[TcpCommunicator] Rank {rank}/{_worldSize} connected to all peers (protocol {ProtocolVersion}).");
         }
 
         public int Rank => _rank;
         public int WorldSize => _worldSize;
 
-        private static TimeSpan ResolveConnectTimeout()
+        /// <summary>Verify that every node agrees on a mode, placement or model
+        /// identity before doing dependent work. This is a consistency check,
+        /// not authentication. Every node must call it at the same point.</summary>
+        public void ValidateConfiguration(string identity)
         {
-            string s = Environment.GetEnvironmentVariable("TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS");
-            if (!string.IsNullOrWhiteSpace(s) && int.TryParse(s, out int secs) && secs > 0)
-                return TimeSpan.FromSeconds(secs);
-            return TimeSpan.FromSeconds(120);
+            ArgumentNullException.ThrowIfNull(identity);
+            byte[] digest = SHA256.HashData(Encoding.UTF8.GetBytes(identity));
+            float[] votes = new float[digest.Length * 8];
+            for (int i = 0; i < votes.Length; i++) votes[i] = (digest[i / 8] >> (i % 8)) & 1;
+            lock (_operationLock)
+            {
+                AllReduce(votes, votes.Length);
+                foreach (float count in votes)
+                    if (count != 0 && count != _worldSize)
+                    {
+                        var error = new InvalidOperationException("Distributed configuration mismatch: all nodes must use the same parallel mode, local degree and model configuration.");
+                        Fail(error);
+                        throw error;
+                    }
+            }
         }
 
-        /// <summary>
-        /// Per-receive timeout for blocking reads. If a peer does not deliver a
-        /// message within this window the receive throws instead of hanging
-        /// indefinitely (the OS TCP keepalive default is often 2+ hours).
-        /// Override with TENSORSHARP_TP_RECV_TIMEOUT_SECONDS.
-        /// </summary>
-        private static int ResolveReceiveTimeoutMs()
+        private static TimeSpan ResolveTimeout(string variable, int fallbackSeconds)
         {
-            string s = Environment.GetEnvironmentVariable("TENSORSHARP_TP_RECV_TIMEOUT_SECONDS");
-            if (!string.IsNullOrWhiteSpace(s) && int.TryParse(s, out int secs) && secs > 0)
-                return secs * 1000;
-            return 300_000;
+            string value = Environment.GetEnvironmentVariable(variable);
+            if (string.IsNullOrWhiteSpace(value)) return TimeSpan.FromSeconds(fallbackSeconds);
+            if (!int.TryParse(value, out int seconds) || seconds < 1 || seconds > int.MaxValue / 1000)
+                throw new ArgumentException($"{variable} must be between 1 and {int.MaxValue / 1000} seconds.");
+            return TimeSpan.FromSeconds(seconds);
         }
 
-        /// <summary>
-        /// Connect to a peer, retrying until <paramref name="deadline"/>. Tolerates
-        /// the peer's listener not being up yet (connection refused / unreachable),
-        /// which is the normal case when nodes are started a few seconds apart.
-        /// </summary>
-        private TcpClient ConnectWithRetry(IPEndPoint endpoint, int remoteRank, DateTime deadline)
+        private static int TimeoutMilliseconds(TimeSpan timeout)
         {
-            const int retryDelayMs = 250;
+            if (timeout.TotalMilliseconds < 1 || timeout.TotalMilliseconds > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(timeout));
+            return (int)Math.Ceiling(timeout.TotalMilliseconds);
+        }
+
+        private void SetHandshakeTimeout(NetworkStream stream, DateTime expires)
+        {
+            int remaining = (int)Math.Ceiling((expires - DateTime.UtcNow).TotalMilliseconds);
+            if (remaining < 1) throw new TimeoutException("TCP mesh handshake deadline expired.");
+            stream.ReadTimeout = stream.WriteTimeout = Math.Min(remaining, _ioTimeoutMs);
+        }
+
+        private NetworkStream Configure(TcpClient client)
+        {
+            client.NoDelay = true;
+            client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            // Keep OS autotuning by default; allow an explicit budget for measured routes.
+            string value = Environment.GetEnvironmentVariable("TENSORSHARP_TP_SOCKET_BUFFER_BYTES");
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                if (!int.TryParse(value, out int bytes) || bytes < 4096)
+                    throw new ArgumentException("TENSORSHARP_TP_SOCKET_BUFFER_BYTES must be an integer >= 4096.");
+                client.SendBufferSize = client.ReceiveBufferSize = bytes;
+            }
+            var stream = client.GetStream();
+            stream.ReadTimeout = stream.WriteTimeout = _ioTimeoutMs;
+            return stream;
+        }
+
+        private (TcpClient, NetworkStream) ConnectWithRetry(IPEndPoint endpoint, int remoteRank,
+            DateTime expires, CancellationToken cancellation)
+        {
             bool announced = false;
-            int attempts = 0;
-
             while (true)
             {
-                var client = new TcpClient { NoDelay = true };
+                cancellation.ThrowIfCancellationRequested();
+                var client = new TcpClient(endpoint.AddressFamily);
                 try
                 {
-                    client.Connect(endpoint);
-                    if (announced)
-                        Console.WriteLine($"[TcpCommunicator] Rank {_rank}: connected to rank {remoteRank} at {endpoint}.");
-                    return client;
+                    client.ConnectAsync(endpoint.Address, endpoint.Port, cancellation).AsTask().GetAwaiter().GetResult();
+                    var stream = Configure(client);
+                    SetHandshakeTimeout(stream, expires);
+                    WriteHandshake(stream);
+                    int receivedRank = ReadHandshake(stream);
+                    if (receivedRank != remoteRank)
+                        throw new InvalidOperationException($"Expected rank {remoteRank} at {endpoint}, received rank {receivedRank}.");
+                    stream.ReadTimeout = stream.WriteTimeout = _ioTimeoutMs;
+                    return (client, stream);
                 }
-                catch (SocketException) when (DateTime.UtcNow < deadline)
+                // A TCP proxy/SSH forward can accept before its destination is
+                // listening, then immediately close. The session is not connected
+                // until its handshake succeeds. Protocol disagreements still fail
+                // immediately; only pre-handshake transport failures are retried.
+                catch (Exception ex) when ((ex is SocketException or IOException) && !cancellation.IsCancellationRequested)
                 {
                     client.Dispose();
-                    attempts++;
                     if (!announced)
                     {
-                        Console.WriteLine($"[TcpCommunicator] Rank {_rank}: waiting for rank {remoteRank} at {endpoint} " +
-                            $"(retrying up to {(deadline - DateTime.UtcNow).TotalSeconds:F0}s)...");
+                        Console.WriteLine($"[TcpCommunicator] Rank {_rank}: waiting for rank {remoteRank} at {endpoint}...");
                         announced = true;
                     }
-                    Thread.Sleep(retryDelayMs);
+                    cancellation.WaitHandle.WaitOne(250);
                 }
-                catch (SocketException ex)
+                catch (Exception ex) when (cancellation.IsCancellationRequested)
                 {
                     client.Dispose();
-                    throw new InvalidOperationException(
-                        $"Rank {_rank} could not connect to rank {remoteRank} at {endpoint} after {attempts} attempts. " +
-                        "Check the peer is running, the host:port is reachable, and firewall rules allow it. " +
-                        "Increase the window with TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS.", ex);
+                    throw new OperationCanceledException("TCP mesh setup deadline expired.", ex, cancellation);
                 }
+                catch { client.Dispose(); throw; }
             }
         }
 
-        /// <summary>
-        /// In-place AllReduce (sum) across all nodes. The buffer is modified
-        /// to contain the element-wise sum of all nodes' inputs.
-        /// All nodes must call this concurrently with the same buffer length.
-        /// The TCP exchange runs on a dedicated I/O thread; the calling
-        /// (compute) thread blocks until the result is ready.
-        /// </summary>
+        private void WriteHandshake(NetworkStream stream)
+        {
+            Span<byte> data = stackalloc byte[16];
+            BinaryPrimitives.WriteInt32LittleEndian(data, ProtocolMagic);
+            BinaryPrimitives.WriteInt32LittleEndian(data[4..], ProtocolVersion);
+            BinaryPrimitives.WriteInt32LittleEndian(data[8..], _rank);
+            BinaryPrimitives.WriteInt32LittleEndian(data[12..], _worldSize);
+            stream.Write(data);
+        }
+
+        private int ReadHandshake(NetworkStream stream)
+        {
+            Span<byte> data = stackalloc byte[16];
+            ReadExact(stream, data[..4]);
+            if (BinaryPrimitives.ReadInt32LittleEndian(data) != ProtocolMagic)
+                throw new InvalidOperationException("Incompatible TCP protocol. Run the same TensorSharp build on every node.");
+            ReadExact(stream, data[4..]);
+            if (BinaryPrimitives.ReadInt32LittleEndian(data[4..]) != ProtocolVersion ||
+                BinaryPrimitives.ReadInt32LittleEndian(data[12..]) != _worldSize)
+                throw new InvalidOperationException("TCP protocol version or node count differs between peers.");
+            return BinaryPrimitives.ReadInt32LittleEndian(data[8..]);
+        }
+
+        /// <summary>Lossless rank-ordered sum. Only root needs a reusable receive buffer.
+        /// Direct synchronous I/O avoids a thread wakeup for every decode collective.</summary>
         public void AllReduce(float[] buffer, int length)
         {
-            _arBuffer = buffer;
-            _arLength = length;
-            _arError = null;
-            _arComplete.Reset();
-            _arRequest.Set();
-            _arComplete.Wait();
-            if (_arError != null)
-                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(_arError).Throw();
-        }
-
-        private void IoLoop()
-        {
-            while (true)
+            ArgumentNullException.ThrowIfNull(buffer);
+            if ((uint)length > (uint)buffer.Length || length > (int.MaxValue - 1) / sizeof(float))
+                throw new ArgumentOutOfRangeException(nameof(length));
+            lock (_operationLock)
             {
-                _arRequest.Wait();
-                if (_ioShutdown) break;
-                _arRequest.Reset();
-
+                ThrowIfUnavailable();
                 try
                 {
-                    AllReduceCore(_arBuffer, _arLength);
-                }
-                catch (Exception ex)
-                {
-                    _arError = ex;
-                }
-
-                _arComplete.Set();
-            }
-        }
-
-        private unsafe void AllReduceCore(float[] buffer, int length)
-        {
-            int byteCount = length * sizeof(float);
-            EnsureAllReduceSendBuffer(byteCount);
-
-            if (_rank == 0)
-            {
-                for (int r = 1; r < _worldSize; r++)
-                {
-                    var (msgType, payload) = ReceiveMessage(r);
-                    if (msgType != MsgAllReduceContribute)
-                        throw new InvalidOperationException(
-                            $"Expected AllReduceContribute from rank {r}, got message type 0x{msgType:X2}.");
-
-                    fixed (float* bufPtr = buffer)
-                    fixed (byte* payPtr = payload)
+                    var values = buffer.AsSpan(0, length);
+                    var bytes = MemoryMarshal.AsBytes(values);
+                    if (_rank == 0)
                     {
-                        float* src = (float*)payPtr;
-                        for (int i = 0; i < length; i++)
-                            bufPtr[i] += src[i];
+                        if (_reduceBuffer.Length < length) _reduceBuffer = new float[length];
+                        var incoming = _reduceBuffer.AsSpan(0, length);
+                        for (int r = 1; r < _worldSize; r++)
+                        {
+                            ReceiveInto(r, MsgAllReduceContribute, MemoryMarshal.AsBytes(incoming));
+                            int i = 0;
+                            if (Vector.IsHardwareAccelerated)
+                                for (; i <= length - Vector<float>.Count; i += Vector<float>.Count)
+                                    (new Vector<float>(values.Slice(i)) + new Vector<float>(incoming.Slice(i))).CopyTo(values.Slice(i));
+                            for (; i < length; i++) values[i] += incoming[i];
+                        }
+                        for (int r = 1; r < _worldSize; r++) SendMessage(r, MsgAllReduceResult, bytes);
                     }
+                    else
+                    {
+                        SendMessage(0, MsgAllReduceContribute, bytes);
+                        ReceiveInto(0, MsgAllReduceResult, bytes);
+                    }
+                    // TCP orders the first and every subsequent operation; no extra barrier.
                 }
-
-                fixed (float* bufPtr = buffer)
-                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)bufPtr, _allReduceSendBuf, 0, byteCount);
-
-                for (int r = 1; r < _worldSize; r++)
-                    SendMessage(r, MsgAllReduceResult, _allReduceSendBuf, byteCount);
-            }
-            else
-            {
-                fixed (float* bufPtr = buffer)
-                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)bufPtr, _allReduceSendBuf, 0, byteCount);
-
-                SendMessage(0, MsgAllReduceContribute, _allReduceSendBuf, byteCount);
-
-                var (msgType, payload) = ReceiveMessage(0);
-                if (msgType != MsgAllReduceResult)
-                    throw new InvalidOperationException(
-                        $"Expected AllReduceResult from rank 0, got message type 0x{msgType:X2}.");
-
-                fixed (float* bufPtr = buffer)
-                    System.Runtime.InteropServices.Marshal.Copy(payload, 0, (IntPtr)bufPtr, byteCount);
-            }
-
-            if (!_barrierRetired)
-            {
-                Barrier();
-                _barrierRetired = true;
+                catch (Exception ex) { Fail(ex); throw; }
             }
         }
 
-        private void EnsureAllReduceSendBuffer(int byteCount)
+        /// <summary>Send a stage activation directly from its F32 source buffer.</summary>
+        public void SendTensor(ReadOnlySpan<float> buffer, int destinationRank)
         {
-            if (_allReduceSendBuf.Length >= byteCount) return;
-            _allReduceSendBuf = new byte[byteCount];
+            ValidateRemoteRank(destinationRank);
+            lock (_operationLock)
+            {
+                ThrowIfUnavailable();
+                try { SendMessage(destinationRank, MsgTensor, MemoryMarshal.AsBytes(buffer)); }
+                catch (Exception ex) { Fail(ex); throw; }
+            }
         }
 
-        /// <summary>
-        /// Driver→worker control broadcast. Called on rank 0 (the driver node)
-        /// to send an op code plus an int payload to every other node. Workers
-        /// call <see cref="ReceiveControl"/> to read it. Unlike AllReduce this is
-        /// one-way (no barrier): it precedes the forward pass whose AllReduces
-        /// then provide the synchronisation.
-        /// </summary>
+        /// <summary>Receive into an F32 destination, checking its expected size before writing.</summary>
+        public void ReceiveTensor(Span<float> buffer, int sourceRank)
+        {
+            ValidateRemoteRank(sourceRank);
+            lock (_operationLock)
+            {
+                ThrowIfUnavailable();
+                try { ReceiveInto(sourceRank, MsgTensor, MemoryMarshal.AsBytes(buffer)); }
+                catch (Exception ex) { Fail(ex); throw; }
+            }
+        }
+
         public void BroadcastControl(int op, int[] payload)
         {
-            int n = payload?.Length ?? 0;
-            byte[] buf = new byte[8 + n * 4];
-            BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(0, 4), op);
-            BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(4, 4), n);
-            for (int i = 0; i < n; i++)
-                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(8 + i * 4, 4), payload[i]);
-
-            for (int r = 0; r < _worldSize; r++)
+            if (_rank != 0) throw new InvalidOperationException("Only rank 0 may broadcast driver controls.");
+            int count = payload?.Length ?? 0;
+            if (count > (MaxControlBytes - 8) / 4) throw new ArgumentOutOfRangeException(nameof(payload));
+            lock (_operationLock)
             {
-                if (r == _rank) continue;
-                SendMessage(r, MsgControl, buf);
+                ThrowIfUnavailable();
+                try
+                {
+                    int size = 8 + count * 4;
+                    Span<byte> data = size <= SmallFrameBytes ? stackalloc byte[size] : new byte[size];
+                    BinaryPrimitives.WriteInt32LittleEndian(data, op);
+                    BinaryPrimitives.WriteInt32LittleEndian(data[4..], count);
+                    if (count > 0) MemoryMarshal.AsBytes(payload.AsSpan()).CopyTo(data[8..]);
+                    for (int r = 1; r < _worldSize; r++) SendMessage(r, MsgControl, data);
+                }
+                catch (Exception ex) { Fail(ex); throw; }
             }
         }
 
-        /// <summary>
-        /// Worker-side receive for <see cref="BroadcastControl"/>. Blocks until
-        /// rank 0 sends the next control message, then returns (op, payload).
-        /// </summary>
         public (int op, int[] payload) ReceiveControl()
         {
-            var (msgType, data) = ReceiveMessage(0);
-            if (msgType != MsgControl)
-                throw new InvalidOperationException(
-                    $"Expected Control from rank 0, got message type 0x{msgType:X2}.");
-
-            int op = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0, 4));
-            int n = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(4, 4));
-            var payload = new int[n];
-            for (int i = 0; i < n; i++)
-                payload[i] = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(8 + i * 4, 4));
-            return (op, payload);
-        }
-
-        /// <summary>
-        /// Broadcast a buffer from <paramref name="rootRank"/> to all nodes.
-        /// </summary>
-        public unsafe void Broadcast(Span<float> buffer, int rootRank)
-        {
-            int byteCount = buffer.Length * sizeof(float);
-
-            if (_rank == rootRank)
+            if (_rank == 0) throw new InvalidOperationException("Rank 0 cannot receive its own driver controls.");
+            lock (_operationLock)
             {
-                byte[] data = new byte[byteCount];
-                fixed (float* bufPtr = buffer)
-                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)bufPtr, data, 0, byteCount);
-
-                for (int r = 0; r < _worldSize; r++)
+                ThrowIfUnavailable();
+                try
                 {
-                    if (r == rootRank) continue;
-                    SendMessage(r, MsgAllReduceResult, data);
+                    int bytes = ReceiveHeader(0, MsgControl);
+                    if (bytes < 8 || bytes > MaxControlBytes || bytes % 4 != 0)
+                        throw new InvalidOperationException($"Malformed control frame length {bytes}.");
+                    Span<byte> header = stackalloc byte[8];
+                    ReadExact(_streams[0], header);
+                    int op = BinaryPrimitives.ReadInt32LittleEndian(header);
+                    int count = BinaryPrimitives.ReadInt32LittleEndian(header[4..]);
+                    if (count != (bytes - 8) / 4)
+                        throw new InvalidOperationException($"Malformed control count {count} for {bytes} bytes.");
+                    int[] payload = new int[count];
+                    ReadExact(_streams[0], MemoryMarshal.AsBytes(payload.AsSpan()));
+                    return (op, payload);
                 }
+                catch (Exception ex) { Fail(ex); throw; }
             }
-            else
-            {
-                var (msgType, payload) = ReceiveMessage(rootRank);
-                if (msgType != MsgAllReduceResult)
-                    throw new InvalidOperationException(
-                        $"Expected Broadcast from rank {rootRank}, got message type 0x{msgType:X2}.");
-
-                fixed (float* bufPtr = buffer)
-                    System.Runtime.InteropServices.Marshal.Copy(payload, 0, (IntPtr)bufPtr, byteCount);
-            }
-
-            Barrier();
         }
 
-        private void SendHeartbeats(object _)
+        public void Broadcast(Span<float> buffer, int rootRank)
         {
-            if (_disposed) return;
-            for (int r = 0; r < _worldSize; r++)
+            if ((uint)rootRank >= (uint)_worldSize) throw new ArgumentOutOfRangeException(nameof(rootRank));
+            lock (_operationLock)
             {
-                if (r == _rank || _streams[r] == null) continue;
-                try { SendMessage(r, MsgHeartbeat, Array.Empty<byte>()); }
-                catch { /* peer gone — the next real op will surface the error */ }
+                ThrowIfUnavailable();
+                try
+                {
+                    var bytes = MemoryMarshal.AsBytes(buffer);
+                    if (_rank == rootRank)
+                    {
+                        for (int r = 0; r < _worldSize; r++)
+                            if (r != rootRank) SendMessage(r, MsgBroadcast, bytes);
+                    }
+                    else ReceiveInto(rootRank, MsgBroadcast, bytes);
+                    BarrierCore();
+                }
+                catch (Exception ex) { Fail(ex); throw; }
             }
         }
 
-        /// <summary>
-        /// Block until all nodes have reached this point. Uses a simple
-        /// gather-then-release protocol through node 0.
-        /// </summary>
         public void Barrier()
+        {
+            lock (_operationLock)
+            {
+                ThrowIfUnavailable();
+                try { BarrierCore(); }
+                catch (Exception ex) { Fail(ex); throw; }
+            }
+        }
+
+        private void BarrierCore()
         {
             if (_rank == 0)
             {
-                // Receive ack from every other node.
-                for (int r = 1; r < _worldSize; r++)
-                {
-                    var (msgType, _) = ReceiveMessage(r);
-                    if (msgType != MsgBarrierAck)
-                        throw new InvalidOperationException(
-                            $"Expected BarrierAck from rank {r}, got 0x{msgType:X2}.");
-                }
-
-                // Release all nodes.
-                for (int r = 1; r < _worldSize; r++)
-                    SendMessage(r, MsgBarrierAck, Array.Empty<byte>());
+                for (int r = 1; r < _worldSize; r++) ReceiveInto(r, MsgBarrierAck, Span<byte>.Empty);
+                for (int r = 1; r < _worldSize; r++) SendMessage(r, MsgBarrierAck, ReadOnlySpan<byte>.Empty);
             }
             else
             {
-                SendMessage(0, MsgBarrierAck, Array.Empty<byte>());
-                var (msgType, _) = ReceiveMessage(0);
-                if (msgType != MsgBarrierAck)
-                    throw new InvalidOperationException(
-                        $"Expected BarrierAck from rank 0, got 0x{msgType:X2}.");
+                SendMessage(0, MsgBarrierAck, ReadOnlySpan<byte>.Empty);
+                ReceiveInto(0, MsgBarrierAck, Span<byte>.Empty);
             }
         }
 
-        private void SendMessage(int destRank, byte msgType, byte[] payload)
+        private void SendHeartbeats(object state)
         {
-            SendMessage(destRank, msgType, payload, payload.Length);
-        }
-
-        private void SendMessage(int destRank, byte msgType, byte[] payload, int payloadLen)
-        {
-            var stream = _streams[destRank];
-            int totalLen = 1 + payloadLen;
-
-            byte[] header = new byte[4];
-            BinaryPrimitives.WriteInt32LittleEndian(header, totalLen);
-
-            lock (_sendLock)
+            if (Volatile.Read(ref _closed) != 0) return;
+            for (int r = 0; r < _worldSize; r++)
             {
-                stream.Write(header, 0, 4);
-                stream.WriteByte(msgType);
-                if (payloadLen > 0)
-                    stream.Write(payload, 0, payloadLen);
-                stream.Flush();
+                // Busy writers already prove liveness; do not queue behind a large transfer.
+                if (r == _rank || !Monitor.TryEnter(_sendLocks[r])) continue;
+                try { SendMessage(r, MsgHeartbeat, ReadOnlySpan<byte>.Empty); }
+                catch (Exception ex) { Fail(ex); return; }
+                finally { Monitor.Exit(_sendLocks[r]); }
             }
         }
 
-        private (byte msgType, byte[] payload) ReceiveMessage(int srcRank)
+        private void SendMessage(int destination, byte type, ReadOnlySpan<byte> payload)
         {
-            var stream = _streams[srcRank];
+            if (payload.Length == int.MaxValue) throw new ArgumentOutOfRangeException(nameof(payload));
+            lock (_sendLocks[destination])
+            {
+                // Coalesce small decode/control messages into one syscall/TCP segment.
+                Span<byte> frame = stackalloc byte[SmallFrameBytes];
+                BinaryPrimitives.WriteInt32LittleEndian(frame, payload.Length + 1);
+                frame[4] = type;
+                var stream = _streams[destination];
+                if (payload.Length <= SmallFrameBytes - 5)
+                {
+                    payload.CopyTo(frame[5..]);
+                    stream.Write(frame[..(5 + payload.Length)]);
+                }
+                else
+                {
+                    stream.Write(frame[..5]);
+                    stream.Write(payload);
+                }
+            }
+        }
 
+        private int ReceiveHeader(int source, byte expectedType, long operationDeadline = 0)
+        {
+            Span<byte> header = stackalloc byte[5];
             while (true)
             {
-                // Read 4-byte length header.
-                byte[] header = ReadExact(stream, 4);
-                int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(header);
-
-                if (payloadLen < 1)
-                    throw new InvalidOperationException("Received message with empty payload (missing type byte).");
-
-                // Read type byte + payload.
-                byte[] full = ReadExact(stream, payloadLen);
-                byte msgType = full[0];
-
-                if (msgType == MsgHeartbeat)
-                    continue; // discard keepalive, keep waiting for the real message
-
-                byte[] payload = new byte[payloadLen - 1];
-                if (payload.Length > 0)
-                    Array.Copy(full, 1, payload, 0, payload.Length);
-
-                return (msgType, payload);
+                ReadExact(_streams[source], header, operationDeadline);
+                int length = BinaryPrimitives.ReadInt32LittleEndian(header);
+                if (length < 1) throw new InvalidOperationException($"Invalid frame length {length} from rank {source}.");
+                byte type = header[4];
+                if (type == MsgHeartbeat)
+                {
+                    if (length != 1) throw new InvalidOperationException("A heartbeat must have an empty payload.");
+                    continue;
+                }
+                if (type != expectedType)
+                    throw new InvalidOperationException($"Expected message type 0x{expectedType:X2} from rank {source}, got 0x{type:X2}.");
+                return length - 1;
             }
         }
 
-        private static byte[] ReadExact(NetworkStream stream, int count)
+        private void ReceiveInto(int source, byte type, Span<byte> destination)
         {
-            byte[] buf = new byte[count];
+            // One monotonic deadline spans every heartbeat, header fragment and
+            // payload fragment. Loading barriers may legitimately outlast it.
+            long deadline = type == MsgBarrierAck ? 0 : Stopwatch.GetTimestamp()
+                + (long)Math.Ceiling(_operationTimeoutMs * (double)Stopwatch.Frequency / 1000);
+            int length = ReceiveHeader(source, type, deadline);
+            if (length != destination.Length)
+                throw new InvalidOperationException($"Collective shape mismatch from rank {source}: expected {destination.Length} bytes, received {length}. All nodes must execute the same operation with the same tensor shape.");
+            ReadExact(_streams[source], destination, deadline);
+        }
+
+        private static TimeoutException OperationTimeout(Exception inner = null) => new(
+            "Timed out waiting for a complete peer data frame: the operation deadline expired. " +
+            "Heartbeats do not count as data progress. Check matching operations and TENSORSHARP_TP_OPERATION_TIMEOUT_SECONDS.", inner);
+
+        private void ReadExact(NetworkStream stream, Span<byte> buffer, long operationDeadline = 0)
+        {
             int offset = 0;
-            while (offset < count)
+            int currentTimeout = _ioTimeoutMs;
+            try
             {
-                int n;
-                try
+                while (offset < buffer.Length)
                 {
-                    n = stream.Read(buf, offset, count - offset);
+                    if (operationDeadline != 0)
+                    {
+                        long remainingTicks = operationDeadline - Stopwatch.GetTimestamp();
+                        if (remainingTicks <= 0) throw OperationTimeout();
+                        int remainingMs = (int)Math.Min(int.MaxValue,
+                            Math.Ceiling(remainingTicks * 1000d / Stopwatch.Frequency));
+                        int timeout = Math.Min(_ioTimeoutMs, Math.Max(1, remainingMs));
+                        if (timeout != currentTimeout)
+                        {
+                            stream.ReadTimeout = timeout;
+                            currentTimeout = timeout;
+                        }
+                    }
+                    int count;
+                    try { count = stream.Read(buffer[offset..]); }
+                    catch (IOException ex) when (ex.InnerException is SocketException se &&
+                        (se.SocketErrorCode == SocketError.TimedOut || se.SocketErrorCode == SocketError.WouldBlock))
+                    {
+                        if (operationDeadline != 0 &&
+                            (currentTimeout < _ioTimeoutMs || Stopwatch.GetTimestamp() >= operationDeadline))
+                            throw OperationTimeout(ex);
+                        throw new TimeoutException($"Timed out waiting for peer data ({buffer.Length} bytes expected, {offset} received). Adjust TENSORSHARP_TP_RECV_TIMEOUT_SECONDS.", ex);
+                    }
+                    if (count == 0) throw new EndOfStreamException("Peer closed the connection.");
+                    offset += count;
                 }
-                catch (IOException ex) when (ex.InnerException is SocketException se
-                    && (se.SocketErrorCode == SocketError.TimedOut || se.SocketErrorCode == SocketError.WouldBlock))
-                {
-                    throw new TimeoutException(
-                        $"Timed out waiting for a peer message ({count} bytes expected, {offset} received). " +
-                        "The remote node may be stuck, still loading, or unreachable. " +
-                        "Adjust with TENSORSHARP_TP_RECV_TIMEOUT_SECONDS.", ex);
-                }
-                if (n == 0)
-                    throw new EndOfStreamException("Peer closed the connection.");
-                offset += n;
+                if (operationDeadline != 0 && Stopwatch.GetTimestamp() >= operationDeadline)
+                    throw OperationTimeout();
             }
-            return buf;
+            finally
+            {
+                if (operationDeadline != 0 && currentTimeout != _ioTimeoutMs)
+                    try { stream.ReadTimeout = _ioTimeoutMs; } catch { /* abort may have closed this socket */ }
+            }
+        }
+
+        private void ValidateRemoteRank(int rank)
+        {
+            if ((uint)rank >= (uint)_worldSize || rank == _rank) throw new ArgumentOutOfRangeException(nameof(rank));
+        }
+
+        private void ThrowIfUnavailable()
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            var fault = Volatile.Read(ref _fault);
+            if (fault != null) throw new IOException("The TCP communicator is faulted; create a new group before retrying.", fault);
+        }
+
+        private void Fail(Exception error)
+        {
+            Interlocked.CompareExchange(ref _fault, error, null);
+            CloseConnections();
+        }
+
+        /// <summary>Close the network after a stage/compute failure. No local
+        /// backend resources are owned or released by this communicator.</summary>
+        public void Abort(Exception failure)
+        {
+            ArgumentNullException.ThrowIfNull(failure);
+            Fail(failure);
+        }
+
+        private void CloseConnections()
+        {
+            if (Interlocked.Exchange(ref _closed, 1) != 0) return;
+            _heartbeatTimer?.Dispose();
+            // Close before waiting: this wakes blocked readers/writers immediately.
+            for (int r = 0; r < _worldSize; r++)
+            {
+                try { _peers[r]?.Client.Shutdown(SocketShutdown.Both); } catch { }
+                try { _streams[r]?.Dispose(); } catch { }
+                try { _peers[r]?.Dispose(); } catch { }
+            }
+            try { _listener.Stop(); } catch { }
         }
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
-
-            _heartbeatTimer?.Dispose();
-
-            _ioShutdown = true;
-            _arRequest.Set();
-            _ioThread?.Join(2000);
-
-            for (int r = 0; r < _worldSize; r++)
-            {
-                _streams[r]?.Dispose();
-                _peers[r]?.Dispose();
-            }
-
-            try { _listener?.Stop(); } catch { }
+            Interlocked.Exchange(ref _disposed, 1);
+            CloseConnections();
         }
     }
 }

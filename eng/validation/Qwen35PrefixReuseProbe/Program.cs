@@ -89,8 +89,10 @@ catch (Exception exception)
 }
 finally
 {
+    string nativeName = OperatingSystem.IsWindows() ? "GgmlOps.dll"
+        : OperatingSystem.IsMacOS() ? "libGgmlOps.dylib" : "libGgmlOps.so";
     string? nativePath = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
-        .FirstOrDefault(module => Path.GetFileName(module.FileName).Equals("GgmlOps.dll", StringComparison.OrdinalIgnoreCase))?.FileName;
+        .FirstOrDefault(module => Path.GetFileName(module.FileName).Equals(nativeName, StringComparison.OrdinalIgnoreCase))?.FileName;
     var enabled = runs.Where(run => run.Warm).ToArray();
     var disabled = runs.Where(run => run.Label.StartsWith("pair-", StringComparison.Ordinal) && !run.CacheEnabled).ToArray();
     bool benchmarkComplete = enabled.Length == pairs && disabled.Length == pairs;

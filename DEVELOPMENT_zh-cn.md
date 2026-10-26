@@ -27,8 +27,8 @@ dotnet --list-sdks
 
 - **`git` 与网络访问：** GGML/CUDA 原生构建会在首次构建时从 [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) 克隆 ggml 源码到 `ExternalProjects/ggml/`（参见 `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`）。克隆默认跟踪 ggml 的默认分支（`master`）；可用 `TENSORSHARP_GGML_GIT_REF` 指定其他引用，或在克隆完成后设置 `TENSORSHARP_GGML_NO_UPDATE=1` 跳过网络更新（用于离线重建）
 - **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具——GGML 以源码形式内嵌 Metal kernel 并在运行时编译，因此构建期不需要 Metal 编译器。若需使用 MLX 后端，还需通过 `bash TensorSharp.Backends.MLX/build-native-macos.sh` 从 `TensorSharp.Backends.MLX/Native/` 构建 `libmlxc`；该构建**会**编译 Metal shader，因此需要**完整的 Xcode 以及 Metal 工具链**，仅安装命令行工具是不够的。首次构建时 `eng/ensure-metal-toolchain.sh` 会自动完成这一准备工作，详见[构建原生 MLX 库](#构建原生-mlx-库仅-macos)
-- **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本。装有多个工具包时，可用 `CUDACXX`（或 `-DCMAKE_CUDA_COMPILER=`）指定用哪个 `nvcc` 构建；`build-windows.ps1` 会优先采用它而不是 `PATH`/`CUDA_PATH`，把选择打印在 `Configuring ...` 一行中，并丢弃使用其他编译器配置过的构建树（CMake 只在首次配置时缓存 CUDA 编译器，此后便会忽略 `CUDACXX`）。注意 CMake 仅在非 Visual Studio 生成器下读取 `CUDACXX`；使用 `Visual Studio NN` 生成器时请改用 `-T cuda=<版本或路径>`。Visual Studio 2026 的 MSVC 14.5x 工具集比当前 CUDA 工具包官方支持的宿主编译器更新，构建会自动向 `nvcc` 传递 `-allow-unsupported-compiler`；请同时安装“适用于 Windows 的 C++ CMake 工具”组件，以便构建使用 Ninja 生成器（Visual Studio 生成器还额外需要为对应 VS 版本提供 MSBuild 集成的 CUDA 工具包）。**cuDNN 会自动准备**：首次 CUDA 构建时由 `eng/fetch-cudnn.ps1` 下载到 `ExternalProjects/cudnn/`（下载约 1.8 GB，磁盘占用约 1.1 GB，只解出 `include/` 与 `bin/`），使 Wan / Qwen-Image VAE 的卷积可以走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。已安装的版本（`TS_CUDNN_DIR`、`CUDNN_DIR`、`CUDA_PATH`）优先于下载，`TENSORSHARP_CUDNN=OFF` 可完全跳过；构建不与它链接——运行时用 `LoadLibrary` 解析，因此有没有它，构建与产物都照常工作
-- **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本。**cuDNN 会自动准备**：首次 CUDA 构建时，`eng/fetch-cudnn.sh` 会从 NVIDIA 公开的 redist 渠道把固定版本下载到 `ExternalProjects/cudnn/`（无需账号，也无需点选许可），Wan / Qwen-Image VAE 的卷积随后走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。系统上已装的 cuDNN（`libcudnn9-dev-cuda-12`、`CUDA_HOME`、`TS_CUDNN_DIR`）优先于下载。它严格可选：获取失败不会让构建失败，编译期只需要头文件，库本身在运行时用 `dlopen` 解析，因此带 cuDNN 构建出的二进制在没有 cuDNN 的机器上照样能跑。`TENSORSHARP_CUDNN=OFF` 完全跳过；configure 阶段会打印实际生效的是哪一条
+- **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA 工具包：发行版使用 CUDA 13.4 构建（CUDA 12.x 仍可构建；CUDA 13 不再支持 Turing 之前的 GPU，且 CUDA 13 构建需要 CUDA 13 驱动，即 R580 或更新版本）。纯 C# `cuda` 后端的内核会编译为 PTX 外加一个包含所检测 GPU 的 SASS 的 fatbin（可用 `CudaFatbinArchitectures` 列出更多架构，例如 `75,86,89,90,120`），因此在比工具包更旧、无法 JIT 新版 PTX 的驱动上也能加载。装有多个工具包时，可用 `CUDACXX`（或 `-DCMAKE_CUDA_COMPILER=`）指定用哪个 `nvcc` 构建；`build-windows.ps1` 会优先采用它而不是 `PATH`/`CUDA_PATH`，把选择打印在 `Configuring ...` 一行中，并丢弃使用其他编译器配置过的构建树（CMake 只在首次配置时缓存 CUDA 编译器，此后便会忽略 `CUDACXX`）。注意 CMake 仅在非 Visual Studio 生成器下读取 `CUDACXX`；使用 `Visual Studio NN` 生成器时请改用 `-T cuda=<版本或路径>`。Visual Studio 2026 的 MSVC 14.5x 工具集比当前 CUDA 工具包官方支持的宿主编译器更新，构建会自动向 `nvcc` 传递 `-allow-unsupported-compiler`；请同时安装“适用于 Windows 的 C++ CMake 工具”组件，以便构建使用 Ninja 生成器（Visual Studio 生成器还额外需要为对应 VS 版本提供 MSBuild 集成的 CUDA 工具包）。**cuDNN 会自动准备**：首次 CUDA 构建时由 `eng/fetch-cudnn.ps1` 下载到 `ExternalProjects/cudnn/`（下载约 1.8 GB，磁盘占用约 1.1 GB，只解出 `include/` 与 `bin/`），使 Wan / Qwen-Image VAE 的卷积可以走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。已安装的版本（`TS_CUDNN_DIR`、`CUDNN_DIR`、`CUDA_PATH`）优先于下载，`TENSORSHARP_CUDNN=OFF` 可完全跳过；构建不与它链接——运行时用 `LoadLibrary` 解析，因此有没有它，构建与产物都照常工作
+- **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA 工具包：发行版使用 CUDA 13.4 构建（CUDA 12.x 仍可构建；CUDA 13 不再支持 Turing 之前的 GPU，且 CUDA 13 构建需要 CUDA 13 驱动，即 R580 或更新版本）。纯 C# `cuda` 后端的内核会编译为 PTX 外加一个包含所检测 GPU 的 SASS 的 fatbin（可用 `CudaFatbinArchitectures` 列出更多架构，例如 `75,86,89,90,120`），因此在比工具包更旧、无法 JIT 新版 PTX 的驱动上也能加载。**cuDNN 会自动准备**：首次 CUDA 构建时，`eng/fetch-cudnn.sh` 会从 NVIDIA 公开的 redist 渠道把固定版本下载到 `ExternalProjects/cudnn/`（无需账号，也无需点选许可），Wan / Qwen-Image VAE 的卷积随后走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。系统上已装的 cuDNN（`libcudnn9-dev-cuda-13`（CUDA 12 工具包对应 `-cuda-12`）、`CUDA_HOME`、`TS_CUDNN_DIR`）优先于下载。它严格可选：获取失败不会让构建失败，编译期只需要头文件，库本身在运行时用 `dlopen` 解析，因此带 cuDNN 构建出的二进制在没有 cuDNN 的机器上照样能跑。`TENSORSHARP_CUDNN=OFF` 完全跳过；configure 阶段会打印实际生效的是哪一条
 - **Windows（GGML Vulkan 后端）：** 这里同样需要 CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具——Vulkan 工具链的准备和后端的编译都由 CMake 完成，缺少它会在 `eng/fetch-vulkan-toolchain.ps1` 阶段就失败。Visual Studio 的“适用于 Windows 的 C++ CMake 工具”组件同时自带 `cmake.exe` 与 `ninja.exe`，两者都不在 `PATH` 上时 `build-windows.ps1` 会回退到该副本；否则请从 [cmake.org/download](https://cmake.org/download/) 安装 CMake。原生构建**仅支持 x64**——`build-windows.ps1` 会自行导入 `vcvars64` 环境，包括覆盖已经激活的 *x86* 环境（普通的“Developer PowerShell for VS”默认是 x86，而 ggml 的 Vulkan 后端无法以 32 位编译）。机器有 Vulkan 运行时（每个较新的 GPU 驱动都带的 `System32\vulkan-1.dll`）时自动启用。已安装 [LunarG Vulkan SDK](https://vulkan.lunarg.com/) 时直接使用；未安装时构建会通过 `eng/fetch-vulkan-toolchain.ps1` 自动把便携工具链（Vulkan-Headers、由系统 loader 生成的 vulkan-1 导入库、glslc、SPIRV-Headers）准备到 `ExternalProjects/vulkan-toolchain/`。用 `build-windows.ps1 --no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF` 退出。运行时需要支持 Vulkan 1.3 的 GPU 驱动
 - **Linux（GGML Vulkan 后端）：** 已安装 Vulkan loader（`libvulkan.so.1`）时自动启用。存在发行版开发包时直接使用（`apt install libvulkan-dev glslc spirv-headers`）；否则构建会通过 `eng/fetch-vulkan-toolchain.sh` 把缺失的部分（Vulkan-Headers、shaderc CI 预编译的 glslc、SPIRV-Headers）自动下载到 `ExternalProjects/vulkan-toolchain/`。用 `build-linux.sh --no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF` 退出
 - GGUF 模型文件（例如来自 [Hugging Face](https://huggingface.co)）
@@ -137,13 +137,15 @@ $env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'; dotnet build TensorSharp.Cli/Tens
 
 在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Windows 和 Linux 上，原生脚本会保留已有的 CUDA 构建，并在检测到 CUDA 工具链时自动启用 GGML_CUDA；也可以通过 `build-windows.ps1 --cuda`、`build-linux.sh --cuda` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` 显式启用。GGML Vulkan 后端在机器有 Vulkan 运行时时同样自动启用，并在首次使用时下载其构建工具链；`--vulkan` / `--no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON/OFF` 可显式指定，显式选择会在后续重建中保持（构建自动准备的 Vulkan 工具链见[前置要求](#前置要求)）。构建产物会自动复制到应用输出目录。
 
-Direct `cuda` 后端由托管 C# 代码和 PTX 内核组成。执行 `dotnet build` 时，`TensorSharp.Backends.Cuda` 会在检测到 `nvcc` 后把 `native/kernels/*.cu` 编译到中间目录（`obj/cuda_ptx/ptx/`），各输出目录的 `cuda_kernels/` 使用的就是这份本地编译的 PTX——构建不会修改 git 跟踪的 `native/ptx/` 文件。如果缺少 `nvcc`，则改用 `native/ptx/` 中提交的 PTX 基线；若该基线也无法加载，PTX 覆盖的算子会使用 CPU 回退。cuBLAS GEMM 仍要求运行时能够找到 CUDA 运行库。
+Direct `cuda` 后端由托管 C# 代码和 PTX 内核组成。执行 `dotnet build` 时，`TensorSharp.Backends.Cuda` 会在检测到 `nvcc` 后把 `native/kernels/*.cu` 编译到中间目录（`obj/cuda_ptx/ptx/`），各输出目录的 `cuda_kernels/` 使用的就是这份本地编译的 PTX——构建不会修改 git 跟踪的 `native/ptx/` 文件。构建还会在每个 `.ptx` 旁写出一个 `.fatbin`（含所解析 GPU 架构的 SASS；也可用 `CudaFatbinArchitectures` 列出多个架构，例如 `75,86,89,90,120`，均需不低于 PTX 目标）以及记录其来源 PTX 的 `.fatbin.sha256`。加载器只在与之匹配的 PTX 旁优先使用 fatbin：CUDA 13.x 工具包生成的 SASS 可在任何 CUDA 13 驱动上加载，而驱动只能 JIT 不比自身更新的工具包生成的 PTX（13.4 的 PTX 在 13.2 驱动上会报 `CUDA error 222`）。`CudaEmitFatbin=false` 时只生成 PTX。如果缺少 `nvcc`，则改用 `native/ptx/` 中提交的 PTX 基线；若该基线也无法加载，PTX 覆盖的算子会使用 CPU 回退。cuBLAS GEMM 仍要求运行时能够找到 CUDA 运行库。
 
 修改 `.cu` 内核后，请显式刷新提交的 PTX 基线并提交差异——没有 `nvcc` 的机器运行的是提交的 PTX，未刷新的内核改动会让这些机器悄悄运行过期内核：
 
 ```powershell
 dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -p:TensorSharpUpdateCommittedPtx=true
 ```
+
+提交的基线以 `compute_61` 为目标，刷新时请使用 CUDA 12 工具包：CUDA 13 只能编译 `compute_75` 及更新的目标，检测到 CUDA 13 的 `nvcc` 时刷新会提前失败。普通构建仍自动检测 GPU（未检测到 GPU 时，CUDA 13 回退到 `compute_75`，CUDA 12 回退到 `compute_61`）。
 
 #### Apple Silicon 上的 Metal 4 tensor API
 
@@ -253,7 +255,7 @@ macOS 27 SDK 默认按 Metal 4.1 编译 Metal shader，其地址空间规则会�
 
 ### GB10 / DGX Spark 构建容器（实验性）
 
-`eng/Dockerfile.gb10` 在**原生 Linux ARM64 Docker 构建机**上构建本 checkout 的主解决方案与原生 GGML/CUDA 代码。它固定了 CUDA 13.0.2 组件、.NET SDK 10.0.401 以及未经修改的 GGML 修订版 `da8e2a54b919557b816b1c2beb432ccb766f7ce0`。
+`eng/Dockerfile.gb10` 在**原生 Linux ARM64 Docker 构建机**上构建本 checkout 的主解决方案与原生 GGML/CUDA 代码。它固定了 CUDA 13.4.3 组件、.NET SDK 10.0.401 以及未经修改的 GGML 修订版 `da8e2a54b919557b816b1c2beb432ccb766f7ce0`。
 该修订版提供 TensorSharp Q8 激活 kernel 使用的 CUDA MMQ 精度配置 API；获取的上游工作树必须保持未修改。精度相关 kernel 仍位于 TensorSharp 自有代码中；构建会检查获取到的 ggml 工作树未被修改。SDK 与干净的 Ubuntu 镜像按 digest 固定；NVIDIA 签名软件源提供显式指定版本的编译器、运行时与 cuBLAS 包，从而避免把完整 CUDA devel 镜像的 profiler 与无用数学库拉到小型托管 runner 上。未使用的 cuBLAS 静态库在安装层中删除；动态链接的 CUDA 库及其许可声明保持不变。Ubuntu 构建依赖从 Ubuntu 软件源安装。这是构建/开发镜像，不是部署镜像；下文的 `runtime` 与 `artifacts` target 负责生成并验证部署布局。
 
 在仓库根目录、可用的 ARM64 构建机上运行：
@@ -292,7 +294,7 @@ docker build --platform linux/arm64 -f eng/Dockerfile.gb10 \
 
 版本默认取自 `Directory.Build.props`；候选版本可用 `--build-arg RELEASE_VERSION=2.8.6-gb10.1`。输出为 `tensorsharp-cli-<version>-linux-arm64-cuda13-GB10.tar.gz`、`tensorsharp-server-<version>-linux-arm64-cuda13-GB10.tar.gz`、`SHA256SUMS` 以及一份无头验证记录。归档启动检查会加载真实打包的 cuBLAS 与 OpenCV 绑定，并在调用各应用的 `--help` 之前通过 ImageMagick 编码一个像素——它检查的是依赖加载，而不是模型推理。
 
-解压任一归档后运行 `./TensorSharp.Cli` 或 `./TensorSharp.Server.Host`，无需安装 .NET 或 CUDA Toolkit。在 Ubuntu 24.04 上需安装 `ca-certificates libgomp1 libgssapi-krb5-2 libicu74 libssl3t64 libstdc++6 zlib1g`；GPU 执行还需要兼容的 NVIDIA 驱动（构建机使用 CUDA 13.0.2）。请保留打包的许可声明，并遵守媒体依赖的再分发/源码义务。
+解压任一归档后运行 `./TensorSharp.Cli` 或 `./TensorSharp.Server.Host`，无需安装 .NET 或 CUDA Toolkit。在 Ubuntu 24.04 上需安装 `ca-certificates libgomp1 libgssapi-krb5-2 libicu74 libssl3t64 libstdc++6 zlib1g`；GPU 执行还需要 CUDA 13 系列的 NVIDIA 驱动（R580 或更新版本；构建机使用 CUDA 13.4.3，`cuda_kernels` 中的 fatbin 带有 sm_121 SASS，DGX OS 自带的 CUDA 13.0 驱动无需 JIT 13.4 PTX 即可加载）。请保留打包的许可声明，并遵守媒体依赖的再分发/源码义务。
 
 若要把干净环境保留为镜像，把导出参数换成 `--target runtime -t tensorsharp-gb10-runtime`；解压后的应用位于 `/opt/tensorsharp/cli` 与 `/opt/tensorsharp/server`，默认命令为 Bash。后续做 GPU 检查时加 `--gpus all`；构建镜像本身从不需要 GPU。无头构建允许宿主缺少 `libcuda.so.1`，并会报告（但不失败）.NET 可选 LTTng 跟踪提供程序所需的 `liblttng-ust.so.0` 不可用，这与 [CoreCLR 的可选加载行为](https://github.com/dotnet/runtime/blob/v10.0.12/src/coreclr/pal/src/misc/tracepointprovider.cpp)一致；其他原生依赖都是必需的。安排好 Spark 的可用时间后，可运行要求驱动的复查：
 
@@ -553,6 +555,8 @@ git push origin vX.Y.Z.W
 | `linux-x64-cpu` | GGML CPU | `.tar.gz` |
 | `linux-x64-cuda` | GGML CUDA + 纯 C# CUDA（PTX）+ CUDA 12.x 运行时 | `.tar.gz` |
 | `osx-arm64` | GGML Metal + MLX | `.tar.gz` |
+
+从下一个发行版起，`-cuda` 归档改用 CUDA 13.4 构建：随附其运行时（`*.so.13` / `*64_13.dll`），在 PTX 旁附带 SASS fatbin，并需要 CUDA 13 驱动（R580 或更新版本）。上表描述的是已发布的发行版。
 
 另有实验性的 GB10 目标，通过 [GB10 Docker 流水线](#gb10--dgx-spark-构建容器实验性)生成 `linux-arm64-cuda13-GB10` 的 CLI 与 Server.Host 归档。目前还没有任何已发布的发行版包含它（v3.3.0.0 至 v2026.09.01 只有上面五种后缀）；请查看具体发行版的资产，不要假定其中包含它。
 

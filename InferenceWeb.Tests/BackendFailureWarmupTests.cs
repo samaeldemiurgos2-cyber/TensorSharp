@@ -90,6 +90,38 @@ public sealed class BackendFailureWarmupTests : IDisposable
     }
 
     [Fact]
+    public void DistributedPrefillFailurePreservesTheOriginalExceptionWithoutResetting()
+    {
+        using var env = new EnvScope();
+        env.Set("TS_PREFILL_WARMUP", "1");
+        env.Set("TS_PREFILL_WARMUP_LEN", "4");
+        var group = new WarmupGroup();
+        var failure = new IOException("remote stage disconnected during prefill");
+        using var model = new DyingBackendModel(_path, group) { RefillFailure = failure };
+        Assert.Same(failure, Assert.Throws<IOException>(model.WarmUpKernels));
+        Assert.Same(failure, group.AbortFailure);
+        Assert.False(model.Failed);
+        Assert.Equal(1, model.Resets);
+    }
+
+    [Theory]
+    [InlineData(1, "prefill enabled", 0)]
+    [InlineData(2, "prefill token count", 1)]
+    public void DifferentDistributedWarmupSchedulesFailBeforeTheNextForward(int mismatchVote, string setting, int forwards)
+    {
+        using var env = new EnvScope();
+        env.Set("TS_PREFILL_WARMUP", "1");
+        env.Set("TS_PREFILL_WARMUP_LEN", "4");
+        var group = new WarmupGroup { MismatchVote = mismatchVote };
+        using var model = new DyingBackendModel(_path, group);
+        var failure = Assert.Throws<InvalidOperationException>(model.WarmUpKernels);
+        Assert.Contains("warmup settings differ", failure.Message);
+        Assert.Contains(setting, failure.Message);
+        Assert.Same(failure, group.AbortFailure);
+        Assert.Equal(forwards, model.Forwards);
+    }
+
+    [Fact]
     public void AForwardOnAnAlreadyDeadBackendNamesTheFailureWithoutRunning()
     {
         using var model = new DyingBackendModel(_path) { Failed = true };
@@ -160,7 +192,7 @@ public sealed class BackendFailureWarmupTests : IDisposable
         public const int VocabSize = 8;
         private readonly float[] _logits = new float[VocabSize];
 
-        public DyingBackendModel(string path) : base(path, BackendType.Cpu)
+        public DyingBackendModel(string path, ITensorParallelGroup group = null) : base(path, BackendType.Cpu, tpGroup: group)
         {
             Config = new ModelConfig { Architecture = "probe", VocabSize = VocabSize };
         }
@@ -171,6 +203,7 @@ public sealed class BackendFailureWarmupTests : IDisposable
         /// per-op op the dead backend refuses) or returns as if it succeeded.</summary>
         public bool ThrowsWhenDying { get; init; }
         public bool RefusesRefill { get; init; }
+        public Exception RefillFailure { get; init; }
         public bool Failed { get; set; }
         public string FailureText { get; init; } = OutOfMemory;
         public int Forwards { get; private set; }
@@ -185,6 +218,7 @@ public sealed class BackendFailureWarmupTests : IDisposable
         protected override float[] ForwardCore(int[] tokens)
         {
             Forwards++;
+            if (RefillFailure != null && tokens.Length > 1) throw RefillFailure;
             if (RefusesRefill && tokens.Length > 1)
                 throw new NotSupportedException("this model does not take a dummy refill");
             if (Forwards == DiesOnForward)
@@ -199,6 +233,32 @@ public sealed class BackendFailureWarmupTests : IDisposable
         }
 
         protected override void ResetKVCacheCore() => Resets++;
+    }
+
+    private sealed class WarmupGroup : ITensorParallelGroup, INestedTensorParallelGroup, IDistributedExecutionGroup
+    {
+        public Exception AbortFailure { get; private set; }
+        public int MismatchVote { get; init; }
+        private int _votes;
+        public int NodeCount => 2;
+        public int Degree => 1;
+        public int GlobalDegree => 2;
+        public int GlobalRankOffset => 0;
+        public bool IsActive => false;
+        public ITensorParallelGroup LocalGroup => this;
+        public IAllocator GetAllocator(int rank) => throw new NotSupportedException();
+        public void CrossNodeAllReduce(float[] buffer, int count)
+        {
+            for (int i = 0; i < count; i++) buffer[i] *= NodeCount;
+            if (++_votes == MismatchVote) buffer[0] = 1;
+        }
+        public void Abort(Exception failure) => AbortFailure = failure;
+        public void AllReduce(Tensor[] tensors) => throw new NotSupportedException();
+        public void BroadcastControl(int op, int[] payload) => throw new NotSupportedException();
+        public (int op, int[] payload) ReceiveControl() => throw new NotSupportedException();
+        public void Synchronize() { }
+        public void Barrier() { }
+        public void Dispose() { }
     }
 
     internal static void WriteProbeGguf(string path)

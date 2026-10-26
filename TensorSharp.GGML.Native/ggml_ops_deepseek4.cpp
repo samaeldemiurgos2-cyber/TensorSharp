@@ -35,6 +35,7 @@
 // skipping it everywhere is mathematically identical.
 // ---------------------------------------------------------------------------
 
+#include "ggml_ops_cuda_launch_policy.h"
 #include "ggml_ops_internal.h"
 #include "ggml_ops_dsv4_fused.h"
 #include "ggml_ops_matmul_precision.h"
@@ -54,6 +55,8 @@
 #include "dsv4_exact_read.h"
 #include "ggml_ops_deepseek41_vision.h"
 #include "ggml_ops_deepseek41_tp.h"
+#include "ggml_ops_layer_pipeline.h"
+#include "layer_partition.h"
 #if defined(TSG_GGML_TEST_HOOKS)
 #include "ggml-impl.h"
 #endif
@@ -499,6 +502,7 @@ struct graph_build_result
     ggml_backend_sched_t sched = nullptr;   // owned; keeps this graph's allocation alive
     graph_inputs inp;
     ggml_tensor * logits = nullptr;
+    std::vector<ggml_tensor *> pipeline_in, pipeline_out;
     ggml_tensor * ds_toks = nullptr;    // I32 [block] drafted ids
     ggml_tensor * ds_conf = nullptr;    // F32 [block] acceptance probabilities
     bool all_logits = false;            // logits for every row (speculative verify)
@@ -558,6 +562,17 @@ struct dsv41_vision_attachment
 struct dsv4_model
 {
     dsv4_hparams hp;
+    tsg_layer_pipeline::channel pipeline;
+    int layer_begin = 0, layer_end = 0;
+    bool owns_layer(int il) const { return !pipeline.active() || (il >= layer_begin && il < layer_end); }
+    bool cache_crosses(int source, int boundary) const {
+        if (source >= boundary) return false;
+        int end = hp.n_layer;
+        for (int next : hp.kv_sources) if (next > source) end = std::min(end, next);
+        for (int il = boundary; il < end; ++il) if (hp.compress_ratios[il] != 0) return true;
+        return false;
+    }
+    ggml_context * remote_weights = nullptr; // metadata only; never allocated or uploaded
     tsg_dsv41::engram_data engram;
     std::unique_ptr<tsg_dsv41::engram_io_pool> engram_io;
     // Engram tables live on the GPU that owns their layer and are gathered by
@@ -722,6 +737,7 @@ struct dsv4_model
         moe_tp.reset();
         vision.reset();
         slots.clear();   // slot buffers must go before the backends below
+        if (remote_weights) ggml_free(remote_weights);
         for (int i = 0; i <= MAX_GPUS; i++)
         {
             if (c_buf[i]) ggml_backend_buffer_free(c_buf[i]);
@@ -895,7 +911,13 @@ static ggml_tensor * dsv4_create_weight(
         return nullptr;
     }
     const tensor_source & src = it->second;
-    ggml_tensor * t = ggml_new_tensor_4d(m.w_ctx[device], src.type, src.ne[0], src.ne[1], src.ne[2], src.ne[3]);
+    int layer = -1;
+    const bool block = sscanf(name, "blk.%d.", &layer) == 1;
+    const bool remote = m.pipeline.active() && (block ? !m.owns_layer(layer)
+        : strcmp(name, "token_embd.weight") == 0 ? m.pipeline.node != 0
+        : m.pipeline.node != m.pipeline.nodes - 1);
+    ggml_tensor * t = ggml_new_tensor_4d(remote ? m.remote_weights : m.w_ctx[device],
+        src.type, src.ne[0], src.ne[1], src.ne[2], src.ne[3]);
     ggml_set_name(t, name);
     return t;
 }
@@ -1512,6 +1534,7 @@ static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
         size_t accepted = 0, unsupported = 0, skipped = 0, failed = 0;
         for (const auto & layout : model_ptr->engram.layers)
         {
+            if (!model_ptr->owns_layer(layout.id)) continue;
             const auto * table = model_ptr->layers[layout.id].engram_embd;
             const auto found = std::find(model_ptr->mmap_bufs.begin(), model_ptr->mmap_bufs.end(), table->buffer);
             if (!table->buffer || found == model_ptr->mmap_bufs.end()) { ++skipped; continue; }
@@ -1550,7 +1573,14 @@ static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
     if (warm_mode != 0)
     {
         size_t bytes = 0;
-        for (const auto & layout : m->engram.layers) bytes += ggml_nbytes(m->layers[layout.id].engram_embd);
+        for (const auto & layout : m->engram.layers)
+            if (m->owns_layer(layout.id)) bytes += ggml_nbytes(m->layers[layout.id].engram_embd);
+        if (bytes == 0)
+        {
+            fprintf(stderr, "[dsv41] Engram warming: this node owns no host table bytes\n");
+            apply_engram_advice();
+            return true;
+        }
         const size_t headroom = (size_t) 8 * 1024 * 1024 * 1024;
         const size_t allowance = dsv4_host_mem_allowance();
         const size_t resident = std::max(bytes, m->mmap_weight_bytes);
@@ -1578,6 +1608,7 @@ static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
         {
             for (const auto & layout : m->engram.layers)
             {
+                if (!m->owns_layer(layout.id)) continue;
                 tsg_dsv4::file_warm_range range;
                 if (dsv4_mapped_file_range(*m, m->layers[layout.id].engram_embd, range)) table_ranges.push_back(range);
             }
@@ -1616,6 +1647,7 @@ static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
                 bytes / 1073741824.0, m->engram_io->threads());
             for (const auto & layout : m->engram.layers)
             {
+                if (!m->owns_layer(layout.id)) continue;
                 auto * table = m->layers[layout.id].engram_embd;
                 m->engram_io->warm(table->data, ggml_nbytes(table));
             }
@@ -1631,6 +1663,7 @@ static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
             std::vector<std::pair<void *, size_t>> ranges;
             for (const auto & layout : m->engram.layers)
             {
+                if (!m->owns_layer(layout.id)) continue;
                 auto * table = m->layers[layout.id].engram_embd;
                 ranges.emplace_back(table->data, ggml_nbytes(table));
             }
@@ -1825,6 +1858,18 @@ static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
         ggml_context * ctx = slot->ctx[d];
 
         const int64_t head = hp.n_embd_head;
+        if (!m.owns_layer(il))
+        {
+            // Preserve only shared compressed state produced by a preceding
+            // node. Remote layers have no local raw KV or compressor state.
+            if (hp.v41 && m.cache_crosses(il, m.layer_begin) && m.layers[il].kv_source == il)
+            {
+                const int64_t rows = ratio == 2 ? m.n_csa_rows : m.n_hca_rows;
+                C.csa_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head, rows);
+                C.lid_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.indexer_head_size, rows);
+            }
+            continue;
+        }
         C.raw_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head, m.ring_raw);
         ggml_format_name(C.raw_k, "cache_raw_k.%d.%d", slot->id, il);
         // State rings carry one extra row (index state_size) that stays
@@ -2251,13 +2296,38 @@ static bool dsv4_backend_matches(const char * reg_name, const char * want)
 
 static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubatch, int n_threads,
                               const char * dspark_path, int n_cpu_moe_req, const char * backend_name,
-                              int tp_ranks)
+                              int tp_ranks, int tp_global_ranks = 0, int tp_rank_offset = 0,
+                              tsg_dsv41_tp::cross_node_all_reduce cross_node = nullptr, void * cross_node_user = nullptr,
+                              int pipeline_node = 0, int pipeline_nodes = 1,
+                              tsg_layer_pipeline::transfer pipeline_transfer = nullptr, void * pipeline_user = nullptr)
 {
     auto t_start = std::chrono::steady_clock::now();
-    if (tp_ranks < 0 || tp_ranks == 1 || tp_ranks > 8)
-        throw std::runtime_error("DeepSeek V4.1 tensor parallelism requires 0 (disabled) or 2..8 ranks");
+    const bool distributed_tp = cross_node != nullptr;
+    if (!tp_global_ranks) tp_global_ranks = tp_ranks;
+    if (tp_ranks < 0 || (!distributed_tp && tp_ranks == 1) || tp_ranks > 8 ||
+        (distributed_tp && (tp_ranks < 1 || tp_global_ranks <= tp_ranks || tp_global_ranks > 16 ||
+            tp_rank_offset < 0 || tp_rank_offset > tp_global_ranks - tp_ranks)) ||
+        (!distributed_tp && (tp_global_ranks != tp_ranks || tp_rank_offset != 0)))
+        throw std::runtime_error("DeepSeek V4.1 tensor parallelism requires 2..8 local ranks, or 1..8 local / 2..16 global distributed ranks");
+    if (distributed_tp && dspark_path && *dspark_path)
+        throw std::runtime_error("Distributed DeepSeek V4.1 TP does not support DSpark control operations");
+    if (distributed_tp && n_cpu_moe_req < 0)
+        throw std::runtime_error("Distributed DeepSeek V4.1 TP requires an explicit CPU-MoE layer count shared by every node");
+    // Automatic per-node memory choices can produce different collective
+    // shapes. Distributed ranks use a common deterministic width instead.
+    if (distributed_tp && n_ubatch <= 0) n_ubatch = 256;
 
     std::unique_ptr<dsv4_model> m(new dsv4_model());
+    if (pipeline_transfer)
+    {
+        if (pipeline_nodes < 2 || pipeline_node < 0 || pipeline_node >= pipeline_nodes || tp_ranks || dspark_path)
+            throw std::runtime_error("Invalid distributed layer topology or incompatible tensor parallel / DSpark request");
+        m->pipeline.node = pipeline_node;
+        m->pipeline.nodes = pipeline_nodes;
+        m->pipeline.exchange = pipeline_transfer;
+        m->pipeline.user = pipeline_user;
+        if (n_ubatch <= 0) n_ubatch = 256;
+    }
     bool engram_random_advice = false, engram_random_override = false;
 
     // --- backends ---
@@ -2267,6 +2337,8 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     // Vulkan path was never exercised at all.
     int n_gpu = 0;
     const bool cpu_only = backend_name && (strcmp(backend_name, "CPU") == 0 || strcmp(backend_name, "cpu") == 0);
+    if (!cpu_only && !tsg::configure_cuda_launch_policy())
+        throw std::runtime_error("Failed to configure the CUDA launch policy");
     if (cpu_only)
     {
         // One logical device reuses the scheduler and placement code while
@@ -2479,11 +2551,19 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                     rn ? rn : "selected");
         }
     }
-    if (tp_ranks && (!hp.v41 || cpu_only || tp_ranks < 2 || tp_ranks != n_gpu))
-        throw std::runtime_error("DeepSeek tensor parallelism requires deepseek41 and must equal its selected GPU count (2..8)");
+    if (tp_ranks && (!hp.v41 || cpu_only || (!distributed_tp && tp_ranks < 2) || tp_ranks != n_gpu))
+        throw std::runtime_error("DeepSeek tensor parallelism requires deepseek41 and must equal its selected local GPU count");
     auto key = [&](const char * suffix) { return arch + "." + suffix; };
     bool ok = true;
     ok &= gguf_get_u32_key(g0, key("block_count").c_str(), &hp.n_layer);
+    m->layer_end = hp.n_layer;
+    if (m->pipeline.active())
+    {
+        if (n_gpu_req > 0 && n_gpu != n_gpu_req)
+            throw std::runtime_error("Distributed layer split requires every selected local device to be available");
+        if ((int64_t) hp.n_layer < (int64_t) pipeline_nodes * n_gpu)
+            throw std::runtime_error("Distributed layer split requires at least one layer per selected device");
+    }
     ok &= gguf_get_u32_key(g0, key("embedding_length").c_str(), &hp.n_embd);
     ok &= gguf_get_u32_key(g0, key("attention.head_count").c_str(), &hp.n_head);
     ok &= gguf_get_u32_key(g0, key("attention.key_length").c_str(), &hp.n_embd_head);
@@ -2674,7 +2754,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     // on the split: counted as root bytes it pushes whole layers onto the
     // earlier devices instead of overflowing the last one.
     root_bytes += dspark_bytes;
-    const size_t head_bytes = root_bytes - embd_bytes;
+    size_t head_bytes = root_bytes - embd_bytes;
 
     // --- geometry ---
     m->n_ctx = n_ctx > 0 ? n_ctx : 16384;
@@ -2739,6 +2819,49 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     cache_geometry.csa_ratio = CSA_RATIO;
     cache_geometry.hca_ratio = HCA_RATIO;
 
+    if (m->pipeline.active())
+    {
+        // Balance resident bytes before discarding other nodes' weights. Equal
+        // layer counts can overflow the final node because it also owns the
+        // output head. The model metadata, common options and cache geometry
+        // are deterministic on every node; free memory never changes the cut.
+        std::vector<size_t> resident((size_t) hp.n_layer), fixed((size_t) pipeline_nodes, 0);
+        std::vector<size_t> replicas((size_t) hp.n_layer, 0);
+        fixed.front() = embd_bytes;
+        fixed.back() = tsg_layer_partition::checked_add(fixed.back(), head_bytes);
+        const char * engram_option = getenv("TS_DSV41_ENGRAM_DEVICE");
+        const bool forced_engram = !cpu_only && engram_option && strcmp(engram_option, "1") == 0;
+        const int64_t ring = tsg_dsv4_plan::ring_rows(hp.n_swa, m->n_ubatch);
+        for (int il = 0; il < hp.n_layer; ++il)
+        {
+            size_t bytes = layer_bytes[il];
+            if (il < n_cpu_moe_req) bytes -= layer_exps_bytes[il];
+            // Automatic Engram placement is opportunistic, after ordinary
+            // weights fit; host-mapped tables do not consume device capacity.
+            if (forced_engram) bytes = tsg_layer_partition::checked_add(bytes, layer_engram_bytes[il]);
+            resident[il] = tsg_layer_partition::checked_add(bytes,
+                tsg_dsv4_plan::layer_cache_bytes(cache_geometry, il, ring));
+            if (hp.v41)
+                for (int source : hp.kv_sources)
+                    if (m->cache_crosses(source, il))
+                        replicas[il] = tsg_layer_partition::checked_add(replicas[il],
+                            (size_t) (hp.n_embd_head + hp.indexer_head_size) *
+                            (hp.compress_ratios[source] == 2 ? m->n_csa_rows : m->n_hca_rows) * sizeof(ggml_fp16_t));
+        }
+        const auto partition = tsg_layer_partition::balance(resident, fixed, n_gpu, replicas);
+        m->layer_begin = partition.boundaries[pipeline_node];
+        m->layer_end = partition.boundaries[pipeline_node + 1];
+        fprintf(stderr, "[dsv4] distributed byte-balanced layer split: node %d/%d owns layers %d..%d, "
+                        "estimated resident %.1f MiB (maximum node %.1f MiB)\n",
+            pipeline_node, pipeline_nodes, m->layer_begin, m->layer_end - 1,
+            partition.resident[pipeline_node] / (1024.0 * 1024.0), partition.peak / (1024.0 * 1024.0));
+        if (pipeline_node != 0) embd_bytes = 0;
+        if (pipeline_node != pipeline_nodes - 1) head_bytes = 0;
+        root_bytes = embd_bytes + head_bytes;
+        for (int il = 0; il < hp.n_layer; ++il)
+            if (!m->owns_layer(il)) layer_bytes[il] = layer_exps_bytes[il] = layer_engram_bytes[il] = 0;
+    }
+
     // --- per-device VRAM budget -------------------------------------------
     // Free VRAM now, minus what the graph itself needs at run time (the
     // scheduler's compute buffers, which are sized from the largest ubatch
@@ -2793,13 +2916,13 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 const auto & gate = sources.at(prefix + "ffn_gate_exps.weight");
                 const auto & up = sources.at(prefix + "ffn_up_exps.weight");
                 const auto & down = sources.at(prefix + "ffn_down_exps.weight");
-                const auto strips = tsg_dsv41_tp::split_weights(down.ne[0], down.type, tp_ranks, il);
-                const auto output_strips = tsg_dsv41_tp::split_outputs(down.ne[1], tp_ranks, il);
+                const auto strips = tsg_dsv41_tp::split_weights(down.ne[0], down.type, tp_global_ranks, il);
+                const auto output_strips = tsg_dsv41_tp::split_outputs(down.ne[1], tp_global_ranks, il);
                 for (int d = 0; d < tp_ranks; ++d)
-                    tp_bytes[il][d] = strips[d].count *
+                    tp_bytes[il][d] = strips[tp_rank_offset + d].count *
                         (ggml_row_size(gate.type, gate.ne[0]) * gate.ne[2] +
                          ggml_row_size(up.type, up.ne[0]) * up.ne[2]) +
-                        ggml_row_size(down.type, down.ne[0]) * output_strips[d].count * down.ne[2];
+                        ggml_row_size(down.type, down.ne[0]) * output_strips[tp_rank_offset + d].count * down.ne[2];
             }
         }
         std::vector<size_t> fixed_bytes((size_t) n_gpu, 0);
@@ -2876,10 +2999,16 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             c.layer_engram_bytes = layer_engram_bytes;
             c.layer_cache_bytes.resize((size_t) hp.n_layer);
             for (int il = 0; il < hp.n_layer; ++il)
-                c.layer_cache_bytes[(size_t) il] = tsg_dsv4_plan::layer_cache_bytes(cache_geometry, il, ring);
+                c.layer_cache_bytes[(size_t) il] = m->owns_layer(il)
+                    ? tsg_dsv4_plan::layer_cache_bytes(cache_geometry, il, ring) : 0;
             c.tp_bytes = tp_bytes;
             c.tp_ranks = tp_ranks;
             c.fixed_bytes = fixed_bytes;
+            if (m->pipeline.active() && hp.v41)
+                for (int source : hp.kv_sources)
+                    if (m->cache_crosses(source, m->layer_begin))
+                        c.fixed_bytes[0] += (size_t) (hp.n_embd_head + hp.indexer_head_size) *
+                            (hp.compress_ratios[source] == 2 ? m->n_csa_rows : m->n_hca_rows) * sizeof(ggml_fp16_t);
             if (m->ds.loaded)
                 c.fixed_bytes[(size_t) m->output_device()] += (size_t) m->ds.n_stages *
                     ((size_t) hp.n_embd_head * ring * sizeof(ggml_fp16_t) + 256) * (m->rewind_cp ? 2 : 1);
@@ -3024,7 +3153,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             return nullptr;
         }
         for (int il = 0; il < hp.n_layer; il++)
-            m->layers[il].device = devs[il];
+            m->layers[il].device = m->owns_layer(il) ? devs[il] : 0;
 
         for (int il = 0; il < n_cpu_moe && il < hp.n_layer; il++)
             m->layers[il].cpu_moe = true;
@@ -3046,6 +3175,12 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     }
 
     // --- create weight contexts ---
+    if (m->pipeline.active())
+    {
+        ggml_init_params wp = { (size_t) (hp.n_layer * 80 + 128) * ggml_tensor_overhead(), nullptr, true };
+        m->remote_weights = ggml_init(wp);
+        if (!m->remote_weights) throw std::runtime_error("Cannot allocate remote layer metadata");
+    }
     for (int d = 0; d <= n_gpu; d++)
     {
         ggml_init_params wp = { (size_t) 4096 * ggml_tensor_overhead(), nullptr, true };
@@ -3062,9 +3197,11 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         std::vector<ggml_backend_dev_t> devices;
         for (int d = 0; d < tp_ranks; ++d) devices.push_back(ggml_backend_get_device(m->backends[d]));
         m->moe_tp = std::make_unique<tsg_dsv41_tp::executor>(devices, hp.n_expert_used,
-            dsv4_warm_pread() ? dsv4_load_thread_count() : 0);
-        fprintf(stderr, "[dsv41] routed-MoE tensor parallelism: %d ranks, sharded gate/up/down weights; "
-                "attention and shared experts use layer placement; exact F32 activation/output gathers\n", tp_ranks);
+            dsv4_warm_pread() ? dsv4_load_thread_count() : 0,
+            tp_global_ranks, tp_rank_offset, cross_node, cross_node_user);
+        fprintf(stderr, "[dsv41] routed-MoE tensor parallelism: %d local / %d global ranks, offset %d; sharded gate/up/down weights; "
+                "attention and shared experts use local layer placement; exact F32 activation/output gathers%s\n",
+                tp_ranks, tp_global_ranks, tp_rank_offset, distributed_tp ? " through the existing cross-node transport" : "");
         // The strip uploads read every routed expert through the page cache and
         // never read it again, while the host-mapped Engram tables are read
         // after them and on every token. Same rule as the ordinary upload (see
@@ -3445,7 +3582,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             for (int il = 0; il < hp.n_layer; ++il)
             {
                 const auto & L = m->layers[il];
-                if (L.kv_source >= 0 && L.device < n_gpu && L.device != m->layers[L.kv_source].device)
+                if (m->owns_layer(il) && L.kv_source >= 0 && L.device < n_gpu && L.device != m->layers[L.kv_source].device)
                     m->layers[L.kv_source].mirror_devices |= 1u << L.device;
             }
             for (int il = 0; il < hp.n_layer; ++il)
@@ -3478,7 +3615,13 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             if (m->ds.loaded) layout.drafter_targets.assign(m->ds.target_layers.begin(), m->ds.target_layers.end());
             std::string reason;
             const int first = tsg_dsv41_yoco::replay_layer(layout, reason);
-            if (setting.keep == 0)
+            if (m->pipeline.active())
+            {
+                if (setting.explicit_value && setting.keep != 0)
+                    throw std::runtime_error("Distributed layer split requires exact prefill: use TS_DSV41_YOCO_KEEP=0");
+                fprintf(stderr, "[dsv41] distributed layer split uses exact prefill (YOCO replay disabled)\n");
+            }
+            else if (setting.keep == 0)
                 fprintf(stderr, "[dsv41] YOCO bounded replay: off (TS_DSV41_YOCO_KEEP=0); every layer runs over every "
                         "position\n");
             else if (first < 0 && setting.explicit_value)
@@ -3659,7 +3802,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         {
             int first = -1, last = -1, count = 0;
             for (int il = 0; il < hp.n_layer; il++)
-                if (m->layers[il].device == d) { if (first < 0) first = il; last = il; count++; }
+                if (m->owns_layer(il) && m->layers[il].device == d) { if (first < 0) first = il; last = il; count++; }
             size_t free_b = 0, total_b = 0;
             ggml_backend_dev_memory(ggml_backend_get_device(m->backends[d]), &free_b, &total_b);
             if (m->moe_tp)
@@ -5213,6 +5356,7 @@ struct graph_builder
     }
 
 #include "ggml_ops_deepseek41.inc"
+#include "ggml_ops_deepseek_layer_pipeline.inc"
 
     // ---- batched multi-slot decode ----
     //
@@ -5687,7 +5831,7 @@ struct graph_builder
 
         // devices that host at least one layer
         bool dev_used[MAX_GPUS + 1] = {};
-        for (int il = 0; il < hp.n_layer; il++) dev_used[m.layers[il].device] = true;
+        for (int il = m.layer_begin; il < m.layer_end; il++) dev_used[m.layers[il].device] = true;
         dev_used[m.input_device()] = true;
         if (m.ds.loaded) dev_used[m.ds.dev] = true;
         const int dev_last = m.output_device();
@@ -5776,6 +5920,7 @@ struct graph_builder
             inp.engram_rows = new_input_i32(hp.hc_mult, "engram_stream_rows", m.layers[m.engram.layers[0].id].device);
             for (size_t e = 0; e < m.engram.layers.size(); ++e)
             {
+                if (!m.owns_layer(m.engram.layers[e].id)) continue;
                 const int dev = m.layers[m.engram.layers[e].id].device;
                 if (m.engram_on_device)
                 {
@@ -5797,8 +5942,12 @@ struct graph_builder
         const int64_t hc = hp.hc_mult;
         ggml_tensor * delayed_pre = nullptr;
 
-        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.input_device()]);   // [n_embd, nt]
-        pin(emb, m.input_device());
+        ggml_tensor * emb = nullptr;
+        if (!m.pipeline.active() || m.pipeline.node == 0)
+        {
+            emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.input_device()]);
+            pin(emb, m.input_device());
+        }
         if (res.image_tokens)
         {
             const int dev = m.input_device();
@@ -5810,15 +5959,21 @@ struct graph_builder
             emb = ggml_set_rows(ctx, emb, inp.image_embeddings, inp.image_indices);
             pin(emb, dev);
         }
-        ggml_tensor * inpL = ggml_reshape_3d(ctx, emb, hp.n_embd, 1, nt);
-        inpL = ggml_repeat_4d(ctx, inpL, hp.n_embd, hc, nt, 1);
+        ggml_tensor * inpL = nullptr;
+        if (m.pipeline.active() && m.pipeline.node > 0)
+            pipeline_begin(inpL, delayed_pre);
+        else
+        {
+            inpL = ggml_reshape_3d(ctx, emb, hp.n_embd, 1, nt);
+            inpL = ggml_repeat_4d(ctx, inpL, hp.n_embd, hc, nt, 1);
+        }
 
         std::vector<ggml_tensor *> ds_feats;
         // YOCO with no kept token in this ubatch: the graph ends after the
         // replay layer's cache writes; a later ubatch of the call has the tail.
         bool yoco_ended = false;
 
-        for (int il = 0; il < hp.n_layer; il++)
+        for (int il = m.layer_begin; il < m.layer_end; il++)
         {
             const dsv4_layer & L = m.layers[il];
             const int dev = L.device;
@@ -5899,7 +6054,9 @@ struct graph_builder
             }
         }
 
-        if (!yoco_ended)
+        if (m.pipeline.active() && m.pipeline.node < m.pipeline.nodes - 1)
+            pipeline_end(inpL, delayed_pre);
+        else if (!yoco_ended)
         {
             if (m.ds.loaded && ds_feats.size() == m.ds.target_layers.size())
                 build_dspark_ring_update(ds_feats, inp.pos[m.ds.dev], inp.raw_idxs[m.ds.dev]);
@@ -6350,6 +6507,7 @@ static void dsv41_stage_engram(dsv4_model & m, graph_build_result & res, const i
         // dequantize happen on the device that owns the table.
         for (size_t e = 0; e < m.engram.layers.size(); ++e)
         {
+            if (!m.owns_layer(m.engram.layers[e].id)) continue;
             const auto * table = m.layers[m.engram.layers[e].id].engram_embd;
             const int32_t * ids = hashes + e * n_rows;
             for (size_t i = 0; i < n_rows; ++i)
@@ -6374,6 +6532,11 @@ static void dsv41_stage_engram(dsv4_model & m, graph_build_result & res, const i
     reads.reserve(m.engram.layers.size());
     for (size_t e = 0; e < m.engram.layers.size(); ++e)
     {
+        if (!m.owns_layer(m.engram.layers[e].id))
+        {
+            reads.emplace_back([](size_t) {});
+            continue;
+        }
         auto * table = m.layers[m.engram.layers[e].id].engram_embd;
         if (!table->data || !ggml_backend_buffer_is_host(table->buffer))
             throw std::runtime_error("V4.1 Engram lookup requires a host-resident table");
@@ -6401,9 +6564,12 @@ static void dsv41_stage_engram(dsv4_model & m, graph_build_result & res, const i
         });
         // run() drains all workers before uploads or staging-buffer reuse.
         for (size_t e = first; e < first + count; ++e)
-            ggml_backend_tensor_set(res.inp.engram[e], rows[e % group_size].data(), 0, table_bytes);
+            if (res.inp.engram[e])
+                ggml_backend_tensor_set(res.inp.engram[e], rows[e % group_size].data(), 0, table_bytes);
     }
 }
+
+#include "ggml_ops_deepseek_layer_transfer.inc"
 
 static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t nt, int64_t p0, bool want_logits, float * logits_out,
                                 bool all_logits = false, const uint8_t * image_mask = nullptr,
@@ -6426,12 +6592,13 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
     // second-device layers. Adjacent chunks are forced onto alternating cache
     // entries (chunk-parity in the signature) so each entry's input tensors
     // are private to in-flight work; reuse waits on the entry's use_events.
-    const bool pipeline = !hp.v41 && !want_logits && m.n_gpu > 1;
+    const bool pipeline = !m.pipeline.active() && !hp.v41 && !want_logits && m.n_gpu > 1;
 
     bool reuse = false;
     graph_build_result * res_p = dsv4_acquire_graph(m, nt, p0, pipeline, &reuse, all_logits, image_tokens);
     if (!res_p) return false;
     graph_build_result & res = *res_p;
+    res.p0 = p0;
 
     auto t_build = now();
     auto t_alloc = now();
@@ -6628,6 +6795,8 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
         dsv41_stage_engram(m, res, hashes.data(), nt, image_mask, image_tokens);
     }
     auto t_inputs = now();
+    if (m.pipeline.active() && m.pipeline.node > 0)
+        dsv4_pipeline_boundary(m, res, false);
 
     // Both architectures can have partially written cache tensors once a
     // graph is submitted, including a non-final asynchronous V4 microbatch.
@@ -6671,9 +6840,20 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
 #endif
     auto t_compute = now();
 
+    if (m.pipeline.active() && m.pipeline.node < m.pipeline.nodes - 1)
+        dsv4_pipeline_boundary(m, res, true);
+
     if (want_logits && logits_out)
-        ggml_backend_tensor_get(res.logits, logits_out, 0,
-                                (size_t) (all_logits ? nt : 1) * hp.n_vocab * sizeof(float));
+    {
+        const size_t bytes = (size_t) (all_logits ? nt : 1) * hp.n_vocab * sizeof(float);
+        if (!m.pipeline.active() || m.pipeline.node == m.pipeline.nodes - 1)
+        {
+            ggml_backend_tensor_get(res.logits, logits_out, 0, bytes);
+            if (m.pipeline.active()) m.pipeline.move(0, true, logits_out, bytes);
+        }
+        else if (m.pipeline.node == 0) m.pipeline.move(m.pipeline.nodes - 1, false, logits_out, bytes);
+        else memset(logits_out, 0, bytes);
+    }
 
     if (perf >= 2)
     {
@@ -7231,6 +7411,44 @@ TSG_EXPORT void * TSGgml_Dsv4LoadModel(const char * gguf_path, int n_gpu, int n_
     }
 }
 
+// Uses the same native TP executor and the application's existing distributed
+// group. The callback is retained by that model until this handle is freed.
+TSG_EXPORT void * TSGgml_Dsv4LoadModelDistributed(const char * gguf_path, int n_gpu, int n_ctx,
+    int n_ubatch, int n_threads, int n_cpu_moe, const char * backend_name,
+    int global_ranks, int rank_offset, tsg_dsv41_tp::cross_node_all_reduce cross_node, void * cross_node_user)
+{
+    tsg::clear_last_error();
+    try
+    {
+        if (!cross_node) throw std::runtime_error("Distributed DeepSeek V4.1 TP needs a cross-node collective");
+        return tsg_dsv4::dsv4_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, nullptr,
+            n_cpu_moe, backend_name, n_gpu, global_ranks, rank_offset, cross_node, cross_node_user);
+    }
+    catch (const std::exception & e)
+    {
+        tsg::report_load_refusal("[dsv41-tp] distributed load failed: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+TSG_EXPORT void * TSGgml_Dsv4LoadModelLayerDistributed(const char * gguf_path, int n_gpu, int n_ctx,
+    int n_ubatch, int n_threads, int n_cpu_moe, const char * backend_name,
+    int node, int nodes, tsg_layer_pipeline::transfer exchange, void * user)
+{
+    tsg::clear_last_error();
+    try
+    {
+        if (!exchange) throw std::runtime_error("Distributed layer split requires a stage transport");
+        return tsg_dsv4::dsv4_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, nullptr,
+            n_cpu_moe, backend_name, 0, 0, 0, nullptr, nullptr, node, nodes, exchange, user);
+    }
+    catch (const std::exception & e)
+    {
+        tsg::report_load_refusal("[dsv4-layer] distributed load failed: %s\n", e.what());
+        return nullptr;
+    }
+}
+
 TSG_EXPORT int TSGgml_Dsv4VocabSize(void * handle)
 {
     if (!handle) return 0;
@@ -7304,7 +7522,7 @@ TSG_TEST_EXPORT int TSGgml_Dsv4TestLayerDevice(void * handle, int layer)
 {
     auto * m = static_cast<tsg_dsv4::dsv4_model *>(handle);
     if (!m || layer < 0 || layer >= m->hp.n_layer) return -1;
-    return m->layers[layer].device;
+    return m->owns_layer(layer) ? m->layers[layer].device : -1;
 }
 
 // Read the allocated weights, graph and drafter ring, not only planner intent.
@@ -7716,7 +7934,7 @@ TSG_EXPORT int TSGgml_Dsv4ForwardBatchedDecode(
     auto * m = (tsg_dsv4::dsv4_model *) handle;
     // The multi-slot graph has no DSpark feature-ring writes. Preserve each
     // request's target/draft state by taking the per-slot path when attached.
-    if (!m->fused || m->ds.loaded) return -2;
+    if (!m->fused || m->ds.loaded || m->pipeline.active()) return -2;
 
     tsg_dsv4::dsv4_slot * slots[tsg_dsv4::DSV4_MAX_BATCHED_SLOTS];
     for (int i = 0; i < n; i++)

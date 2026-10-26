@@ -345,7 +345,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 |---|---|
 | `--kv-cache-dtype <type>` | KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（默认：自动——由后端 / 模型决定；环境变量 `KV_CACHE_DTYPE`）。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径；DeepSeek V4 / V4.1 会在加载时拒绝它们（其执行器的 cache 固定为 F16，由自己的内核读取），显式的 `f32` 会按 `f16` 报告。 |
 | `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。不能与 `--layer-split` 组合；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
-| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。与 `--tp`、`--tp-node-id`、`--tp-peers` 互斥，仅限支持此模式的架构。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
+| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。支持的架构可配合 `--tp-node-id`、`--tp-peers` 跨节点运行；不能同时使用大于 1 的 `--tp`。详见[多节点推理](docs/multi-node-inference.md)。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
 | `--tp-node-id <N>` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `--tp-peers` 一起使用。 |
 | `--tp-peers <list>` | 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。所有节点必须使用完全相同的列表。必须与 `--tp-node-id` 一起使用。 |
 | `--interactive` / `-i` / `--chat` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
@@ -675,7 +675,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
 | `--urls <urls>` | 完整监听 URL（分号分隔），用于 `--port`/`--host` 表达不了的情形（HTTPS、同时绑定多个端点）。两者都给时以 `--port`/`--host` 为准；三者都不给时依次回退到 `PORT`/`HOST` 与 `ASPNETCORE_URLS`。 |
 | `--backend <type>` | 默认计算后端（macOS 上默认 `ggml_metal`，其他平台默认 `ggml_cpu`；省略且本机具备平台默认后端时不打印任何警告；平台默认后端缺失时，启动会警告 `The platform default backend 'X' is unavailable on this machine (available: …). Using 'Y' instead`；显式指定本机没有的后端会拒绝启动模型的加载（退出码 2），不带模型的服务端则警告并回退到可用后端）：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan` |
 | `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。不能与 `--layer-split` 组合；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
-| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。与 `--tp`、`--tp-node-id`、`--tp-peers` 互斥，仅限支持此模式的架构。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
+| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。支持的架构可配合 `--tp-node-id`、`--tp-peers` 跨节点运行；不能同时使用大于 1 的 `--tp`。详见[多节点推理](docs/multi-node-inference.md)。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
 | `--tp-node-id <N>` | 多节点（分布式）张量并行中本节点的 0 起始编号。服务端只能是节点 `0`（对外提供 HTTP 的 driver）；其余节点请用 `TensorSharp.Cli` 启动。必须与 `--tp-peers` 一起使用。环境变量：`TENSORSHARP_TP_NODE_ID`。 |
 | `--tp-peers <list>` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，按节点 ID 排序，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `--tp-node-id` 一起使用。环境变量：`TENSORSHARP_TP_PEERS`。 |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
@@ -847,7 +847,7 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 | `TENSORSHARP_PREFIX_CACHE_DIR` | 持久化共享前缀 checkpoint 的根目录（默认：`<binDir>/prefix-cache`，每个模型一个子目录）。仅服务端识别；`--no-prefix-cache` 会关闭持久化。 |
 | `TS_NO_MULTI_AGENT` | 任何非空且不为 `0` 的值都会关闭子智能体委派，等同于 `--no-multi-agent`。仅服务端识别。 |
 | `TENSORSHARP_TP_DEGREE` | 本地张量并行度（默认 `1`），等价于 `--tp N`，不能用于按层切分。不支持的架构或后端会报错。 |
-| `TENSORSHARP_LAYER_SPLIT_DEGREE` | 本地按层切分的 GPU 数，等价于 `--layer-split N`，与 TP 及分布式 TP 参数互斥。 |
+| `TENSORSHARP_LAYER_SPLIT_DEGREE` | 本地按层切分的 GPU 数，等价于 `--layer-split N`。可配合节点与 peer 参数跨节点运行；不能与大于 1 的 TP 度数组合。 |
 | `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next 的共享 GGML 按层执行器的设备序号，逗号分隔，例如 `0,2`；与 `TENSORSHARP_TP_DEVICES` 独立。原生 GLM/DeepSeek/MiniMax-M3.1 执行器请使用 `CUDA_VISIBLE_DEVICES`。 |
 | `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`；默认 `0..tp-1`）。用于 GGML 后端上的 TP。`ggml_cuda` 上 Muse Spark 与 MiniMax-M3.1 的原生 `--tp` 使用前 N 张 CUDA GPU，设置了该变量时会拒绝加载；请用 `CUDA_VISIBLE_DEVICES` 选择 GPU。 |
 | `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next（`qwen4exp`）多卡按层切分时每张 GPU 分到的层数（逗号分隔，例如 `20,28`），用于取代自动的显存均衡。给出无法满足的值时会直接抛错，而不是静默忽略。 |
@@ -881,7 +881,7 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 | `TS_SCHED_STOP_REPETITION` | `0` 允许陷入重复循环的生成继续跑到 token 上限，而不是被提前结束。 |
 | `TS_SCHED_DECODE_QUANTUM` | 在允许切换序列前的 token 数（默认与 block size 相同）。 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 保留多少个已结束会话的终态，使前缀完全一致的续写不必重新 prefill；仅对声明支持的模型有效（Gemma 4 的 K/V；Qwen 3.5/3.6 的注意力 K/V 加 GatedDeltaNet 递归状态）。每个都钉住一份完整的按请求续写状态（默认：运行中请求上限，至少 `4`；`0` 关闭保留）。 |
-| `TS_MM_EMBEDDING_CACHE_MB` | 图像/音频嵌入缓存的字节预算（默认 `512`）。条目以媒体内容（SHA-256）为键，因此 API 客户端每轮重发同一张图片只编码一次；超出预算后淘汰没有被进行中提示引用的最近最少使用条目。 |
+| `TS_MM_EMBEDDING_CACHE_MB` | 图像/音频嵌入缓存的字节预算（默认为主机内存的 1/64，限定在 512-4096 MB）。条目以媒体内容（SHA-256）为键，因此 API 客户端每轮重发同一张图片只编码一次；超出预算后淘汰没有被进行中提示引用的最近最少使用条目。 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | 在所有会话共享的那段提示词末尾——系统提示词、工具、技能——保留多少个模型状态 checkpoint（默认 `4`）；每个**新**会话从其中一个的副本开始，因此只需重新 prefill 自己的那条消息。适用于 GGML 后端上的 Gemma 4 与 Qwen 3.5 / 3.6 / 3.8-27B 系列，以及 Qwen 3.8 Flash Next；Qwen 模型在张量并行下不支持。一个提示在每个边界（系统指令、完整共享前缀）各发布一个；每个都持有该前缀的一份 K/V，Qwen 上还包括递归状态。`0` 关闭 checkpoint。 |
 | `TS_KV_INITIAL_TOKENS` | 缓存创建时（加载时的主缓存，以及每个按请求的 holder）在任何请求声明预算之前先分配多少 token 的 K/V。`0`（默认）沿用引擎策略：显式设置 `MAX_CONTEXT` 时取整个窗口，否则取后端默认值。缓存仍会按需增长，因此内存受限的设备应把它设小——每个保留的 holder 都要按这个大小付费，主机副本与设备镜像各一份。 |
 | `TS_KV_GENERATION_RESERVE_MAX` | 限制单个请求预先保留的 K/V 中属于生成的那部分（提示词 + `max_new_tokens`）。不设它时，回复长度上限达到或超过上下文窗口，就会让每个请求预留整个窗口。超过上限后缓存按需增长。`0`（默认）表示不限制。 |
@@ -1591,8 +1591,9 @@ CLI 与服务端使用不同参数明确选择运行模式：
   N 张本地 GPU，并通过集合通信归约结果。支持分布式的架构可再加
   `--tp-node-id` 与 `--tp-peers` 跨节点运行。
 - `--layer-split N` / `TENSORSHARP_LAYER_SPLIT_DEGREE=N` 将完整层分配到 N 张本地 GPU。
-  它增加模型容量；一个 token 仍顺序经过各层，因此不保证吞吐提升。此模式仅限单节点单进程，
-  尚不支持跨节点按层切分。
+  它增加模型容量；一个 token 仍顺序经过各层，因此不保证吞吐提升。支持分布式阶段执行器的架构可再加
+  `--tp-node-id` 与 `--tp-peers` 跨节点运行，N 为每个节点的本地 GPU 数。
+  DeepSeek V4.1 与 Mistral 3 的配置及限制见[多节点推理](docs/multi-node-inference.md)（英文）。
 
 两种模式互斥。不支持的模型、后端或模式组合会在启动时失败，不会改为另一种模式或静默回到单卡。
 旧命令如果用 `--tp N` 表示按层切分，需改成 `--layer-split N`。CPU 后端不能运行多 GPU 模式。
@@ -1693,7 +1694,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | MiniMax-M3.1 | ✅（仅本地）+ 按层切分 | GGML CUDA 上的 `--tp N`（2 到 16 张相同型号的 CUDA GPU）在上游 ggml 的 meta 后端上用前 N 张 CUDA GPU 运行原生整模型执行器（用 `CUDA_VISIBLE_DEVICES` 选择；`TENSORSHARP_TP_DEVICES` 会被拒绝）。由于只有四个 KV 头，注意力、稀疏注意力索引器以及 K/V/索引键缓存在每张 GPU 上镜像，因此每张 GPU 能容纳的上下文更少（八张 A40 上为 45,824 token）；稠密、路由与共享专家 FFN 沿隐藏维切分，每层一次 all-reduce。`--tp` 下拒绝：`--layer-split`、`--n-cpu-moe`、`--draft-model`、`TS_MINIMAX_M3_MSA=kernel`、分布式组以及非 CUDA 后端。长提示请用 `--layer-split N`（[卡片](docs/models/minimax-m3_zh-cn.md#张量并行)） |
 | GLM 5.x | ✅（仅本地） | 仅限 GGML GPU 后端；GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 的原生 TP 路径都只支持本地单进程（`--tp-node-id` / `--tp-peers` 对整个 GLM 家族都是硬拒绝）。GLM-5.2 切 MLA head 与每个路由专家内的隐藏行。GLM-5.3-Flash 还会切 KDA head 并让每个 rank 持有对应的递归状态；其 MLA head 与路由专家隐藏行同样切分。注意力局部输出会在每次非线性 Sinkhorn 超连接之前归约。在 GLM-5.3-Flash 满足条件的分段快路径上，路由 MoE 局部输出先归约，随后每个 rank 在本地计算并加入其复制的共享专家；超连接、池化 indexer、router、norm、稠密层与 embedding 也保持不切分并按 rank 执行，output norm / LM head 留在 rank 0。CPU MoE、tracing、部分 `TS_GLM_TP_SHARD` 切分、超额 rank 或缺少原生超连接内核时使用组合调度器回退，其中共享专家只在 rank 0 运行一次。GLM-5.3（非 Flash）同样以本地单进程的方式接受 `--tp N`，并在每个 rank 上复制 MLA 与 indexer cache，因此 `--tp` 会成倍放大 KV 占用；它在 `--tp N>1` 下从未被实际跑过——唯一有记录的算术是一个装不下的例子：`--tp 8` 每个 rank 需要 41.7 GiB，而卡只有 46 GB——因此它只是一个被接受的模式，而不是已验证的配置；另外在那里只要 `--tp N>1`，`--spec` 就会被拒绝。用 `--layer-split N` 选择整层放置 |
 | DeepSeek V4 Flash | 按层切分 | 不是张量并行：整模型执行器按每张卡的空闲显存把连续的整层装箱分配，`--layer-split N` 只限制这次切分用几张卡 |
-| DeepSeek V4.1 Flash | partial TP | `--layer-split N` 选择本地整层放置。GGML CUDA 上的实验性 routed-MoE TP 使用 `--tp N`；不支持注意力 TP 与分布式组。两种模式不能组合。 |
+| DeepSeek V4.1 Flash | partial TP + 按层切分 | GGML CUDA 上的 `--layer-split N` 选择整层放置，`--tp N` 选择路由 MoE 切分。两种模式均可配合节点与 peer 参数跨节点运行；TP 中的注意力保持不切分。详见[多节点配置与限制](docs/multi-node-inference.md)。 |
 | Hunyuan Dense | — | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
 | DiffusionGemma | — | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
 | Wan 2.1 / 2.2、MiniMax-H3 | — | 仅支持单设备：张量并行、按层切分和分布式组均在启动时被拒绝 |

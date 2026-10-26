@@ -928,7 +928,10 @@ namespace TensorSharp.Cli
             {
                 if (parallelism.Distributed is { } distributed)
                 {
-                    ModelBase.ValidateDistributedTensorParallelism(modelPath, backend);
+                    if (parallelism.IsLayerSplit)
+                        ModelBase.ValidateDistributedLayerSplit(modelPath, backend);
+                    else
+                        ModelBase.ValidateDistributedTensorParallelism(modelPath, backend);
                     if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
                         throw new ArgumentException("Distributed --tp requires cuda, ggml_cuda, or ggml_vulkan.");
                     var peerEndpoints = distributed.PeerEndpoints;
@@ -936,11 +939,14 @@ namespace TensorSharp.Cli
                     int localDegree = distributed.LocalDegree;
                     // The on-node group has to match the backend: direct CUDA drives
                     // CudaAllocators, the ggml backends drive per-rank ggml backends.
-                    tpGroup = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan
+                    tpGroup = parallelism.IsLayerSplit
+                        ? new TensorSharp.Distributed.DistributedLayerSplitGroup(
+                            ModelBase.CreateGgmlLocalLayerSplitGroup(backend, localDegree), tpNodeId, peerEndpoints)
+                        : backend is BackendType.GgmlCuda or BackendType.GgmlVulkan
                         ? new TensorSharp.Distributed.DistributedTensorParallelGroup(
                             ModelBase.CreateGgmlLocalTpGroup(backend, localDegree), tpNodeId, peerEndpoints)
                         : new TensorSharp.Distributed.DistributedTensorParallelGroup(localDegree, tpNodeId, peerEndpoints);
-                    tpDegree = localDegree;
+                    tpDegree = parallelism.IsLayerSplit ? 1 : localDegree;
                 }
 
                 createdModel = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath,

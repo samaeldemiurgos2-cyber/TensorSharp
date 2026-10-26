@@ -643,6 +643,125 @@ public class SpeculativeExecutionTests
         Assert.Empty(model.ProtocolViolations);
     }
 
+    // ----- batched (multi-sequence) steps: ProposeForBatch / CommitBatch -----
+
+    [Fact]
+    public void BatchedStep_PerfectDrafts_KeepsTheDrafterChainExact()
+    {
+        var model = new FakeSpeculativeModel { BlockDraftSize = 3 };
+        var exec = NewExec(model, maxDraftTokens: 3);
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        var drafts = new List<int>();
+        for (int step = 0; step < 3; step++)
+        {
+            Assert.Equal(3, exec.ProposeForBatch(lastToken, pos, kMax: 3, drafts));
+            int m = VerifyWindowLikeTheBatchedTrunk(model, lastToken, pos, drafts, window: 4,
+                out float[] features, out int next);
+            Assert.Equal(3, m);
+            exec.CommitBatch(lastToken, pos, drafts, m, features, 0, verifyTicks: 0);
+            pos += m + 1;
+            lastToken = next;
+            Assert.Equal(model.ExpectedNext(pos - 1), lastToken);
+            Assert.Equal(pos, model.CacheSeqLen);
+        }
+        Assert.Equal(3, exec.Stats.VerifySteps);
+        Assert.Equal(9, exec.Stats.TokensAccepted);
+        Assert.Equal(0, exec.Stats.RollbackSteps);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void BatchedStep_WrongDraft_KeepsThePrefixAndChainsFromTheLastKeptRow()
+    {
+        var model = new FakeSpeculativeModel { BlockDraftSize = 3 };
+        var exec = NewExec(model, maxDraftTokens: 3);
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        model.DraftWrongPositions.Add(pos + 1);
+
+        var drafts = new List<int>();
+        Assert.Equal(3, exec.ProposeForBatch(lastToken, pos, kMax: 3, drafts));
+        int m = VerifyWindowLikeTheBatchedTrunk(model, lastToken, pos, drafts, window: 4,
+            out float[] features, out int next);
+        Assert.Equal(1, m);
+        Assert.Equal(model.ExpectedNext(pos + 1), next);
+        exec.CommitBatch(lastToken, pos, drafts, m, features, 0, verifyTicks: 0);
+        Assert.Equal(pos + 2, model.CacheSeqLen);
+
+        // The next window chains from the last KEPT row, not the window's last row.
+        Assert.Equal(3, exec.ProposeForBatch(next, pos + 2, kMax: 3, drafts));
+        Assert.Equal(1, exec.Stats.RollbackSteps);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void BatchedStep_SeededContext_RidesItsFirstVerifyWithTheAnchorAlone()
+    {
+        // A fused holder arms over tokens a plain prefill committed: there is no
+        // carried row to draft from until one verify has tapped it.
+        var model = new FakeSpeculativeModel { BlockDraftSize = 3, ResumesAfterGap = true };
+        var exec = NewExec(model, maxDraftTokens: 3);
+        int[] prompt = Enumerable.Range(1, 5).ToArray();
+        int lastToken = Argmax(model.Forward(prompt));
+        exec.SeedCommitted(prompt);
+
+        var drafts = new List<int>();
+        Assert.Equal(0, exec.ProposeForBatch(lastToken, prompt.Length, kMax: 3, drafts));
+        int m = VerifyWindowLikeTheBatchedTrunk(model, lastToken, prompt.Length, drafts, window: 4,
+            out float[] features, out int next);
+        Assert.Equal(0, m);
+        exec.CommitBatch(lastToken, prompt.Length, drafts, m, features, 0, verifyTicks: 0);
+
+        Assert.Equal(3, exec.ProposeForBatch(next, prompt.Length + 1, kMax: 3, drafts));
+        Assert.Equal(1, exec.Stats.PlainSteps);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void BatchedStep_SeededContext_WithTheCarryOnDevice_DraftsOnItsFirstVerify()
+    {
+        // A drafter that reads every committed row's taps from the model's own state
+        // (the direct-CUDA Qwen engine) has no carry to capture: a context armed over a
+        // plain prefill drafts on its first verify instead of riding it with the anchor.
+        var model = new FakeSpeculativeModel { BlockDraftSize = 3, ResumesAfterGap = true, CarryOnDevice = true };
+        var exec = NewExec(model, maxDraftTokens: 3);
+        int[] prompt = Enumerable.Range(1, 5).ToArray();
+        int lastToken = Argmax(model.Forward(prompt));
+        exec.SeedCommitted(prompt);
+
+        var drafts = new List<int>();
+        Assert.Equal(3, exec.ProposeForBatch(lastToken, prompt.Length, kMax: 3, drafts));
+        int m = VerifyWindowLikeTheBatchedTrunk(model, lastToken, prompt.Length, drafts, window: 4,
+            out float[] features, out int next);
+        Assert.Equal(3, m);
+        exec.CommitBatch(lastToken, prompt.Length, drafts, m, features, 0, verifyTicks: 0);
+
+        Assert.Equal(model.ExpectedNext(prompt.Length + 3), next);
+        Assert.Equal(0, exec.Stats.PlainSteps);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    /// <summary>The trunk side of one batched verify for one fake sequence: forward
+    /// the padded window, read each row's argmax and taps, and keep only the anchor
+    /// plus the accepted drafts (what the batched commit advances).</summary>
+    private static int VerifyWindowLikeTheBatchedTrunk(FakeSpeculativeModel model, int lastToken, int position,
+        List<int> drafts, int window, out float[] features, out int nextToken)
+    {
+        var tokens = new int[window];
+        tokens[0] = lastToken;
+        for (int t = 1; t < window; t++)
+            tokens[t] = t - 1 < drafts.Count ? drafts[t - 1] : tokens[t - 1];
+        features = new float[window * HiddenSize];
+        var logits = new float[window * VocabSize];
+        model.SpecForward(tokens, features, logits, allLogitsRows: true);
+        int RowArgmax(int row) => Argmax(logits.AsSpan(row * VocabSize, VocabSize).ToArray());
+        int m = 0;
+        while (m < drafts.Count && RowArgmax(m) == drafts[m])
+            m++;
+        nextToken = RowArgmax(m);
+        model.SpecRewindCache(position + m + 1);
+        return m;
+    }
+
     private static SpeculativeExecution NewExec(FakeSpeculativeModel model, int maxDraftTokens,
         float? minDraftProb = null)
     {
@@ -1169,6 +1288,10 @@ public class SpeculativeExecutionTests
         /// (see <see cref="IDraftHead.DraftHeadResumesAfterGap"/>).</summary>
         public bool ResumesAfterGap { get; set; }
         public bool DraftHeadResumesAfterGap => ResumesAfterGap;
+        /// <summary>Whether the fake keeps the drafter's taps itself, so the carried and
+        /// caught-up rows are placeholders (see <see cref="ISpeculativeTarget.SpecCarryOnDevice"/>).</summary>
+        public bool CarryOnDevice { get; set; }
+        public bool SpecCarryOnDevice => CarryOnDevice;
 
         public float[] Forward(int[] tokens)
         {
@@ -1264,7 +1387,7 @@ public class SpeculativeExecutionTests
         {
             BlockDraftCalls++;
             float expectH = position == 0 ? 0f : position;
-            if (Math.Abs(hPrev[0] - expectH) > 0.001f)
+            if (!CarryOnDevice && Math.Abs(hPrev[0] - expectH) > 0.001f)
                 ProtocolViolations.Add($"block draft at pos {position} got hPrev {hPrev[0]} (expected {expectH})");
 
             int n = Math.Min(BlockDraftSize, draftOut.Length);
@@ -1294,7 +1417,7 @@ public class SpeculativeExecutionTests
             for (int k = 0; k < tokens.Length; k++)
             {
                 float expectH = startPos + k == 0 ? 0f : startPos + k;
-                if (Math.Abs(hRows[k * HiddenSize] - expectH) > 0.001f)
+                if (!CarryOnDevice && Math.Abs(hRows[k * HiddenSize] - expectH) > 0.001f)
                 {
                     ProtocolViolations.Add(
                         $"catch-up row {k} at startPos {startPos} got h {hRows[k * HiddenSize]} (expected {expectH})");

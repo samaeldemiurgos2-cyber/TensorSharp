@@ -580,11 +580,15 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
                 int[] top = Enumerable.Range(0, logits.Length).OrderByDescending(j => logits[j]).Take(5).ToArray();
                 float serialMargin = logits[top[0]] - logits[top[1]];
 
-                // Serial and batched GGML CPU matmuls can use different vector
-                // reductions. If their top two logits are effectively tied,
-                // either greedy token is valid; later tokens on this stream
-                // are no longer comparable after the first choice diverges.
-                Assert.True(backend == BackendType.GgmlCpu && expected[i][t] == top[0] &&
+                // Serial and batched matmuls can reduce in a different order:
+                // GGML CPU vector reductions, and ggml-cuda kernels instantiated
+                // per batch width, whose rounding depends on the toolkit (with
+                // 8 host layers, CUDA 13.4 flips a 0.0198 margin that 12.8 kept).
+                // The QSA indexer's top-k turns such a last-bit difference into a
+                // different key set; with top-k covering the context the streams
+                // match. If the top two logits are effectively tied, either greedy
+                // token is valid; later tokens follow different histories.
+                Assert.True(backend is BackendType.GgmlCpu or BackendType.GgmlCuda && expected[i][t] == top[0] &&
                     streams[i][t] == top[1] && serialMargin <= .02f,
                     $"Stream {i} diverged at token {t} outside a near-tie: expected={expected[i][t]}, " +
                     $"actual={streams[i][t]}, serial margin={serialMargin:R}, " +
@@ -598,7 +602,7 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         }
         Assert.True(model.ArenaBatchedDecodeSteps > 0, "Parallel requests never executed a batched graph.");
         output.WriteLine($"{backend}, hostLayers={offloadLayers}: three parallel 8-token streams matched independent serial greedy " +
-            $"with {nearTieDivergences} near-tied CPU choice(s); {model.ArenaBatchedDecodeSteps} arena steps.");
+            $"with {nearTieDivergences} near-tied greedy choice(s); {model.ArenaBatchedDecodeSteps} arena steps.");
     }
 
     private static async Task<List<int>> Drain(InferenceRequestHandle handle)

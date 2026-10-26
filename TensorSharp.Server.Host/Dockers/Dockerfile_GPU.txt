@@ -28,9 +28,12 @@
 
 # CUDA toolkit / OS for both stages. Override at build time to match the CUDA
 # version your target driver supports (the *devel* and *runtime* tags must
-# share the same CUDA_VERSION). 12.2.2 JIT-compiles on any reasonably recent
-# NVIDIA driver (>= 535), which covers every current Hugging Face GPU tier.
-ARG CUDA_VERSION=12.2.2
+# share the same CUDA_VERSION). The default, 13.4.3, needs a CUDA 13 driver
+# (R580 or newer) for its runtime, and the default PTX-only CUDA_ARCHS below is
+# JIT-compiled by the driver, which must then support CUDA 13.4 itself. On an
+# older host driver build with `--build-arg CUDA_VERSION=12.2.2` (JIT-compiles
+# on any driver >= 535) or give CUDA_ARCHS a `-real` arch (SASS, no JIT).
+ARG CUDA_VERSION=13.4.3
 ARG UBUNTU_VERSION=22.04
 
 ############################################################
@@ -89,8 +92,9 @@ ENV TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL=${GGML_BUILD_JOBS}
 
 # The direct-CUDA PTX backend (`--backend cuda`) is compiled too because nvcc is
 # present. PTX is forward-compatible, so target compute_75 once and let the
-# driver JIT it on any GPU >= 7.5. (The default runtime backend is ggml_cuda;
-# this just keeps `--backend cuda` available for experimentation.)
+# driver JIT it on any GPU >= 7.5 (its fatbin adds sm_75 SASS for a T4, which
+# loads on any CUDA 13 driver). The default runtime backend is ggml_cuda; this
+# just keeps `--backend cuda` available for experimentation.
 ENV TENSORSHARP_CUDA_ARCH=compute_75
 
 # Override TENSORSHARP_REF to pin a tag/branch/commit of your choice.

@@ -10,6 +10,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Globalization;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
@@ -842,7 +844,7 @@ namespace TensorSharp.Runtime
                         ? messages : InjectMultimodalTokens(messages, architecture);
                     string effectiveTemplate = EnableGemma4CachedToolReasoningReplay(
                         template, preprocessed, architecture);
-                    var jinja = new Jinja2Template(effectiveTemplate);
+                    var jinja = GetParsedTemplate(effectiveTemplate);
                     var context = BuildJinja2Context(
                         preprocessed, addGenerationPrompt, tools, enableThinking, architecture, reasoningEffort);
                     string result = jinja.Render(context);
@@ -898,6 +900,47 @@ namespace TensorSharp.Runtime
 
             Console.Error.WriteLine($"[ChatTemplate] Using hardcoded template for '{architecture}'");
             return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, template);
+        }
+
+        // Parsing depends on the exact effective template, including the optional
+        // replay hook, but never on messages/tools/thinking. Only the AST is shared;
+        // each Render builds a fresh context, including its namespaces and macros.
+        // Bound both count and source size because model reloads/custom templates
+        // can otherwise retain arbitrarily many parsed templates for the host's life.
+        private static readonly object ParsedTemplateGate = new();
+        private static readonly Dictionary<string, Jinja2Template> ParsedTemplates = new(StringComparer.Ordinal);
+        private static readonly Queue<string> ParsedTemplateOrder = new();
+        private static int ParsedTemplateCharacters;
+        private const int MaxParsedTemplates = 16;
+        private const int MaxParsedTemplateCharacters = 1024 * 1024;
+
+        private static Jinja2Template GetParsedTemplate(string template)
+        {
+            lock (ParsedTemplateGate)
+            {
+                if (ParsedTemplates.TryGetValue(template, out Jinja2Template? cached))
+                    return cached;
+            }
+            // Parsing and rendering do not hold the shared lock. Invalid templates
+            // still take the existing per-call fallback path and are not cached.
+            var parsed = new Jinja2Template(template);
+            if (template.Length > MaxParsedTemplateCharacters) return parsed;
+            lock (ParsedTemplateGate)
+            {
+                if (ParsedTemplates.TryGetValue(template, out Jinja2Template? cached))
+                    return cached;
+                while (ParsedTemplateOrder.Count >= MaxParsedTemplates
+                    || ParsedTemplateCharacters + template.Length > MaxParsedTemplateCharacters)
+                {
+                    string oldest = ParsedTemplateOrder.Dequeue();
+                    ParsedTemplates.Remove(oldest);
+                    ParsedTemplateCharacters -= oldest.Length;
+                }
+                ParsedTemplates.Add(template, parsed);
+                ParsedTemplateOrder.Enqueue(template);
+                ParsedTemplateCharacters += template.Length;
+            }
+            return parsed;
         }
 
         // (architecture, reason-kind) pairs whose Jinja→hardcoded fallback has
@@ -1645,7 +1688,7 @@ namespace TensorSharp.Runtime
                             ["function"] = new Dictionary<string, object>
                             {
                                 ["name"] = tc.Name,
-                                ["arguments"] = tc.Arguments ?? new Dictionary<string, object?>()
+                                ["arguments"] = NormalizeJinjaToolArgument(tc.Arguments) ?? new Dictionary<string, object?>()
                             }
                         });
                     }
@@ -1699,6 +1742,49 @@ namespace TensorSharp.Runtime
             }
 
             return ctx;
+        }
+
+        // OpenAI history deserialization leaves JsonElement values inside the
+        // argument dictionary. Templates use `value is string` to choose raw
+        // XML text versus JSON: passing those elements through would quote an
+        // ordinary string again and teach the next tool call the wrong format.
+        // Build render-local containers so templates cannot mutate saved history.
+        private static object? NormalizeJinjaToolArgument(object? value)
+        {
+            if (value is JsonElement json)
+            {
+                switch (json.ValueKind)
+                {
+                    case JsonValueKind.String: return json.GetString();
+                    case JsonValueKind.True: return true;
+                    case JsonValueKind.False: return false;
+                    case JsonValueKind.Null:
+                    case JsonValueKind.Undefined: return null;
+                    case JsonValueKind.Object:
+                        var properties = new Dictionary<string, object?>();
+                        foreach (var property in json.EnumerateObject())
+                            properties[property.Name] = NormalizeJinjaToolArgument(property.Value);
+                        return properties;
+                    case JsonValueKind.Array:
+                        return json.EnumerateArray().Select(item => NormalizeJinjaToolArgument(item)).ToList();
+                    case JsonValueKind.Number:
+                        if (json.TryGetInt32(out int integer)) return integer;
+                        if (json.TryGetInt64(out long wideInteger)) return wideInteger;
+                        string raw = json.GetRawText();
+                        if (BigInteger.TryParse(raw, NumberStyles.AllowLeadingSign,
+                            CultureInfo.InvariantCulture, out var arbitraryInteger)) return arbitraryInteger;
+                        if (json.TryGetDecimal(out decimal fraction) &&
+                            JsonElement.DeepEquals(json, JsonSerializer.SerializeToElement(fraction))) return fraction;
+                        // Keep out-of-range exponents/precision exact instead of
+                        // rounding them through double or emitting Infinity.
+                        return json.Clone();
+                }
+            }
+            if (value is IDictionary<string, object?> dictionary)
+                return dictionary.ToDictionary(pair => pair.Key, pair => NormalizeJinjaToolArgument(pair.Value));
+            if (value is IList<object?> list)
+                return list.Select(item => NormalizeJinjaToolArgument(item)).ToList();
+            return value;
         }
 
         private static void BuildJinjaToolIds(

@@ -40,6 +40,11 @@ public interface IHolderPrefixCacheModel : IPrefixCacheModel, IBatchedPagedModel
     /// True when the holder is (now) safe to copy; false when it is unknown or cannot be settled.</summary>
     bool SettleForCopy(string payloadKey);
 
+    /// <summary>Clone directly into a request-sized allocation when supported. The hint was
+    /// fitted and budgeted by the coordinator; ordinary retained-cache callers keep compact copies.</summary>
+    bool TryCloneRetainedCache(string retainedKey, string newRequestId, int requiredContextTokens)
+        => TryCloneRetainedCache(retainedKey, newRequestId);
+
     bool IPrefixCacheModel.TryCaptureCopy(string requestId, string payloadKey, out PayloadFootprint footprint)
         => HolderPrefixCacheAdapter.TryCaptureCopy(this, requestId, payloadKey, out footprint);
 
@@ -60,6 +65,25 @@ public interface IHolderPrefixCacheModel : IPrefixCacheModel, IBatchedPagedModel
 
     bool IPrefixCacheModel.TryExport(string payloadKey, Stream destination)
         => !string.IsNullOrEmpty(payloadKey) && destination != null && TryExportRetainedCache(payloadKey, destination);
+
+    bool IPrefixCacheModel.TryPrepareBackgroundExport(string payloadKey, out Action<Stream>? write)
+    {
+        write = null;
+        return !string.IsNullOrEmpty(payloadKey) && TryPrepareBackgroundRetainedExport(payloadKey, out write);
+    }
+
+    void IPrefixCacheModel.NoteBackgroundExport(string payloadKey, System.Threading.Tasks.Task task)
+        => NoteBackgroundRetainedExport(payloadKey, task);
+
+    /// <summary>See <see cref="IPrefixCacheModel.TryPrepareBackgroundExport"/>; a retained holder
+    /// whose bytes stay readable until <see cref="NoteBackgroundRetainedExport"/>'s task completes.</summary>
+    bool TryPrepareBackgroundRetainedExport(string payloadKey, out Action<Stream>? write)
+    {
+        write = null;
+        return false;
+    }
+
+    void NoteBackgroundRetainedExport(string payloadKey, System.Threading.Tasks.Task task) { }
 
     bool IPrefixCacheModel.TryImport(string payloadKey, int tokens, Stream source, out PayloadFootprint footprint)
         => HolderPrefixCacheAdapter.TryImport(this, payloadKey, tokens, source, out footprint);
@@ -146,7 +170,7 @@ public static class HolderPrefixCacheAdapter
         return request.Op switch
         {
             MaterializeOp.Clone => model.SettleForCopy(request.PayloadKey)
-                                   && model.TryCloneRetainedCache(request.PayloadKey, request.TargetRequestId),
+                                   && model.TryCloneRetainedCache(request.PayloadKey, request.TargetRequestId, request.RequiredContextTokens),
             MaterializeOp.Donate => model.TryRebindRetainedCache(request.PayloadKey, request.TargetRequestId),
             _ => false,
         };

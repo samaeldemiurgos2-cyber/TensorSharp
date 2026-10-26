@@ -1,5 +1,6 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
+#include "ggml_ops_cuda_launch_policy.h"
 #include "ggml_ops_deepseek41_vision.h"
 #include "ggml_ops_internal.h"
 #include "gguf.h"
@@ -497,6 +498,7 @@ std::shared_ptr<encoder> encoder::load(const std::string & path, const std::stri
         state.backend = ggml_backend_cpu_init();
         if (state.backend) ggml_backend_cpu_set_n_threads(state.backend, n_threads > 0 ? n_threads : 4);
     } else {
+        require(tsg::configure_cuda_launch_policy(), "cannot configure the CUDA launch policy");
         int matched = 0;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             auto dev = ggml_backend_dev_get(i);

@@ -34,6 +34,9 @@ namespace TensorSharp.Models
     {
         // Sparse host lookup tables can opt out of reading every row at startup.
         protected virtual bool ShouldPrefaultWeight(GgufTensorInfo info) => true;
+        /// <summary>A stage executor excludes other nodes' weights before touching their pages.</summary>
+        protected virtual bool ShouldLoadWeight(GgufTensorInfo info) => true;
+        protected virtual IAllocator AllocatorForWeight(string name) => _allocator;
 
         protected void LoadWeights()
         {
@@ -42,7 +45,7 @@ namespace TensorSharp.Models
             // otherwise reads the file at one-or-two-stream speed, which is the
             // whole cold-load time on network-backed model storage.
             ReadBonsaiMetadata();
-            _gguf.PrefaultFileCache(ShouldPrefaultWeight);
+            _gguf.PrefaultFileCache(info => ShouldLoadWeight(info) && ShouldPrefaultWeight(info));
             Console.Write("Loading model weights...");
             int countF32 = 0;
             int countQuant = 0;
@@ -53,6 +56,7 @@ namespace TensorSharp.Models
             foreach (var kv in _gguf.Tensors)
             {
                 var info = kv.Value;
+                if (!ShouldLoadWeight(info)) continue;
                 long byteCount = _gguf.GetTensorByteCount(info);
 
                 if (info.Type is GgmlTensorType.PQ2_0 or GgmlTensorType.PTQ1_0)
@@ -160,7 +164,7 @@ namespace TensorSharp.Models
                     for (int i = 0; i < ggufShape.Length; i++)
                         tsShape[i] = ggufShape[ggufShape.Length - 1 - i];
 
-                    var tensor = new Tensor(_allocator, DType.Float32, tsShape);
+                    var tensor = new Tensor(AllocatorForWeight(info.Name), DType.Float32, tsShape);
                     IntPtr destPtr = GetStoragePtr(tensor);
 
                     if (info.Type == GgmlTensorType.F32)
@@ -1166,7 +1170,7 @@ namespace TensorSharp.Models
                 {
                     int gateDim = (int)gf.Sizes[0], upDim = (int)uf.Sizes[0];
                     int inDim = (int)gf.Sizes[1];
-                    var fusedTensor = new Tensor(_allocator, DType.Float32, gateDim + upDim, inDim);
+                    var fusedTensor = new Tensor(AllocatorForWeight(guName), DType.Float32, gateDim + upDim, inDim);
                     using (var s0 = fusedTensor.Narrow(0, 0, gateDim)) Ops.Copy(s0, gf);
                     using (var s1 = fusedTensor.Narrow(0, gateDim, upDim)) Ops.Copy(s1, uf);
                     _weights[guName] = fusedTensor;

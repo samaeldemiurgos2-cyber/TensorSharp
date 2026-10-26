@@ -15,6 +15,67 @@ namespace InferenceWeb.Tests;
 public class BpeTokenizerTests
 {
     [Fact]
+    public void Encode_RepeatedPiecesKeepBoundaryMergesAndReturnedListsIndependent()
+    {
+        string[] vocabulary = ["a", "b", "c", "ab", "abc", "<bos>", "<eos>"];
+        var tokenizer = new BpeTokenizer(vocabulary, [1, 1, 1, 1, 1, 3, 3],
+            ["a b", "ab c"], 5, [6], addBos: true, addEos: true);
+        Assert.Equal(new[] { 3 }, tokenizer.Encode("ab", addSpecial: false));
+        Assert.Equal(new[] { 2 }, tokenizer.Encode("c", addSpecial: false));
+        // Previously encoded substrings are not tokenization boundaries.
+        Assert.Equal(new[] { 4 }, tokenizer.Encode("abc", addSpecial: false));
+        var mutated = tokenizer.Encode("abc");
+        mutated[1] = -100;
+        mutated.Clear();
+        Assert.Equal(new[] { 5, 4, 6 }, tokenizer.Encode("abc"));
+        Assert.Equal(new[] { 4 }, tokenizer.Encode("abc", addSpecial: false));
+    }
+
+    [Fact]
+    public void Encode_ConcurrentRequestsKeepEachVocabularyAndSpecialFlags()
+    {
+        var first = new BpeTokenizer(["a", "b", "ab", "<eos>"], [1, 1, 1, 3],
+            ["a b"], -1, [3], addBos: false, addEos: true);
+        var second = new BpeTokenizer(["ab", "b", "a", "<eos>"], [1, 1, 1, 3],
+            ["a b"], -1, [3], addBos: false, addEos: true);
+        Parallel.For(0, 256, iteration =>
+        {
+            bool special = iteration % 2 == 0;
+            Assert.Equal(special ? new[] { 2, 3, 2, 3 } : new[] { 2, 3, 2 },
+                first.Encode("ab<eos>ab", special));
+            Assert.Equal(special ? new[] { 0, 3, 0, 3 } : new[] { 0, 3, 0 },
+                second.Encode("ab<eos>ab", special));
+        });
+    }
+
+    [Fact]
+    public void Encode_ManyDistinctPiecesAndLongUncachedPiecesKeepExactIds()
+    {
+        string[] vocabulary = Enumerable.Range('a', 26).Select(c => ((char)c).ToString()).ToArray();
+        var tokenizer = new BpeTokenizer(vocabulary, new int[26], [], -1, [], false, false);
+        for (int i = 0; i < 20000; i++)
+        {
+            int value = i;
+            string word = "a";
+            for (int j = 0; j < 4; j++) { word += (char)('a' + value % 26); value /= 26; }
+            Assert.Equal(word.Select(c => c - 'a'), tokenizer.Encode(word, false));
+        }
+        string longPiece = new('a', 1024);
+        Assert.Equal(Enumerable.Repeat(0, 1024), tokenizer.Encode(longPiece, false));
+        Assert.Equal(new[] { 0, 1, 2 }, tokenizer.Encode("abc", false));
+    }
+
+    [Fact]
+    public void Encode_SpecialTokenOverlapKeepsVocabularyOrder()
+    {
+        var tokenizer = new BpeTokenizer(["ab", "abc", "c"], [3, 3, 1], [], -1, [], false, false);
+        // The shorter control marker is declared first; optimization must not
+        // silently switch to longest-match semantics for overlapping markers.
+        Assert.Equal(new[] { 0, 2, 0 }, tokenizer.Encode("abcab", false));
+        Assert.Equal(new[] { 0, 2, 0 }, tokenizer.Encode("abcab", false));
+    }
+
+    [Fact]
     public void Encode_DiscardsStaleCandidateAfterNeighborMerge()
     {
         // Initial candidates for "xabc":

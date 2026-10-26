@@ -85,17 +85,28 @@ namespace TensorSharp.Runtime.Speculative
 
         public bool HandlesOwnPrefill => _head.DraftSelfCatchUp;
 
+        public int PrefillContextRows => _head.DraftContextRows;
+
         public int Propose(in DraftContext ctx, List<int> draftOut)
         {
             int n = _head.DraftBlock(ctx.LastToken, ctx.CarryHidden, ctx.Position, _blockTokens, _blockConf);
+            return SelectDrafts(_blockTokens, _blockConf, n, ctx.MaxTokens, draftOut);
+        }
+
+        /// <summary>The cumulative-confidence gate over one drafted block: keeps the
+        /// longest prefix (at most <paramref name="maxTokens"/>) whose product of
+        /// confidences stays at or above <see cref="MinDraftProb"/>. Shared by
+        /// <see cref="Propose"/> and drafts made for several sequences at once.</summary>
+        public int SelectDrafts(int[] blockTokens, float[] blockConf, int n, int maxTokens, List<int> draftOut)
+        {
             double cumulative = 1.0;
-            int limit = Math.Min(n, ctx.MaxTokens);
+            int limit = Math.Min(n, maxTokens);
             for (int i = 0; i < limit; i++)
             {
-                cumulative *= _blockConf[i];
+                cumulative *= blockConf[i];
                 if (cumulative < MinDraftProb)
                     break;
-                draftOut.Add(_blockTokens[i]);
+                draftOut.Add(blockTokens[i]);
             }
             return draftOut.Count;
         }

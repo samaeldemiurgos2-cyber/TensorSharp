@@ -120,6 +120,15 @@ namespace TensorSharp.Cuda
             return AddBytes(deviceBuffer, checked(index * ElementType.Size()));
         }
 
+        /// <summary>The device address of element <paramref name="index"/> once the device copy is
+        /// current, for a reader in the same context (on another stream: synchronize this
+        /// allocator's stream first).</summary>
+        public IntPtr DevicePtrForRead(long index)
+        {
+            EnsureDeviceCurrent();
+            return DevicePtrAtElement(index);
+        }
+
         public override void EnsureDeviceCurrent()
         {
             ThrowIfDisposed();
@@ -143,6 +152,28 @@ namespace TensorSharp.Cuda
                 deviceDirty = false;
                 if (CudaProfileCounters.Enabled)
                     CudaProfileCounters.RecordSync("HtoD(async)", ByteLength, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+            }
+        }
+
+        /// <summary>Copies <paramref name="byteCount"/> bytes from host memory straight into the
+        /// device copy at <paramref name="storageIndex"/>, on the allocator's stream after its
+        /// earlier work, and waits for it (the source may be reused on return). The device copy
+        /// becomes the current one; no host mirror is touched.</summary>
+        public void CopyToDevice(long storageIndex, IntPtr src, long byteCount)
+        {
+            ThrowIfDisposed();
+            if (src == IntPtr.Zero && byteCount > 0)
+                throw new ArgumentNullException(nameof(src));
+            ValidateByteRange(storageIndex, byteCount);
+            EnsureDeviceCurrent();
+            lock (sync)
+            {
+                AllocatorImpl.Context.MakeCurrent();
+                CudaDriverApi.cuMemcpyHtoDAsync(DevicePtrAtElement(storageIndex), src, new UIntPtr((ulong)byteCount),
+                    AllocatorImpl.Stream.Handle).ThrowOnError();
+                CudaDriverApi.cuStreamSynchronize(AllocatorImpl.Stream.Handle).ThrowOnError();
+                deviceDirty = true;
+                hostDirty = false;
             }
         }
 

@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -75,6 +76,19 @@ namespace TensorSharp.Runtime
         private readonly bool _addEos;
         private readonly bool _spmStyleBpe;
         private readonly bool _normalizeNfc;
+
+        // A BPE piece is independent only AFTER the pre-tokenizer has split the
+        // complete text. Caching whole messages or arbitrary prefixes would change
+        // merges at their boundaries. Agent prompts repeat thousands of these
+        // pieces (instructions, tool schemas and history) on every request.
+        // Values never escape this tokenizer; Encode copies ids into its own list.
+        private readonly ConcurrentDictionary<string, int[]> _pieceCache = new(StringComparer.Ordinal);
+        private readonly Queue<string> _pieceCacheOrder = new();
+        private readonly object _pieceCacheGate = new();
+        private int _pieceCacheBytes;
+        private const int MaxCachedPieceLength = 256;
+        private const int MaxCachedPieces = 16384;
+        private const int MaxPieceCacheBytes = 4 * 1024 * 1024;
 
         public string[] Vocab => _vocab;
         public int BosTokenId => _bosTokenId;
@@ -197,6 +211,10 @@ namespace TensorSharp.Runtime
 
             foreach (var special in _specialTokens)
             {
+                // Most control tokens are absent. Checking the original text once
+                // avoids rebuilding/scanning every fragment left by earlier markers.
+                // The remaining passes keep vocabulary-order overlap precedence.
+                if (!text.Contains(special, StringComparison.Ordinal)) continue;
                 int id = _vocabLookup.TryGetValue(special, out var sid) ? sid : -1;
                 if (id < 0) continue;
 
@@ -244,6 +262,13 @@ namespace TensorSharp.Runtime
                 string fragmentText = _normalizeNfc ? NormalizeNfc(frag.text) : frag.text;
                 foreach (string split in SplitForBpe(fragmentText))
                 {
+                    if (_pieceCache.TryGetValue(split, out int[]? cached))
+                    {
+                        ids.AddRange(cached);
+                        continue;
+                    }
+
+                    List<int> piece;
                     if (_spmStyleBpe)
                     {
                         string spmNormalized = split.Replace(" ", "\u2581", StringComparison.Ordinal);
@@ -254,26 +279,23 @@ namespace TensorSharp.Runtime
                         if (spmNormalized.All(c => c == '\n') &&
                             _vocabLookup.TryGetValue(spmNormalized, out int newlineId))
                         {
-                            ids.Add(newlineId);
-                            continue;
+                            piece = new List<int> { newlineId };
                         }
-
-                        ids.AddRange(BpeMerge(
-                            spmNormalized,
-                            rawUnicodeCodePoints: true,
-                            byteFallback: true));
-                        continue;
+                        else
+                        {
+                            piece = BpeMerge(spmNormalized,
+                                rawUnicodeCodePoints: true, byteFallback: true);
+                        }
                     }
-
-                    string normalized = NormalizeSplit(split);
-
-                    if (_vocabLookup.TryGetValue(normalized, out int directId))
+                    else
                     {
-                        ids.Add(directId);
-                        continue;
+                        string normalized = NormalizeSplit(split);
+                        piece = _vocabLookup.TryGetValue(normalized, out int directId)
+                            ? new List<int> { directId }
+                            : BpeMerge(normalized);
                     }
-
-                    ids.AddRange(BpeMerge(normalized));
+                    ids.AddRange(piece);
+                    CachePiece(split, piece);
                 }
             }
 
@@ -286,6 +308,28 @@ namespace TensorSharp.Runtime
             }
 
             return ids;
+        }
+
+        private void CachePiece(string text, List<int> ids)
+        {
+            // Do not retain long one-off payloads, including base64 and image text.
+            if (text.Length > MaxCachedPieceLength) return;
+            int bytes = text.Length * sizeof(char) + ids.Count * sizeof(int);
+            if (bytes > MaxPieceCacheBytes) return;
+            lock (_pieceCacheGate)
+            {
+                if (_pieceCache.ContainsKey(text)) return;
+                while (_pieceCacheOrder.Count >= MaxCachedPieces
+                    || _pieceCacheBytes + bytes > MaxPieceCacheBytes)
+                {
+                    string oldest = _pieceCacheOrder.Dequeue();
+                    if (_pieceCache.TryRemove(oldest, out int[]? removed))
+                        _pieceCacheBytes -= oldest.Length * sizeof(char) + removed.Length * sizeof(int);
+                }
+                _pieceCache[text] = ids.ToArray();
+                _pieceCacheOrder.Enqueue(text);
+                _pieceCacheBytes += bytes;
+            }
         }
 
         /// <summary>

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -228,6 +229,53 @@ class LoadTimingTests(unittest.TestCase):
             runner.companion_paths(["--draft-model", "--tp", "2"])
 
 
+class QualityEvaluationTests(unittest.TestCase):
+    def test_quality_stage_reuses_strict_evaluator_and_preserves_identity_profile_and_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            arguments = SimpleNamespace(repo=root, output=root, model=root / "weights.gguf", context=4096,
+                port=5199, timeout=120, quality_max_tokens=128,
+                quality_scenarios="json_schema,json_unicode,short_zh,multi_turn,tool_round_trip")
+            extra = ["--tp", "2", "--tp-node-id", "0", "--tp-peers", "node0:9500,node1:9500", "--n-cpu-moe", "17"]
+            report = {"status": "running", "exit_code": 0, "model_sha256": "first-shard",
+                      "model_verification_report_sha256": "all-shard-verification",
+                      "environment": {"TS_DSV41_YOCO_KEEP": "0"},
+                      "coverage": {"text_http": "passed", "strict_quality_http": "requested"}}
+            with patch.object(runner.subprocess, "call", return_value=7) as invoke:
+                runner.run_quality_evaluation(arguments, report, extra, {"actual": "environment"})
+            command = report["quality_command"]
+            def value(flag): return command[command.index(flag) + 1]
+            self.assertEqual("tensorsharp", value("--engine"))
+            self.assertEqual("http://127.0.0.1:5199", value("--url"))
+            self.assertEqual("all-shard-verification", value("--weights-id"))
+            self.assertEqual(arguments.quality_scenarios, value("--scenarios"))
+            self.assertEqual(("1", "1", "128"), (value("--concurrency"), value("--repeats"), value("--max-tokens")))
+            self.assertNotIn("--thinking", command)
+            self.assertNotIn("--accept-fenced-json", command)
+            profile = json.loads(value("--profile"))
+            self.assertEqual(extra, profile["extra_arguments"])
+            self.assertEqual(4096, profile["context"])
+            self.assertEqual("0", profile["environment"]["TS_DSV41_YOCO_KEEP"])
+            invoke.assert_called_once_with(command, cwd=root, env={"actual": "environment"})
+            self.assertEqual(7, report["quality_exit_code"])
+            self.assertEqual(7, report["exit_code"])
+            self.assertEqual("failed", report["coverage"]["strict_quality_http"])
+            self.assertEqual("passed", report["coverage"]["text_http"])
+            report["exit_code"] = 31
+            with patch.object(runner.subprocess, "call", return_value=0):
+                runner.run_quality_evaluation(arguments, report, extra, {})
+            self.assertEqual(31, report["exit_code"])
+            self.assertEqual("passed", report["coverage"]["strict_quality_http"])
+
+    def test_quality_scenarios_require_server_and_positive_token_budget_before_launch(self):
+        for options in (["--quality-scenarios", "json_schema"],
+                        ["--server", "--quality-scenarios", "json_schema", "--quality-max-tokens", "0"]):
+            with patch.object(runner.sys, "argv", ["run-parallel-case", "--model", "missing.gguf", "--output", "unused", *options]), \
+                    patch.object(runner.subprocess, "Popen") as launch, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit): runner.main()
+                launch.assert_not_called()
+
+
 class RuntimeIdentityTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -348,7 +396,8 @@ class SourceIdentityTests(unittest.TestCase):
     def test_tar_snapshot_identifies_sources_without_claiming_git_head(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ("TensorSharp.GGML.Native/ops.cpp", "TensorSharp.Models/Model.cs",
+            for name in ("TensorSharp.GGML.Native/ops.cpp", "TensorSharp.GGML.Native/pipeline.inc",
+                         "TensorSharp.Core/LayerSplitPlan.cs", "TensorSharp.Models/Model.cs",
                          "TensorSharp.Models/bin/generated.cs", "TensorSharp.Models/obj/generated.cs",
                          "TensorSharp.GGML.Native/build/debug.cu", "Directory.Build.props"):
                 path = root / name
@@ -361,11 +410,14 @@ class SourceIdentityTests(unittest.TestCase):
                 self.assertIsNone(first["revision"])
                 self.assertEqual(first["declared_base_revision"], "declared-base")
                 files = {name for group in first["groups"].values() for name in group["files"]}
-                self.assertEqual(files, {"TensorSharp.GGML.Native/ops.cpp", "TensorSharp.Models/Model.cs", "Directory.Build.props"})
+                self.assertEqual(files, {"TensorSharp.GGML.Native/ops.cpp", "TensorSharp.GGML.Native/pipeline.inc",
+                                         "TensorSharp.Core/LayerSplitPlan.cs", "TensorSharp.Models/Model.cs", "Directory.Build.props"})
                 (root / "TensorSharp.Models/bin/generated.cs").write_text("new generated output")
                 self.assertEqual(first["groups"], runner.source_identity(root)["groups"])
                 (root / "TensorSharp.Models/Model.cs").write_text("changed source")
                 self.assertNotEqual(first["groups"]["managed_sources"], runner.source_identity(root)["groups"]["managed_sources"])
+                (root / "TensorSharp.GGML.Native/pipeline.inc").write_text("changed native pipeline")
+                self.assertNotEqual(first["groups"]["native_sources"], runner.source_identity(root)["groups"]["native_sources"])
 
 
 class CgroupMemoryTests(unittest.TestCase):

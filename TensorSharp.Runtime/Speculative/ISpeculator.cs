@@ -127,6 +127,14 @@ namespace TensorSharp.Runtime.Speculative
         bool HandlesOwnPrefill { get; }
 
         /// <summary>
+        /// Trailing committed positions this speculator's state can still read at
+        /// the end of a prompt (a block drafter's KV ring). Prefill rows older than
+        /// that are overwritten before any proposal, so they need no hidden-state
+        /// capture or <see cref="Commit"/>. <see cref="int.MaxValue"/>: every row.
+        /// </summary>
+        int PrefillContextRows => int.MaxValue;
+
+        /// <summary>
         /// True when this algorithm can arm on a sequence that ADOPTED a KV prefix it
         /// never processed itself - the cache came from another request (prefix cache)
         /// or an earlier turn, so trunk positions exist that this speculator did not

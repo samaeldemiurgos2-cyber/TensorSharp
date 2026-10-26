@@ -148,28 +148,57 @@ namespace TensorSharp.Models
             double xRatio = (double)srcW / dstW;
             double yRatio = (double)srcH / dstH;
 
-            Parallel.For(0, dstH, dy =>
+            // Screenshots usually arrive at a size that is already a multiple of the patch
+            // factor. Every bilinear weight is then 0 or 1 (fx = fy = 0), so the sample is
+            // the source pixel itself: composite and normalize it directly.
+            if (srcW == dstW && srcH == dstH)
             {
-                double srcY = (dy + 0.5) * yRatio - 0.5;
-                int y0 = Math.Max(0, (int)srcY);
-                int y1 = Math.Min(srcH - 1, y0 + 1);
-                double fy = srcY - y0;
+                Parallel.For(0, dstH, dy => NormalizeIdentityRow(rgba, result, dstW, pixels, dy));
+                return result;
+            }
 
-                for (int dx = 0; dx < dstW; dx++)
-                {
-                    double srcX = (dx + 0.5) * xRatio - 0.5;
-                    int x0 = Math.Max(0, (int)srcX);
-                    int x1 = Math.Min(srcW - 1, x0 + 1);
-                    double fx = srcX - x0;
-
-                    int dstIdx = dy * dstW + dx;
-                    result[dstIdx] = BilinearSampleNormalized(rgba, srcW, x0, y0, x1, y1, fx, fy, 0);
-                    result[pixels + dstIdx] = BilinearSampleNormalized(rgba, srcW, x0, y0, x1, y1, fx, fy, 1);
-                    result[2 * pixels + dstIdx] = BilinearSampleNormalized(rgba, srcW, x0, y0, x1, y1, fx, fy, 2);
-                }
-            });
-
+            Parallel.For(0, dstH, dy => ResizeBilinearRow(rgba, result, srcW, srcH, dstW, pixels, xRatio, yRatio, dy));
             return result;
+        }
+
+        // The row bodies run once per image row on every image turn. Optimized up front:
+        // as lambdas they stayed tier-0 code for a server's first images (~100 ms per
+        // 1344x768 screenshot instead of a few).
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+        private static void NormalizeIdentityRow(byte[] rgba, float[] result, int dstW, int pixels, int dy)
+        {
+            int row = dy * dstW;
+            for (int dx = 0; dx < dstW; dx++)
+            {
+                int pixelBase = (row + dx) * 4;
+                int dstIdx = row + dx;
+                result[dstIdx] = Math.Clamp(CompositeChannelToNormalized(rgba, pixelBase, 0), -1f, 1f);
+                result[pixels + dstIdx] = Math.Clamp(CompositeChannelToNormalized(rgba, pixelBase, 1), -1f, 1f);
+                result[2 * pixels + dstIdx] = Math.Clamp(CompositeChannelToNormalized(rgba, pixelBase, 2), -1f, 1f);
+            }
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+        private static void ResizeBilinearRow(byte[] rgba, float[] result, int srcW, int srcH, int dstW, int pixels,
+            double xRatio, double yRatio, int dy)
+        {
+            double srcY = (dy + 0.5) * yRatio - 0.5;
+            int y0 = Math.Max(0, (int)srcY);
+            int y1 = Math.Min(srcH - 1, y0 + 1);
+            double fy = srcY - y0;
+
+            for (int dx = 0; dx < dstW; dx++)
+            {
+                double srcX = (dx + 0.5) * xRatio - 0.5;
+                int x0 = Math.Max(0, (int)srcX);
+                int x1 = Math.Min(srcW - 1, x0 + 1);
+                double fx = srcX - x0;
+
+                int dstIdx = dy * dstW + dx;
+                result[dstIdx] = BilinearSampleNormalized(rgba, srcW, x0, y0, x1, y1, fx, fy, 0);
+                result[pixels + dstIdx] = BilinearSampleNormalized(rgba, srcW, x0, y0, x1, y1, fx, fy, 1);
+                result[2 * pixels + dstIdx] = BilinearSampleNormalized(rgba, srcW, x0, y0, x1, y1, fx, fy, 2);
+            }
         }
 
         private static float BilinearSampleNormalized(byte[] rgba, int srcW, int x0, int y0, int x1, int y1,

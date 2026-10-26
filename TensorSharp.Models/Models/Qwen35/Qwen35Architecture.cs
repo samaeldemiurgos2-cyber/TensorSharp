@@ -16,7 +16,11 @@ namespace TensorSharp.Models
             Id = "qwen35",
             DisplayName = "Qwen 3.5 / Qwen 3.6 (Gated DeltaNet + MoE)",
             Aliases = new[] { "qwen35", "qwen35moe", "qwen3next" },
-            Factory = c => new Qwen35Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath),
+            // --backend cuda on a dense NVFP4 checkpoint runs the direct-CUDA engine
+            // (TS_Q35_NATIVE=0 keeps the managed path).
+            Factory = c => c.Backend == BackendType.Cuda && c.TpDegree <= 1 && c.TpGroup == null && Qwen35CudaModel.CanServe(c.Probe)
+                ? new Qwen35CudaModel(c.GgufPath, c.DraftModelPath)
+                : new Qwen35Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath),
             ProjectorFileHints = new[]
             {
                 "Qwen3.5-mmproj-F16.gguf",

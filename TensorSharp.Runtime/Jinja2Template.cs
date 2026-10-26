@@ -1150,8 +1150,13 @@ namespace TensorSharp.Runtime
             if (val == null) return "null";
             if (val is bool b) return b ? "true" : "false";
             if (val is string s) return System.Text.Json.JsonSerializer.Serialize(s);
-            if (val is int i) return i.ToString(CultureInfo.InvariantCulture);
-            if (val is double d) return d.ToString(CultureInfo.InvariantCulture);
+            if (val is byte or sbyte or short or ushort or int or uint or long or ulong
+                or float or double or decimal or System.Numerics.BigInteger)
+                return ((IFormattable)val).ToString(null, CultureInfo.InvariantCulture);
+            // Tool-history normalization retains JSON numbers beyond CLR decimal
+            // range/precision. Their validated JSON spelling must remain numeric.
+            if (val is System.Text.Json.JsonElement json)
+                return json.GetRawText();
             if (val is IList<object> list)
             {
                 var sb = new StringBuilder("[");

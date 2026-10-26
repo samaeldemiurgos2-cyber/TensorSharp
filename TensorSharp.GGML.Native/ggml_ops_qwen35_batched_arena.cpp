@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -46,15 +47,16 @@ extern "C" void TSGgml_Qwen35ResetVerifyCacheForHostPointer(const void* host_ptr
 //
 // Design (mirrors gptoss arena; per-family differences noted):
 //   * ATTENTION layers (every 4th on Qwen3.8): per-layer persistent K/V arena
-//     [head_dim, cap, kv_heads, n_slots+1] (head-plane-major, IDENTICAL to
-//     this family's host cache layout [kv_heads, cap, head_dim]), ONE
+//     [head_dim, cap, kv_heads, n_slots] (head-plane-major, IDENTICAL to
+//     this family's host cache layout [kv_heads, cap, head_dim]), followed by
+//     one discard row per (slot, head) for padded SET_ROWS writes. ONE
 //     ggml_set_rows per K/V per layer (row = slot*kvH*cap + head*cap + pos),
 //     a shared causal mask [cap, 1, 1, n_slots], and CUDA per-slot flash_attn_ext
 //     nodes in the SAME graph (Metal retains its batched flash-attention).
 //     All QKV/output projections and FFNs read their weights once for the batch.
 //   * GDN layers (the other 3/4): per-slot recurrent-state ARENAS —
-//     conv_arena [convDim, conv_dim, n_slots+1] and delta_arena
-//     [head_k, head_v, v_heads, n_slots+1] — updated IN-GRAPH by the same
+//     conv_arena [convDim, conv_dim, n_slots] and delta_arena
+//     [head_k, head_v, v_heads, n_slots] — updated IN-GRAPH by the same
 //     per-slot ssm_conv + ggml_gated_delta_net + cpy-back chain the solo
 //     kernel uses. The state never crosses the bus between steps; that is
 //     exactly the piece whose absence forced the old batched path's per-step
@@ -81,6 +83,14 @@ extern "C" void TSGgml_Qwen35ResetVerifyCacheForHostPointer(const void* host_ptr
 //     decode and verify kernel entries, from LRU slot eviction, and from the
 //     pool reset. on_drop (InvalidateHostBuffer chain, holder dispose)
 //     discards without flushing — the host was rewritten behind us.
+//
+// HOLDER-BOUND MODE (CUDA default; TS_QAB_BOUND=0 disables): attention and
+// recurrence already run per slot on CUDA, so slot s binds its holder's own
+// resident K/V, conv and delta copies (the solo decode's keys, sizes and usage)
+// instead of arena planes. One graph per (slot order, capacities, windows, keys);
+// replay first checks every key still maps to the device copy the graph baked.
+// There is no join, flush or seed: a step leaves each holder exactly as a solo
+// fused decode step would, and no KV is duplicated.
 //
 // Gates (decline -> engine round-robins, correctness never at risk):
 // CUDA or Metal backend, no TP, fused-graph KV cache types, no MoE CPU offload,
@@ -149,6 +159,17 @@ namespace
         std::vector<QabSlot> slots;
         std::vector<int> attn_windows;         // CUDA: effective KV lengths in stable-slot order
 
+        // Holder-bound mode (CUDA): per-(layer, slot) tensors bound to each holder's
+        // own resident device copies instead of arena-owned planes. Indexed
+        // [layer * n_slots + slot]; null where the layer kind does not apply.
+        bool bound = false;
+        std::vector<std::uintptr_t> bound_sig;  // slot count, rows, windows and every bound host key
+        std::vector<int> bound_cache_rows;      // per slot
+        std::int64_t mask_len = 0;              // attention mask rows (max window when bound)
+        std::vector<ggml_tensor*> k_bound, v_bound, conv_bound, delta_bound;
+        struct BoundKey { const void* host; ggml_backend_buffer_t buffer; void* addr; std::size_t bytes; };
+        std::vector<BoundKey> bound_keys;       // replay is valid while every key keeps this device copy
+
         std::vector<std::int32_t> tok_stage;
         std::vector<float> hidden_stage;
         std::vector<std::int32_t> pos_stage;
@@ -165,9 +186,46 @@ namespace
             token_in = hidden_in = pos_in = idx_in = attn_mask = logits_out = sampled_out = nullptr;
             has_argmax = false;
             k_arena.clear(); v_arena.clear(); conv_arena.clear(); delta_arena.clear();
+            k_bound.clear(); v_bound.clear(); conv_bound.clear(); delta_bound.clear();
+            bound_keys.clear();
+            bound_sig.clear();
+            bound_cache_rows.clear();
+            bound = false;
+            mask_len = 0;
             valid = false;
         }
+
+        // A bound graph bakes the device addresses of its holders' resident copies.
+        // Any free or replacement of one (demotion, reseed, resize) invalidates it.
+        bool bound_bindings_current() const
+        {
+            for (const BoundKey& k : bound_keys)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                if (!try_peek_cached_device_copy(k.host, k.bytes, buf, addr) ||
+                    buf != k.buffer || addr != k.addr)
+                    return false;
+            }
+            return true;
+        }
     };
+
+    // Holder-bound arena decode: CUDA attention already runs per slot, so each
+    // slot can read and write its holder's own resident K/V and recurrent-state
+    // copies (the buffers the solo decode and verify graphs bind). That removes
+    // the arena's duplicate KV planes, the join copy through host memory, the
+    // flush on retirement and the full re-seed at every window rebuild; the
+    // holder's state after a step is exactly the solo decode's. Env
+    // TS_QAB_BOUND=0 restores the arena-owned layout.
+    bool qab_bound_enabled()
+    {
+        static const bool enabled = [] {
+            const char* v = std::getenv("TS_QAB_BOUND");
+            return v == nullptr || std::strcmp(v, "0") != 0;
+        }();
+        return enabled && g_backend_type == BACKEND_TYPE_CUDA;
+    }
 
     struct QabPool
     {
@@ -427,6 +485,16 @@ TSG_EXPORT void TSGgml_Qwen35ArenaDiscardHostPointer(void* host_ptr)
     tsg_q35arena::on_drop(host_ptr);
 }
 
+// 1 when batched decode binds each holder's own resident cache copies (see
+// qab_bound_enabled): a successful step then leaves holders exactly as a solo
+// fused decode does, with no arena slot to flush.
+TSG_EXPORT int TSGgml_Qwen35ArenaUsesHolderBuffers()
+{
+    if (!ensure_backend())
+        return 0;
+    return qab_bound_enabled() ? 1 : 0;
+}
+
 // Drop all arena state. Dirty slots flush to their host bytes first on the
 // active rank. Like the GPT-OSS arena pool, this is NOT chained into the solo
 // TSGgml_Qwen35ResetDecodeCache (the solo pool churns per holder swap and
@@ -552,22 +620,14 @@ static int qab_decode_batched(
         }
         for (int l = 0; l < num_layers; l++)
         {
+            if (layers[l].is_moe != 0 && layers[l].proj_scales != nullptr)
+            {
+                set_last_error("Qwen3.5 arena batched decode: MoE sidecar scales are unsupported.");
+                return 0;
+            }
             if (layers[l].is_moe != 0 && layers[l].cpu_moe != 0)
             {
                 set_last_error("Qwen3.5 arena batched decode: MoE CPU offload not supported (v1).");
-                return 0;
-            }
-            // Per-tensor NVFP4 weight scales (scale2). The solo decode and verify
-            // graphs wrap every projection in q35_scaled(..., t.psc[TSQ35_SC_*]);
-            // this graph has no psc[] and would emit bare mul_mats, i.e. compute
-            // the whole model at an effective scale of 1.0 with no error raised.
-            // The managed caller declines first (Qwen35Model.BatchedArenaDecode.cs),
-            // and this is the belt to that braces: a wrong answer must never be a
-            // reachable outcome of forgetting a gate one layer up.
-            if (layers[l].proj_scales != nullptr)
-            {
-                set_last_error("Qwen3.5 arena batched decode: per-tensor sidecar scales "
-                               "(NVFP4 scale2) are not applied by the arena graph.");
                 return 0;
             }
         }
@@ -627,7 +687,8 @@ static int qab_decode_batched(
         const int conv_dim = 2 * key_dim + value_dim;
         const std::size_t convBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
         const std::size_t deltaBytes = static_cast<std::size_t>(head_k_dim) * head_v_dim * num_v_heads * sizeof(float);
-        const int n_slots_req = qab_slot_bucket(n_seqs);
+        const bool bound = qab_bound_enabled();
+        const int n_slots_req = bound ? n_seqs : qab_slot_bucket(n_seqs);
         const void* sig_disc = layers[0].attn_norm_w;
 
         std::lock_guard<std::mutex> qlock(qab_mutex());
@@ -635,11 +696,54 @@ static int qab_decode_batched(
 
         // ---- entry lookup / build ----
         QabPool& pool = qab_pool();
+        // A model uses only one batch-width bucket at a time. Keeping its old
+        // 2-lane arena while allocating a 4-lane arena duplicates every KV and
+        // recurrent-state buffer and can exhaust the device before allocation
+        // falls back. Publish dirty slots to their holders first, including
+        // temporarily absent sequences that may return on the next batch.
+        // Other model instances retain their own independently keyed entries.
+        for (auto& previous : pool.entries)
+        {
+            if (!bound && previous.valid && previous.sig_disc == sig_disc && previous.n_slots != n_slots_req)
+            {
+                qab_flush_entry(previous);
+                previous.release_graph();
+                previous.slots.clear();
+            }
+        }
+        // Bound entries are keyed by everything their graph bakes in: the slot
+        // order, each holder's capacity and attention window, and every host key.
+        std::vector<std::uintptr_t> bound_sig;
+        std::vector<int> bound_windows;
+        if (bound)
+        {
+            bound_windows.resize(n_seqs);
+            bound_sig.reserve(1 + static_cast<std::size_t>(n_seqs) * (2 + 2 * attn_layers + 2 * gdn_layers));
+            bound_sig.push_back(static_cast<std::uintptr_t>(n_seqs));
+            for (int i = 0; i < n_seqs; i++)
+            {
+                bound_windows[i] = static_cast<int>(std::min<std::int64_t>(cache_sizes[i],
+                    qab_cap_round(static_cast<std::int64_t>(positions[i]) + 1)));
+                bound_sig.push_back(static_cast<std::uintptr_t>(cache_sizes[i]));
+                bound_sig.push_back(static_cast<std::uintptr_t>(bound_windows[i]));
+            }
+            for (std::size_t j = 0; j < static_cast<std::size_t>(attn_layers) * n_seqs; j++)
+            {
+                bound_sig.push_back(reinterpret_cast<std::uintptr_t>(k_cache_arr[j]));
+                bound_sig.push_back(reinterpret_cast<std::uintptr_t>(v_cache_arr[j]));
+            }
+            for (std::size_t j = 0; j < static_cast<std::size_t>(gdn_layers) * n_seqs; j++)
+            {
+                bound_sig.push_back(reinterpret_cast<std::uintptr_t>(conv_state_arr[j]));
+                bound_sig.push_back(reinterpret_cast<std::uintptr_t>(delta_state_arr[j]));
+            }
+        }
         int entry_idx = -1;
         for (int i = 0; i < kQabMaxEntries; i++)
         {
             QabEntry& e = pool.entries[i];
-            if (e.valid && e.sig_disc == sig_disc && e.n_slots == n_slots_req &&
+            if (e.valid && e.bound == bound && (!bound || e.bound_sig == bound_sig) &&
+                e.sig_disc == sig_disc && e.n_slots == n_slots_req &&
                 e.num_layers == num_layers && e.H == H && e.vocab == vocab_size &&
                 e.hd == hd && e.kvH == kvH && e.kv_type == kvType &&
                 e.hidden_input == hidden_input)
@@ -648,7 +752,12 @@ static int qab_decode_batched(
                 break;
             }
         }
-        const bool cuda_windows = g_backend_type == BACKEND_TYPE_CUDA;
+        if (bound && entry_idx >= 0 && !pool.entries[entry_idx].bound_bindings_current())
+        {
+            pool.entries[entry_idx].release_graph();
+            entry_idx = -1;
+        }
+        const bool cuda_windows = !bound && g_backend_type == BACKEND_TYPE_CUDA;
         std::vector<int> windows_by_seq;
         std::vector<int> desired_windows;
         bool windows_changed = false;
@@ -698,10 +807,21 @@ static int qab_decode_batched(
                 pool.entries[entry_idx].attn_windows != desired_windows;
         }
         const bool needs_build = (entry_idx < 0) ||
-            (pool.entries[entry_idx].cap < maxTotal) || windows_changed;
+            (!bound && pool.entries[entry_idx].cap < maxTotal) || windows_changed;
 
         if (needs_build)
         {
+            if (bound)
+            {
+                // Windows only grow while the same holders decode together, so a
+                // graph for the same slot keys at older windows will not replay.
+                for (auto& stale : pool.entries)
+                    if (stale.valid && stale.bound && stale.sig_disc == sig_disc &&
+                        stale.n_slots == n_slots_req && stale.bound_sig.size() == bound_sig.size() &&
+                        std::equal(bound_sig.begin() + 1 + 2 * n_seqs, bound_sig.end(),
+                                   stale.bound_sig.begin() + 1 + 2 * n_seqs))
+                        stale.release_graph();
+            }
             if (entry_idx < 0)
             {
                 for (int i = 0; i < kQabMaxEntries; i++)
@@ -730,13 +850,28 @@ static int qab_decode_batched(
             e.hidden_input = hidden_input;
             e.conv_dim = conv_dim; e.convDim = convDim;
             e.head_k = head_k_dim; e.head_v = head_v_dim; e.v_heads = num_v_heads;
+            if (bound)
+            {
+                e.bound = true;
+                e.bound_sig = bound_sig;
+                e.bound_cache_rows.assign(cache_sizes, cache_sizes + n_seqs);
+                e.attn_windows = bound_windows;
+                e.mask_len = *std::max_element(bound_windows.begin(), bound_windows.end());
+                e.cap = 0;
+                e.rows_per_slot = 0;
+                e.slots.clear();
+            }
+            else
+            {
             // Window-only rebuilds preserve physical allocation. Grow the arena
             // geometrically only when its existing capacity is insufficient.
             e.cap = std::max(qab_cap_round(maxTotal),
                 cuda_windows && maxTotal <= prev_cap ? prev_cap : prev_cap * 2);
             e.rows_per_slot = static_cast<std::int64_t>(kvH) * e.cap;
+            e.mask_len = e.cap;
             e.slots.assign(e.n_slots, QabSlot{});
             e.attn_windows.clear();
+            }
             if (cuda_windows)
             {
                 if (e.cap > std::numeric_limits<int>::max())
@@ -769,7 +904,11 @@ static int qab_decode_batched(
                 return 0;
             };
 
-            const std::int64_t arena_rows = e.rows_per_slot * (n_slots + 1);
+            // Attention reads only the real slot planes. Padded SET_ROWS
+            // columns need one unique discard row per (slot, head), not a full
+            // context-sized extra slot. Distinct rows avoid concurrent writes.
+            const std::int64_t discard_rows = static_cast<std::int64_t>(kvH) * n_slots;
+            const std::int64_t arena_rows = e.rows_per_slot * n_slots + discard_rows;
 
             if (hidden_input)
             {
@@ -783,7 +922,7 @@ static int qab_decode_batched(
             }
             e.pos_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_slots);
             e.idx_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, static_cast<std::int64_t>(kvH) * n_slots);
-            e.attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, e.cap, 1, 1, n_slots);
+            e.attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, e.mask_len, 1, 1, n_slots);
             ggml_set_input(e.pos_in);
             ggml_set_input(e.idx_in);
             ggml_set_input(e.attn_mask);
@@ -792,7 +931,33 @@ static int qab_decode_batched(
             e.v_arena.assign(num_layers, nullptr);
             e.conv_arena.assign(num_layers, nullptr);
             e.delta_arena.assign(num_layers, nullptr);
-            for (int l = 0; l < num_layers; l++)
+            if (bound)
+            {
+                // Shapes and byte sizes match the solo decode's bindings of the same
+                // host keys, so both graphs resolve to one resident copy per key.
+                const std::size_t per = static_cast<std::size_t>(num_layers) * n_slots;
+                e.k_bound.assign(per, nullptr);
+                e.v_bound.assign(per, nullptr);
+                e.conv_bound.assign(per, nullptr);
+                e.delta_bound.assign(per, nullptr);
+                for (int l = 0; l < num_layers; l++)
+                    for (int s = 0; s < n_slots; s++)
+                    {
+                        const std::size_t ix = static_cast<std::size_t>(l) * n_slots + s;
+                        if (layers[l].is_recurrent == 0)
+                        {
+                            const std::int64_t rows = static_cast<std::int64_t>(kvH) * e.bound_cache_rows[s];
+                            e.k_bound[ix] = ggml_new_tensor_2d(ctx, kvType, hd, rows);
+                            e.v_bound[ix] = ggml_new_tensor_2d(ctx, kvType, hd, rows);
+                        }
+                        else
+                        {
+                            e.conv_bound[ix] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, convDim, conv_dim);
+                            e.delta_bound[ix] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_k_dim, head_v_dim, num_v_heads, 1);
+                        }
+                    }
+            }
+            for (int l = 0; l < num_layers && !bound; l++)
             {
                 if (layers[l].is_recurrent == 0)
                 {
@@ -801,8 +966,8 @@ static int qab_decode_batched(
                 }
                 else
                 {
-                    e.conv_arena[l] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, convDim, conv_dim, n_slots + 1);
-                    e.delta_arena[l] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_k_dim, head_v_dim, num_v_heads, n_slots + 1);
+                    e.conv_arena[l] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, convDim, conv_dim, n_slots);
+                    e.delta_arena[l] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_k_dim, head_v_dim, num_v_heads, n_slots);
                 }
             }
 
@@ -837,6 +1002,7 @@ static int qab_decode_batched(
                 ggml_tensor* shexp_up_w = nullptr;
                 ggml_tensor* shexp_down_w = nullptr;
                 ggml_tensor* shexp_gate_inp_w = nullptr;
+                ggml_tensor* psc[TSQ35_SC_COUNT] = {};
             };
             std::vector<LW> lw(num_layers);
             for (int l = 0; l < num_layers; l++)
@@ -936,13 +1102,13 @@ static int qab_decode_batched(
                     ggml_tensor* v_raw;
                     if (d.separate_qkv != 0)
                     {
-                        qg_part = tsg::bonsai_mul_mat(ctx, t.qkv_w, normed, d.qkv_w);                       // [qFullDim, N]
-                        k_raw = tsg::bonsai_mul_mat(ctx, t.k_w, normed, d.k_w);                           // [kDim, N]
-                        v_raw = tsg::bonsai_mul_mat(ctx, t.v_w, normed, d.v_w);
+                        qg_part = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.qkv_w, normed, d.qkv_w), q35_psc(ctx, t, d, TSQ35_SC_QKV));                       // [qFullDim, N]
+                        k_raw = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.k_w, normed, d.k_w), q35_psc(ctx, t, d, TSQ35_SC_K));                           // [kDim, N]
+                        v_raw = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.v_w, normed, d.v_w), q35_psc(ctx, t, d, TSQ35_SC_V));
                     }
                     else
                     {
-                        ggml_tensor* qkv = tsg::bonsai_mul_mat(ctx, t.qkv_w, normed, d.qkv_w);              // [qFullDim+2kDim, N]
+                        ggml_tensor* qkv = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.qkv_w, normed, d.qkv_w), q35_psc(ctx, t, d, TSQ35_SC_QKV));              // [qFullDim+2kDim, N]
                         qg_part = ggml_view_2d(ctx, qkv, qFullDim, n_slots, qkv->nb[1], 0);
                         k_raw = ggml_view_2d(ctx, qkv, kDim, n_slots, qkv->nb[1],
                             static_cast<std::size_t>(qFullDim) * sizeof(float));
@@ -986,14 +1152,43 @@ static int qab_decode_batched(
                     // scratch slice). Attention reads views of the set_rows
                     // RESULT so the write->read edge is a real src edge.
                     ggml_tensor* v_3d = ggml_reshape_3d(ctx, ggml_cont(ctx, v_raw), hd, kvH, n_slots);
-                    ggml_tensor* k_rows = ggml_reshape_2d(ctx, k_rope, hd, static_cast<std::int64_t>(kvH) * n_slots);
-                    ggml_tensor* v_rows = ggml_reshape_2d(ctx, v_3d, hd, static_cast<std::int64_t>(kvH) * n_slots);
-                    ggml_tensor* k_set = ggml_set_rows(ctx, e.k_arena[l], k_rows, e.idx_in);
-                    ggml_tensor* v_set = ggml_set_rows(ctx, e.v_arena[l], v_rows, e.idx_in);
-                    if (!op_unsupported && !backend_supports_op(k_set))
-                        op_unsupported = true;
-                    state_writes.push_back(k_set);
-                    state_writes.push_back(v_set);
+                    ggml_tensor* k_set = nullptr;
+                    ggml_tensor* v_set = nullptr;
+                    std::vector<ggml_tensor*> k_sets, v_sets;
+                    if (bound)
+                    {
+                        // One scatter per slot into that holder's own K/V copy
+                        // (idx carries head*rows + pos for the slot's kvH rows).
+                        for (int s = 0; s < n_slots; s++)
+                        {
+                            const std::size_t ix = static_cast<std::size_t>(l) * n_slots + s;
+                            ggml_tensor* idx_s = ggml_view_1d(ctx, e.idx_in, kvH,
+                                static_cast<std::size_t>(s) * kvH * sizeof(std::int64_t));
+                            ggml_tensor* k_rows_s = ggml_view_2d(ctx, k_rope, hd, kvH, k_rope->nb[1],
+                                static_cast<std::size_t>(s) * k_rope->nb[2]);
+                            ggml_tensor* v_rows_s = ggml_view_2d(ctx, v_3d, hd, kvH, v_3d->nb[1],
+                                static_cast<std::size_t>(s) * v_3d->nb[2]);
+                            ggml_tensor* ks = ggml_set_rows(ctx, e.k_bound[ix], k_rows_s, idx_s);
+                            ggml_tensor* vs = ggml_set_rows(ctx, e.v_bound[ix], v_rows_s, idx_s);
+                            if (!op_unsupported && !backend_supports_op(ks))
+                                op_unsupported = true;
+                            state_writes.push_back(ks);
+                            state_writes.push_back(vs);
+                            k_sets.push_back(ks);
+                            v_sets.push_back(vs);
+                        }
+                    }
+                    else
+                    {
+                        ggml_tensor* k_rows = ggml_reshape_2d(ctx, k_rope, hd, static_cast<std::int64_t>(kvH) * n_slots);
+                        ggml_tensor* v_rows = ggml_reshape_2d(ctx, v_3d, hd, static_cast<std::int64_t>(kvH) * n_slots);
+                        k_set = ggml_set_rows(ctx, e.k_arena[l], k_rows, e.idx_in);
+                        v_set = ggml_set_rows(ctx, e.v_arena[l], v_rows, e.idx_in);
+                        if (!op_unsupported && !backend_supports_op(k_set))
+                            op_unsupported = true;
+                        state_writes.push_back(k_set);
+                        state_writes.push_back(v_set);
+                    }
 
                     if (op_unsupported)
                         return abort_build("set_rows unsupported for the arena shapes.");
@@ -1009,20 +1204,24 @@ static int qab_decode_batched(
                         // read SET_ROWS results to preserve every write/read edge.
                         for (int s = 0; s < n_slots; s++)
                         {
-                            const std::size_t slot_offset =
+                            // Bound slots read their holder's copy at its own pitch.
+                            const std::int64_t slot_cap = bound ? e.bound_cache_rows[s] : e.cap;
+                            const std::size_t slot_offset = bound ? 0 :
                                 static_cast<std::size_t>(s) * e.rows_per_slot * row_bytes;
-                            ggml_tensor* k_slot = ggml_view_3d(ctx, k_set, hd, e.cap, kvH,
-                                row_bytes, static_cast<std::size_t>(e.cap) * row_bytes, slot_offset);
-                            ggml_tensor* v_slot = ggml_view_3d(ctx, v_set, hd, e.cap, kvH,
-                                row_bytes, static_cast<std::size_t>(e.cap) * row_bytes, slot_offset);
+                            ggml_tensor* k_src = bound ? k_sets[s] : k_set;
+                            ggml_tensor* v_src = bound ? v_sets[s] : v_set;
+                            ggml_tensor* k_slot = ggml_view_3d(ctx, k_src, hd, slot_cap, kvH,
+                                row_bytes, static_cast<std::size_t>(slot_cap) * row_bytes, slot_offset);
+                            ggml_tensor* v_slot = ggml_view_3d(ctx, v_src, hd, slot_cap, kvH,
+                                row_bytes, static_cast<std::size_t>(slot_cap) * row_bytes, slot_offset);
                             const int window = e.attn_windows[s];
                             // Keep physical head pitch while exposing the same
                             // effective length as solo. The shared helper also
                             // protects affected CUDA F16 truncated-window reads.
                             ggml_tensor* k_view = view_kv_cache_window(ctx, k_slot, hd,
-                                static_cast<int>(e.cap), kvH, 0, window, kv_cache_type, 1, nH / kvH);
+                                static_cast<int>(slot_cap), kvH, 0, window, kv_cache_type, 1, nH / kvH);
                             ggml_tensor* v_view = view_kv_cache_window(ctx, v_slot, hd,
-                                static_cast<int>(e.cap), kvH, 0, window, kv_cache_type, 1, nH / kvH);
+                                static_cast<int>(slot_cap), kvH, 0, window, kv_cache_type, 1, nH / kvH);
                             if (k_view == nullptr || v_view == nullptr)
                                 return abort_build("failed to create per-slot KV attention windows.");
                             ggml_tensor* q_slot = ggml_view_3d(ctx, q_rope, hd, 1, nH,
@@ -1060,7 +1259,7 @@ static int qab_decode_batched(
                     ggml_tensor* gate_cont = ggml_cont(ctx, gate_view);
                     ggml_tensor* attn_gated = ggml_mul(ctx, attn_2d, ggml_sigmoid(ctx, gate_cont));
                     ggml_tensor* attn_flat = ggml_reshape_2d(ctx, ggml_cont(ctx, attn_gated), qDim, n_slots);
-                    block_out = tsg::bonsai_mul_mat(ctx, t.o_w, attn_flat, d.o_w);                          // [H, N]
+                    block_out = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.o_w, attn_flat, d.o_w), q35_psc(ctx, t, d, TSQ35_SC_O));                          // [H, N]
                 }
                 else
                 {
@@ -1072,7 +1271,7 @@ static int qab_decode_batched(
                     if (t.gdn_gate_w == nullptr)
                     {
                         const std::int64_t packed_dim = d.gdn_qkv_ne1;
-                        ggml_tensor* packed = tsg::bonsai_mul_mat(ctx, t.gdn_qkv_w, normed, d.gdn_qkv_w);         // [packed_dim, N]
+                        ggml_tensor* packed = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.gdn_qkv_w, normed, d.gdn_qkv_w), q35_psc(ctx, t, d, TSQ35_SC_GDN_QKV));         // [packed_dim, N]
                         qkv_mixed = ggml_view_2d(ctx, packed, conv_dim, n_slots, packed->nb[1], 0);
                         z = ggml_view_2d(ctx, packed, value_dim, n_slots, packed->nb[1],
                             static_cast<std::size_t>(conv_dim) * sizeof(float));
@@ -1084,10 +1283,10 @@ static int qab_decode_batched(
                     }
                     else
                     {
-                        qkv_mixed = tsg::bonsai_mul_mat(ctx, t.gdn_qkv_w, normed, d.gdn_qkv_w);
-                        z = tsg::bonsai_mul_mat(ctx, t.gdn_gate_w, normed, d.gdn_gate_w);
-                        beta_raw = tsg::bonsai_mul_mat(ctx, t.ssm_beta_w, normed, d.ssm_beta_w);
-                        alpha_raw = tsg::bonsai_mul_mat(ctx, t.ssm_alpha_w, normed, d.ssm_alpha_w);
+                        qkv_mixed = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.gdn_qkv_w, normed, d.gdn_qkv_w), q35_psc(ctx, t, d, TSQ35_SC_GDN_QKV));
+                        z = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.gdn_gate_w, normed, d.gdn_gate_w), q35_psc(ctx, t, d, TSQ35_SC_GDN_GATE));
+                        beta_raw = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.ssm_beta_w, normed, d.ssm_beta_w), q35_psc(ctx, t, d, TSQ35_SC_BETA));
+                        alpha_raw = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.ssm_alpha_w, normed, d.ssm_alpha_w), q35_psc(ctx, t, d, TSQ35_SC_ALPHA));
                     }
                     ggml_tensor* qkv_cont = ggml_cont(ctx, qkv_mixed);                        // [conv_dim, N]
                     ggml_tensor* beta_all = ggml_sigmoid(ctx, ggml_cont(ctx, beta_raw));      // [num_v_heads, N]
@@ -1109,8 +1308,10 @@ static int qab_decode_batched(
                         : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, value_dim, n_slots);
                     for (int s = 0; s < n_slots; s++)
                     {
-                        ggml_tensor* conv_slice = ggml_view_2d(ctx, e.conv_arena[l], convDim, conv_dim,
-                            e.conv_arena[l]->nb[1], static_cast<std::size_t>(s) * e.conv_arena[l]->nb[2]);
+                        const std::size_t bix = static_cast<std::size_t>(l) * n_slots + s;
+                        ggml_tensor* conv_slice = bound ? e.conv_bound[bix] :
+                            ggml_view_2d(ctx, e.conv_arena[l], convDim, conv_dim,
+                                e.conv_arena[l]->nb[1], static_cast<std::size_t>(s) * e.conv_arena[l]->nb[2]);
                         ggml_tensor* qkv_col = ggml_view_2d(ctx, qkv_cont, conv_dim, 1,
                             qkv_cont->nb[1], static_cast<std::size_t>(s) * qkv_cont->nb[1]);
                         ggml_tensor* conv_input = ggml_concat(ctx, conv_slice,
@@ -1142,10 +1343,11 @@ static int qab_decode_batched(
                         ggml_tensor* g_s = ggml_view_4d(ctx, g_all, 1, num_v_heads, 1, 1,
                             g_all->nb[0], g_all->nb[1], g_all->nb[1],
                             static_cast<std::size_t>(s) * g_all->nb[1]);
-                        ggml_tensor* state4 = ggml_view_4d(ctx, e.delta_arena[l],
-                            head_k_dim, head_v_dim, num_v_heads, 1,
-                            e.delta_arena[l]->nb[1], e.delta_arena[l]->nb[2], e.delta_arena[l]->nb[3],
-                            static_cast<std::size_t>(s) * e.delta_arena[l]->nb[3]);
+                        ggml_tensor* state4 = bound ? e.delta_bound[bix] :
+                            ggml_view_4d(ctx, e.delta_arena[l],
+                                head_k_dim, head_v_dim, num_v_heads, 1,
+                                e.delta_arena[l]->nb[1], e.delta_arena[l]->nb[2], e.delta_arena[l]->nb[3],
+                                static_cast<std::size_t>(s) * e.delta_arena[l]->nb[3]);
 
                         ggml_tensor* gdn = ggml_gated_delta_net(ctx, q4, k4, v4, g_s, beta_s, state4, 1);
                         if (l == 0 || (s == 0 && !op_unsupported))
@@ -1184,7 +1386,7 @@ static int qab_decode_batched(
                     ggml_tensor* z_3d = ggml_reshape_3d(ctx, ggml_cont(ctx, z), head_v_dim, num_v_heads, n_slots);
                     ggml_tensor* gated = ggml_mul(ctx, out_n, ggml_silu(ctx, z_3d));
                     ggml_tensor* gated_flat = ggml_reshape_2d(ctx, gated, value_dim, n_slots);
-                    block_out = tsg::bonsai_mul_mat(ctx, t.ssm_out_w, gated_flat, d.ssm_out_w);                    // [H, N]
+                    block_out = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.ssm_out_w, gated_flat, d.ssm_out_w), q35_psc(ctx, t, d, TSQ35_SC_SSM_OUT));                    // [H, N]
                 }
 
                 ggml_tensor* residual1 = ggml_add(ctx, hidden, block_out);
@@ -1196,14 +1398,14 @@ static int qab_decode_batched(
                 {
                     ggml_tensor* act;
                     if (t.gu_w != nullptr)
-                        act = ggml_swiglu(ctx, tsg::bonsai_mul_mat(ctx, t.gu_w, ffn_normed, d.gu_w));
+                        act = ggml_swiglu(ctx, q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.gu_w, ffn_normed, d.gu_w), q35_psc(ctx, t, d, TSQ35_SC_GU)));
                     else
                     {
-                        ggml_tensor* g2 = tsg::bonsai_mul_mat(ctx, t.ffn_gate_w, ffn_normed, d.ffn_gate_w);
-                        ggml_tensor* u2 = tsg::bonsai_mul_mat(ctx, t.ffn_up_w, ffn_normed, d.ffn_up_w);
+                        ggml_tensor* g2 = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.ffn_gate_w, ffn_normed, d.ffn_gate_w), q35_psc(ctx, t, d, TSQ35_SC_FFN_GATE));
+                        ggml_tensor* u2 = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.ffn_up_w, ffn_normed, d.ffn_up_w), q35_psc(ctx, t, d, TSQ35_SC_FFN_UP));
                         act = ggml_mul(ctx, ggml_silu(ctx, g2), u2);
                     }
-                    ffn_down = tsg::bonsai_mul_mat(ctx, t.down_w, act, d.down_w);                               // [H, N]
+                    ffn_down = q35_scaled(ctx, tsg::bonsai_mul_mat(ctx, t.down_w, act, d.down_w), q35_psc(ctx, t, d, TSQ35_SC_DOWN));                               // [H, N]
                 }
                 else
                 {
@@ -1307,6 +1509,10 @@ static int qab_decode_batched(
             {
                 const TSGgmlQwen35LayerDesc& d = layers[l];
                 LW& t = lw[l];
+                // Only consumed scale slots exist, matching the solo and verify graphs.
+                for (int slot = 0; slot < TSQ35_SC_COUNT; ++slot)
+                    if (t.psc[slot] != nullptr)
+                        bind_or_mark(t.psc[slot], static_cast<float*>(d.proj_scales) + slot, sizeof(float));
                 bind_or_mark(t.attn_norm_w, d.attn_norm_w, static_cast<std::size_t>(H) * sizeof(float));
                 bind_or_mark(t.post_attn_norm_w, d.post_attn_norm_w, static_cast<std::size_t>(H) * sizeof(float));
                 if (d.is_recurrent == 0)
@@ -1360,6 +1566,49 @@ static int qab_decode_batched(
             bind_or_mark(final_norm_t, final_norm_data, static_cast<std::size_t>(H) * sizeof(float));
             bind_or_mark(token_embd_t, token_embd_data, static_cast<std::size_t>(token_embd_bytes));
 
+            if (bound)
+            {
+                // Bind each slot to its holder's resident copies with the solo
+                // decode's usage and sizes. A copy created here has never been
+                // written: fill it from the host bytes (the truth whenever no copy
+                // exists) before anything can fail, so the cache never publishes
+                // an unwritten entry.
+                auto bind_holder = [&](ggml_tensor* tgt, const void* host, std::size_t bytes) -> bool {
+                    bool needs_upload = false;
+                    if (!try_bind_cached_tensor(g_backend, dev, tgt, const_cast<void*>(host), bytes, needs_upload,
+                                                GGML_BACKEND_BUFFER_USAGE_COMPUTE))
+                        return false;
+                    if (needs_upload)
+                        ggml_backend_tensor_set(tgt, host, 0, bytes);
+                    e.bound_keys.push_back({host, tgt->buffer, tgt->data, bytes});
+                    return true;
+                };
+                host_read_barrier();
+                for (int l = 0, al = 0, gl = 0; l < num_layers; l++)
+                {
+                    const bool attn = layers[l].is_recurrent == 0;
+                    for (int s = 0; s < n_slots; s++)
+                    {
+                        const std::size_t ix = static_cast<std::size_t>(l) * n_slots + s;
+                        bool ok;
+                        if (attn)
+                        {
+                            const std::size_t kv_bytes = kv_cache_bytes(kvH, e.bound_cache_rows[s], hd, kv_cache_type);
+                            ok = bind_holder(e.k_bound[ix], k_cache_arr[static_cast<std::size_t>(al) * n_seqs + s], kv_bytes) &&
+                                 bind_holder(e.v_bound[ix], v_cache_arr[static_cast<std::size_t>(al) * n_seqs + s], kv_bytes);
+                        }
+                        else
+                        {
+                            ok = bind_holder(e.conv_bound[ix], conv_state_arr[static_cast<std::size_t>(gl) * n_seqs + s], convBytes) &&
+                                 bind_holder(e.delta_bound[ix], delta_state_arr[static_cast<std::size_t>(gl) * n_seqs + s], deltaBytes);
+                        }
+                        if (!ok)
+                            return abort_build("failed to bind a holder's resident cache copy.");
+                    }
+                    (attn ? al : gl)++;
+                }
+            }
+
             // Everything unbound (inputs, arenas, intermediates, logits) lands in
             // the entry's own buffer — nothing references the shared gallocr
             // pool, which is what lets this graph survive prefills and holder
@@ -1392,196 +1641,208 @@ static int qab_decode_batched(
 
         // ---- slot assignment + joins ----
         std::vector<int> slot_of(n_seqs, -1);
-        for (int i = 0; i < n_seqs; i++)
+        if (bound)
+        {
+            // Slot i is sequence i; the holders' copies already hold their state.
+            for (int i = 0; i < n_seqs; i++)
+                slot_of[i] = i;
+        }
+        for (int i = 0; i < n_seqs && !bound; i++)
         {
             const void* key = k_cache_arr[i];   // first attention layer, seq i
             for (int s = 0; s < n_slots; s++)
                 if (e.slots[s].active && e.slots[s].key == key) { slot_of[i] = s; break; }
         }
-        // The graph advances EVERY slot's GDN recurrent state each step (there
-        // is no per-slot skip in a slot-stable graph), so an ACTIVE slot whose
-        // sequence is not in this call would be phantom-advanced by a pad
-        // token. Flush and retire such slots now; their sequences simply
-        // rejoin later. (KV padded lanes are already scratch-redirected; the
-        // recurrent state has no such escape.)
-        for (int s = 0; s < n_slots; s++)
+        // Arena-owned slots retire absent sequences and join newcomers by
+        // copying their state in; bound slots have nothing to move.
+        if (!bound)
         {
-            if (!e.slots[s].active) continue;
-            bool in_call = false;
-            for (int i = 0; i < n_seqs; i++)
-                if (slot_of[i] == s) { in_call = true; break; }
-            if (!in_call)
-                qab_flush_and_drop_slot(e, s);
-        }
-        // A sequence may hold a DIRTY slot in a different bucket's entry (the
-        // concurrency crossed a power of two). Flush that mapping first so the
-        // join below reads current host bytes instead of pre-arena state.
-        {
-            QabRegistry& reg = qab_registry();
+            // The graph advances EVERY slot's GDN recurrent state each step (there
+            // is no per-slot skip in a slot-stable graph), so an ACTIVE slot whose
+            // sequence is not in this call would be phantom-advanced by a pad
+            // token. Flush and retire such slots now; their sequences simply
+            // rejoin later. (KV padded lanes are already scratch-redirected; the
+            // recurrent state has no such escape.)
+            for (int s = 0; s < n_slots; s++)
+            {
+                if (!e.slots[s].active) continue;
+                bool in_call = false;
+                for (int i = 0; i < n_seqs; i++)
+                    if (slot_of[i] == s) { in_call = true; break; }
+                if (!in_call)
+                    qab_flush_and_drop_slot(e, s);
+            }
+            // A sequence may hold a DIRTY slot in a different bucket's entry (the
+            // concurrency crossed a power of two). Flush that mapping first so the
+            // join below reads current host bytes instead of pre-arena state.
+            {
+                QabRegistry& reg = qab_registry();
+                for (int i = 0; i < n_seqs; i++)
+                {
+                    if (slot_of[i] >= 0) continue;
+                    auto it = reg.find(k_cache_arr[i]);
+                    if (it != reg.end())
+                    {
+                        // slot_of[i] < 0 means no matching slot in THIS entry, so
+                        // any registry hit is a stale mapping elsewhere.
+                        qab_flush_and_drop_slot(
+                            pool.entries[it->second.first], it->second.second);
+                    }
+                }
+            }
             for (int i = 0; i < n_seqs; i++)
             {
                 if (slot_of[i] >= 0) continue;
-                auto it = reg.find(k_cache_arr[i]);
-                if (it != reg.end())
-                {
-                    // slot_of[i] < 0 means no matching slot in THIS entry, so
-                    // any registry hit is a stale mapping elsewhere.
-                    qab_flush_and_drop_slot(
-                        pool.entries[it->second.first], it->second.second);
-                }
-            }
-        }
-        for (int i = 0; i < n_seqs; i++)
-        {
-            if (slot_of[i] >= 0) continue;
-            int s = -1;
-            for (int j = 0; j < n_slots; j++)
-                if (!e.slots[j].active) { s = j; break; }
-            if (s < 0)
-            {
-                std::uint64_t best = std::numeric_limits<std::uint64_t>::max();
+                int s = -1;
                 for (int j = 0; j < n_slots; j++)
-                {
-                    bool in_call = false;
-                    for (int k = 0; k < n_seqs; k++)
-                        if (slot_of[k] == j) { in_call = true; break; }
-                    if (!in_call && e.slots[j].last_used < best) { best = e.slots[j].last_used; s = j; }
-                }
+                    if (!e.slots[j].active) { s = j; break; }
                 if (s < 0)
                 {
-                    set_last_error("Qwen3.5 arena batched decode: no free arena slot.");
-                    return 0;
+                    std::uint64_t best = std::numeric_limits<std::uint64_t>::max();
+                    for (int j = 0; j < n_slots; j++)
+                    {
+                        bool in_call = false;
+                        for (int k = 0; k < n_seqs; k++)
+                            if (slot_of[k] == j) { in_call = true; break; }
+                        if (!in_call && e.slots[j].last_used < best) { best = e.slots[j].last_used; s = j; }
+                    }
+                    if (s < 0)
+                    {
+                        set_last_error("Qwen3.5 arena batched decode: no free arena slot.");
+                        return 0;
+                    }
+                    qab_flush_and_drop_slot(e, s);
                 }
-                qab_flush_and_drop_slot(e, s);
-            }
-            slot_of[i] = s;
-            QabSlot& sl = e.slots[s];
-            sl.active = true;
-            sl.key = k_cache_arr[i];
-            sl.cache_rows = cache_sizes[i];
-            sl.len = 0;
-            sl.clean = 0;
-            sl.state_seeded = false;
-            sl.state_dirty = false;
-            sl.k_hosts.resize(attn_layers);
-            sl.v_hosts.resize(attn_layers);
-            sl.conv_hosts.resize(gdn_layers);
-            sl.delta_hosts.resize(gdn_layers);
-            for (int l = 0, al = 0, gl = 0; l < num_layers; l++)
-            {
-                if (layers[l].is_recurrent == 0)
-                {
-                    sl.k_hosts[al] = k_cache_arr[static_cast<std::size_t>(al) * n_seqs + i];
-                    sl.v_hosts[al] = v_cache_arr[static_cast<std::size_t>(al) * n_seqs + i];
-                    al++;
-                }
-                else
-                {
-                    sl.conv_hosts[gl] = conv_state_arr[static_cast<std::size_t>(gl) * n_seqs + i];
-                    sl.delta_hosts[gl] = delta_state_arr[static_cast<std::size_t>(gl) * n_seqs + i];
-                    gl++;
-                }
-            }
-            QabRegistry& reg = qab_registry();
-            for (const void* p : sl.k_hosts) reg[p] = {entry_idx, s};
-            for (const void* p : sl.v_hosts) reg[p] = {entry_idx, s};
-            for (const void* p : sl.conv_hosts) reg[p] = {entry_idx, s};
-            for (const void* p : sl.delta_hosts) reg[p] = {entry_idx, s};
-        }
-
-        // Joins: extend KV when a slot's valid length lags this call's position,
-        // and independently seed the complete GDN state when a slot is newly
-        // assigned or rolled back (including position zero). KV comes from the
-        // resident device copy when one is current (post solo decode), else from
-        // the host bytes (post prefill). GDN state uses the same source rule,
-        // except a host-authoritative holder forces the host source.
-        std::vector<char> bounce;
-        for (int i = 0; i < n_seqs; i++)
-        {
-            const int s = slot_of[i];
-            QabSlot& sl = e.slots[s];
-            const std::int64_t pos = positions[i];
-            if (sl.len > pos)
-            {
-                // A position rollback cannot reuse the arena: KV rows could keep
-                // their prefix, but the GDN recurrent state at `pos` is NOT a
-                // prefix of the state at `len` (recurrence has no rewind — the
-                // glm5next/KDA rule applies here too). Rejoin from scratch off
-                // the resident/host source, which the engine has already rolled
-                // back through its own solo paths.
+                slot_of[i] = s;
+                QabSlot& sl = e.slots[s];
+                sl.active = true;
+                sl.key = k_cache_arr[i];
+                sl.cache_rows = cache_sizes[i];
                 sl.len = 0;
                 sl.clean = 0;
                 sl.state_seeded = false;
                 sl.state_dirty = false;
-            }
-            const bool needs_kv_join = sl.len < pos;
-            const bool needs_state_seed = !sl.state_seeded || needs_kv_join;
-            if (needs_kv_join)
-            {
-                const std::int64_t from = sl.len;
-                const std::size_t bytes = static_cast<std::size_t>(pos - from) * row_bytes;
-                for (int l = 0, al = 0; l < num_layers; l++)
+                sl.k_hosts.resize(attn_layers);
+                sl.v_hosts.resize(attn_layers);
+                sl.conv_hosts.resize(gdn_layers);
+                sl.delta_hosts.resize(gdn_layers);
+                for (int l = 0, al = 0, gl = 0; l < num_layers; l++)
                 {
-                    if (layers[l].is_recurrent != 0) continue;
-                    const void* kh = sl.k_hosts[al];
-                    const void* vh = sl.v_hosts[al];
-                    const std::size_t cache_total = static_cast<std::size_t>(sl.cache_rows) * kvH * row_bytes;
-                    bounce.resize(bytes);
-                    for (int which = 0; which < 2; which++)
+                    if (layers[l].is_recurrent == 0)
                     {
-                        const void* host = (which == 0) ? kh : vh;
-                        ggml_tensor* arena = (which == 0) ? e.k_arena[l] : e.v_arena[l];
-                        for (int h = 0; h < kvH; h++)
+                        sl.k_hosts[al] = k_cache_arr[static_cast<std::size_t>(al) * n_seqs + i];
+                        sl.v_hosts[al] = v_cache_arr[static_cast<std::size_t>(al) * n_seqs + i];
+                        al++;
+                    }
+                    else
+                    {
+                        sl.conv_hosts[gl] = conv_state_arr[static_cast<std::size_t>(gl) * n_seqs + i];
+                        sl.delta_hosts[gl] = delta_state_arr[static_cast<std::size_t>(gl) * n_seqs + i];
+                        gl++;
+                    }
+                }
+                QabRegistry& reg = qab_registry();
+                for (const void* p : sl.k_hosts) reg[p] = {entry_idx, s};
+                for (const void* p : sl.v_hosts) reg[p] = {entry_idx, s};
+                for (const void* p : sl.conv_hosts) reg[p] = {entry_idx, s};
+                for (const void* p : sl.delta_hosts) reg[p] = {entry_idx, s};
+            }
+
+            // Joins: extend KV when a slot's valid length lags this call's position,
+            // and independently seed the complete GDN state when a slot is newly
+            // assigned or rolled back (including position zero). KV comes from the
+            // resident device copy when one is current (post solo decode), else from
+            // the host bytes (post prefill). GDN state uses the same source rule,
+            // except a host-authoritative holder forces the host source.
+            std::vector<char> bounce;
+            for (int i = 0; i < n_seqs; i++)
+            {
+                const int s = slot_of[i];
+                QabSlot& sl = e.slots[s];
+                const std::int64_t pos = positions[i];
+                if (sl.len > pos)
+                {
+                    // A position rollback cannot reuse the arena: KV rows could keep
+                    // their prefix, but the GDN recurrent state at `pos` is NOT a
+                    // prefix of the state at `len` (recurrence has no rewind — the
+                    // glm5next/KDA rule applies here too). Rejoin from scratch off
+                    // the resident/host source, which the engine has already rolled
+                    // back through its own solo paths.
+                    sl.len = 0;
+                    sl.clean = 0;
+                    sl.state_seeded = false;
+                    sl.state_dirty = false;
+                }
+                const bool needs_kv_join = sl.len < pos;
+                const bool needs_state_seed = !sl.state_seeded || needs_kv_join;
+                if (needs_kv_join)
+                {
+                    const std::int64_t from = sl.len;
+                    const std::size_t bytes = static_cast<std::size_t>(pos - from) * row_bytes;
+                    for (int l = 0, al = 0; l < num_layers; l++)
+                    {
+                        if (layers[l].is_recurrent != 0) continue;
+                        const void* kh = sl.k_hosts[al];
+                        const void* vh = sl.v_hosts[al];
+                        const std::size_t cache_total = static_cast<std::size_t>(sl.cache_rows) * kvH * row_bytes;
+                        bounce.resize(bytes);
+                        for (int which = 0; which < 2; which++)
                         {
-                            const std::size_t src_off =
-                                (static_cast<std::size_t>(h) * sl.cache_rows + static_cast<std::size_t>(from)) * row_bytes;
-                            if (!qab_read_source(host, src_off, bytes, cache_total, bounce.data(), false))
+                            const void* host = (which == 0) ? kh : vh;
+                            ggml_tensor* arena = (which == 0) ? e.k_arena[l] : e.v_arena[l];
+                            for (int h = 0; h < kvH; h++)
                             {
-                                set_last_error("Qwen3.5 arena batched decode: KV join source read failed.");
-                                return 0;
+                                const std::size_t src_off =
+                                    (static_cast<std::size_t>(h) * sl.cache_rows + static_cast<std::size_t>(from)) * row_bytes;
+                                if (!qab_read_source(host, src_off, bytes, cache_total, bounce.data(), false))
+                                {
+                                    set_last_error("Qwen3.5 arena batched decode: KV join source read failed.");
+                                    return 0;
+                                }
+                                const std::int64_t arow = static_cast<std::int64_t>(s) * e.rows_per_slot +
+                                                          static_cast<std::int64_t>(h) * e.cap + from;
+                                ggml_backend_tensor_set(arena, bounce.data(),
+                                    static_cast<std::size_t>(arow) * row_bytes, bytes);
                             }
-                            const std::int64_t arow = static_cast<std::int64_t>(s) * e.rows_per_slot +
-                                                      static_cast<std::int64_t>(h) * e.cap + from;
-                            ggml_backend_tensor_set(arena, bounce.data(),
-                                static_cast<std::size_t>(arow) * row_bytes, bytes);
                         }
+                        al++;
                     }
-                    al++;
+                    sl.len = pos;
+                    sl.clean = pos;
                 }
-                sl.len = pos;
-                sl.clean = pos;
-            }
-            // Recurrent state is not a KV row prefix. A newly assigned (or
-            // rolled-back) slot must seed its complete conv/delta state even at
-            // position zero, where there are no KV rows to join. Otherwise the
-            // first decode reuses the previous occupant's arena state.
-            if (needs_state_seed)
-            {
-                const bool force_host = gdn_host_auth[i] != 0;
-                bounce.resize(std::max(convBytes, deltaBytes));
-                for (int l = 0, gl = 0; l < num_layers; l++)
+                // Recurrent state is not a KV row prefix. A newly assigned (or
+                // rolled-back) slot must seed its complete conv/delta state even at
+                // position zero, where there are no KV rows to join. Otherwise the
+                // first decode reuses the previous occupant's arena state.
+                if (needs_state_seed)
                 {
-                    if (layers[l].is_recurrent == 0) continue;
-                    const void* ch = sl.conv_hosts[gl];
-                    const void* dh = sl.delta_hosts[gl];
-                    if (!qab_read_source(ch, 0, convBytes, convBytes, bounce.data(), force_host))
+                    const bool force_host = gdn_host_auth[i] != 0;
+                    bounce.resize(std::max(convBytes, deltaBytes));
+                    for (int l = 0, gl = 0; l < num_layers; l++)
                     {
-                        set_last_error("Qwen3.5 arena batched decode: conv state join read failed.");
-                        return 0;
+                        if (layers[l].is_recurrent == 0) continue;
+                        const void* ch = sl.conv_hosts[gl];
+                        const void* dh = sl.delta_hosts[gl];
+                        if (!qab_read_source(ch, 0, convBytes, convBytes, bounce.data(), force_host))
+                        {
+                            set_last_error("Qwen3.5 arena batched decode: conv state join read failed.");
+                            return 0;
+                        }
+                        ggml_backend_tensor_set(e.conv_arena[l], bounce.data(),
+                            static_cast<std::size_t>(s) * convBytes, convBytes);
+                        if (!qab_read_source(dh, 0, deltaBytes, deltaBytes, bounce.data(), force_host))
+                        {
+                            set_last_error("Qwen3.5 arena batched decode: delta state join read failed.");
+                            return 0;
+                        }
+                        ggml_backend_tensor_set(e.delta_arena[l], bounce.data(),
+                            static_cast<std::size_t>(s) * deltaBytes, deltaBytes);
+                        gl++;
                     }
-                    ggml_backend_tensor_set(e.conv_arena[l], bounce.data(),
-                        static_cast<std::size_t>(s) * convBytes, convBytes);
-                    if (!qab_read_source(dh, 0, deltaBytes, deltaBytes, bounce.data(), force_host))
-                    {
-                        set_last_error("Qwen3.5 arena batched decode: delta state join read failed.");
-                        return 0;
-                    }
-                    ggml_backend_tensor_set(e.delta_arena[l], bounce.data(),
-                        static_cast<std::size_t>(s) * deltaBytes, deltaBytes);
-                    gl++;
+                    sl.state_seeded = true;
                 }
-                sl.state_seeded = true;
             }
+
         }
 
         // ---- per-step inputs (slot order) ----
@@ -1593,7 +1854,7 @@ static int qab_decode_batched(
             for (int h = 0; h < kvH; h++)
                 e.idx_stage[static_cast<std::size_t>(s) * kvH + h] =
                     static_cast<std::int64_t>(n_slots) * e.rows_per_slot +
-                    static_cast<std::int64_t>(h) * e.cap + s;   // scratch slice
+                    static_cast<std::int64_t>(s) * kvH + h;   // unique discard row
         for (int i = 0; i < n_seqs; i++)
         {
             const int s = slot_of[i];
@@ -1605,9 +1866,10 @@ static int qab_decode_batched(
                     static_cast<std::size_t>(H) * sizeof(float));
             e.pos_stage[s] = rope_positions != nullptr ? rope_positions[i] : positions[i];
             for (int h = 0; h < kvH; h++)
-                e.idx_stage[static_cast<std::size_t>(s) * kvH + h] =
-                    static_cast<std::int64_t>(s) * e.rows_per_slot +
-                    static_cast<std::int64_t>(h) * e.cap + positions[i];
+                e.idx_stage[static_cast<std::size_t>(s) * kvH + h] = bound
+                    ? static_cast<std::int64_t>(h) * e.bound_cache_rows[s] + positions[i]
+                    : static_cast<std::int64_t>(s) * e.rows_per_slot +
+                      static_cast<std::int64_t>(h) * e.cap + positions[i];
         }
 
         host_read_barrier();
@@ -1617,7 +1879,7 @@ static int qab_decode_batched(
             decode_input_set_async(e.token_in, e.tok_stage.data(), e.tok_stage.size() * sizeof(std::int32_t));
         decode_input_set_async(e.pos_in, e.pos_stage.data(), e.pos_stage.size() * sizeof(std::int32_t));
         decode_input_set_async(e.idx_in, e.idx_stage.data(), e.idx_stage.size() * sizeof(std::int64_t));
-        qab_fill_mask(e.mask_stage, e.cap, n_slots, pos_by_slot.data());
+        qab_fill_mask(e.mask_stage, e.mask_len, n_slots, pos_by_slot.data());
         decode_input_set_async(e.attn_mask, e.mask_stage.data(), e.mask_stage.size() * sizeof(ggml_fp16_t));
 
         compute_started = true;
@@ -1633,7 +1895,7 @@ static int qab_decode_batched(
             // status -1: managed code must fail the affected sequences instead
             // of re-serving this token through a stale serial recurrent state.
             // Their pre-step KV rows [clean,len) remain coherent and are flushed.
-            for (int i = 0; i < n_seqs; i++)
+            for (int i = 0; i < n_seqs && !bound; i++)
             {
                 QabSlot& sl = e.slots[slot_of[i]];
                 sl.state_dirty = false;
@@ -1684,7 +1946,7 @@ static int qab_decode_batched(
             }
         }
 
-        for (int i = 0; i < n_seqs; i++)
+        for (int i = 0; i < n_seqs && !bound; i++)
         {
             QabSlot& sl = e.slots[slot_of[i]];
             sl.len = positions[i] + 1;

@@ -191,7 +191,10 @@ public class CudaBackendTests
                         expected += l * rr;
                     }
 
-                    Assert.InRange(MathF.Abs(expected - actual[(b * rows + r) * cols + c]), 0.0f, 5e-4f);
+                    // The handle allows tensor-op (TF32) SGEMM: 64 products of unit-scale values
+                    // round to ~5e-4, and cuBLAS 13's kernels landed at 5.1e-4 where cuBLAS 12's
+                    // stayed under it. A transposed-operand bug is off by O(1).
+                    Assert.InRange(MathF.Abs(expected - actual[(b * rows + r) * cols + c]), 0.0f, 1e-3f);
                 }
             }
         }

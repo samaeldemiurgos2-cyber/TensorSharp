@@ -109,3 +109,46 @@ Run the local harness regression tests without a model or GPU:
 ```powershell
 python -m unittest discover -s eng/validation/tests -p test_qwen_chat_cache_benchmark.py -v
 ```
+
+## Stateless replay and changing screenshots
+
+Stateless APIs default to `TS_PREFIX_CACHE_ISOLATION=lineage`: private continuation
+state is used only when the client history matches a previously emitted turn.
+Named Web UI sessions always keep their own conversation scope. A replay from
+another engine can have different assistant tokens, and a computer-use client
+can replace an earlier screenshot. Neither necessarily proves the original
+lineage, so default reuse may stop at the public system/tools prefix.
+
+For a **trusted single-tenant server**, `TS_PREFIX_CACHE_ISOLATION=shared`
+explicitly allows requests using the same stateless API session to share matching
+private token prefixes. This removes the requirement to reproduce TensorSharp's
+own prior assistant response; it does not bypass token or image-content matching.
+It does not merge named Web UI sessions. Do not enable it for mutually untrusted
+users: private-prefix hit timing and cache retention are shared. Record this
+setting for both sides of any engine comparison. `strict` instead assigns every
+stateless request a fresh private scope even if its lineage matches.
+
+For non-rewindable recurrent holders such as Qwen3.8-27B, automatic private
+checkpoints leave the model's required logits-producing prompt tail uncomputed.
+An identical text retry can therefore reuse the checkpoint, whereas a snapshot
+at the complete prompt end could not be rewound to produce those logits. With
+images/audio, the automatic checkpoint is placed immediately before the newest
+media span, so replacing that span can reuse the preceding conversation. Older
+media still must match by content. Explicit cache breakpoints keep their existing
+policy and override these automatic boundaries. The checkpoint is a full model
+state copy, so measure its cost on the actual GPU and record how many states fit
+under the configured memory budget; fake-model tests do not establish GPU speed.
+
+Qwen active clones reserve the incoming request's fitted prompt/generation
+capacity during the clone itself, using the same request reservation policy as
+prefill. The estimate and allocation share that fixed capacity; a refused budget
+creates no holder. Retained snapshots remain compact, and GPU mirrors are still
+created lazily. An active CUDA clone can take an existing idle holder of exactly
+that capacity; its old arena and device bindings are invalidated before copying.
+This avoids faulting fresh anonymous host pages on every warmed request without
+increasing global pool limits or changing checkpoint allocation. This avoids
+copying a long prefix into a small clone only to grow
+and copy it again on the first prefill. Record actual capacity and memory pressure:
+`TS_KV_INITIAL_TOKENS` does not force every retained snapshot to that size.
+See [Nsight request attribution](README-qwen-nsys-profile.md) to distinguish GPU
+work, transfers and host/idle gaps in a short diagnostic capture.

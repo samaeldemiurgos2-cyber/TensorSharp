@@ -37,6 +37,10 @@ public sealed class DenseDecoderSyntheticModelBuilder
     public uint ExpertCount { get; init; }
     public string RopeScalingType { get; init; }
     public float RopeBase { get; init; } = 1_000_000f;
+    public int LayerCount { get; init; } = NumBlocks;
+    public bool TiedOutput { get; init; }
+    /// <summary>Store one layer's matrices as F16 while all other weights remain F32.</summary>
+    public int? HalfPrecisionLayer { get; init; }
 
     private static readonly string[] MistralControlTokens = { "[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]" };
 
@@ -57,12 +61,12 @@ public sealed class DenseDecoderSyntheticModelBuilder
         {
             Gen("token_embd.weight", 0.08f, Hidden, VocabSize),
             Gen("output_norm.weight", 0.5f, Hidden, offset: 1f),
-            Gen("output.weight", 0.08f, Hidden, VocabSize),
         };
+        if (!TiedOutput) t.Add(Gen("output.weight", 0.08f, Hidden, VocabSize));
         if (IncludeRopeFreqs)
             t.Add(Gen("rope_freqs.weight", 0.1f, HeadDim / 2, offset: 1f));
 
-        for (int l = 0; l < NumBlocks; l++)
+        for (int l = 0; l < LayerCount; l++)
         {
             string p = $"blk.{l}.";
             t.Add(Gen(p + "attn_norm.weight", 0.2f, Hidden, offset: 1f));
@@ -109,7 +113,7 @@ public sealed class DenseDecoderSyntheticModelBuilder
         var kv = new List<(string, Action<BinaryWriter>)>
         {
             ("general.architecture", Str(Architecture)),
-            ($"{a}.block_count", U32(NumBlocks)),
+            ($"{a}.block_count", U32(checked((uint)LayerCount))),
             ($"{a}.context_length", U32(4096)),
             ($"{a}.embedding_length", U32(Hidden)),
             ($"{a}.feed_forward_length", U32(FfnLength)),
@@ -192,7 +196,7 @@ public sealed class DenseDecoderSyntheticModelBuilder
 
     private const int Alignment = 32;
 
-    private static void WriteGguf(Stream fs, List<(string Key, Action<BinaryWriter> Write)> kv,
+    private void WriteGguf(Stream fs, List<(string Key, Action<BinaryWriter> Write)> kv,
         List<(string Name, ulong[] Dims, float[] Data)> tensors)
     {
         using var head = new MemoryStream();
@@ -213,9 +217,11 @@ public sealed class DenseDecoderSyntheticModelBuilder
                 WriteStr(w, name);
                 w.Write((uint)dims.Length);
                 foreach (ulong d in dims) w.Write(d);
-                w.Write(0u); // F32
+                bool half = HalfPrecisionLayer.HasValue && dims.Length == 2 &&
+                    name.StartsWith($"blk.{HalfPrecisionLayer.Value}.", StringComparison.Ordinal);
+                w.Write(half ? 1u : 0u); // F16 or F32
                 w.Write(offset);
-                ulong bytes = (ulong)data.Length * sizeof(float);
+                ulong bytes = (ulong)data.Length * (ulong)(half ? sizeof(ushort) : sizeof(float));
                 offset += (bytes + Alignment - 1) / Alignment * Alignment;
             }
         }
@@ -224,10 +230,16 @@ public sealed class DenseDecoderSyntheticModelBuilder
         fs.Write(headBytes, 0, headBytes.Length);
         int pad = (Alignment - headBytes.Length % Alignment) % Alignment;
         fs.Write(new byte[pad], 0, pad);
-        foreach (var (_, _, data) in tensors)
+        foreach (var (name, dims, data) in tensors)
         {
-            byte[] raw = new byte[data.Length * sizeof(float)];
-            Buffer.BlockCopy(data, 0, raw, 0, raw.Length);
+            bool half = HalfPrecisionLayer.HasValue && dims.Length == 2 &&
+                name.StartsWith($"blk.{HalfPrecisionLayer.Value}.", StringComparison.Ordinal);
+            byte[] raw = new byte[data.Length * (half ? sizeof(ushort) : sizeof(float))];
+            if (half)
+                for (int i = 0; i < data.Length; i++)
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(raw.AsSpan(i * sizeof(ushort)),
+                        BitConverter.HalfToUInt16Bits((Half)data[i]));
+            else Buffer.BlockCopy(data, 0, raw, 0, raw.Length);
             fs.Write(raw, 0, raw.Length);
             int tail = (Alignment - raw.Length % Alignment) % Alignment;
             fs.Write(new byte[tail], 0, tail);
