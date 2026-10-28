@@ -524,11 +524,11 @@ def main():
                 print(f"{name} c{concurrency} repeat{repeat}: "
                       f"{sum(c['status'] == 'ok' for c in cases)}/{concurrency} passed{lenient}; {wall:.2f}s", flush=True)
                 report["summary"] = summarize(report["cases"])
-                args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+                args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     report["run_complete"] = True
     if args.reference:
         report["comparison"] = compare(report, json.loads(args.reference.read_text()), args.tolerance)
-    args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     failed = any(c["status"] != "ok" for c in report["cases"])
     failed |= report.get("comparison", {}).get("status") == "fail"
     return int(failed)

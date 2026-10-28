@@ -35,7 +35,7 @@ struct quantized_fixture
     size_t row_bytes;
     std::vector<unsigned char> gate, up;
 
-    quantized_fixture(ggml_type kind, int width, int height, int count)
+    quantized_fixture(ggml_type kind, int width, int height, int count, int template_rows = 0)
         : type(kind), inner(width), rows(height), experts(count), row_bytes(ggml_row_size(kind, width))
     {
         ggml_quantize_init(type);
@@ -45,6 +45,27 @@ struct quantized_fixture
             packed.resize(row_bytes * rows * experts);
             std::mt19937 random(seed);
             std::normal_distribution<float> normal(0.0f, 1.0f / std::sqrt(float(inner)));
+            if (template_rows > 0)
+            {
+                // Full GLM geometry contains billions of weights. Quantize a
+                // varied row pool once, then permute it by expert/tile/row so
+                // the test keeps real strides and MMQ grids without spending
+                // minutes repeatedly searching IQ codebooks during setup.
+                std::vector<float> values(size_t(inner) * template_rows);
+                std::vector<unsigned char> pool(row_bytes * template_rows);
+                for (float & value : values) value = normal(random);
+                require(ggml_quantize_chunk(type, values.data(), pool.data(), 0, template_rows, inner,
+                    ggml_quantize_requires_imatrix(type) ? importance.data() : nullptr) == pool.size(),
+                    "Cannot quantize GLM row-pool fixture");
+                for (int expert = 0; expert < experts; ++expert)
+                for (int row = 0; row < rows; ++row)
+                {
+                    const int source = (expert * 37 + (row / 128) * 17 + row % 16) % template_rows;
+                    std::memcpy(packed.data() + (size_t(expert) * rows + row) * row_bytes,
+                        pool.data() + size_t(source) * row_bytes, row_bytes);
+                }
+                return;
+            }
             std::vector<float> values(size_t(inner) * 16);
             std::vector<unsigned char> tile(row_bytes * 16);
             for (int expert = 0; expert < experts; ++expert)
@@ -73,7 +94,8 @@ struct quantized_fixture
 };
 
 static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backend,
-    const quantized_fixture & data, int tokens, bool down, int selected_experts = 4)
+    const quantized_fixture & data, int tokens, bool down, int selected_experts = 4, int degree = 2,
+    int routing = 0, bool require_owned = false)
 {
     const int used = std::min(selected_experts, data.experts), slots = down ? used : 1;
     auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
@@ -94,21 +116,22 @@ static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backe
         tsg_dsv4_fused_desc gate_desc, up_desc, pair_desc;
         bool owned = false;
     };
-    std::array<shard, 2> shards;
-    for (int rank = 0; rank < 2; ++rank)
+    std::vector<shard> shards(degree);
+    for (int rank = 0; rank < degree; ++rank)
     {
         auto & s = shards[rank];
         // 640-wide gate/up slices retain overlapping MMQ tiles around the
         // logical 320-row boundary, exactly as Qwen4Exp's loader does.
-        s.first = down ? rank * data.rows / 2 : rank * 256;
-        s.count = down ? data.rows / 2 : 384;
+        const int logical_first = rank * data.rows / degree, logical_end = (rank + 1) * data.rows / degree;
+        s.first = down ? logical_first : logical_first / 128 * 128;
+        s.count = (down ? logical_end : (logical_end + 127) / 128 * 128) - s.first;
         s.gate = ggml_new_tensor_3d(ctx, data.type, data.inner, s.count, data.experts);
         s.up = ggml_new_tensor_3d(ctx, data.type, data.inner, s.count, data.experts);
         s.gate_bytes = data.slice(data.gate, s.first, s.count);
         s.up_bytes = data.slice(data.up, s.first, s.count);
 #ifdef TSG_GGML_USE_CUDA
         s.owned = tsg_matmul_id_quant_strip_supported(allocator, s.gate, tokens, data.rows, s.first);
-        require(tokens < 129 || s.owned, "Prefill fixture did not engage the owned CUDA strip kernel");
+        require((tokens < 129 && !require_owned) || s.owned, "Prefill fixture did not engage the owned CUDA strip kernel");
 #else
         s.owned = true;
 #endif
@@ -159,11 +182,33 @@ static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backe
         for (float & value : activations) value = normal(random);
         for (int token = 0; token < tokens; ++token)
         for (int slot = 0; slot < used; ++slot)
-            selected[token * used + slot] = (3 * token + 2 * slot + reuse) % data.experts;
+            selected[token * used + slot] = routing == 1
+                ? (token % 7 + slot * 5 + reuse) % std::min(32, data.experts)
+                : routing == 2 ? (token * 17 + slot * 37 + reuse * 13) % data.experts
+                : (3 * token + 2 * slot + reuse) % data.experts;
         ggml_backend_tensor_set(input, activations.data(), 0, activations.size() * sizeof(float));
         ggml_backend_tensor_set(ids, selected.data(), 0, selected.size() * sizeof(int32_t));
         require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "Quantized FFN graph compute failed");
         const auto expected_gate = get(plain_gate), expected_up = get(plain_up);
+        auto require_equal = [&](const float * actual, const float * expected, int count,
+                                 const shard & s, int column, const char * matrix)
+        {
+            if (std::memcmp(actual, expected, count * sizeof(float)) == 0) return;
+            int first = 0;
+            while (first < count && std::memcmp(actual + first, expected + first, sizeof(float)) == 0) ++first;
+            double maximum = 0, error2 = 0, ref2 = 0;
+            for (int row = 0; row < count; ++row)
+            {
+                const double delta = double(actual[row]) - expected[row];
+                maximum = std::max(maximum, std::abs(delta)); error2 += delta * delta;
+                ref2 += double(expected[row]) * expected[row];
+            }
+            std::fprintf(stderr, "QUANT_STRIP_MISMATCH role=%s matrix=%s type=%s inner=%d rows=%d experts=%d used=%d tokens=%d routing=%d reuse=%d first_row=%d stored_rows=%d column=%d first_difference=%d actual=%.9g expected=%.9g max_abs=%.9g rel_l2=%.9g\n",
+                down ? "down" : "gate/up", matrix, ggml_type_name(data.type), data.inner, data.rows,
+                data.experts, used, tokens, routing, reuse, s.first, s.count, column, first,
+                actual[first], expected[first], maximum, std::sqrt(error2 / std::max(1e-30, ref2)));
+            require(false, "Quantized row strip differs from untouched upstream projection");
+        };
         size_t compared = 0;
         for (const auto & s : shards)
         {
@@ -171,10 +216,8 @@ static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backe
             for (int column = 0; column < tokens * used; ++column)
             {
                 const size_t full = size_t(column) * data.rows + s.first, part = size_t(column) * s.count;
-                require(std::memcmp(actual_gate.data() + part, expected_gate.data() + full, s.count * sizeof(float)) == 0,
-                    "Quantized gate/down row slice differs from untouched upstream projection");
-                require(std::memcmp(actual_up.data() + part, expected_up.data() + full, s.count * sizeof(float)) == 0,
-                    "Quantized up/down row slice differs from untouched upstream projection");
+                require_equal(actual_gate.data() + part, expected_gate.data() + full, s.count, s, column, "gate");
+                require_equal(actual_up.data() + part, expected_up.data() + full, s.count, s, column, "up");
                 compared += 2 * s.count;
             }
             if (s.pair)
@@ -213,9 +256,9 @@ static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backe
                 squared_error += error * error; squared_reference += reference * reference; ++samples;
             }
         }
-        std::printf("%s QUANT_FFN role=%s weights=%s inner=%d rows=%d tokens=%d used=%d reuse=%d owned=%d bit_identical_values=%zu f64_samples=%zu f64_max_abs=%.8g f64_rel_l2=%.8g\n",
+        std::printf("%s QUANT_FFN role=%s weights=%s inner=%d rows=%d experts=%d tokens=%d used=%d routing=%d reuse=%d owned=%d bit_identical_values=%zu f64_samples=%zu f64_max_abs=%.8g f64_rel_l2=%.8g\n",
             ggml_backend_name(backend), down ? "down" : "gate/up/pair", ggml_type_name(data.type),
-            data.inner, data.rows, tokens, used, reuse, shards[0].owned, compared, samples, max_abs,
+            data.inner, data.rows, data.experts, tokens, used, routing, reuse, shards[0].owned, compared, samples, max_abs,
             std::sqrt(squared_error / std::max(1e-30, squared_reference)));
     }
     auto unchanged = [](ggml_tensor * tensor, const std::vector<unsigned char> & expected)
@@ -227,6 +270,30 @@ static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backe
     unchanged(gate, data.gate); unchanged(up, data.up);
     for (const auto & s : shards) { unchanged(s.gate, s.gate_bytes); unchanged(s.up, s.up_bytes); }
     ggml_backend_buffer_free(buffer); ggml_free(ctx);
+}
+
+static void run_glm_quantized(ggml_backend_t allocator, ggml_backend_t backend,
+                            const std::string & only_type, const std::string & role)
+{
+    bool selected = false;
+    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS })
+    {
+        if (!only_type.empty() && only_type != ggml_type_name(type)) continue;
+        for (bool down : { false, true })
+        {
+            if ((!role.empty() && role != (down ? "down" : "gate")) ||
+                (down && type == GGML_TYPE_IQ2_S) || (!down && type == GGML_TYPE_IQ4_XS)) continue;
+            selected = true;
+            std::printf("GLM_STRIP_BEGIN type=%s role=%s experts=288 used=8 tokens=128 degree=4\n",
+                ggml_type_name(type), down ? "down" : "gate/up");
+            quantized_fixture data(type, down ? 2048 : 4096, down ? 4096 : 2048, 288, 512);
+            // Balanced coverage and a hot subset leaving most experts empty.
+            // Both change activations and expert IDs on a second graph replay.
+            for (int routing : { 2, 1 })
+                check_quantized_strip(allocator, backend, data, 128, down, 8, 4, routing, true);
+        }
+    }
+    require(selected, "GLM mode expects iq2_s gate, iq3_s gate/down, or iq4_xs down");
 }
 
 #if defined(TSG_GGML_USE_CUDA) && defined(TSG_GGML_TEST_HOOKS)
@@ -272,18 +339,25 @@ static void run_quantized(ggml_backend_t allocator, ggml_backend_t backend, cons
         return value;
     };
     bool selected = false;
-    for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+    for (ggml_type type : {GGML_TYPE_Q5_1, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
         GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
         GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS})
     {
         if (!only_type.empty() && lowercase(only_type) != lowercase(ggml_type_name(type))) continue;
         selected = true;
         quantized_fixture gate_up(type, inner, 640, 8);
-        quantized_fixture down(type, type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ? 640 : 768, 2560, 8);
+        quantized_fixture down(type, type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ? 640 : 768, 2560, 8);
         for (int tokens : {1, 4, 8, 9, 17, 31, 129})
         {
             check_quantized_strip(allocator, backend, gate_up, tokens, false);
             check_quantized_strip(allocator, backend, down, tokens, true);
+            if (type == GGML_TYPE_Q5_1)
+            {
+                // Four global ranks (two nodes with two GPUs) preserve the real
+                // 640-channel FFN and 2560-channel output row offsets.
+                check_quantized_strip(allocator, backend, gate_up, tokens, false, 4, 4);
+                check_quantized_strip(allocator, backend, down, tokens, true, 4, 4);
+            }
         }
         if (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0)
         {
@@ -548,23 +622,27 @@ static void run(ggml_backend_t allocator, ggml_backend_t backend)
 int main(int argc, char ** argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    bool quantized = false, wide_quantized = false;
-    std::string only_type;
+    bool quantized = false, wide_quantized = false, glm_quantized = false;
+    std::string only_type, role;
     int inner = 256;
     for (int arg = 1; arg < argc; ++arg)
     {
         const std::string option(argv[arg]);
         if (option == "--quant-strip-only") quantized = true;
         else if (option == "--quant-strip-wide-only") wide_quantized = true;
+        else if (option == "--quant-strip-glm-only") glm_quantized = true;
         else if (option == "--type" && arg + 1 < argc) only_type = argv[++arg];
+        else if (option == "--role" && arg + 1 < argc) role = argv[++arg];
         else if (option == "--inner" && arg + 1 < argc) inner = std::atoi(argv[++arg]);
-        else require(false, "Usage: [--quant-strip-only [--type iq2_xs] [--inner 2560]] | --quant-strip-wide-only");
+        else require(false, "Usage: [--quant-strip-only [--type iq2_xs] [--inner 2560]] | --quant-strip-wide-only | [--quant-strip-glm-only [--type iq2_s] [--role gate|down]]");
     }
     require(inner > 0 && inner % 256 == 0, "Quantized --inner must be a positive multiple of256");
-    require(quantized || (only_type.empty() && inner == 256), "--type/--inner require --quant-strip-only");
-    require(!(quantized && wide_quantized), "Select one quantized test mode");
+    require(quantized || glm_quantized || (only_type.empty() && inner == 256), "--type/--inner require a quantized test mode");
+    require(!glm_quantized || inner == 256, "GLM mode fixes its actual inner dimensions");
+    require(role.empty() || (glm_quantized && (role == "gate" || role == "down")), "--role requires GLM mode and gate|down");
+    require(int(quantized) + int(wide_quantized) + int(glm_quantized) <= 1, "Select one quantized test mode");
 #if !defined(TSG_GGML_USE_CUDA) || !defined(TSG_GGML_TEST_HOOKS)
-    if (wide_quantized) return 77;
+    if (wide_quantized || glm_quantized) return 77;
 #endif
 #ifdef TSG_GGML_USE_CUDA
     const int devices = ggml_backend_cuda_get_device_count();
@@ -580,6 +658,7 @@ int main(int argc, char ** argv)
             run_wide_quantized(cuda, backend);
 #endif
         }
+        else if (glm_quantized) run_glm_quantized(cuda, backend, only_type, role);
         else if (quantized) run_quantized(cuda, backend, only_type, inner);
         else run(cuda, backend);
         ggml_backend_free(backend);

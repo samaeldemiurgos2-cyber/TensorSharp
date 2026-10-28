@@ -2,6 +2,11 @@
 
 [← 返回模型索引](README_zh-cn.md) | [English](qwen38-flash-next.md)
 
+> **多节点执行：** `ggml_cuda` 下，在 `--layer-split N` 或 `--tp N` 后加
+> `--tp-node-id` 和 `--tp-peers`，其中 N 是每个节点的 GPU 数量。所有节点需使用相同
+> 的检查点、构建及数值配置。启动顺序和限制见[多节点指南](../multi-node-inference.md)。
+> 下文历史上的单机测量不代表多节点性能。
+
 Qwen3.8-Flash-Next 是一个混合型 MoE：GatedDeltaNet 递归层与全注意力层交错
 （其中一部分全注意力层挂在 Qwen Sparse Attention 的 indexer 后面），再加上一个
 PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF 架构 id 是
@@ -271,7 +276,7 @@ embedding，并保留其 MRoPE 位置。prefill 后为重试保留的图像片�
 不包含同步图像准备与编码；这些短文本复制检查不代表通用质量或完整媒体请求延迟。
 另外，普通/MTP HTTP 两种模式各通过 24/24 文本请求与 3/3 图像场景，包含附件顺序与
 历史图像。该配置因余量不足拒绝保留缓存，因此后续轮次重新 prefill。本地证据：
-`docs/validation/model-matrix-20260927/qwen38/SUMMARY.md`（不提交）。该架构现支持下文所述的本地张量并行；跨节点执行仍不支持。
+`docs/validation/model-matrix-20260927/qwen38/SUMMARY.md`（不提交）。这批历史测试未验证跨节点执行；当前支持范围见[多节点指南](../multi-node-inference.md)。
 
 `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` 挂上逐 token 的 MTP 块（仅限 GGML 后端；该头必须是单个 GGUF 文件，并在模型加载时挂上）；它只为从位置 0 开始
 prefill 的单独请求做投机（与其他序列共享的步，以及延续保留 holder 或共享前缀克隆的轮次，都按普通
@@ -505,7 +510,10 @@ down 按输出行切分，再汇集输出供 hyper-connection 写回。每个 ra
 down 点积保持原始完整宽度，避免求和顺序的微小差异被后续激活量化放大。
 注意力、GDN、QSA、PLE 使用复制的权重及各 rank 独立状态，
 输出头仅在 rank 0 执行。图像与工具调用沿用同一目标图；投机回滚会恢复每个 rank
-的 GDN/PLE 状态。TP 下仍不支持共享前缀检查点，也不支持跨节点执行。
+的 GDN/PLE 状态。TP 下仍不支持共享前缀检查点。`ggml_cuda` 下可使用
+`--tp-node-id` 和 `--tp-peers` 扩展到多个节点，FFN 行切分依据全局 rank 数量。
+分布式按层切分则传递完整的 F32 超连接残差，GDN、卷积、PLE 与 QSA 状态留在所属层。
+分布式模式当前仅支持串行文本请求，不支持媒体、投机解码及保留序列快照。
 两次汇集使用 TensorSharp CUDA FP32 collective；回退路径以零复制切片避开
 上游 CUDA 自动 BF16 阈值，设备 collective 不可用时使用 FP32 主机归约。
 两次通信增加数据量以保持数值精度，无需修改 ggml。
@@ -514,7 +522,8 @@ FFN 中间宽度和输出宽度必须能被并行度整除；投影按完整输�
 量化 prefill 保留原始 MMQ tile 和归约几何，gate/up 切片保留重叠的 128 行边界 tile，再裁剪输出。
 在中间宽度 640 的检查点上，TP2 每个 rank 为逻辑 320 行保存 384 行，TP4 为逻辑 160 行保存 256 行。
 不支持的配置会在批量加载权重前依据 GGUF 元数据拒绝。当前模型路径要求 CUDA MMQ stream-K，
-FFN 类型限于 Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ1_S、IQ3_S、IQ4_XS、IQ4_NL 和 Q8_0。
+FFN 类型限于 Q5_1、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ1_S、IQ3_S、IQ4_XS、IQ4_NL 和 Q8_0。
+UD-Q4_K_XL 的 Q5_1 down 权重使用 TensorSharp 自有的精确输出行切分内核。
 这包含 UD-Q2_K_XL 的 IQ2_XS/IQ3_XXS 路由 gate/up 权重、Q5_K/Q6_K 共享权重和 IQ4_NL/Q8_0 down 权重。
 完整输出行数及 down 输出切片须为 128 的倍数。IQ1_M 仍被拒绝，因为上游 ggml 没有该格式的 MMQ tile kernel。
 其他 FFN 类型（包括 F32/F16/BF16）、设备或无法保持归约顺序的布局会明确拒绝。

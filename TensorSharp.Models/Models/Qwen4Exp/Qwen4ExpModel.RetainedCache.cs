@@ -107,7 +107,7 @@ namespace TensorSharp.Models
         /// <summary>Retention and rebinding move nothing, so they work wherever the
         /// complete span path does, including a layer split.</summary>
         public bool SupportsRetainedFusedCache =>
-            _kCache != null && CompleteSpanPathAvailable && GdnStateLayoutMatchesNative;
+            _kCache != null && CompleteSpanPathAvailable && GdnStateLayoutMatchesNative && !HasDistributedQwen;
 
         public bool SupportsExactFusedCacheReuse => SupportsRetainedFusedCache;
 

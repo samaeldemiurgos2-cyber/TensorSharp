@@ -259,7 +259,12 @@ public class DistributedTpConfigTests
     [Fact]
     public void Constructor_NodeIdOutOfRange_Throws()
     {
-        var peers = new[] { new IPEndPoint(IPAddress.Loopback, 9500) };
+        // Two peers: a single-peer list now fails the peer-count check first.
+        var peers = new[]
+        {
+            new IPEndPoint(IPAddress.Loopback, 9500),
+            new IPEndPoint(IPAddress.Loopback, 9501),
+        };
         Assert.Throws<ArgumentOutOfRangeException>(
             () => new DistributedTpConfig(5, 1, peers));
     }

@@ -23,7 +23,10 @@ public sealed class Qwen4ExpTensorParallelTests
         Assert.True(ModelArchitectureRegistry.TryGet("qwen4exp", out var architecture));
         Assert.Equal(MultiGpuMode.TensorParallel, architecture.MultiGpu);
         Assert.True(architecture.SupportsLayerSplit);
-        Assert.False(architecture.SupportsDistributedTensorParallel);
+        Assert.True(architecture.SupportsDistributedTensorParallel);
+        Assert.Equal(new[] { BackendType.GgmlCuda }, architecture.DistributedTensorParallelBackends);
+        Assert.True(architecture.SupportsDistributedLayerSplit);
+        Assert.Equal(new[] { BackendType.GgmlCuda }, architecture.DistributedLayerSplitBackends);
         ITensorParallelGroup group = null!;
         Assert.Equal(2, ModelBase.ResolveTensorParallelSupport(architecture, BackendType.GgmlCuda, 2, ref group, out int split));
         Assert.Equal(1, split);
@@ -41,6 +44,7 @@ public sealed class Qwen4ExpTensorParallelTests
     [InlineData(13, false, 256, 12)] // Q5_K gate/up
     [InlineData(16, false, 256, 12)] // IQ2_XXS gate/up
     [InlineData(17, false, 2560, 640)] // Target model IQ2_XS gate/up; keep its 2560-element dots intact
+    [InlineData(7, false, 640, 2560)] // Q4_K_XL Q5_1 down output rows
     [InlineData(18, false, 2560, 640)] // Target model IQ3_XXS gate/up
     [InlineData(19, false, 256, 12)] // IQ1_S gate/up
     [InlineData(22, false, 256, 12)] // IQ2_S gate/up
@@ -88,6 +92,8 @@ public sealed class Qwen4ExpTensorParallelTests
     }
 
     [Theory]
+    [InlineData(7, 2)]
+    [InlineData(7, 4)]
     [InlineData(13, 2)]
     [InlineData(13, 4)]
     [InlineData(16, 2)]

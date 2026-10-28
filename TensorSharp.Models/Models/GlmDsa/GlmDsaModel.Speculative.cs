@@ -160,7 +160,7 @@ namespace TensorSharp.Models
         /// the same one-graph trunk pass, and a rejected window is undone through
         /// the KDA recurrent-state snapshot (GlmDsaModel.Glm5NextSpeculative.cs).
         /// </summary>
-        public bool SpeculationProfitable => true;
+        public bool SpeculationProfitable => !IsDistributedGlm;
 
         /// <summary>
         /// The verify batch writes MLA rows (and, on the trunk, indexer keys) for
@@ -227,6 +227,7 @@ namespace TensorSharp.Models
         /// (see GlmDsaModel.Glm5NextSpeculative.cs).</summary>
         public void SpecSnapshotRecurrentState()
         {
+            RefuseUnmirroredGlmOperation("speculative recurrent-state snapshots");
             if (IsGlm5NextArch)
                 Glm5NextSnapshotRecurrentState();
         }
@@ -234,12 +235,14 @@ namespace TensorSharp.Models
         /// <summary>See <see cref="SpecSnapshotRecurrentState"/>.</summary>
         public void SpecRestoreRecurrentState()
         {
+            RefuseUnmirroredGlmOperation("speculative recurrent-state restore");
             if (IsGlm5NextArch)
                 Glm5NextRestoreRecurrentState();
         }
 
         public void SpecRewindCache(int length)
         {
+            RefuseUnmirroredGlmOperation("speculative cache rewind");
             if (length < 0)
                 throw new ArgumentOutOfRangeException(nameof(length));
             if (IsGlm5NextArch)
@@ -263,6 +266,7 @@ namespace TensorSharp.Models
         /// </summary>
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            RefuseUnmirroredGlmOperation("speculative forwards");
             ArgumentNullException.ThrowIfNull(tokens);
             if (tokens.Length == 0)
                 throw new ArgumentException("At least one token is required.", nameof(tokens));

@@ -41,6 +41,7 @@ namespace TensorSharp.Models.Architecture
             ModelArchitectureRegistry.Register(DeepSeek4Architecture.Descriptor);
             ModelArchitectureRegistry.Register(DeepSeek41Architecture.Descriptor);
             ModelArchitectureRegistry.Register(GlmDsaArchitecture.Descriptor);
+            ModelArchitectureRegistry.Register(GlmDsaArchitecture.FlashDescriptor);
             ModelArchitectureRegistry.Register(MiniMaxM3Architecture.Descriptor);
 
             // Generative media.

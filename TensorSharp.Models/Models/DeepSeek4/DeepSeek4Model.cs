@@ -45,6 +45,8 @@ namespace TensorSharp.Models
         private GgmlDeepSeek4Native.CrossNodeAllReduce _distributedTpReduce;
         private GgmlDeepSeek4Native.LayerTransfer _distributedLayerTransfer;
         private float[] _distributedTpBuffer = Array.Empty<float>();
+        // Native stage transfers address peers by pipeline stage; see LayerSplitPlan.
+        private bool _layerDriverRunsLastStage;
         private bool _distributedTpAborted;
         protected bool IsDistributedNativeTensorParallel => _tpGroup?.NodeCount > 1;
         protected bool IsDistributedNativeLayerSplit => LayerSplitGroup?.NodeCount > 1;
@@ -195,15 +197,23 @@ namespace TensorSharp.Models
                         throw new NotSupportedException("Distributed layer split does not mirror DSpark operations; omit --draft-model.");
                     string headerIdentity = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
                         ReadModelHeaderForIdentity(ggufPath)));
+                    _layerDriverRunsLastStage = LayerSplitPlan.DriverRunsLastStageFromEnvironment();
                     DeepSeek41Architecture.ValidateDistributedExecutionConfig(LayerSplitGroup,
                         $"layer|{arch}|header={headerIdentity}|layers={Config.NumLayers}|hidden={Config.HiddenSize}" +
                         $"|nodes={LayerSplitGroup.NodeCount}|local={LayerSplitGroup.Degree}|ctx={maxContext}" +
+                        $"|driverLast={_layerDriverRunsLastStage}" +
                         $"|ubatch={(nUbatch > 0 ? nUbatch : 256)}|cpu_moe={nCpuMoe}" +
                         DeepSeek41Architecture.DistributedNumericalOptions());
                     _distributedLayerTransfer = TransferLayerState;
+                    // With the default rotated order node 0 runs the last stage and
+                    // node 1 the first, so the full-vocabulary logits stay local.
                     _handle = GgmlDeepSeek4Native.LoadModelLayerDistributed(ggufPath, LayerSplitGroup.Degree,
-                        LayerSplitGroup.NodeId, LayerSplitGroup.NodeCount, maxContext, nUbatch, nThreads,
+                        LayerSplitPlan.StageOf(LayerSplitGroup.NodeId, LayerSplitGroup.NodeCount, _layerDriverRunsLastStage),
+                        LayerSplitGroup.NodeCount, maxContext, nUbatch, nThreads,
                         nCpuMoe, backendName, _distributedLayerTransfer);
+                    if (_handle != IntPtr.Zero)
+                        GgmlDeepSeek4Native.SetPipelineDriver(_handle,
+                            LayerSplitPlan.StageOf(0, LayerSplitGroup.NodeCount, _layerDriverRunsLastStage));
                 }
                 else if (IsDistributedNativeTensorParallel)
                 {
@@ -295,6 +305,7 @@ namespace TensorSharp.Models
             if (_distributedTpAborted || bytes < 0 || data == IntPtr.Zero) return false;
             try
             {
+                peer = LayerSplitPlan.NodeOfStage(peer, LayerSplitGroup.NodeCount, _layerDriverRunsLastStage);
                 int words = checked((bytes + 3) / 4);
                 if (_distributedTpBuffer.Length < words) _distributedTpBuffer = new float[words];
                 fixed (float* buffer = _distributedTpBuffer)

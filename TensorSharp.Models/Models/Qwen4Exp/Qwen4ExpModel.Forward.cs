@@ -71,7 +71,7 @@ namespace TensorSharp.Models
             _maxContextLength = maxSeqLen;
             _kvCacheCapacity = initialSeqLen;
             _initialKvCacheCapacity = initialSeqLen;
-            ApplyModelAlignedKvCacheDefault(_quantWeights);
+            if (_q4eStage == null) ApplyModelAlignedKvCacheDefault(_quantWeights);
             DType kvDtype = _kvCacheDtype.ToDType();
 
             int nLayer = Config.NumLayers;
@@ -86,6 +86,7 @@ namespace TensorSharp.Models
 
             for (int l = 0; l < nLayer; l++)
             {
+                if (!OwnsQwenLayer(l)) continue;
                 if (_isRecurrent[l])
                 {
                     _gdnConvState[l] = new float[(long)(_convKernel - 1) * _convDim];
@@ -104,7 +105,7 @@ namespace TensorSharp.Models
                 }
             }
 
-            if (_pleHeads > 0)
+            if (_pleHeads > 0 && OwnsQwenPle)
                 // PINNED: the span kernel seeds its device conv state from this address.
                 _pleConvState = GC.AllocateArray<float>(
                     checked((int)((long)(_pleConvKernel - 1) * _pleNgram * _hcDim)), pinned: true);
@@ -130,7 +131,7 @@ namespace TensorSharp.Models
             DType kvDtype = _kvCacheDtype.ToDType();
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                if (_isRecurrent[l]) continue;
+                if (!OwnsQwenLayer(l) || _isRecurrent[l]) continue;
                 GrowCache(ref _kCache[l], Config.NumKVHeads, newCapacity, Config.HeadDim, kvDtype);
                 GrowCache(ref _vCache[l], Config.NumKVHeads, newCapacity, Config.HeadDim, kvDtype);
                 if (_idxKCache[l] != null)
@@ -293,8 +294,9 @@ namespace TensorSharp.Models
                 if (_kvCacheHostStale) FlushArenaCache(_kCache);
                 return ForwardCoreInner(tokens);
             }
-            catch
+            catch (Exception failure)
             {
+                _q4eDistributed?.Abort(failure);
                 // A thrown forward must not leak this request's pending
                 // multimodal state into the NEXT sequence the engine runs (the
                 // per-sequence executor catches per-request errors and moves on).
@@ -308,6 +310,8 @@ namespace TensorSharp.Models
 
         private float[] ForwardCoreInner(int[] tokens)
         {
+            if (_q4eStage != null) return ForwardQwenDistributedStage(tokens);
+            _q4eDistributed?.ThrowIfAborted();
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
@@ -1105,7 +1109,7 @@ namespace TensorSharp.Models
             if (_pleArgs != null) return true;
             if (_pleArgsFailed) return false;
             int il = -1;
-            for (int l = 0; l < Config.NumLayers; l++) if (_isPle[l]) { il = l; break; }
+            for (int l = 0; l < Config.NumLayers; l++) if (_isPle[l] && OwnsQwenLayer(l)) { il = l; break; }
             if (il < 0) { _pleArgsFailed = true; return false; }
             if (!TryResolveQuant($"blk.{il}.ple_key.weight", out IntPtr kw, out int kwT, out long kwB)
                 || !TryResolveQuant($"blk.{il}.ple_value.weight", out IntPtr vw, out int vwT, out long vwB)
@@ -1210,7 +1214,7 @@ namespace TensorSharp.Models
                         _layerKinds[l] = _isRecurrent[l] ? (byte)1 : (byte)0;
                 }
 
-                int firstAttn = Array.IndexOf(_layerKinds, (byte)0);
+                int firstAttn = Array.FindIndex(_kCache, cache => cache != null);
                 long tMask = Stopwatch.GetTimestamp();
                 BuildAttnMask(totalLen, seqLen, startPos,
                         firstAttn >= 0 ? _kCache[firstAttn].ElementType : DType.Float16);
@@ -1218,15 +1222,15 @@ namespace TensorSharp.Models
 
                 bool ranAnything = false;
                 _spanLogitsValid = false;
-                bool fuseHead = EnsureHeadArgs();
-                bool fusePle = EnsurePleArgs();
+                bool fuseHead = (_q4eStage == null || _q4eStage.IsLast) && EnsureHeadArgs();
+                bool fusePle = OwnsQwenPle && EnsurePleArgs();
 
                 // The host PleLayer cut runs OUTSIDE a span, and only a span carries the
                 // device: PleLayer would execute on whatever rank the thread happens to
                 // hold (always 0) while its layer's weights and state live on another
                 // GPU. It is reached only when the PLE descriptors fail, so refuse the
                 // combination rather than add an untested placement path.
-                if ((LayerSplitDegree > 1 || IsTensorParallel) && !fusePle)
+                if ((LayerSplitDegree > 1 || IsTensorParallel || _q4eStage != null) && OwnsQwenPle && !fusePle)
                 {
                     _tokenGraphUnsupported = true;
                     throw new NotSupportedException(
@@ -1267,8 +1271,9 @@ namespace TensorSharp.Models
                 fixed (byte* kp = _layerKinds)
                 fixed (ushort* mp = _attnMask)
                 {
-                    int begin = 0, spanIdx = 0;
-                    for (int il = 0; il <= Config.NumLayers; il++)
+                    int end = _q4eStage?.EndLayer ?? Config.NumLayers;
+                    int begin = _q4eStage?.FirstLayer ?? 0, spanIdx = 0;
+                    for (int il = begin; il <= end; il++)
                     {
                         // The host-side PLE layer cuts the token into spans - unless
                         // the PLE block rides inside the span, which is the default.
@@ -1277,10 +1282,10 @@ namespace TensorSharp.Models
                         // crosses the seam through the host buffer it is already
                         // passed in - the same hand-off a PLE cut uses - so a seam
                         // costs one 40 KB round trip per decode token and nothing else.
-                        bool deviceCut = il < Config.NumLayers && il > begin
+                        bool deviceCut = il < end && il > begin
                             && (DeviceForLayer(il) != DeviceForLayer(begin)
                                 || (_diagnosticSpanLayers > 0 && il - begin >= _diagnosticSpanLayers));
-                        bool cut = il == Config.NumLayers || (_isPle[il] && !fusePle) || deviceCut;
+                        bool cut = il == end || (_isPle[il] && !fusePle) || deviceCut;
                         if (!cut) continue;
                         if (il > begin)
                         {
@@ -1366,7 +1371,7 @@ namespace TensorSharp.Models
                         // the HOST PleLayer even though the PLE block is also built into
                         // the spans, so PLE executed twice and its n-gram conv history
                         // advanced twice for one token.
-                        if (il < Config.NumLayers && _isPle[il] && !fusePle)
+                        if (il < end && _isPle[il] && !fusePle)
                         {
                             long tPle = Stopwatch.GetTimestamp();
                             PleLayer(res, tokens, seqLen, startPos, il);
@@ -1395,7 +1400,7 @@ namespace TensorSharp.Models
             {
                 _tokenGraphUnsupported = true;
                 if (IsTensorParallel || _specForwardActive || HasQsa
-                    || LayerSplitDegree > 1 || _pendingMRoPEPositions != null)
+                    || LayerSplitDegree > 1 || _q4eStage != null || _pendingMRoPEPositions != null)
                 {
                     // Preserve the cause, and do not promise a fallback whose state
                     // cannot represent this configuration (notably QSA).
@@ -1414,7 +1419,7 @@ namespace TensorSharp.Models
             var args = GC.AllocateArray<Qwen4ExpAttnArgs>(Config.NumLayers, pinned: true);
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                if (_isRecurrent[l]) continue;
+                if (!OwnsQwenLayer(l) || _isRecurrent[l]) continue;
                 if (!TryFillAttnArgs(l, ref args[l])) { _fusedAttnUnsupported = true; return false; }
             }
             _attnArgs = args;
@@ -1434,7 +1439,7 @@ namespace TensorSharp.Models
             EnsureGdnScratch();
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                if (!_isRecurrent[l]) continue;
+                if (!OwnsQwenLayer(l) || !_isRecurrent[l]) continue;
                 // The kernel wants the conv history as [d_conv-1, conv_dim] rather
                 // than the host ring the op-by-op path walks.
                 if (_gdnConvStateT[l] == null)
@@ -1456,7 +1461,7 @@ namespace TensorSharp.Models
             // the graph each time - exactly the cost the cache exists to remove.
             var args = GC.AllocateArray<Qwen4ExpFfnArgs>(Config.NumLayers, pinned: true);
             for (int l = 0; l < Config.NumLayers; l++)
-                if (!TryFillFfnArgs(l, ref args[l])) { _fusedFfnUnsupported = true; return false; }
+                if (OwnsQwenLayer(l) && !TryFillFfnArgs(l, ref args[l])) { _fusedFfnUnsupported = true; return false; }
             _ffnArgs = args;
             return true;
         }

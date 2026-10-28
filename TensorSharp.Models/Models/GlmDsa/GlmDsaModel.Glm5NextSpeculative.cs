@@ -50,7 +50,8 @@ namespace TensorSharp.Models
         /// <see cref="IsGlm5Next"/> (set by the managed config parser, which the
         /// native constructor returns before), this is true on BOTH execution
         /// paths.</summary>
-        private bool IsGlm5NextArch => string.Equals(Config.Architecture, "glm5next", StringComparison.Ordinal);
+        internal static bool IsFlashArchitecture(string architecture) => architecture is "glm5next" or "glm5-next";
+        private bool IsGlm5NextArch => IsFlashArchitecture(Config.Architecture);
 
         // Managed-path snapshot: one copy per recurrent layer, plus the ring
         // write index and the position they belong to.

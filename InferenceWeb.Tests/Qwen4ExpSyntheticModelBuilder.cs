@@ -57,11 +57,15 @@ internal static class Qwen4ExpSyntheticModelBuilder
     /// Optional expert counts exercise router reductions at the trained model's width.</summary>
     public static string Write(string path, int indexerTopK = 16, int contextLength = 4096, bool q2kxlExperts = false,
         GgmlType pleConvType = GgmlType.F32, GgmlType ssmConvType = GgmlType.F32,
-        GgmlType? matrixNormType = null, bool qsa = true, int expertCount = Experts, int expertUsedCount = ExpertsUsed)
+        GgmlType? matrixNormType = null, bool qsa = true, int expertCount = Experts, int expertUsedCount = ExpertsUsed,
+        int hiddenSize = Hidden, bool q4kxlExperts = false, bool tiedOutput = false)
     {
         if (expertCount < 1 || expertUsedCount < 1 || expertUsedCount > expertCount)
             throw new System.ArgumentOutOfRangeException(nameof(expertUsedCount), "Expert counts must be positive, and selected experts cannot exceed total experts.");
-        const int hcDim = Hc * Hidden;
+        if (hiddenSize < 256 || hiddenSize % 256 != 0)
+            throw new System.ArgumentOutOfRangeException(nameof(hiddenSize), "Hidden size must contain complete 256-value quantization blocks.");
+        int hcDim = Hc * hiddenSize;
+        int pleHeadDim = hiddenSize / ((PleNgram - 1) * PleHeadsPerNgram);
         const int keyDim = StateSize * KHeads, valueDim = StateSize * VHeads, convDim = 2 * keyDim + valueDim;
         // Block-quantized rows must contain a whole block; the ordinary floating-point
         // fixtures retain the shipped four-tap convolution layout.
@@ -101,7 +105,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
             if (matrixNormType is { } type)
             {
                 norm.Type = type;
-                norm.Dims = n == hcDim ? new ulong[] { Hidden, Hc } : new ulong[] { (ulong)n, 1 };
+                norm.Dims = n == hcDim ? new ulong[] { (ulong)hiddenSize, Hc } : new ulong[] { (ulong)n, 1 };
             }
             return norm;
         }
@@ -112,17 +116,18 @@ internal static class Qwen4ExpSyntheticModelBuilder
             return conv;
         }
 
-        var embd = Gen("token_embd.weight", 1.0f, Hidden, Vocab);
+        var embd = Gen("token_embd.weight", 1.0f, hiddenSize, Vocab);
         embd.Type = GgmlType.Q8_0;
         t.Add(embd);
-        t.Add(Blocks("output.weight", GgmlType.Q6_K, 1.2f / System.MathF.Sqrt(Hidden), Hidden, Vocab));
+        if (!tiedOutput)
+            t.Add(Blocks("output.weight", GgmlType.Q6_K, 1.2f / System.MathF.Sqrt(hiddenSize), hiddenSize, Vocab));
         t.Add(Norm("output_hc_norm.weight", hcDim));
         t.Add(Proj("output_hc_down.weight", hcDim, HcLowRank));
         t.Add(Proj("output_hc_up.weight", HcLowRank, hcDim));
 
         ulong pleRows = 0;
         foreach (ulong v in PleVocab) pleRows += v;
-        t.Add(Blocks("per_layer_token_embd.weight", GgmlType.IQ4_NL, 0.5f, PleHeadDim, (int)pleRows));
+        t.Add(Blocks("per_layer_token_embd.weight", GgmlType.IQ4_NL, 0.5f, pleHeadDim, (int)pleRows));
 
         for (int il = 0; il < Layers; il++)
         {
@@ -137,27 +142,27 @@ internal static class Qwen4ExpSyntheticModelBuilder
 
             if (IsRecurrent(il))
             {
-                t.Add(Proj(p + "attn_qkv.weight", Hidden, convDim));
-                t.Add(Proj(p + "attn_gate.weight", Hidden, valueDim));
-                t.Add(Proj(p + "ssm_alpha.weight", Hidden, VHeads, GgmlType.F32));
-                t.Add(Proj(p + "ssm_beta.weight", Hidden, VHeads, GgmlType.F32));
+                t.Add(Proj(p + "attn_qkv.weight", hiddenSize, convDim));
+                t.Add(Proj(p + "attn_gate.weight", hiddenSize, valueDim));
+                t.Add(Proj(p + "ssm_alpha.weight", hiddenSize, VHeads, GgmlType.F32));
+                t.Add(Proj(p + "ssm_beta.weight", hiddenSize, VHeads, GgmlType.F32));
                 t.Add(Conv(p + "ssm_conv1d.weight", ssmConvType, ssmConvKernel, convDim));
                 t.Add(Gen(p + "ssm_dt.bias", 0.5f, VHeads));
                 // ssm_a ships pre-negated (-exp(A_log)): the recurrence decays.
                 t.Add(GenAround(p + "ssm_a", -0.9f, 0.3f, VHeads));
                 t.Add(Norm(p + "ssm_norm.weight", StateSize));
-                t.Add(Proj(p + "ssm_out.weight", valueDim, Hidden, gain: OutGain));
+                t.Add(Proj(p + "ssm_out.weight", valueDim, hiddenSize, gain: OutGain));
             }
             else
             {
-                t.Add(Proj(p + "attn_q.weight", Hidden, Heads * 2 * HeadDim));
-                t.Add(Proj(p + "attn_k.weight", Hidden, KvHeads * HeadDim));
-                t.Add(Proj(p + "attn_v.weight", Hidden, KvHeads * HeadDim));
+                t.Add(Proj(p + "attn_q.weight", hiddenSize, Heads * 2 * HeadDim));
+                t.Add(Proj(p + "attn_k.weight", hiddenSize, KvHeads * HeadDim));
+                t.Add(Proj(p + "attn_v.weight", hiddenSize, KvHeads * HeadDim));
                 t.Add(Norm(p + "attn_q_norm.weight", HeadDim));
                 t.Add(Norm(p + "attn_k_norm.weight", HeadDim));
-                t.Add(Proj(p + "attn_output.weight", Heads * HeadDim, Hidden, gain: OutGain));
-                t.Add(Proj(p + "indexer.k_proj.weight", Hidden, IndexerDim, GgmlType.BF16));
-                t.Add(Proj(p + "indexer.q_proj.weight", Hidden, IndexerHeads * IndexerDim, GgmlType.BF16));
+                t.Add(Proj(p + "attn_output.weight", Heads * HeadDim, hiddenSize, gain: OutGain));
+                t.Add(Proj(p + "indexer.k_proj.weight", hiddenSize, IndexerDim, GgmlType.BF16));
+                t.Add(Proj(p + "indexer.q_proj.weight", hiddenSize, IndexerHeads * IndexerDim, GgmlType.BF16));
                 t.Add(Norm(p + "indexer.k_norm.weight", IndexerDim));
                 t.Add(Norm(p + "indexer.q_norm.weight", IndexerDim));
             }
@@ -165,8 +170,8 @@ internal static class Qwen4ExpSyntheticModelBuilder
             if (il == PleLayer)
             {
                 t.Add(Conv(p + "ple_conv1d.weight", pleConvType, pleConvKernel, hcDim));
-                t.Add(Proj(p + "ple_key.weight", Hidden, hcDim));
-                t.Add(Proj(p + "ple_value.weight", Hidden, Hidden, gain: OutGain));
+                t.Add(Proj(p + "ple_key.weight", hiddenSize, hcDim));
+                t.Add(Proj(p + "ple_value.weight", hiddenSize, hiddenSize, gain: OutGain));
                 t.Add(Norm(p + "ple_norm_key.weight", hcDim));
                 t.Add(Norm(p + "ple_norm_query.weight", hcDim));
                 t.Add(Norm(p + "ple_norm_conv.weight", hcDim));
@@ -181,14 +186,19 @@ internal static class Qwen4ExpSyntheticModelBuilder
                 gateUp = il == 2 ? GgmlType.IQ3_XXS : GgmlType.IQ2_XS;
                 down = GgmlType.IQ4_NL;
             }
-            t.Add(Proj(p + "ffn_gate_inp.weight", Hidden, expertCount, GgmlType.F32));
-            t.Add(Experts3(p + "ffn_gate_exps.weight", Hidden, ExpertFf, gateUp));
-            t.Add(Experts3(p + "ffn_up_exps.weight", Hidden, ExpertFf, gateUp));
-            t.Add(Experts3(p + "ffn_down_exps.weight", ExpertFf, Hidden, down, gain: OutGain));
-            t.Add(Gen(p + "ffn_gate_inp_shexp.weight", 1.5f / System.MathF.Sqrt(Hidden), Hidden));
-            t.Add(Proj(p + "ffn_gate_shexp.weight", Hidden, SharedFf));
-            t.Add(Proj(p + "ffn_up_shexp.weight", Hidden, SharedFf));
-            t.Add(Proj(p + "ffn_down_shexp.weight", SharedFf, Hidden, gain: OutGain));
+            if (q4kxlExperts)
+            {
+                gateUp = GgmlType.Q4_K;
+                down = GgmlType.Q5_1;
+            }
+            t.Add(Proj(p + "ffn_gate_inp.weight", hiddenSize, expertCount, GgmlType.F32));
+            t.Add(Experts3(p + "ffn_gate_exps.weight", hiddenSize, ExpertFf, gateUp));
+            t.Add(Experts3(p + "ffn_up_exps.weight", hiddenSize, ExpertFf, gateUp));
+            t.Add(Experts3(p + "ffn_down_exps.weight", ExpertFf, hiddenSize, down, gain: OutGain));
+            t.Add(Gen(p + "ffn_gate_inp_shexp.weight", 1.5f / System.MathF.Sqrt(hiddenSize), hiddenSize));
+            t.Add(Proj(p + "ffn_gate_shexp.weight", hiddenSize, SharedFf));
+            t.Add(Proj(p + "ffn_up_shexp.weight", hiddenSize, SharedFf));
+            t.Add(Proj(p + "ffn_down_shexp.weight", SharedFf, hiddenSize, gain: OutGain));
         }
 
         const string a = "qwen4exp.";
@@ -202,7 +212,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
             new Str { Key = "general.name", V = "Synthetic qwen4exp engine fixture" },
             new U32 { Key = a + "block_count", V = Layers },
             new U32 { Key = a + "context_length", V = (uint)contextLength },
-            new U32 { Key = a + "embedding_length", V = Hidden },
+            new U32 { Key = a + "embedding_length", V = (uint)hiddenSize },
             new U32 { Key = a + "attention.head_count", V = Heads },
             new U32 { Key = a + "attention.head_count_kv", V = KvHeads },
             new I32Arr { Key = a + "rope.dimension_sections", V = new[] { 11, 11, 10, 0 } },
@@ -232,7 +242,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
             new U32 { Key = a + "ple.heads_per_ngram", V = PleHeadsPerNgram },
             new U32 { Key = a + "ple.conv_kernel", V = (uint)pleConvKernel },
             new U32 { Key = a + "ple.eos_token_id", V = EosToken },
-            new U32 { Key = a + "embedding_length_per_layer_input", V = PleHeadDim },
+            new U32 { Key = a + "embedding_length_per_layer_input", V = (uint)pleHeadDim },
             // The shipped multipliers: the hash is exercised at its real 64-bit width.
             new U64Arr { Key = a + "ple.layer_multipliers", V = new ulong[] { 23703573157769, 20109073645365, 8052911324071 } },
             new U64Arr { Key = a + "ple.head_offsets", V = pleOffsets },

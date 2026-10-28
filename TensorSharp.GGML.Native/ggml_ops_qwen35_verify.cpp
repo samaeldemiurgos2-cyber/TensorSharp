@@ -578,7 +578,9 @@ namespace
 
         const std::size_t convStateBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
         const std::size_t deltaStateBytes = static_cast<std::size_t>(head_k_dim) * head_v_dim * num_v_heads * sizeof(float);
-        constexpr int kVerifyKvStride = 256;
+        // static: the persist_stride initializer below reads it without a
+        // capture, which MSVC rejects for an automatic constexpr (C3493).
+        static constexpr int kVerifyKvStride = 256;
         // Persist mode pads the attention window to a fixed stride so one cached graph
         // serves every start_pos in that stride (the mask masks the unused tail).
         // Pad the attended window up to the flash-attention KV stride on BOTH

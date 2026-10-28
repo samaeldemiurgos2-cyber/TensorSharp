@@ -16,7 +16,7 @@ namespace InferenceWeb.Tests;
 /// </summary>
 internal static class SyntheticGguf
 {
-    public enum GgmlType { F32 = 0, F16 = 1, Q8_0 = 8, Q6_K = 14, IQ2_XS = 17, IQ3_XXS = 18, IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23, BF16 = 30 }
+    public enum GgmlType { F32 = 0, F16 = 1, Q5_1 = 7, Q8_0 = 8, Q4_K = 12, Q6_K = 14, IQ2_XS = 17, IQ3_XXS = 18, IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23, BF16 = 30 }
 
     private const int Q8Block = 32;
     private const int Q8BlockBytes = 2 + Q8Block;   // f16 scale + 32 int8
@@ -26,6 +26,8 @@ internal static class SyntheticGguf
     private static (int Values, int Bytes) BlockOf(GgmlType type) => type switch
     {
         GgmlType.Q8_0 => (32, 34),
+        GgmlType.Q5_1 => (32, 24),      // f16 d, f16 m, high bits[4], low bits[16]
+        GgmlType.Q4_K => (256, 144),    // f16 d, f16 dmin, scales[12], quant bits[128]
         GgmlType.IQ4_NL => (32, 18),     // f16 d, 16 bytes of 4-bit indices
         GgmlType.Q6_K => (256, 210),     // ql[128], qh[64], int8 scales[16], f16 d
         GgmlType.IQ3_S => (256, 110),    // f16 d, qs[64], qh[8], signs[32], scales[4]
@@ -138,6 +140,8 @@ internal static class SyntheticGguf
         // The typical |decoded code| of each format, which sets the block scale d.
         float typical = type switch
         {
+            GgmlType.Q5_1 => 16f,          // unsigned 5-bit code with a negative minimum
+            GgmlType.Q4_K => 16f * 32f,    // unsigned 4-bit code and 6-bit sub-scales
             GgmlType.IQ4_NL => 64f,          // kvalues_iq4nl span [-127, 113]
             GgmlType.IQ4_XS => 64f * 16f,    // times a 6-bit sub-scale minus 32
             GgmlType.IQ3_S => 16f * 7f,      // (1 + 2 * 4-bit scale) times grid values up to 15
@@ -153,6 +157,15 @@ internal static class SyntheticGguf
             ushort bits = BitConverter.HalfToUInt16Bits((System.Half)d);
             raw[at] = (byte)(bits & 0xFF);
             raw[at + 1] = (byte)(bits >> 8);
+            if (type is GgmlType.Q5_1 or GgmlType.Q4_K)
+            {
+                // Both formats have a second floating-point coefficient. Random
+                // payload bytes are valid codes, but those coefficients must be finite.
+                float minimum = type == GgmlType.Q5_1 ? -15.5f * d : 7.5f * d;
+                ushort minBits = BitConverter.HalfToUInt16Bits((System.Half)minimum);
+                raw[at + 2] = (byte)minBits;
+                raw[at + 3] = (byte)(minBits >> 8);
+            }
         }
         var ul = new ulong[dims.Length];
         for (int i = 0; i < dims.Length; i++) ul[i] = (ulong)dims[i];

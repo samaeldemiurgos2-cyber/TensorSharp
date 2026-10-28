@@ -539,8 +539,10 @@ the driver and matching CLI workers together to change that configuration.
 Requests for the already loaded model remain available. Local multi-GPU
 behavior retains its existing paths. Distributed
 automatic prefill uses microbatches of 256; explicit positive
-`TS_DSV4_UBATCH` remains configurable. `--layer-split` cannot be combined with
-distributed groups. Use the [fixed-token validation procedure](../../eng/validation/DeepSeek41DistributedProbe/README.md)
+`TS_DSV4_UBATCH` remains configurable. For distributed whole-layer placement,
+replace `--tp N` with `--layer-split N` on every node and retain the peer
+arguments; see the [multi-node guide](../multi-node-inference.md).
+Use the [fixed-token validation procedure](../../eng/validation/DeepSeek41DistributedProbe/README.md)
 for numerical controls and the HTTP suites for actual checkpoint quality.
 
 The following device-resident exchange description applies to local TP.

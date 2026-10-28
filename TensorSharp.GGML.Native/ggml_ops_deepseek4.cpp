@@ -6849,9 +6849,10 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
         if (!m.pipeline.active() || m.pipeline.node == m.pipeline.nodes - 1)
         {
             ggml_backend_tensor_get(res.logits, logits_out, 0, bytes);
-            if (m.pipeline.active()) m.pipeline.move(0, true, logits_out, bytes);
+            if (m.pipeline.active() && m.pipeline.driver != m.pipeline.node)
+                m.pipeline.move(m.pipeline.driver, true, logits_out, bytes);
         }
-        else if (m.pipeline.node == 0) m.pipeline.move(m.pipeline.nodes - 1, false, logits_out, bytes);
+        else if (m.pipeline.node == m.pipeline.driver) m.pipeline.move(m.pipeline.nodes - 1, false, logits_out, bytes);
         else memset(logits_out, 0, bytes);
     }
 
@@ -8165,6 +8166,16 @@ TSG_EXPORT void TSGgml_Dsv4Free(void * handle)
 {
     if (!handle) return;
     delete (tsg_dsv4::dsv4_model *) handle;
+}
+
+// Stage whose host samples (default 0). Set before the first forward; every
+// node must pass the same value. Returns 1 on success, 0 when not a pipeline.
+TSG_EXPORT int TSGgml_Dsv4SetPipelineDriver(void * handle, int driver)
+{
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    if (!m || !m->pipeline.active() || driver < 0 || driver >= m->pipeline.nodes) return 0;
+    m->pipeline.driver = driver;
+    return 1;
 }
 
 #if defined(TSG_GGML_TEST_HOOKS)

@@ -16,6 +16,7 @@ public abstract partial class ModelBase
     {
         if (LayerSplitGroup == null && LayerSplitDegree <= 1) return;
         int node = LayerSplitGroup?.NodeId ?? 0, nodes = LayerSplitGroup?.NodeCount ?? 1;
+        bool driverLast = nodes > 1 && LayerSplitPlan.DriverRunsLastStageFromEnvironment();
         if (balanceWeightBytes)
         {
             var bytes = new long[Config.NumLayers];
@@ -29,9 +30,9 @@ public abstract partial class ModelBase
                 else head = checked(head + resident);
             }
             if (!_gguf.Tensors.ContainsKey("output.weight")) head = checked(head + embedding);
-            LayerPlacement = LayerSplitPlan.CreateWeighted(bytes, LayerSplitDegree, node, nodes, embedding, head);
+            LayerPlacement = LayerSplitPlan.CreateWeighted(bytes, LayerSplitDegree, node, nodes, embedding, head, driverLast);
         }
-        else LayerPlacement = new LayerSplitPlan(Config.NumLayers, LayerSplitDegree, node, nodes);
+        else LayerPlacement = new LayerSplitPlan(Config.NumLayers, LayerSplitDegree, node, nodes, driverLast);
         _layerAllocators = new IAllocator[LayerSplitDegree];
         for (int rank = 0; rank < _layerAllocators.Length; rank++)
             _layerAllocators[rank] = LayerSplitGroup?.GetAllocator(rank) ?? new GgmlAllocator(_ggmlContext, rank);
@@ -45,7 +46,7 @@ public abstract partial class ModelBase
             var identity = new StringBuilder(executionIdentity);
             identity.Append('|').Append(Config.NumLayers).Append('|').Append(Config.HiddenSize)
                 .Append('|').Append(Config.VocabSize).Append('|').Append(ResolveConfiguredContextLength())
-                .Append('|').Append(balanceWeightBytes);
+                .Append('|').Append(balanceWeightBytes).Append('|').Append(driverLast);
             foreach (var entry in _gguf.Tensors.OrderBy(entry => entry.Key, StringComparer.Ordinal))
                 identity.Append('|').Append(entry.Key).Append(':').Append(entry.Value.Type)
                     .Append(':').Append(string.Join(',', entry.Value.Shape));
@@ -69,8 +70,9 @@ public abstract partial class ModelBase
         if (IsGgmlBackend) GgmlBasicOps.SetActiveRank(rank);
     }
 
-    /// <summary>Only the first node embeds; each stage executes its own whole layers;
-    /// the last stage projects and returns logits to node zero. Persistent layer state
+    /// <summary>Only the first stage embeds; each stage executes its own whole layers;
+    /// the last stage projects. Its logits stay local when node zero runs the last
+    /// stage (the default order) and are returned to node zero otherwise. Persistent layer state
     /// remains with its owner. Families with extra cross-layer state use the same
     /// ILayerSplitGroup transport with their complete boundary-state representation.</summary>
     protected float[] ForwardLayerPipeline(int[] tokens, Func<Tensor> embed,
@@ -89,7 +91,7 @@ public abstract partial class ModelBase
             else
             {
                 var input = new float[elements];
-                LayerSplitGroup.Receive(input, elements, LayerPlacement.NodeId - 1);
+                LayerSplitGroup.Receive(input, elements, LayerPlacement.PreviousNode);
                 hidden = new Tensor(_allocator, DType.Float32, tokens.Length, Config.HiddenSize);
                 hidden.SetElementsAsFloat(input);
             }
@@ -114,16 +116,16 @@ public abstract partial class ModelBase
                 float[] result = project(hidden);
                 if (result.Length != Config.VocabSize)
                     throw new InvalidOperationException("The output stage returned an unexpected vocabulary size.");
-                if (!LayerPlacement.IsFirst) LayerSplitGroup.Send(result, result.Length, 0);
+                if (LayerPlacement.NodeId != 0) LayerSplitGroup.Send(result, result.Length, 0);
                 return result;
             }
 
             var outgoing = TensorToFloatArray(hidden);
             if (outgoing.Length != elements) throw new InvalidOperationException("Invalid layer-stage activation shape.");
-            LayerSplitGroup.Send(outgoing, elements, LayerPlacement.NodeId + 1);
-            if (!LayerPlacement.IsFirst) return Array.Empty<float>();
+            LayerSplitGroup.Send(outgoing, elements, LayerPlacement.NextNode);
+            if (LayerPlacement.NodeId != 0) return Array.Empty<float>();
             var logits = new float[Config.VocabSize];
-            LayerSplitGroup.Receive(logits, logits.Length, LayerPlacement.NodeCount - 1);
+            LayerSplitGroup.Receive(logits, logits.Length, LayerPlacement.NodeOfStage(LayerPlacement.NodeCount - 1));
             return logits;
         }
         catch (Exception failure)

@@ -79,10 +79,13 @@
     <ReferenceNativeSymbol Include="TSGgml_Dsv4ForwardSpec" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4Free" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4LoadModel" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv4LoadModelDistributed" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv4LoadModelLayerDistributed" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4NPast" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4ResetChecked" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4Rewind" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4SetActiveSlot" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv4SetPipelineDriver" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotAlloc" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotCanAlloc" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotCanRetain" SymbolType="Function" />
@@ -165,6 +168,8 @@
     <ReferenceNativeSymbol Include="TSGgml_GlmKdaStateCapture" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmKdaStateRestore" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmLoadModel" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GlmLoadModelDistributed" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GlmLoadModelLayerPipeline" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmMtpCatchUp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmMtpDraftStep" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmNPast" SymbolType="Function" />
@@ -173,6 +178,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GlmResetChecked" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmRewind" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmSetActiveSlot" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GlmSetPipelineDriver" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmSetReclaimableSlots" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmSlotAlloc" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmSlotFree" SymbolType="Function" />
@@ -357,7 +363,9 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpStateSnapshotRestore" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTokenSpan" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTokenSpanTp" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTokenSpanTpGlobal" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTpWeightSupported" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTpWeightSupportedGlobal" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenImage21Forward" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenImage21ForwardTp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenImage21GetPrefixCacheInfo" SymbolType="Function" />

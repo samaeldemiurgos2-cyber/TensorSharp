@@ -1,6 +1,6 @@
 # GLM-5.x（`glm-dsa`、`glm5next`）
 
-> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。下面的历史命令与测量早于这项默认值变更；多 GPU 启动请加 `--layer-split N`。按层切分仅限单节点。
+> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。GLM-5.3-Flash（`glm5next`）在 `ggml_cuda` 上可通过 `--tp-node-id` 和 `--tp-peers` 使用两种多节点模式，N 为每个节点的 GPU 数量。较早的 `glm-dsa` 变体仍仅支持单机。见[多节点指南](../multi-node-inference.md)；下文单机历史测量不代表多节点性能。
 
 [← 返回模型索引](README_zh-cn.md) | [English](glm.md)
 
@@ -10,6 +10,8 @@ GLM-5.2 是一个 744B 参数的 MoE 模型（256 个路由专家，top-8，外�
 官方宣称上下文：1M token。GGUF 架构 id 是 `glm-dsa`（加载器也接受 `glm_dsa`）。**GLM-5.3** 是同一套层结构的
 新版本，整页内容对它同样适用——见[下文专节](#glm-53glm-dsa)。**GLM-5.3-Flash**
 （`glm5next`）复用同一个执行器——见[下文专节](#glm-53-flashglm5next)。
+也支持较新 GGUF 使用的 `glm5-next` 架构名；元数据按文件的实际前缀读取，
+聊天协议统一使用 GLM-5.3-Flash。
 
 ## 这一层长什么样
 
@@ -128,10 +130,9 @@ GLM-5.3-Flash GGUF 可作对照。请把托管路径当作用于 A/B 的参考�
 `TS_GLM_TP_OVERSUBSCRIBE=1` 允许多个 rank 共用一张 GPU —— 单卡机器上就是这样验证
 切分正确性的。
 
-GLM 5.x 的原生张量并行执行器对 GLM-5.2、GLM-5.3 与 GLM-5.3-Flash
-**都只支持本地单进程**。它不会加入跨节点的 `ITensorParallelGroup`，因此
-`--tp-node-id` / `--tp-peers` 不能让这条路径变成分布式运行——整个 GLM 系列都会在
-构建模型之前直接拒绝这两个参数。
+GLM-5.2 与 GLM-5.3（`glm-dsa`）的原生张量并行仍**仅支持本地单进程**，
+会拒绝 `--tp-node-id` / `--tp-peers`。GLM-5.3-Flash（`glm5next`）则为混合
+KDA/MLA 计算图提供了独立的多节点适配器，见[多节点指南](../multi-node-inference.md)。
 
 ### 并发请求的服务方式
 
@@ -617,14 +618,26 @@ KDA 递归状态（卷积尾部 + delta-net 状态，每序列约 150 MB）无�
 | rank 汇合 | 注意力的 rank 局部隐状态会在非线性 Sinkhorn 超连接之前归约。分段快路径先归约路由专家局部输出，再由每个 rank 在本地计算并加入其复制的共享专家，然后进入超连接 |
 | 不切分的工作 | 超连接、池化 indexer、router、norm、稠密层、共享专家与 embedding 都保持不切分。分段路径按 rank 复制这些计算；output norm 与 LM head 留在 rank 0。组合调度器回退路径则只在 rank 0 计算并加入一次共享专家 |
 
-GLM 5.x 的原生 TP 路径在 GGML GPU 后端上对 GLM-5.2、GLM-5.3 与 GLM-5.3-Flash
-都只支持本地单进程，不支持分布式或跨节点运行。
+GLM-5.3-Flash 在 `ggml_cuda` 上可通过 `--tp-node-id` 和 `--tp-peers` 扩展到多节点。
+路由专家切片使用全局 rank 数量，跨节点归约先于非线性超连接执行。
+分布式 TP 在每个 rank 上复制注意力及其缓存，保留完整的 head 几何，避免注意力切片中观察到的数值漂移。
+每个 rank 计算图在分配前也会像 layer split 调度器那样运行 CUDA 后端的图优化，为融合的 MoE
+加权求和、top-k router 与共享专家内核登记分配依赖。缺少这一步时分配器可能让这些缓冲区重叠，
+融合在运行时被跳过，各 rank 的算术略有不同，再被 288 选 8 的路由在 42 层中放大。在 UD-IQ3_XXS
+权重、两节点各两张 A40 上，分布式 TP 现与分布式 layer split 逐位一致：3,366 token 预填充、
+512 token 分块预填充、256 次解码及 refill 的全部 521 个全词表向量相同。`TS_GLM_TP_GRAPH_OPTIMIZE=0`
+可恢复旧的分配方式以作对比，所有节点须取相同值。
+分布式 `--layer-split N` 则传递完整 F32 超连接残差，KDA 与池化 DSA/MLA 缓存
+留在所属层。该模式当前使用单条镜像文本序列，不支持媒体、投机解码及多序列 slot。
 
-GLM-5.3-Flash 在默认的完整切分（head 与路由专家隐藏行都切）、每张本地 GPU 一个 rank、
+本地 TP 中，GLM-5.3-Flash 在默认的完整切分（head 与路由专家隐藏行都切）、每张本地 GPU 一个 rank、
 不启用 CPU MoE 或 tracing、且后端具备原生超连接内核时，会构建按 rank 分段计算图并并发提交。
 路由 MoE 先完成归约，随后每个 rank 在本地计算并加入其复制的共享专家。
 启用 CPU MoE、张量 tracing、部分 `TS_GLM_TP_SHARD` 切分、rank 超额共享 GPU，或后端缺少
-原生超连接内核时，则自动使用组合调度器回退路径；该路径只在 rank 0 计算并加入一次共享专家。
+原生超连接内核时，本地执行会使用组合调度器回退路径；该路径只在 rank 0 计算并加入一次共享专家。
+多节点 TP 会拒绝这些配置，因为本地回退路径无法正确执行全局切片。多节点 TP 使用
+`--n-cpu-moe 0`，不要设置 `TS_GLM_TP_SHARD`，并关闭 `TS_GLM_TRACE`。
+原生执行器支持每节点 1–8 张 GPU；路由专家维度及量化块边界限制全局并行度，本地 head 切分另受 head 数量约束。
 
 ### Direct CUDA 上的 GLM-5.3-Flash
 
@@ -634,7 +647,8 @@ GLM-5.3-Flash 在默认的完整切分（head 与路由专家隐藏行都切）�
 
 [`Glm5NextCudaEngineTests`](../../InferenceWeb.Tests/Glm5NextCudaEngineTests.cs)
 定义了数值范围：四层合成夹具使用生产内核宽度，包含 KDA/MLA 注意力与稠密/MoE FFN；40 token
-预填充与六行强制解码结果和 `ggml_cuda` 对比，要求 argmax 一致且相对 L2 误差不超过 2e-2。
+预填充与六行强制解码结果和 `ggml_cuda` 对比，要求 argmax 一致且归一化最大误差不超过 2e-2；
+该误差等于最大绝对 logit 差除以 `max(1, max(abs(reference)))`。
 独立检查覆盖双设备按层切分、稀疏索引规则、重置、交错槽位、图捕获解码、批量解码与验证回退。
 这些针对性约束不构成完整检查点数值一致性、模型质量或提速的验证；缺少硬件时 CUDA 场景会跳过。
 

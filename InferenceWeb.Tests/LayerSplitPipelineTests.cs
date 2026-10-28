@@ -53,8 +53,14 @@ public sealed class LayerSplitPipelineTests : IDisposable
     [Theory]
     [InlineData(2, 2, 7)]
     [InlineData(3, 2, 11)]
-    public async Task PipelineMatchesLocalPrefillDecodeRefillResetAndTruncate(int nodeCount, int localDegree, int layerCount)
+    public Task PipelineMatchesLocalPrefillDecodeRefillResetAndTruncate(int nodeCount, int localDegree, int layerCount)
+        => RunPipelineParity(_path, nodeCount, localDegree, layerCount);
+
+    /// <summary>Shared by the default (driver runs the last stage) and legacy
+    /// (driver runs the first stage) orders; the plan is read like the model reads it.</summary>
+    internal static async Task RunPipelineParity(string _path, int nodeCount, int localDegree, int layerCount)
     {
+        bool driverLast = LayerSplitPlan.DriverRunsLastStageFromEnvironment();
         var endpoints = Endpoints(nodeCount);
         var models = await Task.WhenAll(Enumerable.Range(0, nodeCount).Select(rank => Task.Run(() =>
         {
@@ -97,9 +103,9 @@ public sealed class LayerSplitPipelineTests : IDisposable
             {
                 var model = models[rank];
                 Assert.Equal(reference.Controls, model.Controls);
-                Assert.Equal(rank == 0 ? 8 : 0, model.Embeddings);
-                Assert.Equal(rank == nodeCount - 1 ? 8 : 0, model.Projections);
-                var plan = new LayerSplitPlan(layerCount, localDegree, rank, nodeCount);
+                var plan = new LayerSplitPlan(layerCount, localDegree, rank, nodeCount, driverLast);
+                Assert.Equal(plan.IsFirst ? 8 : 0, model.Embeddings);
+                Assert.Equal(plan.IsLast ? 8 : 0, model.Projections);
                 Assert.Equal(Enumerable.Range(plan.FirstLayer, plan.EndLayer - plan.FirstLayer)
                     .SelectMany(layer => Enumerable.Repeat(layer, 8)).Order(), model.ExecutedLayers.Order());
                 Assert.All(model.ExecutedLayers, layer => Assert.True(plan.Owns(layer)));
@@ -224,7 +230,8 @@ public sealed class LayerSplitPipelineTests : IDisposable
             .WaitAsync(TimeSpan.FromSeconds(20));
         try
         {
-            models[1].FailureLayer = 3;
+            // Fail inside the worker's own stage, whichever order is configured.
+            models[1].FailureLayer = models[1].Placement.FirstLayer;
             models[0].BeginDistributedDriver();
             var worker = Task.Run(() => Record.Exception(models[1].RunDistributedWorkerLoop));
             var driver = Task.Run(() => Record.Exception(() => models[0].Forward([7, 12])));
@@ -254,6 +261,7 @@ public sealed class LayerSplitPipelineTests : IDisposable
         public List<string> Controls { get; } = [];
         public int Embeddings { get; private set; }
         public int Projections { get; private set; }
+        public LayerSplitPlan Placement => LayerPlacement;
         public bool TensorParallelActive => IsTensorParallel;
         public int FailureLayer { get; set; } = -1;
         public int CachedTokens(int layer) => _states[layer].Count;

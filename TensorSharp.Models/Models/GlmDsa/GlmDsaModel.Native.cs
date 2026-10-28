@@ -30,6 +30,7 @@ namespace TensorSharp.Models
 
         /// <summary>True when a whole-model executor drives this instance.</summary>
         private bool UsesNativeExecutor => _exec != null;
+        protected override bool ShardsWeightsInComponents => UsesNativeExecutor;
 
         private static bool IsGgmlBackendType(BackendType backend) =>
             backend == BackendType.GgmlCuda || backend == BackendType.GgmlVulkan ||
@@ -45,15 +46,32 @@ namespace TensorSharp.Models
         private static BackendType ValidateParallelism(BackendType backend, int tpDegree,
             ITensorParallelGroup tpGroup, int layerSplitDegree)
         {
+            try { return ValidateParallelismCore(backend, tpDegree, tpGroup, layerSplitDegree); }
+            catch (Exception failure)
+            {
+                // This runs before the base constructor. Its failure must also
+                // release peers waiting for model agreement or weight loading.
+                try { (tpGroup as IDistributedExecutionGroup)?.Abort(failure); } catch { }
+                throw;
+            }
+        }
+
+        private static BackendType ValidateParallelismCore(BackendType backend, int tpDegree,
+            ITensorParallelGroup tpGroup, int layerSplitDegree)
+        {
             if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
             if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
-            if (layerSplitDegree > 1 && (tpDegree > 1 || tpGroup != null))
+            if (tpGroup is ILayerSplitGroup && layerSplitDegree != 1 && layerSplitDegree != tpGroup.Degree)
+                throw new ArgumentException("The explicit GLM layer-split degree disagrees with its execution group.");
+            if (layerSplitDegree > 1 && (tpDegree > 1 || (tpGroup != null && tpGroup is not ILayerSplitGroup)))
                 throw new ArgumentException("--layer-split and --tp cannot be combined.");
+            bool fixtureCpu = backend == BackendType.GgmlCpu && tpGroup is ILayerSplitGroup &&
+                Environment.GetEnvironmentVariable("TS_GLM_TP_OVERSUBSCRIBE") == "1";
             if (layerSplitDegree > 1 && (!NativeRequested(backend) ||
-                backend is not (BackendType.GgmlCuda or BackendType.GgmlVulkan)))
+                (backend is not (BackendType.GgmlCuda or BackendType.GgmlVulkan) && !fixtureCpu)))
                 throw new NotSupportedException("GLM --layer-split requires the native ggml_cuda or ggml_vulkan executor; remove TS_GLM_NATIVE=0.");
-            if (NativeRequested(backend) && tpGroup != null)
-                throw new NotSupportedException("GLM native tensor parallelism is local/single-process only; remove --tp-node-id/--tp-peers.");
+            if (tpGroup != null)
+                ValidateNativeDistributedGroup(backend, tpDegree, tpGroup);
             string shardOverride = Environment.GetEnvironmentVariable("TS_GLM_TP_SHARD");
             if (NativeRequested(backend) && tpDegree > 1 && shardOverride != null &&
                 (!int.TryParse(shardOverride, out int shards) || (shards & 3) == 0))
@@ -122,8 +140,8 @@ namespace TensorSharp.Models
             // --tp shards weights; --layer-split only changes whole-layer placement.
             int tp = tpDegree > 1 ? tpDegree : 1;
             _nativeTp = tp;
-            int nGpu = ResolveNativeGpuCount(tpDegree, layerSplitDegree);
-            int requested = Math.Max(tpDegree, layerSplitDegree);
+            int nGpu = IsDistributedGlm ? GlmDistributedGroup.Degree : ResolveNativeGpuCount(tpDegree, layerSplitDegree);
+            int requested = nGpu;
             if (requested > 1 && backend is BackendType.GgmlCuda or BackendType.GgmlVulkan)
             {
                 var kind = backend == BackendType.GgmlCuda ? GgmlBackendType.Cuda : GgmlBackendType.Vulkan;
@@ -150,9 +168,11 @@ namespace TensorSharp.Models
             bool ctxIsHardLimit = !string.IsNullOrWhiteSpace(
                 Environment.GetEnvironmentVariable("MAX_CONTEXT"));
 
-            IntPtr handle = GgmlGlmNative.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
-                ResolveCpuMoeLayers(), BackendRegistryName(backend), tp, ctxIsHardLimit,
-                NativeMtpRequested());
+            IntPtr handle = IsDistributedGlm
+                ? LoadDistributedNative(ggufPath, backend, maxContext, nUbatch, nThreads)
+                : GgmlGlmNative.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
+                    ResolveCpuMoeLayers(), BackendRegistryName(backend), tp, ctxIsHardLimit,
+                    NativeMtpRequested());
             if (handle == IntPtr.Zero)
                 throw NativeLoadRefused("glm", ggufPath,
                     "TS_GLM_NATIVE=0 selects the per-op path instead of the native executor.");
@@ -175,6 +195,7 @@ namespace TensorSharp.Models
         {
             lock (_nativeSync)
             {
+                _distributedNative?.ThrowIfAborted();
                 if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                     _logitsBuffer = new float[Config.VocabSize];
                 BeforeGraphCall();
@@ -182,7 +203,11 @@ namespace TensorSharp.Models
                 try { ok = _exec.Forward(tokens, _logitsBuffer); }
                 finally { AfterGraphCall(); }
                 if (!ok)
-                    throw new InvalidOperationException("glm-dsa native forward failed (see stderr).");
+                {
+                    var error = new InvalidOperationException("glm-dsa native forward failed (see stderr).", _distributedNative?.Failure);
+                    _distributedNative?.Abort(error);
+                    throw error;
+                }
                 _cacheSeqLen = _exec.NPast;
                 return _logitsBuffer;
             }
@@ -251,18 +276,24 @@ namespace TensorSharp.Models
             }
             // One tiny forward allocates the scheduler's compute buffers so the
             // first real request does not pay for them mid-prompt.
+            Exception failure = null;
             try
             {
+                GlmDistributedGroup?.Barrier();
                 int bos = Tokenizer?.BosTokenId ?? 0;
                 ForwardNative(new[] { bos });
             }
             catch (Exception ex)
             {
+                failure = ex;
+                if (IsDistributedGlm) { _distributedNative?.Abort(ex); throw; }
                 Console.Error.WriteLine($"[glm] warmup forward failed: {ex.Message}");
             }
             finally
             {
-                ResetNative();
+                if (!IsDistributedGlm || failure == null)
+                    try { ResetNative(); }
+                    catch (Exception error) { _distributedNative?.Abort(error); throw; }
             }
         }
 
@@ -273,6 +304,8 @@ namespace TensorSharp.Models
             {
                 _exec?.Dispose();
                 _exec = null;
+                GC.KeepAlive(_distributedReduce);
+                GC.KeepAlive(_distributedTransfer);
             }
 
             // The per-op path's caches are this model's own tensors; the base

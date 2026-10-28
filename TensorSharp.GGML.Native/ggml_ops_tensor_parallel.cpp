@@ -897,6 +897,10 @@ namespace tsg
                     for (int r = 0; r < rank_count; ++r)
                     {
                         ScopedRank rank(r);
+                        // tensor_set runs on a different stream than this rank's own
+                        // collective, which must finish before its buffer is
+                        // overwritten. After the network exchange that wait is free.
+                        if (r != 0) ggml_backend_synchronize(g_backend);
                         ggml_backend_tensor_set(plans[r]->ar_tensor[s], s_xnode.data(), 0, n * sizeof(float));
                     }
                 }

@@ -66,11 +66,11 @@ public class TensorParallelSupportGateTests
     {
         // A distributed group cannot be downgraded on one node: the other nodes
         // would still be waiting on collectives this rank will never issue. A
-        // layer split is single-process, so it is not an answer here either.
+        // different placement mode cannot satisfy the requested collectives.
         ITensorParallelGroup group = new StubTpGroup();
         var ex = Assert.Throws<NotSupportedException>(
-            () => Resolve("qwen4exp", BackendType.GgmlCuda, 2, ref group, out _));
-        Assert.Contains("qwen4exp", ex.Message, StringComparison.OrdinalIgnoreCase);
+            () => Resolve("deepseek4", BackendType.GgmlCuda, 2, ref group, out _));
+        Assert.Contains("deepseek4", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
@@ -104,13 +104,13 @@ public class TensorParallelSupportGateTests
     }
 
     [Fact]
-    public void GlmNativeTensorParallelism_RejectsDistributedGroupBeforeModelConstruction()
+    public void OlderGlmNativeTensorParallelism_RejectsDistributedGroupBeforeModelConstruction()
     {
         var context = new ModelCreateContext(
             "/model-is-not-opened.gguf", BackendType.GgmlCuda, probe: null,
             tpDegree: 2, tpGroup: new StubTpGroup());
 
-        var error = Assert.Throws<NotSupportedException>(() => Arch("glm5next").Factory(context));
+        var error = Assert.Throws<NotSupportedException>(() => Arch("glm-dsa").Factory(context));
         Assert.Contains("local/single-process", error.Message, StringComparison.Ordinal);
         Assert.Contains("--tp-node-id/--tp-peers", error.Message, StringComparison.Ordinal);
     }

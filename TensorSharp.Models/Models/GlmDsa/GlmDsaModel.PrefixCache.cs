@@ -61,7 +61,7 @@ namespace TensorSharp.Models
 
         public PrefixCacheCapabilities GetPrefixCacheCapabilities()
         {
-            bool slots = UsesNativeExecutor;
+            bool slots = UsesNativeExecutor && !IsDistributedGlm;
             return new PrefixCacheCapabilities
             {
                 Class = FamilyClass.N,
@@ -108,7 +108,7 @@ namespace TensorSharp.Models
             footprint = default;
             lock (_nativeSync)
             {
-                if (!UsesNativeExecutor || _slotByRequest == null) return false;
+                if (IsDistributedGlm || !UsesNativeExecutor || _slotByRequest == null) return false;
                 _retainedSlots ??= new OrderedDictionary<string, SlotRetention.RetainedSlot>(StringComparer.Ordinal);
                 if (!SlotRetention.RetainSlot(_slotByRequest, _retainedSlots, requestId, payloadKey, length, SupportsKVCacheTruncation,
                         ref _primarySlot, ref _activeSlotKey, new ExecutorGlmSlotStore(_exec)))
@@ -124,7 +124,7 @@ namespace TensorSharp.Models
             footprint = default;
             lock (_nativeSync)
             {
-                if (!UsesNativeExecutor) return false;
+                if (IsDistributedGlm || !UsesNativeExecutor) return false;
                 _retainedSlots ??= new OrderedDictionary<string, SlotRetention.RetainedSlot>(StringComparer.Ordinal);
                 if (!SlotRetention.ConvertPrimarySlot(_retainedSlots, payloadKey, length, ref _primarySlot, ref _activeSlotKey, new ExecutorGlmSlotStore(_exec)))
                     return false;
@@ -139,7 +139,7 @@ namespace TensorSharp.Models
             if (request.Op != MaterializeOp.Donate) return false;   // slots are moved, never copied
             lock (_nativeSync)
             {
-                if (!UsesNativeExecutor || !SlotRetention.CanDonate(_retainedSlots, request.PayloadKey, request.PayloadTokens, request.TargetTokens, SupportsKVCacheTruncation))
+                if (IsDistributedGlm || !UsesNativeExecutor || !SlotRetention.CanDonate(_retainedSlots, request.PayloadKey, request.PayloadTokens, request.TargetTokens, SupportsKVCacheTruncation))
                     return false;
                 _slotByRequest ??= new Dictionary<string, int>(StringComparer.Ordinal);
                 return SlotRetention.DonateSlot(_slotByRequest, _retainedSlots, request.PayloadKey, request.TargetRequestId, out _);
@@ -150,7 +150,7 @@ namespace TensorSharp.Models
         {
             lock (_nativeSync)
             {
-                if (!UsesNativeExecutor || _slotByRequest == null) return false;
+                if (IsDistributedGlm || !UsesNativeExecutor || _slotByRequest == null) return false;
                 _retainedSlots ??= new OrderedDictionary<string, SlotRetention.RetainedSlot>(StringComparer.Ordinal);
                 return SlotRetention.ReturnSlot(_slotByRequest, _retainedSlots, requestId, payloadKey, ref _primarySlot, ref _activeSlotKey,
                     new ExecutorGlmSlotStore(_exec));
@@ -160,7 +160,7 @@ namespace TensorSharp.Models
         public bool CanMaterialize(string payloadKey, int payloadTokens, int targetTokens)
         {
             lock (_nativeSync)
-                return UsesNativeExecutor && SlotRetention.CanDonate(_retainedSlots, payloadKey, payloadTokens, targetTokens, SupportsKVCacheTruncation);
+                return !IsDistributedGlm && UsesNativeExecutor && SlotRetention.CanDonate(_retainedSlots, payloadKey, payloadTokens, targetTokens, SupportsKVCacheTruncation);
         }
 
         public void ReleasePayloads(ReadOnlySpan<string> payloadKeys, ReleaseReason reason)

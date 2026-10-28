@@ -104,8 +104,9 @@ public class HostLoadRefusalProcessTests : IDisposable
         new object[] { new[] { "--tp=two" }, "--tp" },
         new object[] { new[] { "--tp=2", "--layer-split=2" }, "cannot both" },
         new object[] { new[] { "--tp-node-id=0" }, "--tp-peers" },
-        new object[] { new[] { "--layer-split=2", "--tp-node-id=0",
-            "--tp-peers=127.0.0.1:9500,127.0.0.1:9501" }, "one node only" },
+        // Distributed layer split is valid; a node ID outside the peer list is not.
+        new object[] { new[] { "--layer-split=2", "--tp-node-id=2",
+            "--tp-peers=127.0.0.1:9500,127.0.0.1:9501" }, "must be less than the number of peers" },
     };
 
     [Theory]
