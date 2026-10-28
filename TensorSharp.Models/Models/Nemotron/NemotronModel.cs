@@ -201,6 +201,11 @@ namespace TensorSharp.Models
         private IntPtr[] _moeUpPtrs;
         private IntPtr[] _moeDownPtrs;
         private float[] _moeUpScales;
+        /// <summary>The GGML MoE kernel's per-call expert cap (<c>numExperts</c> in [1, 16]).</summary>
+        internal const int MoEExpertsPerKernelCall = 16;
+        // One chunk's routing weights when a token routes to more experts than one kernel
+        // call takes (Super VL: 22). Reused across tokens and layers.
+        private readonly float[] _moeChunkRouteW = new float[MoEExpertsPerKernelCall];
 
         // Pre-allocated tensors for expert matmul reuse (avoids per-expert allocation)
         private Tensor _expertUpResult;
@@ -251,8 +256,18 @@ namespace TensorSharp.Models
             IAllocator visionAllocator = _backend == BackendType.Cuda
                 ? new CpuAllocator(BlasEnum.DotNet)
                 : _allocator;
-            _visionEncoder = new NemotronVisionEncoder(mmProjPath, visionAllocator);
-            _visionEncoder.SetHostModel(this);
+            var encoder = new NemotronVisionEncoder(mmProjPath, visionAllocator);
+            if (encoder.OutputDim != Config.HiddenSize)
+            {
+                int outputDim = encoder.OutputDim;
+                encoder.Dispose();
+                throw new InvalidDataException(
+                    $"Nemotron vision projector '{Path.GetFileName(mmProjPath)}' produces {outputDim}-wide embeddings, " +
+                    $"but the language model's hidden size is {Config.HiddenSize}: it belongs to another model.");
+            }
+            encoder.SetHostModel(this);
+            _visionEncoder?.Dispose();
+            _visionEncoder = encoder;
         }
 
         public void LoadAudioEncoder(string mmProjPath)
@@ -436,7 +451,11 @@ namespace TensorSharp.Models
             Console.WriteLine($"SSM: dConv={_ssmDConv}, dInner={_ssmDInner}, dState={_ssmDState}, " +
                 $"nHead={_ssmNHead}, nGroup={_ssmNGroup}, headDim={_ssmHeadDim}");
             Console.WriteLine($"Layer types: {attnCount} attention, {mamba2Count} Mamba2, {ffnCount} FFN" +
-                (_numExperts > 0 ? $" (MoE: {_numExperts} experts, top-{_numExpertsUsed})" : " (dense)"));
+                (_numExperts > 0
+                    ? _numExpertsUsed > 0
+                        ? $" (MoE: {_numExperts} experts, top-{_numExpertsUsed})"
+                        : $" (MoE: {_numExperts} experts, top-k per block)"
+                    : " (dense)"));
             if (_attentionScale != 0)
                 Console.WriteLine($"Attention scale: {_attentionScale}");
 
@@ -794,63 +813,111 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Derive the per-layer MoE expert count and top-k after weights are loaded.
-        /// Uniform checkpoints (Nemotron-H/Omni/Super) leave every FFN layer at the
-        /// global <c>_numExperts</c>/<c>_numExpertsUsed</c>; the "Puzzle"/Bolt
-        /// checkpoints declare varied per-layer counts (the routed-expert tensor's last
-        /// dim, cross-checked with the per-layer <c>expert_used_count</c> array).
+        /// Set the per-layer MoE expert count and top-k after weights are loaded (see
+        /// <see cref="DerivePerLayerMoEConfig"/>), and log them when they vary by block.
         /// </summary>
         private void InitPerLayerMoEConfig()
         {
             int numLayers = Config.NumLayers;
-            _numExpertsPerLayer = new int[numLayers];
-            _numExpertsUsedPerLayer = new int[numLayers];
+            var isMoE = new bool[numLayers];
+            for (int l = 0; l < numLayers; l++)
+                isMoE[l] = _layerTypes[l] == LayerType.FFN;
+
+            var config = DerivePerLayerMoEConfig(isMoE, _numExperts, _numExpertsUsed,
+                l => _stackedExpertWeights.TryGetValue($"blk.{l}.ffn_up_exps.weight", out var stackedUp)
+                    ? stackedUp.NumExperts : 0,
+                _expertUsedCountArray);
+            _numExpertsPerLayer = config.Experts;
+            _numExpertsUsedPerLayer = config.Used;
+            _hasPerLayerMoEConfig = config.Varied;
             if (_numExperts <= 0)
                 return;
 
-            bool varied = false;
-            int maxExperts = 0, maxUsed = 0;
-            for (int l = 0; l < numLayers; l++)
-            {
-                if (_layerTypes[l] != LayerType.FFN)
-                {
-                    _numExpertsPerLayer[l] = 0;
-                    _numExpertsUsedPerLayer[l] = 0;
-                    continue;
-                }
-
-                int numExperts = _numExperts;
-                if (_stackedExpertWeights.TryGetValue($"blk.{l}.ffn_up_exps.weight", out var stackedUp)
-                    && stackedUp.NumExperts > 0)
-                {
-                    numExperts = stackedUp.NumExperts;
-                }
-
-                int numUsed = _numExpertsUsed;
-                if (_expertUsedCountArray != null && l < _expertUsedCountArray.Length)
-                    numUsed = (int)_expertUsedCountArray[l];
-
-                _numExpertsPerLayer[l] = numExperts;
-                _numExpertsUsedPerLayer[l] = numUsed;
-                if (numExperts != _numExperts || numUsed != _numExpertsUsed)
-                    varied = true;
-                maxExperts = Math.Max(maxExperts, numExperts);
-                maxUsed = Math.Max(maxUsed, numUsed);
-            }
-
-            _hasPerLayerMoEConfig = varied;
-
-            if (varied && IsTensorParallel)
+            if (config.Varied && IsTensorParallel)
                 throw new NotSupportedException(
                     "Nemotron per-block MoE configuration (Nemotron Puzzle/Bolt) is not yet supported under tensor parallelism.");
 
             // Grow the global backing sizes to the observed maximum so the pre-allocated
             // routing buffers (_moeProbs/_moeTopExperts/pointer tables) always fit every
             // layer. No-op for uniform checkpoints.
-            if (maxExperts > _numExperts)
-                _numExperts = maxExperts;
-            if (maxUsed > _numExpertsUsed)
-                _numExpertsUsed = maxUsed;
+            if (config.MaxExperts > _numExperts)
+                _numExperts = config.MaxExperts;
+            if (config.MaxUsed > _numExpertsUsed)
+                _numExpertsUsed = config.MaxUsed;
+
+            if (config.Varied)
+                Console.WriteLine($"MoE per block: {config.Describe()}");
+        }
+
+        /// <summary>Per-layer MoE expert counts and top-k, as <see cref="DerivePerLayerMoEConfig"/> derives them.</summary>
+        internal readonly record struct PerLayerMoEConfig(int[] Experts, int[] Used, bool Varied, int MaxExperts, int MaxUsed)
+        {
+            /// <summary>One line for the load log: the ranges over the MoE layers, e.g.
+            /// <c>"40 MoE layers, 64-128 experts, top-4-8"</c>.</summary>
+            public string Describe()
+            {
+                int layers = 0, minE = int.MaxValue, minU = int.MaxValue;
+                for (int l = 0; l < Experts.Length; l++)
+                {
+                    if (Experts[l] <= 0) continue;
+                    layers++;
+                    minE = Math.Min(minE, Experts[l]);
+                    minU = Math.Min(minU, Used[l]);
+                }
+                if (layers == 0) return "no MoE layers";
+                string Range(int lo, int hi) => lo == hi ? lo.ToString() : $"{lo}-{hi}";
+                return $"{layers} MoE layers, {Range(minE, MaxExperts)} experts, top-{Range(minU, MaxUsed)}";
+            }
+        }
+
+        /// <summary>
+        /// Derive the per-layer MoE expert count and top-k after weights are loaded.
+        /// Uniform checkpoints (Nemotron-H/Omni/Super) leave every FFN layer at the
+        /// global <paramref name="globalExperts"/>/<paramref name="globalUsed"/>; the
+        /// "Puzzle"/Bolt checkpoints declare varied per-layer counts (the routed-expert
+        /// tensor's last dim, cross-checked with the per-layer <c>expert_used_count</c>
+        /// array). Bolt sets only the array, so its scalar top-k is 0.
+        /// </summary>
+        /// <param name="isMoELayer">Per layer: whether it is an MoE (FFN) block.</param>
+        /// <param name="stackedExperts">Per layer: the expert count of its stacked
+        /// <c>ffn_up_exps</c> tensor, or 0 when it has none.</param>
+        /// <param name="usedCountArray">The per-layer <c>expert_used_count</c> array, or null.</param>
+        internal static PerLayerMoEConfig DerivePerLayerMoEConfig(
+            bool[] isMoELayer, int globalExperts, int globalUsed, Func<int, int> stackedExperts, uint[]? usedCountArray)
+        {
+            int numLayers = isMoELayer.Length;
+            var experts = new int[numLayers];
+            var used = new int[numLayers];
+            if (globalExperts <= 0)
+                return new PerLayerMoEConfig(experts, used, false, 0, 0);
+
+            bool varied = false;
+            int maxExperts = 0, maxUsed = 0;
+            for (int l = 0; l < numLayers; l++)
+            {
+                if (!isMoELayer[l])
+                    continue;
+
+                int numExperts = globalExperts;
+                int stacked = stackedExperts(l);
+                if (stacked > 0)
+                    numExperts = stacked;
+
+                int numUsed = globalUsed;
+                if (usedCountArray != null && l < usedCountArray.Length)
+                    numUsed = (int)usedCountArray[l];
+                if (numUsed > numExperts)
+                    throw new System.IO.InvalidDataException(
+                        $"Nemotron layer {l} routes to top-{numUsed} of only {numExperts} experts.");
+
+                experts[l] = numExperts;
+                used[l] = numUsed;
+                if (numExperts != globalExperts || numUsed != globalUsed)
+                    varied = true;
+                maxExperts = Math.Max(maxExperts, numExperts);
+                maxUsed = Math.Max(maxUsed, numUsed);
+            }
+            return new PerLayerMoEConfig(experts, used, varied, maxExperts, maxUsed);
         }
 
         /// <summary>
@@ -2549,9 +2616,9 @@ namespace TensorSharp.Models
                         var dnQw0 = _expertDownQW[layer][topExperts[0]];
                         if (upQw0 != null && dnQw0 != null)
                         {
-                            const int MAX_EXPERTS_PER_CALL = 16;
+                            const int MAX_EXPERTS_PER_CALL = MoEExpertsPerKernelCall;
                             bool chunked = nUsed > MAX_EXPERTS_PER_CALL;
-                            float[] chunkRouteW = chunked ? new float[MAX_EXPERTS_PER_CALL] : routeW;
+                            float[] chunkRouteW = chunked ? _moeChunkRouteW : routeW;
                             float[] layerUpScale = _layerExpertUpScale != null
                                 && layer < _layerExpertUpScale.Length
                                 ? _layerExpertUpScale[layer] : null;

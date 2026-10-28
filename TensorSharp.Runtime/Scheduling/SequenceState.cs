@@ -40,6 +40,20 @@ namespace TensorSharp.Runtime.Scheduling
             if (promptTokens.Count == 0) throw new ArgumentException("Prompt must be non-empty.", nameof(promptTokens));
             if (maxNewTokens <= 0) throw new ArgumentOutOfRangeException(nameof(maxNewTokens));
 
+            // K/V computed under a LoRA adapter is not the base model's, and the base
+            // model's is not the adapter's. Every reuse path (radix pages, retained holders,
+            // checkpoints, the live cache) is keyed by tokens and conversation scope only, so
+            // a LoRA sequence takes the explicit no-cache policy: an empty breakpoint list
+            // (no prefix is matched, captured, retained or continued, and the live cache it
+            // leaves behind is not continued by the next request) and no public prefix.
+            LoraAdapter = samplingConfig?.LoraAdapter;
+            if (LoraAdapter != null)
+            {
+                cacheBreakpoints = Array.Empty<int>();
+                sharedPrefixTokens = 0;
+                publicCheckpointBoundaries = null;
+            }
+
             Sn = Interlocked.Increment(ref _counter);
             RequestId = requestId ?? $"seq-{Sn:X}";
             BlockTable = new BlockTable(blockSize);
@@ -207,6 +221,20 @@ namespace TensorSharp.Runtime.Scheduling
         /// want continuation reuse pass a stable conversation scope.
         /// </summary>
         public string? CacheScope { get; }
+
+        /// <summary>The text-LoRA adapter this sequence runs under
+        /// (<see cref="SamplingConfig.LoraAdapter"/>), or null for the base model. The
+        /// scheduler only puts sequences with the same adapter in one step, and the engine
+        /// activates it around that step's forward.</summary>
+        public ILoraAdapterHandle? LoraAdapter { get; }
+
+        /// <summary>Adapter targets applied by the forwards this sequence took part in, until
+        /// its first token proves every target was applied (<see cref="LoraTargetsVerified"/>).</summary>
+        internal HashSet<string>? LoraTargetsApplied { get; set; }
+
+        /// <summary>Set once the engine has checked, at this sequence's first sampled token,
+        /// that its prompt ran with every target of <see cref="LoraAdapter"/> applied.</summary>
+        internal bool LoraTargetsVerified { get; set; }
 
         public SequenceStatus Status { get; internal set; }
         public DateTime SubmittedAt { get; }

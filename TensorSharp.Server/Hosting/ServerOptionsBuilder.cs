@@ -675,6 +675,34 @@ public static class ServerOptionsBuilder
         return SpeculativeCliFlags.Apply(args);
     }
 
+    /// <summary>
+    /// Translate <c>--text-lora-dir &lt;dir&gt;</c> into <c>TS_TEXT_LORA_DIR</c>: the only
+    /// directory <c>POST /v1/loras</c> may load text-LoRA adapters from. Without it (and
+    /// without the variable) runtime adapter loading is refused. The directory must exist;
+    /// last one wins. Returns true when the flag was present.
+    /// </summary>
+    public static bool ApplyTextLoraDirCliFlag(string[] args)
+    {
+        if (args == null || args.Length == 0)
+            return false;
+        string? dir = null;
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (!string.Equals(args[i], TensorSharp.Models.Lora.TextLoraPaths.DirectoryFlag, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                throw new ArgumentException($"{TensorSharp.Models.Lora.TextLoraPaths.DirectoryFlag} requires a directory.");
+            dir = args[++i];
+        }
+        if (dir == null)
+            return false;
+        string full = Path.GetFullPath(dir);
+        if (!Directory.Exists(full))
+            throw new ArgumentException($"{TensorSharp.Models.Lora.TextLoraPaths.DirectoryFlag}: directory not found: {full}");
+        Environment.SetEnvironmentVariable(TensorSharp.Models.Lora.TextLoraPaths.DirectoryEnvironmentVariable, full);
+        return true;
+    }
+
     /// <summary>Disable scheduler prefix reuse when the host's prefix-cache opt-out
     /// is present. Startup preparation and persistence use the same parsed flag.</summary>
     public static bool ApplyPrefixCacheCliFlag(string[] args)
@@ -1412,7 +1440,8 @@ public static class ServerOptionsBuilder
                 || TryReadOption(args, ref i, "--height", out _)
                 || TryReadOption(args, ref i, LoraCliFlags.LoraFlag, out _)
                 || TryReadOption(args, ref i, LoraCliFlags.ScaleFlag, out _)
-                || TryReadOption(args, ref i, LoraCliFlags.ConfigFlag, out _))
+                || TryReadOption(args, ref i, LoraCliFlags.ConfigFlag, out _)
+                || TryReadOption(args, ref i, TensorSharp.Models.Lora.TextLoraPaths.DirectoryFlag, out _))
             {
                 continue;
             }
@@ -1500,6 +1529,7 @@ public static class ServerOptionsBuilder
         knownFlags.AddRange(CodeExecOptions.SwitchFlags);
         knownFlags.AddRange(CodeExecOptions.ValueFlags);
         knownFlags.AddRange(LoraCliFlags.Flags);
+        knownFlags.Add(TensorSharp.Models.Lora.TextLoraPaths.DirectoryFlag);
         string? best = null;
         int bestDist = int.MaxValue;
         foreach (var flag in knownFlags)

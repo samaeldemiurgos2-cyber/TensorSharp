@@ -190,6 +190,22 @@ The existing `QwenImage21LoraSet` is the only LoRA implementation and is **image
 
 #### 2.2.1 LoRA weight format
 
+> **As implemented** (`TextLoraLoader`, `TextLoraNames`, `TextLoraBinder`): adapters are `.safetensors`, not
+> GGUF. A factor is named `{target}.lora_a` / `{target}.lora_b`, `lora.{target}.lora_a` / `.lora_b`, or as a
+> standard PEFT file names it (`base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight`, mapped to
+> `blk.0.attn_q.weight`). Rank and alpha come from a sibling `adapter_config.json` or the safetensors
+> metadata. `{target}` is the model file's weight; a target the model fused at load (`attn_q/k/v` ->
+> `attn_qkv`, `ffn_gate/up` -> `ffn_gate_up`) is composed exactly into the fused weight. An adapter with any
+> module that does not fit the loaded model is refused at load, naming the modules.
+>
+> Selection is per request (`lora` on `/v1/chat/completions` and `/v1/responses`). The adapter rides on the
+> request's `SamplingConfig` to its `SequenceState`; the scheduler only batches sequences with the same
+> adapter in one step, the engine activates it around that step's forward, and a LoRA sequence neither
+> reuses nor publishes any cached prefix. A request whose forward skipped one of the adapter's targets
+> (a fused or native path that bypasses `LinearForward`, e.g. Qwen3.5 on `ggml_cuda`/`cpu`) is failed
+> before its first token instead of answering with the base model. `POST /v1/loras` loads only from the
+> directory named by `--text-lora-dir` / `TS_TEXT_LORA_DIR`.
+
 A LoRA adapter is a standalone GGUF file containing:
 
 | Tensor name pattern | Shape | Description |

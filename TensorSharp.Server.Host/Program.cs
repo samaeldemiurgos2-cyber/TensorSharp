@@ -197,6 +197,9 @@ bool redisFlagsApplied, continuousBatchingFlagApplied, specFlagsApplied, qwenIma
 try
 {
     ServerOptionsBuilder.ApplyPrefixCacheCliFlag(args);
+    // Translate --text-lora-dir into TS_TEXT_LORA_DIR, the only directory POST /v1/loras
+    // may read adapters from (runtime loading is refused without one).
+    ServerOptionsBuilder.ApplyTextLoraDirCliFlag(args);
     // Translate --redis-url into TS_RESPONSES_STORE_REDIS_URL, which backs the Responses
     // API store with Redis.
     redisFlagsApplied = ServerOptionsBuilder.ApplyRedisCliFlags(args);

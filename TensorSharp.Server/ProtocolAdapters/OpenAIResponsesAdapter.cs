@@ -254,9 +254,9 @@ public sealed class OpenAIResponsesAdapter
             completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxOutputTokens, effectiveTools, enableThinking)).ConfigureAwait(false);
         if (inferenceMessages == null) return;
 
-        // LoRA selection: an explicit `lora` field names an adapter, or "none"/empty to
-        // clear. The selection is request-scoped and always reverted at the end.
-        bool loraApplied = false;
+        // LoRA selection: an explicit `lora` field names an adapter, or "none"/empty for the
+        // base model. The adapter rides on this request's sampling config down to its
+        // sequence; the engine applies it to that sequence's forward passes only.
         if (body.TryGetProperty("lora", out var loraProp))
         {
             if (loraProp.ValueKind != JsonValueKind.String)
@@ -268,35 +268,27 @@ public sealed class OpenAIResponsesAdapter
             }
 
             string? loraName = loraProp.GetString();
-            if (!_svc.TrySetActiveLora(loraName, out string? loraError))
+            if (!_svc.TryResolveLora(loraName, out var loraAdapter, out string? loraError))
             {
                 logger.LogWarning(LogEventIds.HttpRequestRejected,
                     "/v1/responses rejected: {LoraError} (id={ResponseId})", loraError, requestId);
                 await WriteErrorAsync(ctx, 400, loraError!).ConfigureAwait(false);
                 return;
             }
-            loraApplied = true;
+            samplingConfig.LoraAdapter = loraAdapter;
         }
 
-        try
+        if (stream)
         {
-            if (stream)
-            {
-                await StreamResponseAsync(ctx, requestId, modelName!, instructions, maxOutputTokens,
-                    inferenceMessages, samplingConfig, effectiveTools, enableThinking, responseFormat, store,
-                    skillPlan, logger, knowledge).ConfigureAwait(false);
-            }
-            else
-            {
-                await CompleteSyncAsync(ctx, requestId, modelName!, instructions, maxOutputTokens,
-                    inferenceMessages, samplingConfig, effectiveTools, enableThinking, responseFormat, store,
-                    skillPlan, logger, knowledge).ConfigureAwait(false);
-            }
+            await StreamResponseAsync(ctx, requestId, modelName!, instructions, maxOutputTokens,
+                inferenceMessages, samplingConfig, effectiveTools, enableThinking, responseFormat, store,
+                skillPlan, logger, knowledge).ConfigureAwait(false);
         }
-        finally
+        else
         {
-            if (loraApplied)
-                _svc.ClearActiveLora();
+            await CompleteSyncAsync(ctx, requestId, modelName!, instructions, maxOutputTokens,
+                inferenceMessages, samplingConfig, effectiveTools, enableThinking, responseFormat, store,
+                skillPlan, logger, knowledge).ConfigureAwait(false);
         }
     }
 

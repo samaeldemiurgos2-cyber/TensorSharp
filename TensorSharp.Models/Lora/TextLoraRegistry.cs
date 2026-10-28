@@ -23,9 +23,9 @@ namespace TensorSharp.Models.Lora
     /// Adapters are immutable after load, so the read path is lock-free: <see cref="Get"/>
     /// and <see cref="List"/> only observe the <see cref="ConcurrentDictionary{TKey, TValue}"/>.
     /// <see cref="Load"/> replaces an existing entry under the same name (reload semantics),
-    /// and <see cref="Unload"/> removes one. A caller must not detach or replace an adapter
-    /// that a model currently holds active; the model's <c>SetActiveLora</c> grabs a strong
-    /// reference, so an unloaded adapter that is still active stays alive by that reference.
+    /// and <see cref="Unload(string)"/> removes one. A request that is already running keeps
+    /// its own reference to the adapter it started with (<c>SamplingConfig.LoraAdapter</c>),
+    /// so replacing or unloading one never changes the weights under a running request.
     /// </para>
     /// </summary>
     public sealed class TextLoraRegistry : IDisposable
@@ -47,8 +47,21 @@ namespace TensorSharp.Models.Lora
             return adapter;
         }
 
+        /// <summary>Register an already loaded adapter under its name, replacing (and returning)
+        /// any adapter registered under it before.</summary>
+        public TextLoraAdapter? Register(TextLoraAdapter adapter)
+        {
+            ArgumentNullException.ThrowIfNull(adapter);
+            TextLoraAdapter? previous = null;
+            _adapters.AddOrUpdate(adapter.Name, adapter, (_, old) => { previous = old; return adapter; });
+            return previous;
+        }
+
         /// <summary>Unload and stop advertising an adapter by name. Returns true when it was loaded.</summary>
         public bool Unload(string name) => _adapters.TryRemove(name, out _);
+
+        /// <summary>Unload an adapter by name, handing back the instance that was registered.</summary>
+        public bool Unload(string name, out TextLoraAdapter? removed) => _adapters.TryRemove(name, out removed);
 
         /// <summary>The adapter registered under <paramref name="name"/>, or null.</summary>
         public TextLoraAdapter? Get(string name) => _adapters.TryGetValue(name, out var adapter) ? adapter : null;

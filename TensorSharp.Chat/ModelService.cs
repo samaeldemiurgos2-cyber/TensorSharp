@@ -83,48 +83,121 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// Loaded text-LoRA adapters, held independently of the base model so they can be
-        /// loaded and unloaded at runtime. Populated by the host's startup directory scan
-        /// and by the adapters that consume a <c>lora</c> request field.
+        /// loaded and unloaded at runtime (<see cref="LoadLora"/>, <see cref="UnloadLora"/>)
+        /// and selected per request by the adapters that consume a <c>lora</c> request field
+        /// (<see cref="TryResolveLora"/>).
         /// </summary>
         public TextLoraRegistry LoraRegistry { get; } = new();
 
         /// <summary>
-        /// Select the named LoRA adapter on the loaded model for subsequent inference, or
-        /// clear the selection when <paramref name="name"/> is null/empty/<c>"none"</c>.
-        /// Returns false with a reason when no model is loaded or the adapter is unknown.
+        /// The only directory runtime adapter loading may read from, set by the host at startup
+        /// from <c>--text-lora-dir</c> / <c>TS_TEXT_LORA_DIR</c>; null disables
+        /// <c>POST /v1/loras</c>. See <see cref="TextLoraPaths.ResolveWithin"/>.
         /// </summary>
-        public bool TrySetActiveLora(string? name, out string? error)
+        public string? LoraDirectory
         {
+            get => _loraDirectory
+                ?? (Environment.GetEnvironmentVariable(TextLoraPaths.DirectoryEnvironmentVariable) is { Length: > 0 } dir ? dir : null);
+            set => _loraDirectory = string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+        private string? _loraDirectory;
+
+        /// <summary>
+        /// Resolve a request's <c>lora</c> field to the adapter it runs under: null (with true)
+        /// for null, empty or <c>"none"</c>. The adapter is prepared on the loaded model here,
+        /// so a request is refused with a reason - unknown name, an adapter that does not fit
+        /// this model, or one whose forward is known to skip some of its targets - before it
+        /// is queued, never answered by the base model instead.
+        /// </summary>
+        public bool TryResolveLora(string? name, out TextLoraAdapter? adapter, out string? error)
+        {
+            adapter = null;
             error = null;
+            if (string.IsNullOrWhiteSpace(name) || string.Equals(name, "none", StringComparison.OrdinalIgnoreCase))
+                return true;
+
             var model = Model;
             if (model == null)
             {
                 error = "No model is loaded.";
                 return false;
             }
-
-            if (string.IsNullOrWhiteSpace(name) || string.Equals(name, "none", StringComparison.OrdinalIgnoreCase))
-            {
-                model.SetActiveLora(null);
-                return true;
-            }
-
-            var adapter = LoraRegistry.Get(name);
-            if (adapter == null)
+            var found = LoraRegistry.Get(name);
+            if (found == null)
             {
                 error = $"No LoRA adapter named '{name}' is loaded.";
                 return false;
             }
-
-            model.SetActiveLora(adapter);
+            try
+            {
+                lock (model.GpuComputeLock)
+                    model.PrepareLora(found);
+            }
+            catch (InvalidDataException ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+            string? unsupported = model.GetLoraUnsupportedReason(found);
+            if (unsupported != null)
+            {
+                error = unsupported;
+                return false;
+            }
+            adapter = found;
             return true;
         }
 
-        /// <summary>Detach any active LoRA from the loaded model.</summary>
-        public void ClearActiveLora() => Model?.SetActiveLora(null);
+        /// <summary>
+        /// Load an adapter from <paramref name="relativePath"/> inside <see cref="LoraDirectory"/>,
+        /// prepare it on the loaded model, and register it under <paramref name="name"/>
+        /// (replacing an adapter of that name; requests already running keep the old one).
+        /// An adapter that does not fit the loaded model is refused and not registered.
+        /// </summary>
+        /// <exception cref="LoraPathException">The path is outside the directory, or none is configured.</exception>
+        /// <exception cref="InvalidDataException">The file is malformed or does not fit the model.</exception>
+        public TextLoraAdapter LoadLora(string name, string relativePath, string? relativeConfigPath, float? scale)
+        {
+            if (!TextLoraPaths.IsValidName(name))
+                throw new ArgumentException(
+                    "A LoRA name is 1-64 letters, digits, '.', '_' or '-', starts with a letter or digit, and is not \"none\".",
+                    nameof(name));
+            string weights = TextLoraPaths.ResolveWithin(LoraDirectory, relativePath, ".safetensors");
+            string? config = relativeConfigPath == null
+                ? null
+                : TextLoraPaths.ResolveWithin(LoraDirectory, relativeConfigPath, ".json");
 
-        /// <summary>The name of the LoRA adapter currently active on the loaded model, or null.</summary>
-        public string? ActiveLoraName => Model?.ActiveLoraName;
+            var adapter = TextLoraLoader.Load(name, weights, config, scale);
+            var model = Model;
+            if (model != null)
+            {
+                lock (model.GpuComputeLock)
+                    model.PrepareLora(adapter);
+            }
+            var previous = LoraRegistry.Register(adapter);
+            if (previous != null)
+                ReleaseLoraOnModel(previous);
+            return adapter;
+        }
+
+        /// <summary>Unload the adapter registered under <paramref name="name"/> and free its device
+        /// copy. Requests already running under it finish with it.</summary>
+        public bool UnloadLora(string name)
+        {
+            if (!LoraRegistry.Unload(name, out var removed))
+                return false;
+            if (removed != null)
+                ReleaseLoraOnModel(removed);
+            return true;
+        }
+
+        private void ReleaseLoraOnModel(TextLoraAdapter adapter)
+        {
+            var model = Model;
+            if (model == null) return;
+            lock (model.GpuComputeLock)
+                model.ReleaseLora(adapter);
+        }
 
         /// <summary>
         /// Non-null when an explicitly requested <c>--draft-model</c> could not

@@ -1390,6 +1390,11 @@ namespace TensorSharp.Models
 
         public override bool SupportsKVCacheTruncation => false;
 
+        /// <summary>Qwen3.5 runs every text projection in its own fused or native kernels, never
+        /// through <see cref="ModelBase.LinearForward"/>, so a LoRA delta would never be applied;
+        /// adapters are refused up front instead of answering with the base model.</summary>
+        public override bool SupportsTextLora => false;
+
         /// <summary>Qwen 3.5/3.8 implement the split FFN: BuildLayerKeys populates
         /// _ffnGateSplitQW/_ffnUpSplitQW when the fused tensor is absent,
         /// FFNCachedSplitGateUp runs the managed path, and all three fused native

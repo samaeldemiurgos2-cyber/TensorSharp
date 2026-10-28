@@ -772,6 +772,10 @@ namespace TensorSharp.Models
             var selectedExperts = new int[totalAssignments];
             var routeWeightsAll = new float[totalAssignments];
             var tokenLogits = new float[_numExperts];
+            // The per-expert NVFP4 down scale2 rides on the routing weight, exactly as in the
+            // single-device MoE paths (see InitExpertScales): every TP expert path below
+            // consumes routeWeightsAll and applies only the up scale itself.
+            float[] downScale = _layerExpertScale?[layer];
             for (int s = 0; s < seqLen; s++)
             {
                 Array.Copy(routePtr, s * _numExperts, tokenLogits, 0, _numExperts);
@@ -779,7 +783,7 @@ namespace TensorSharp.Models
                 for (int k = 0; k < nUsed; k++)
                 {
                     selectedExperts[s * nUsed + k] = te[k];
-                    routeWeightsAll[s * nUsed + k] = tw[k];
+                    routeWeightsAll[s * nUsed + k] = downScale != null ? tw[k] * downScale[te[k]] : tw[k];
                 }
             }
 

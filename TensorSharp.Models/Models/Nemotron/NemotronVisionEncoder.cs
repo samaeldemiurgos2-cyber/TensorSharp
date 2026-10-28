@@ -10,6 +10,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using TensorSharp;
@@ -70,6 +72,10 @@ namespace TensorSharp.Models
         public int ScaleFactor => _scaleFactor;
         public NemotronImageProcessor ImageProcessor => _imageProcessor;
 
+        /// <summary>Width of one projected image embedding (the projector's last layer); it must
+        /// equal the language model's hidden size.</summary>
+        public int OutputDim => GetWeightOutDim("mm.model.mlp.3.weight");
+
         public NemotronVisionEncoder(string mmProjPath, IAllocator allocator)
         {
             _allocator = allocator;
@@ -94,6 +100,16 @@ namespace TensorSharp.Models
                 $"image={_imageSize}, patch={_patchSize}, projDim={_projectionDim}, scale={_scaleFactor}, gelu={_useGelu}");
 
             LoadWeights(gguf);
+            try
+            {
+                FuseSplitAttentionProjections();
+                ValidateTensors(Path.GetFileName(mmProjPath));
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
 
             if (_weights.TryGetValue("v.class_embd", out var classEmb))
             {
@@ -182,6 +198,118 @@ namespace TensorSharp.Models
                 count++;
             }
             Console.WriteLine($" done ({count} tensors)");
+        }
+
+        /// <summary>
+        /// Bring split attention projections into the fused <c>attn_qkv</c> layout
+        /// <see cref="SelfAttention"/> runs. The Super VL (ggml-org) and Nano Omni mmproj files
+        /// store <c>v.blk.N.attn_qkv.{weight,bias}</c>; the Bolt mmproj
+        /// (<c>mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf</c>) stores
+        /// <c>attn_q/attn_k/attn_v</c> weights and biases separately. Concatenating them along the
+        /// output dimension as <c>[Q | K | V]</c> is exactly the fused projection, and keeps one
+        /// matmul per block. A missing split bias is taken as zero.
+        /// </summary>
+        private void FuseSplitAttentionProjections()
+        {
+            int fused = 0;
+            for (int b = 0; b < _blockCount; b++)
+            {
+                string prefix = $"v.blk.{b}";
+                string qkvName = $"{prefix}.attn_qkv.weight";
+                if (_weights.ContainsKey(qkvName))
+                    continue;
+                string[] parts = { $"{prefix}.attn_q", $"{prefix}.attn_k", $"{prefix}.attn_v" };
+                var weights = new Tensor[3];
+                bool complete = true;
+                for (int i = 0; i < 3; i++)
+                    complete &= _weights.TryGetValue(parts[i] + ".weight", out weights[i]);
+                if (!complete)
+                    continue; // ValidateTensors names what is missing.
+
+                for (int i = 0; i < 3; i++)
+                {
+                    if (weights[i].DimensionCount != 2 || weights[i].Sizes[0] != _hiddenSize || weights[i].Sizes[1] != _hiddenSize)
+                        throw new InvalidDataException(
+                            $"Nemotron vision block {b}: {parts[i]}.weight is [{string.Join(", ", weights[i].Sizes.ToArray())}], " +
+                            $"expected [{_hiddenSize}, {_hiddenSize}] (clip.vision.embedding_length).");
+                }
+
+                var qkv = new Tensor(_allocator, DType.Float32, 3L * _hiddenSize, _hiddenSize);
+                for (int i = 0; i < 3; i++)
+                {
+                    using var dst = qkv.Narrow(0, (long)i * _hiddenSize, _hiddenSize);
+                    Ops.Copy(dst, weights[i]);
+                }
+                _weights[qkvName] = qkv;
+
+                bool anyBias = false;
+                for (int i = 0; i < 3; i++)
+                    anyBias |= _weights.ContainsKey(parts[i] + ".bias");
+                if (anyBias)
+                {
+                    var bias = new Tensor(_allocator, DType.Float32, 3L * _hiddenSize);
+                    Ops.Fill(bias, 0f);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        if (!_weights.TryGetValue(parts[i] + ".bias", out var partBias))
+                            continue;
+                        if (partBias.ElementCount() != _hiddenSize)
+                            throw new InvalidDataException(
+                                $"Nemotron vision block {b}: {parts[i]}.bias has {partBias.ElementCount()} elements, expected {_hiddenSize}.");
+                        using var dst = bias.Narrow(0, (long)i * _hiddenSize, _hiddenSize);
+                        using var src = partBias.View(_hiddenSize);
+                        Ops.Copy(dst, src);
+                    }
+                    _weights[$"{prefix}.attn_qkv.bias"] = bias;
+                }
+
+                foreach (string part in parts)
+                {
+                    foreach (string suffix in new[] { ".weight", ".bias" })
+                    {
+                        if (_weights.Remove(part + suffix, out var t))
+                            t.Dispose();
+                    }
+                }
+                fused++;
+            }
+            if (fused > 0)
+                Console.WriteLine($"  Fused split attention projections: {fused} block(s) attn_q/k/v -> attn_qkv");
+        }
+
+        /// <summary>
+        /// Fail the load, naming every tensor, when the mmproj lacks one the encoder reads.
+        /// Without this a missing projection surfaced as a NullReferenceException on the first
+        /// image (and as a skipped multimodal warm-up at startup).
+        /// </summary>
+        private void ValidateTensors(string fileName)
+        {
+            var missing = new List<string>();
+            void Require(string name)
+            {
+                if (!_weights.ContainsKey(name)) missing.Add(name);
+            }
+
+            Require("v.patch_embd.weight");
+            for (int b = 0; b < _blockCount; b++)
+            {
+                string prefix = $"v.blk.{b}";
+                if (!_weights.ContainsKey($"{prefix}.attn_qkv.weight"))
+                    missing.Add($"{prefix}.attn_qkv.weight (or {prefix}.attn_q/attn_k/attn_v.weight)");
+                Require($"{prefix}.attn_out.weight");
+                Require($"{prefix}.ffn_up.weight");
+                Require($"{prefix}.ffn_down.weight");
+            }
+            Require("mm.model.mlp.1.weight");
+            Require("mm.model.mlp.3.weight");
+
+            if (missing.Count == 0)
+                return;
+            const int shown = 6;
+            string list = string.Join(", ", missing.Take(shown)) +
+                (missing.Count > shown ? $" and {missing.Count - shown} more" : string.Empty);
+            throw new InvalidDataException(
+                $"Nemotron vision projector '{fileName}' is missing {missing.Count} tensor(s) the encoder needs: {list}.");
         }
 
         /// <summary>

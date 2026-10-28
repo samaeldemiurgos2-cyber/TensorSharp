@@ -1,6 +1,7 @@
 # Nemotron 3.5 Super VL / Bolt support - Design & gap analysis
 
-**Status:** All gaps addressed. G1/G2/G6 implemented; G3/G4 verified already covered; G5 already supported by existing vision code.
+**Status:** Text path addressed: G1/G2/G6 implemented; G3/G4 verified already covered. G5 (vision) needed a fix for
+Bolt's split-projection mmproj, see G5 below.
 **Date:** 2026-10-19 / 2026-10-20
 **Target models:**
 - `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` (ggml-org GGUF, ~79GB)
@@ -193,14 +194,27 @@ weights and OOM-killed it on a 121 GB Spark during prefill warmup. Run models at
 ship in -- these GGUFs are sized deliberately for the platform. If a dtype genuinely is unsupported,
 fix it in TensorSharp-owned native code rather than inflating the footprint.
 
-### G5 -- Vision -- **already supported**
+### G5 -- Vision -- **fixed for Bolt's split projections**
 
 Super-VL / Bolt are `image-text-to-text` with a RADIO-family vision tower in the mmproj.
-`NemotronVisionEncoder` handles the exact `clip` mmproj + `nemotron_omni` projector format:
-it reads `clip.vision.*` config keys, loads `v.blk.*` ViT blocks (with bias and GELU) and
-`mm.model.mlp.*` projector tensors. `LoadVisionEncoder` is already wired. The
-RADIO ViT (32 blocks, 1280 embed, 16 heads, GELU, bias, scale_factor=2, MLP 1280->20480->4096)
-matches the existing code exactly. No additional work needed.
+`NemotronVisionEncoder` reads the `clip` mmproj + `nemotron_omni` projector format: `clip.vision.*`
+config keys, `v.blk.*` ViT blocks (with bias and GELU) and `mm.model.mlp.*` projector tensors.
+
+An earlier revision of this document said the mmproj had been verified against its header and needed no
+work. That was wrong: only the language-model GGUF header had been read. The mmproj files differ:
+
+| mmproj | attention projections |
+|---|---|
+| Super VL (ggml-org), Nano Omni | fused `v.blk.N.attn_qkv.{weight,bias}` |
+| Bolt (`mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`, `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF`) | separate `attn_q` / `attn_k` / `attn_v` weights and biases |
+
+The encoder read only `attn_qkv`, so every Bolt image request threw `NullReferenceException` (HTTP 500)
+and the startup multimodal warm-up was skipped. The encoder now concatenates split `attn_q/k/v` (and
+their biases; a missing one is zero) into the fused `[Q | K | V]` layout at load, which is exactly the
+fused projection, and refuses at load - naming every tensor - an mmproj missing a tensor it reads, or
+whose projector width does not match the language model. `NemotronVisionSplitQkvTests` checks a split
+file encodes identically to its fused twin. The Bolt mmproj itself has not been run here; the reported
+layout comes from the review of the PR on 2x A40.
 
 ## 5. Summary
 
@@ -281,7 +295,22 @@ non-zero and fall back.
   path. Expert-parallel MoE throws `NotSupportedException` for up-scaled experts rather than routing
   garbage, because `MoEFFNPrefill` has no per-expert scale hook and building EP shards removes the
   per-expert weights the fallback needs.
-- **Vision (G5)** -- unchanged, still unexercised end-to-end.
+- **Tensor parallelism is refused for Super VL and Bolt.** Both ship `.scale` sidecars, and `--tp` is
+  refused for such a GGUF unless the family sets `SupportsTensorParallelWeightScales`, which Nemotron does
+  not. The TP router now folds the per-expert NVFP4 down scale into the routing weights like the
+  single-device paths (so the TP MoE math is complete), but per-tensor scales on the TP linears are not
+  audited and no TP run has validated the family, so the opt-in stays off. The per-block (Bolt) TP check
+  in `InitPerLayerMoEConfig` is therefore unreachable today.
+- **Super VL needs a GPU with more than ~73 GB.** With `--tp` refused there is no way to split it across
+  smaller cards, and `NemotronModel` logs `--n-cpu-moe` but still preloads every expert to the GPU (as
+  `main` did). On a 48 GB card it runs on `ggml_cpu` only.
+- **Vision (G5)** -- Bolt's split projections are covered by a synthetic parity test only; no Bolt image
+  has been encoded end-to-end here.
+- **Direct `cuda` prefill attention changed.** Every Nemotron prefill on the direct `cuda` backend now goes
+  through `TryGqaPrefillAttention`. The kernel matches the CPU reference (max error 1.21e-4) and is
+  1.7-3.6x faster at 2K-8K tokens, but greedy text can differ at near-ties (2 of 7 Nemotron-H 8B answers
+  were reworded, both still correct), and the gain did not show end to end in Lightning's ~6K-token
+  prefill.
 - **CPU offload** with 512 NVFP4 experts per layer (`--n-cpu-moe`).
 - The new group-16/head_dim-128 flash prefill kernel is restricted to `windowSize == 0`; it implements
   sliding windows but only full attention has been run.

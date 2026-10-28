@@ -41,6 +41,9 @@ public sealed class DenseDecoderSyntheticModelBuilder
     public bool TiedOutput { get; init; }
     /// <summary>Store one layer's matrices as F16 while all other weights remain F32.</summary>
     public int? HalfPrecisionLayer { get; init; }
+    /// <summary>Rewrites a tensor's generated values (name, GGUF dims, values) before it is
+    /// written, e.g. to merge a LoRA delta into a weight. Null leaves every tensor as generated.</summary>
+    public Func<string, ulong[], float[], float[]> TransformTensor { get; init; }
 
     private static readonly string[] MistralControlTokens = { "[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]" };
 
@@ -84,6 +87,9 @@ public sealed class DenseDecoderSyntheticModelBuilder
             t.Add(Gen(p + "ffn_up.weight", 0.08f, Hidden, FfnLength));
             t.Add(Gen(p + "ffn_down.weight", 0.08f, FfnLength, Hidden));
         }
+        if (TransformTensor != null)
+            for (int i = 0; i < t.Count; i++)
+                t[i] = (t[i].Item1, t[i].Item2, TransformTensor(t[i].Item1, t[i].Item2, t[i].Item3));
         return t;
     }
 

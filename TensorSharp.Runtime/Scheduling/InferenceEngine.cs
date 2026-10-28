@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -394,6 +395,18 @@ namespace TensorSharp.Runtime.Scheduling
                         continue;
                     }
 
+                    ILoraAdapterHandle? stepAdapter;
+                    IReadOnlyCollection<string>? stepLoraTargets;
+                    try
+                    {
+                        stepAdapter = ActivateStepLoraAdapter(output, out stepLoraTargets);
+                    }
+                    catch (Exception ex)
+                    {
+                        FailStepSequences(ex, output, "LoRA");
+                        continue;
+                    }
+
                     try
                     {
                         results = _executor.ExecuteStep(output);
@@ -403,6 +416,16 @@ namespace TensorSharp.Runtime.Scheduling
                         FailStepSequences(ex, output, "executor");
                         continue;
                     }
+                    finally
+                    {
+                        // Nothing outside this step - a media encode, a warm-up, the next
+                        // step's scheduling - may run under this step's adapter.
+                        if (stepAdapter != null)
+                            ((ILoraAdapterModel)_model).ActivateLoraAdapter(null);
+                    }
+
+                    if (stepAdapter != null)
+                        VerifyLoraTargets(stepAdapter, stepLoraTargets!, results);
 
                     Interlocked.Increment(ref _totalStepsRun);
                     Interlocked.Add(ref _totalForwardTicks, sw.ElapsedTicks);
@@ -419,6 +442,99 @@ namespace TensorSharp.Runtime.Scheduling
                     NotifyReleasedSequences(output);
                 }
             }
+        }
+
+        /// <summary>
+        /// Select the text-LoRA adapter of the sequences <paramref name="output"/> runs, on
+        /// the model, for this step only. The scheduler admits only sequences with the same
+        /// adapter beside each other (<see cref="ContinuousBatchScheduler.LoraBarrierHolds"/>);
+        /// a mixed step is refused rather than run under one of them.
+        /// </summary>
+        private ILoraAdapterHandle? ActivateStepLoraAdapter(SchedulerOutput output, out IReadOnlyCollection<string>? targets)
+        {
+            targets = null;
+            ILoraAdapterHandle? adapter = null;
+            bool first = true;
+            foreach (var work in output.ScheduledWork)
+            {
+                var seqAdapter = work.Sequence.LoraAdapter;
+                if (first) { adapter = seqAdapter; first = false; }
+                else if (!ReferenceEquals(adapter, seqAdapter))
+                    throw new InvalidOperationException(
+                        "A scheduler step mixed sequences under different LoRA adapters; refusing to run it.");
+            }
+            if (adapter == null) return null;
+            if (_model is not ILoraAdapterModel loraModel)
+                throw new NotSupportedException(
+                    $"LoRA adapter '{adapter.Name}' was requested, but this model cannot apply text-LoRA adapters.");
+            loraModel.ActivateLoraAdapter(adapter);
+            // Read while it is active (an adapter unloaded mid-request is materialized for this
+            // step only), and start the step's applied set empty: a failed step may have left some.
+            targets = loraModel.GetLoraTargets(adapter);
+            loraModel.TakeAppliedLoraTargets();
+            return adapter;
+        }
+
+        /// <summary>
+        /// Refuse a LoRA request whose prompt ran without one of its adapter's targets. A
+        /// target is skipped when the model's forward for this backend never goes through the
+        /// LoRA-aware projection for that weight (a fused or native kernel); answering anyway
+        /// would return the base model's text as though it were the adapter's. The check runs
+        /// at the sequence's first sampled token, before anything is published to the client:
+        /// by then every layer has run over the whole prompt.
+        /// </summary>
+        private void VerifyLoraTargets(ILoraAdapterHandle adapter, IReadOnlyCollection<string> targets,
+            List<SequenceStepResult> results)
+        {
+            var loraModel = (ILoraAdapterModel)_model;
+            var applied = loraModel.TakeAppliedLoraTargets();
+            for (int i = 0; i < results.Count; i++)
+            {
+                var r = results[i];
+                var seq = r.Sequence;
+                if (seq.LoraTargetsVerified || r.Error != null || r.SlotUnavailable) continue;
+                if (r.TokensForwarded > 0)
+                {
+                    seq.LoraTargetsApplied ??= new HashSet<string>(StringComparer.Ordinal);
+                    seq.LoraTargetsApplied.UnionWith(applied);
+                }
+                if (r.SampledToken < 0) continue;
+
+                var missing = new List<string>();
+                foreach (string target in targets)
+                    if (seq.LoraTargetsApplied == null || !seq.LoraTargetsApplied.Contains(target))
+                        missing.Add(target);
+                if (missing.Count == 0)
+                {
+                    seq.LoraTargetsVerified = true;
+                    seq.LoraTargetsApplied = null;
+                    continue;
+                }
+
+                loraModel.MarkLoraUnsupported(adapter, missing);
+                _logger.LogError(
+                    "LoRA adapter '{Adapter}' was not applied to {Missing} of its {Targets} target weight(s) by this " +
+                    "model's forward pass (first: {First}); failing request {RequestId} rather than returning base-model output.",
+                    adapter.Name, missing.Count, targets.Count, missing[0], seq.RequestId);
+                results[i] = new SequenceStepResult
+                {
+                    Sequence = seq,
+                    TokensForwarded = r.TokensForwarded,
+                    IsPrefill = r.IsPrefill,
+                    ForwardElapsedTicks = r.ForwardElapsedTicks,
+                    Error = new NotSupportedException(LoraNotAppliedMessage(adapter.Name, missing)),
+                };
+            }
+        }
+
+        /// <summary>The error a client sees when the model's forward skipped adapter targets.</summary>
+        public static string LoraNotAppliedMessage(string adapterName, IReadOnlyList<string> missing)
+        {
+            const int shown = 8;
+            string list = string.Join(", ", missing.Count <= shown ? missing : missing.Take(shown));
+            if (missing.Count > shown) list += $" and {missing.Count - shown} more";
+            return $"LoRA adapter '{adapterName}' cannot be applied by this model on this backend: its forward pass " +
+                $"does not apply the adapter to {list}.";
         }
 
         private void NotifyReleasedSequences(SchedulerOutput output)

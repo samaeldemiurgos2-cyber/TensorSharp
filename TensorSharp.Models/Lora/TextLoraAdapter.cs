@@ -50,7 +50,7 @@ namespace TensorSharp.Models.Lora
     /// (e.g. <c>"blk.0.attn_qkv.weight"</c>). Immutable after load, so it is safe to
     /// share between the registry, the model and concurrent inference readers.
     /// </summary>
-    public sealed class TextLoraAdapter
+    public sealed class TextLoraAdapter : TensorSharp.Runtime.ILoraAdapterHandle
     {
         public string Name { get; }
 

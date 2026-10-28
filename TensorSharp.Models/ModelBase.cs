@@ -28,7 +28,7 @@ using TensorSharp.MLX;
 namespace TensorSharp.Models
 {
 
-    public abstract partial class ModelBase : IModelArchitecture
+    public abstract partial class ModelBase : IModelArchitecture, ILoraAdapterModel
     {
         public ModelConfig Config { get; protected set; }
         public ITokenizer Tokenizer { get; protected set; }
@@ -108,11 +108,14 @@ namespace TensorSharp.Models
         protected readonly HashSet<string> _stackedExpertMemberNames = new();
 
         // ---- LoRA (text adapters) ----
-        // The adapter selected with SetActiveLora. Its deltas are immutable (owned by the
-        // registry); the materialized Device tensors in _loraTensors are owned here and are
-        // rebuilt on every swap. See SetActiveLora for the concurrency contract.
-        private TextLoraAdapter? _activeLora;
-        private readonly Dictionary<string, (Tensor AT, Tensor BT)> _loraTensors = new(StringComparer.Ordinal);
+        // Adapters prepared on this model (PrepareLora), each materialized once into device
+        // tensors keyed by the loaded weight it updates. The adapter's own deltas are
+        // immutable and owned by the registry. The engine selects one for a step
+        // (ActivateLoraAdapter) and clears it afterwards; LinearForward applies it.
+        private readonly Dictionary<TextLoraAdapter, MaterializedLora> _preparedLoras = new(ReferenceEqualityComparer.Instance);
+        private MaterializedLora? _activeLora;
+        // Weights a delta was applied to since the engine last asked (TakeAppliedLoraTargets).
+        private readonly HashSet<string> _loraApplied = new(StringComparer.Ordinal);
 
         private bool _quantBackendReady;
         private bool _cudaQuantWeightsPrepared;
@@ -1525,55 +1528,177 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Select the LoRA adapter every subsequent linear projection applies on top of the
-        /// base weights, or null to run the base model unchanged. Calling this replaces the
-        /// current selection; the previous adapter's device tensors are released.
-        ///
-        /// <para>
-        /// <b>Concurrency:</b> selection is a property of this shared model instance. It is
-        /// safe to swap between requests that are processed one at a time (the CLI, or a
-        /// server running serial inference). Per-sequence adapter scoping under continuous
-        /// batching needs engine-level adapter state and is not yet implemented — do not
-        /// rely on this staying constant while concurrent requests share the engine.
-        /// </para>
+        /// The device-resident form of one adapter on this model: one <c>(AT, BT)</c> pair per
+        /// loaded weight it updates (fused targets composed, see <see cref="TextLoraBinder"/>).
         /// </summary>
-        public void SetActiveLora(TextLoraAdapter? adapter)
+        private sealed class MaterializedLora : IDisposable
         {
-            foreach (var (_, pair) in _loraTensors)
-            {
-                pair.AT.Dispose();
-                pair.BT.Dispose();
-            }
-            _loraTensors.Clear();
-            _activeLora = adapter;
+            public required TextLoraAdapter Adapter { get; init; }
+            public required Dictionary<string, (Tensor AT, Tensor BT)> Tensors { get; init; }
+            /// <summary>Not kept in <see cref="_preparedLoras"/>: built for one step and released after it.</summary>
+            public bool Transient { get; init; }
+            /// <summary>Why this model's forward cannot apply the adapter, once a request found out.</summary>
+            public string? Unsupported { get; set; }
 
-            if (adapter == null)
+            public void Dispose()
+            {
+                foreach (var (_, pair) in Tensors)
+                {
+                    pair.AT.Dispose();
+                    pair.BT.Dispose();
+                }
+                Tensors.Clear();
+            }
+        }
+
+        /// <summary>
+        /// Bind <paramref name="adapter"/> to this model's loaded weights and upload its factors
+        /// once, so selecting it for a step costs nothing. Idempotent. Refuses, naming every
+        /// module, an adapter any of whose modules is not a weight of this model or has another
+        /// shape: half an adapter is neither the base model nor the adapter.
+        /// Call under <see cref="GpuComputeLock"/>; it allocates device tensors.
+        /// </summary>
+        /// <exception cref="System.IO.InvalidDataException">A module cannot be applied to this model.</exception>
+        public IReadOnlyCollection<string> PrepareLora(TextLoraAdapter adapter)
+        {
+            ArgumentNullException.ThrowIfNull(adapter);
+            if (!_preparedLoras.TryGetValue(adapter, out var prepared))
+            {
+                prepared = Materialize(adapter, transient: false);
+                _preparedLoras[adapter] = prepared;
+            }
+            return prepared.Tensors.Keys.ToArray();
+        }
+
+        /// <summary>Release the device tensors <see cref="PrepareLora"/> made for
+        /// <paramref name="adapter"/>. A request still running under it re-materializes it for
+        /// each of its remaining steps. Call under <see cref="GpuComputeLock"/>.</summary>
+        public void ReleaseLora(TextLoraAdapter adapter)
+        {
+            if (adapter == null || !_preparedLoras.Remove(adapter, out var prepared)) return;
+            if (ReferenceEquals(_activeLora, prepared)) _activeLora = null;
+            prepared.Dispose();
+        }
+
+        /// <summary>Whether <paramref name="adapter"/> is prepared on this model.</summary>
+        public bool IsLoraPrepared(TextLoraAdapter adapter) => adapter != null && _preparedLoras.ContainsKey(adapter);
+
+        /// <summary>Why this model cannot apply <paramref name="adapter"/>, or null when nothing
+        /// has shown that it cannot (<see cref="ILoraAdapterModel.MarkLoraUnsupported"/>).</summary>
+        public string? GetLoraUnsupportedReason(TextLoraAdapter adapter)
+            => adapter != null && _preparedLoras.TryGetValue(adapter, out var prepared) ? prepared.Unsupported : null;
+
+        /// <summary>
+        /// Whether this architecture can serve text-LoRA adapters at all. A family whose
+        /// forward never routes its projections through <see cref="LinearForward"/> overrides
+        /// this to false. A family that routes only some of them is still caught per request:
+        /// the engine refuses a LoRA request whose prompt ran without one of the adapter's
+        /// targets (<see cref="ILoraAdapterModel.TakeAppliedLoraTargets"/>).
+        /// </summary>
+        public virtual bool SupportsTextLora => true;
+
+        void ILoraAdapterModel.ActivateLoraAdapter(ILoraAdapterHandle? handle)
+        {
+            if (_activeLora is { Transient: true } transient && !ReferenceEquals(transient.Adapter, handle))
+                transient.Dispose();
+            if (handle == null)
+            {
+                _activeLora = null;
                 return;
-
-            foreach (var (weightName, delta) in adapter.Deltas)
-            {
-                if (TryGetWeightDims(weightName, out long inDim, out long outDim))
-                {
-                    if (delta.In != inDim || delta.Out != outDim)
-                    {
-                        Console.WriteLine(
-                            $"  LoRA '{adapter.Name}': target weight '{weightName}' has shape [{outDim}, {inDim}] but the " +
-                            $"delta expects [{delta.Out}, {delta.In}]; this delta is skipped.");
-                        continue;
-                    }
-                }
-                else
-                {
-                    Console.WriteLine(
-                        $"  LoRA '{adapter.Name}': target weight '{weightName}' is not present in the loaded model " +
-                        $"(it may have been fused on load, e.g. attn_q/attn_k/attn_v -> attn_qkv); this delta is skipped.");
-                    continue;
-                }
-
-                Tensor at = CreateFloatTensor(delta.AT, delta.In, delta.Rank);  // [in, rank]
-                Tensor bt = CreateFloatTensor(delta.BT, delta.Rank, delta.Out); // [rank, out]
-                _loraTensors[weightName] = (at, bt);
             }
+            if (handle is not TextLoraAdapter adapter)
+                throw new ArgumentException($"'{handle.Name}' is not a text-LoRA adapter.", nameof(handle));
+            if (ReferenceEquals(_activeLora?.Adapter, adapter))
+                return;
+            _activeLora = _preparedLoras.TryGetValue(adapter, out var prepared)
+                ? prepared
+                : Materialize(adapter, transient: true);
+        }
+
+        IReadOnlyCollection<string> ILoraAdapterModel.GetLoraTargets(ILoraAdapterHandle adapter)
+        {
+            if (_activeLora != null && ReferenceEquals(_activeLora.Adapter, adapter))
+                return _activeLora.Tensors.Keys.ToArray();
+            if (adapter is TextLoraAdapter text && _preparedLoras.TryGetValue(text, out var prepared))
+                return prepared.Tensors.Keys.ToArray();
+            return Array.Empty<string>();
+        }
+
+        IReadOnlyCollection<string> ILoraAdapterModel.TakeAppliedLoraTargets()
+        {
+            lock (_loraApplied)
+            {
+                var applied = _loraApplied.ToArray();
+                _loraApplied.Clear();
+                return applied;
+            }
+        }
+
+        void ILoraAdapterModel.MarkLoraUnsupported(ILoraAdapterHandle adapter, IReadOnlyCollection<string> missing)
+        {
+            if (adapter is TextLoraAdapter text && _preparedLoras.TryGetValue(text, out var prepared))
+                prepared.Unsupported ??= TensorSharp.Runtime.Scheduling.InferenceEngine.LoraNotAppliedMessage(text.Name, missing.ToList());
+        }
+
+        private MaterializedLora Materialize(TextLoraAdapter adapter, bool transient)
+        {
+            if (!SupportsTextLora)
+                throw new System.IO.InvalidDataException(
+                    $"LoRA adapter '{adapter.Name}' cannot be applied: {Config?.Architecture ?? GetType().Name} does not " +
+                    "route its projections through the LoRA-aware linear path.");
+            if (IsTensorParallel)
+                throw new System.IO.InvalidDataException(
+                    $"LoRA adapter '{adapter.Name}' cannot be applied while the model is sharded for tensor parallelism.");
+
+            var binding = TextLoraBinder.Bind(adapter, LoadedWeightDims, FileWeightDims);
+            if (binding.Errors.Count > 0)
+            {
+                const int shown = 8;
+                string list = string.Join("; ", binding.Errors.Take(shown));
+                if (binding.Errors.Count > shown) list += $"; and {binding.Errors.Count - shown} more";
+                throw new System.IO.InvalidDataException(
+                    $"LoRA adapter '{adapter.Name}' does not fit the loaded model ({binding.Errors.Count} of " +
+                    $"{adapter.Deltas.Count} module(s)): {list}.");
+            }
+
+            var tensors = new Dictionary<string, (Tensor AT, Tensor BT)>(StringComparer.Ordinal);
+            try
+            {
+                foreach (var target in binding.Targets)
+                {
+                    Tensor at = CreateFloatTensor(target.AT, target.In, target.Rank);  // [in, rank]
+                    Tensor bt;
+                    try { bt = CreateFloatTensor(target.BT, target.Rank, target.Out); } // [rank, out]
+                    catch { at.Dispose(); throw; }
+                    tensors[target.WeightName] = (at, bt);
+                }
+            }
+            catch
+            {
+                foreach (var (_, pair) in tensors) { pair.AT.Dispose(); pair.BT.Dispose(); }
+                throw;
+            }
+            return new MaterializedLora { Adapter = adapter, Tensors = tensors, Transient = transient };
+        }
+
+        private (long In, long Out)? LoadedWeightDims(string weightName)
+            => TryGetWeightDims(weightName, out long inDim, out long outDim) ? (inDim, outDim) : null;
+
+        private (long In, long Out)? FileWeightDims(string weightName)
+        {
+            if (_gguf == null || !_gguf.Tensors.TryGetValue(weightName, out var info) || info.Shape.Length < 2)
+                return null;
+            return ((long)info.Shape[0], (long)info.Shape[1]);
+        }
+
+        private void DisposeLoras()
+        {
+            if (_activeLora is { Transient: true } transient)
+                transient.Dispose();
+            _activeLora = null;
+            foreach (var prepared in _preparedLoras.Values)
+                prepared.Dispose();
+            _preparedLoras.Clear();
         }
 
         /// <summary>
@@ -1588,7 +1713,7 @@ namespace TensorSharp.Models
                 outDim = qw.Ne1;
                 return true;
             }
-            if (_weights.TryGetValue(weightName, out var w))
+            if (_weights.TryGetValue(weightName, out var w) && w.DimensionCount == 2)
             {
                 inDim = w.Sizes[1];
                 outDim = w.Sizes[0];
@@ -1598,11 +1723,9 @@ namespace TensorSharp.Models
             return false;
         }
 
-        /// <summary>The name of the active LoRA adapter, or null when none is selected.</summary>
-        public string? ActiveLoraName => _activeLora?.Name;
-
-        /// <summary>True when a LoRA adapter is selected, so fused fast paths that bypass the
-        /// generic <see cref="LinearForward"/> can fall back to the LoRA-aware path.</summary>
+        /// <summary>True while the engine has a LoRA adapter selected for the current step, so
+        /// fused fast paths that bypass the generic <see cref="LinearForward"/> can fall back
+        /// to the LoRA-aware path.</summary>
         protected bool HasActiveLora => _activeLora != null;
 
         /// <summary>
@@ -1663,9 +1786,13 @@ namespace TensorSharp.Models
             // Apply the active LoRA delta on top of the base projection. The fused FFN
             // paths skip LinearForward entirely, so they are gated off when a LoRA is
             // active (TryFusedDenseSwiGLUFFNInto below and any future fused kernels).
-            if (HasActiveLora && _loraTensors.TryGetValue(weightName, out var lora))
+            // Recording the weight lets the engine refuse a request whose forward skipped
+            // one of the adapter's targets on some other path.
+            if (_activeLora != null && _activeLora.Tensors.TryGetValue(weightName, out var lora))
             {
                 ApplyLoraDelta(result, input, lora);
+                lock (_loraApplied)
+                    _loraApplied.Add(weightName);
             }
 
             _linearTicks += Stopwatch.GetTimestamp() - t0;
@@ -2991,6 +3118,8 @@ namespace TensorSharp.Models
             // group, so every driver exit path (normal or exception) lets the
             // workers leave their loops cleanly.
             SignalDistributedWorkersShutdown();
+
+            DisposeLoras();
 
             if (MultimodalInjector is IDisposable multimodalInjector)
                 multimodalInjector.Dispose();

@@ -24,9 +24,11 @@ namespace TensorSharp.Server.Endpoints;
 /// <c>/v1/responses</c>, and is listed under <c>GET /v1/models</c>.
 ///
 /// <para>
-/// These are operator-only actions: <c>path</c> is an arbitrary file path on the
-/// server host, so they must be protected by the operator's own network boundary
-/// exactly as the model-file loading surface is.
+/// <c>POST</c> reads only from the directory the operator named at startup
+/// (<c>--text-lora-dir</c> / <c>TS_TEXT_LORA_DIR</c>): <c>path</c> and <c>config</c> are
+/// relative to it, and anything resolving outside it is refused before the file system
+/// is consulted (<see cref="TextLoraPaths.ResolveWithin"/>). Without a directory the route
+/// refuses every load. Error text never carries the directory's location.
 /// </para>
 /// </summary>
 public static class LoraEndpoints
@@ -42,10 +44,9 @@ public static class LoraEndpoints
                     ["rank"] = a.Rank,
                     ["alpha"] = a.Alpha,
                     ["modules"] = a.Modules,
-                    ["active"] = string.Equals(svc.ActiveLoraName, a.Name, StringComparison.Ordinal),
                 })
                 .ToList();
-            return Results.Json(new { @object = "list", data });
+            return Results.Json(new { @object = "list", data, loading_enabled = svc.LoraDirectory != null });
         });
 
         endpoints.MapPost("/v1/loras", async (HttpContext ctx, ModelService svc) =>
@@ -57,6 +58,11 @@ public static class LoraEndpoints
             try
             {
                 var doc = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body).ConfigureAwait(false);
+                if (doc.ValueKind != JsonValueKind.Object)
+                {
+                    await BadAsync(ctx, "request body must be a JSON object").ConfigureAwait(false);
+                    return;
+                }
                 if (!doc.TryGetProperty("name", out var nameEl) || nameEl.ValueKind != JsonValueKind.String ||
                     string.IsNullOrWhiteSpace(nameEl.GetString()))
                 {
@@ -68,15 +74,29 @@ public static class LoraEndpoints
                 if (!doc.TryGetProperty("path", out var pathEl) || pathEl.ValueKind != JsonValueKind.String ||
                     string.IsNullOrWhiteSpace(pathEl.GetString()))
                 {
-                    await BadAsync(ctx, "a non-empty \"path\" to a .safetensors file is required").ConfigureAwait(false);
+                    await BadAsync(ctx, "a non-empty \"path\" to a .safetensors file in the server's LoRA directory is required").ConfigureAwait(false);
                     return;
                 }
                 path = pathEl.GetString()!;
 
-                if (doc.TryGetProperty("config", out var configEl) && configEl.ValueKind == JsonValueKind.String)
-                    config = configEl.GetString();
-                if (doc.TryGetProperty("scale", out var scaleEl) && scaleEl.ValueKind == JsonValueKind.Number)
-                    scale = scaleEl.GetSingle();
+                if (doc.TryGetProperty("config", out var configEl))
+                {
+                    if (configEl.ValueKind != JsonValueKind.String && configEl.ValueKind != JsonValueKind.Null)
+                    {
+                        await BadAsync(ctx, "\"config\" must be a string").ConfigureAwait(false);
+                        return;
+                    }
+                    config = configEl.ValueKind == JsonValueKind.String ? configEl.GetString() : null;
+                }
+                if (doc.TryGetProperty("scale", out var scaleEl))
+                {
+                    if (scaleEl.ValueKind != JsonValueKind.Number || !scaleEl.TryGetSingle(out float s) || !float.IsFinite(s))
+                    {
+                        await BadAsync(ctx, "\"scale\" must be a finite number").ConfigureAwait(false);
+                        return;
+                    }
+                    scale = s;
+                }
             }
             catch (JsonException)
             {
@@ -84,14 +104,15 @@ public static class LoraEndpoints
                 return;
             }
 
-            // Detach before replacing so a reload of an active adapter releases the old
-            // device tensors rather than leaving them pinned by the model.
-            if (string.Equals(svc.ActiveLoraName, name, StringComparison.Ordinal))
-                svc.ClearActiveLora();
+            if (svc.LoraDirectory == null)
+            {
+                await WriteErrorAsync(ctx, 403, TextLoraPaths.ResolveWithinDisabledMessage).ConfigureAwait(false);
+                return;
+            }
 
             try
             {
-                var adapter = svc.LoraRegistry.Load(name, path, config, scale);
+                var adapter = svc.LoadLora(name, path, config, scale);
                 ctx.Response.ContentType = "application/json";
                 await ctx.Response.WriteAsJsonAsync(new
                 {
@@ -102,18 +123,17 @@ public static class LoraEndpoints
                     summary = adapter.Summary,
                 }).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is FileNotFoundException or InvalidDataException or ArgumentException)
+            catch (Exception ex) when (IsLoadFailure(ex))
             {
-                await BadAsync(ctx, ex.Message).ConfigureAwait(false);
+                // A file the server will open but cannot use: malformed, an unsupported
+                // dtype, unreadable, or an adapter that does not fit the loaded model.
+                await BadAsync(ctx, TextLoraPaths.Redact(ex.Message, svc.LoraDirectory)).ConfigureAwait(false);
             }
         });
 
         endpoints.MapDelete("/v1/loras/{name}", (ModelService svc, string name) =>
         {
-            if (string.Equals(svc.ActiveLoraName, name, StringComparison.Ordinal))
-                svc.ClearActiveLora();
-
-            bool removed = svc.LoraRegistry.Unload(name);
+            bool removed = svc.UnloadLora(name);
             return removed
                 ? Results.Json(new { removed = true })
                 : Results.Json(new { error = $"No LoRA adapter named '{name}' is loaded." }, statusCode: 404);
@@ -122,9 +142,17 @@ public static class LoraEndpoints
         return endpoints;
     }
 
-    private static async Task BadAsync(HttpContext ctx, string message)
+    /// <summary>Failures that are the request's (or the file's) fault, answered with 400.</summary>
+    internal static bool IsLoadFailure(Exception ex) =>
+        ex is LoraPathException or InvalidDataException or ArgumentException or IOException
+            or UnauthorizedAccessException or NotSupportedException or JsonException or OverflowException
+            or InvalidOperationException or FormatException;
+
+    private static Task BadAsync(HttpContext ctx, string message) => WriteErrorAsync(ctx, 400, message);
+
+    private static async Task WriteErrorAsync(HttpContext ctx, int status, string message)
     {
-        ctx.Response.StatusCode = 400;
+        ctx.Response.StatusCode = status;
         await ctx.Response.WriteAsJsonAsync(new { error = message }).ConfigureAwait(false);
     }
 }

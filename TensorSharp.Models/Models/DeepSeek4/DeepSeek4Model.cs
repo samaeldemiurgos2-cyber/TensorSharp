@@ -524,6 +524,10 @@ namespace TensorSharp.Models
         /// aligning the head to the ratio is not sufficient. Plain V4 and the pure-C# executor,
         /// which has no checkpoint, keep re-prefilling, which is correct, just not cheap.</para>
         /// </summary>
+        /// <summary>DeepSeek V4 runs its projections in its own executor, never through
+        /// <see cref="ModelBase.LinearForward"/>, so text-LoRA adapters are refused up front.</summary>
+        public override bool SupportsTextLora => false;
+
         public override bool SupportsKVCacheTruncation => _truncateAlign > 0;
 
         /// <summary>The compression-block alignment the native truncate requires (the lcm

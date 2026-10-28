@@ -12,27 +12,32 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.Lora
 {
     /// <summary>
-    /// Loads text-LoRA adapters from a <c>.safetensors</c> file whose tensor names mirror
-    /// TensorSharp weight names with a <c>.lora_a</c> / <c>.lora_b</c> suffix. This is the
-    /// same "down/up factors" convention PEFT uses, only the target name is the TensorSharp
-    /// weight name rather than a <c>q_proj</c>-style module id:
+    /// Loads text-LoRA adapters from a <c>.safetensors</c> file. Factors are named by the
+    /// model file's (GGUF) weight with a <c>.lora_a</c> / <c>.lora_b</c> suffix, optionally
+    /// prefixed <c>lora.</c>, or as a standard PEFT file names them
+    /// (<c>base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight</c>); see
+    /// <see cref="TextLoraNames"/>:
     ///
     /// <code>
-    /// blk.0.attn_qkv.weight.lora_a   [rank, in]
-    /// blk.0.attn_qkv.weight.lora_b   [out, rank]
-    /// blk.0.ffn_gate_up.weight.lora_a
-    /// blk.0.ffn_gate_up.weight.lora_b
+    /// blk.0.attn_q.weight.lora_a     [rank, in]
+    /// blk.0.attn_q.weight.lora_b     [out, rank]
     /// blk.0.ffn_down.weight.lora_a
     /// blk.0.ffn_down.weight.lora_b
     /// output.weight.lora_a
     /// output.weight.lora_b
     /// </code>
+    ///
+    /// Targets are the file's weights, not the weights a model holds after load: an adapter
+    /// on <c>attn_q</c>/<c>attn_k</c>/<c>attn_v</c> or <c>ffn_gate</c>/<c>ffn_up</c> applies
+    /// to a model that fused them, composed exactly into the fused weight
+    /// (<see cref="TextLoraBinder"/>).
     ///
     /// The optional <c>adapter_config.json</c> (PEFT style) supplies <c>r</c> and
     /// <c>lora_alpha</c>; without it the rank is inferred from the <c>lora_a</c> shape and
@@ -61,15 +66,30 @@ namespace TensorSharp.Models.Lora
             using var st = new SafetensorsFile(safetensorsPath);
 
             // A lora_a tensor pairs with a lora_b tensor on the same target weight.
+            // Factor names are normalised to the model file's weight names first (see
+            // TextLoraNames), so a PEFT file and a TensorSharp-named one load the same way.
             var pairs = new Dictionary<string, (SafetensorTensorInfo? A, SafetensorTensorInfo? B)>(StringComparer.Ordinal);
+            var unmappedModules = new SortedSet<string>(StringComparer.Ordinal);
             foreach (var kv in st.Tensors)
             {
-                string tensorName = kv.Key;
-                if (tensorName.EndsWith(".lora_a", StringComparison.Ordinal))
-                    Upsert(ref pairs, tensorName[..^".lora_a".Length], a: kv.Value);
-                else if (tensorName.EndsWith(".lora_b", StringComparison.Ordinal))
-                    Upsert(ref pairs, tensorName[..^".lora_b".Length], b: kv.Value);
+                if (!TextLoraNames.TryParse(kv.Key, out string target, out LoraFactor factor, out string? unmapped))
+                    continue;
+                if (unmapped != null)
+                {
+                    unmappedModules.Add(unmapped);
+                    continue;
+                }
+                var existing = pairs.TryGetValue(target, out var pair) ? pair : default;
+                if ((factor == LoraFactor.A ? existing.A : existing.B) != null)
+                    throw new InvalidDataException(
+                        $"LoRA file '{safetensorsPath}' has two {(factor == LoraFactor.A ? "lora_a" : "lora_b")} tensors for '{target}'.");
+                Upsert(ref pairs, target, a: factor == LoraFactor.A ? kv.Value : null, b: factor == LoraFactor.B ? kv.Value : null);
             }
+            if (unmappedModules.Count > 0)
+                throw new InvalidDataException(
+                    $"LoRA file '{safetensorsPath}' targets {unmappedModules.Count} module(s) with no known model-file weight " +
+                    $"name: {string.Join(", ", unmappedModules.Take(8))}{(unmappedModules.Count > 8 ? ", ..." : string.Empty)}. " +
+                    "Name the factors '<gguf weight>.lora_a' / '.lora_b' instead.");
 
             // Metadata rank/alpha are the least specific source, so only use them when
             // the config did not already supply a value.
@@ -85,16 +105,17 @@ namespace TensorSharp.Models.Lora
 
             if (pairs.Count == 0)
                 throw new InvalidDataException(
-                    $"LoRA file '{safetensorsPath}' contains no '<weight>.lora_a' / '<weight>.lora_b' tensor pairs.");
+                    $"LoRA file '{safetensorsPath}' contains no LoRA factor pairs ('<weight>.lora_a' / '<weight>.lora_b', " +
+                    "or PEFT '<module>.lora_A.weight' / '<module>.lora_B.weight').");
 
             int rank = configuredRank;
             var deltas = new Dictionary<string, LoraDelta>(StringComparer.Ordinal);
             foreach (var (target, (aInfo, bInfo)) in pairs)
             {
                 if (aInfo == null)
-                    throw new InvalidDataException($"LoRA file '{safetensorsPath}' has no '{target}.lora_a' tensor for '{target}.lora_b'.");
+                    throw new InvalidDataException($"LoRA file '{safetensorsPath}' has a lora_b but no lora_a tensor for '{target}'.");
                 if (bInfo == null)
-                    throw new InvalidDataException($"LoRA file '{safetensorsPath}' has no '{target}.lora_b' tensor for '{target}.lora_a'.");
+                    throw new InvalidDataException($"LoRA file '{safetensorsPath}' has a lora_a but no lora_b tensor for '{target}'.");
 
                 if (aInfo.Shape.Length != 2 || bInfo.Shape.Length != 2)
                     throw new InvalidDataException(

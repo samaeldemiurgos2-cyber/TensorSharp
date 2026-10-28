@@ -373,6 +373,16 @@ namespace TensorSharp.Server.Host.Hosting
                     "its recipe is locked. Default: none (a PDD bundle's pdd_config.json is found next to its weights).",
                     "--lora-config config/lora/qwen-image-2.1-viggle-turbo.json"),
             }),
+            ("Text-LoRA adapters (chat models)", new[]
+            {
+                new OptionHelp("--text-lora-dir <dir>",
+                    "The only directory POST /v1/loras may load text-LoRA adapters from; a request's \"path\" and \"config\" " +
+                    "are relative to it, and anything resolving outside it (.., an absolute path, a link) is refused. A loaded " +
+                    "adapter is selected per request with the \"lora\" field of /v1/chat/completions and /v1/responses; " +
+                    "requests under different adapters never share a forward pass, and a LoRA request reuses no cached " +
+                    "prefix. Also TS_TEXT_LORA_DIR. Default: none - runtime adapter loading is refused.",
+                    "--text-lora-dir /srv/loras"),
+            }),
             ("Video-generation defaults and companion models", new[]
             {
                 new OptionHelp("--video-width <px>",

@@ -449,6 +449,17 @@ namespace TensorSharp.Runtime.Scheduling
                 if (output.PreemptedRequestIds.Contains(seq.RequestId))
                     break;
 
+                // One step runs one adapter (see LoraBarrierHolds): a sequence under another
+                // LoRA adapter - or the base model beside a LoRA batch - waits until the
+                // running set drains. Stopping here rather than skipping it keeps admission
+                // first-come-first-served, so a stream of same-adapter requests cannot
+                // starve it.
+                if (LoraBarrierHolds(seq))
+                {
+                    LogLoraWait(seq);
+                    break;
+                }
+
                 // Admit by capacity. A newcomer is admitted only when the free pool
                 // can hold its whole prompt on top of what the prompts already
                 // running still have to allocate. Admitting on the strength of its
@@ -816,6 +827,34 @@ namespace TensorSharp.Runtime.Scheduling
             _radixCache?.EnsureFreePages((int)Math.Min(_pool.NumBlocks, Math.Max(0, need + outstanding)));
             return (long)_pool.NumFreeBlocks - outstanding >= need;
         }
+
+        /// <summary>
+        /// True when <paramref name="candidate"/> cannot join the running set because it runs
+        /// under a different text-LoRA adapter than the sequences already running. The
+        /// model applies one adapter to a whole forward pass, so admitting it would run one
+        /// request's prompt through another's adapter (or a plain request through a LoRA).
+        /// The running set always shares one adapter, so comparing with any member suffices.
+        /// </summary>
+        internal bool LoraBarrierHolds(SequenceState candidate)
+        {
+            if (_runningOrder.Count == 0) return false;
+            return !ReferenceEquals(_runningOrder[0].LoraAdapter, candidate.LoraAdapter);
+        }
+
+        private string? _loraWaitLoggedFor;
+
+        private void LogLoraWait(SequenceState seq)
+        {
+            if (string.Equals(_loraWaitLoggedFor, seq.RequestId, StringComparison.Ordinal)) return;
+            _loraWaitLoggedFor = seq.RequestId;
+            _logger.LogInformation(
+                "Request {RequestId} ({Adapter}) waits for {Running} running request(s) under {RunningAdapter}: " +
+                "one forward pass applies one LoRA adapter.",
+                seq.RequestId, DescribeAdapter(seq.LoraAdapter), _running.Count, DescribeAdapter(_runningOrder[0].LoraAdapter));
+        }
+
+        private static string DescribeAdapter(ILoraAdapterHandle? adapter)
+            => adapter == null ? "base model" : $"LoRA '{adapter.Name}'";
 
         private string? _capacityWaitLoggedFor;
 

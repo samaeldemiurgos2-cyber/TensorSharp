@@ -300,6 +300,10 @@ public partial class MiniMaxM3Model : ModelBase
     /// whether attention was forced dense (TS_MINIMAX_M3_MSA=dense changes every K/V row past
     /// top_k x block_size, so its caches are never shared with the sparse model's).
     /// </summary>
+    /// <summary>MiniMax-M3 runs its projections in its own executor, never through
+    /// <see cref="ModelBase.LinearForward"/>, so text-LoRA adapters are refused up front.</summary>
+    public override bool SupportsTextLora => false;
+
     public override string KVStateFingerprint =>
         $"minimax-m3|layers={Config.NumLayers}|heads={Config.NumHeads}:{Config.NumKVHeads}:{_headDim}" +
         $"|rope={_ropeDim}:{Config.RopeBase}:{Config.RopeScale}" +
