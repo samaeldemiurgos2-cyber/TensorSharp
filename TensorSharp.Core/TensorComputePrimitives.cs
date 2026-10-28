@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Numerics;
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 
 namespace TensorSharp
@@ -241,37 +242,63 @@ namespace TensorSharp
         /// <summary>
         /// Convert a contiguous block of <paramref name="n"/> float values to
         /// IEEE 754 binary16 (half) and write them into <paramref name="dst"/>.
-        /// Uses <see cref="System.Half"/> which the BCL implements with the
-        /// hardware FP16 instructions when available.
+        /// Uses the JIT-vectorized BCL widening (<see cref="System.Numerics.Tensors.TensorPrimitives"/>),
+        /// the same kernel the safetensors reader and Qwen-Image dequant use;
+        /// round-to-nearest, bit-identical to the scalar <see cref="System.Half"/> loop.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void F32ToF16(ushort* dst, float* src, int n)
         {
-            for (int i = 0; i < n; i++)
-                dst[i] = BitConverter.HalfToUInt16Bits((System.Half)src[i]);
+            TensorPrimitives.ConvertToHalf(
+                new ReadOnlySpan<float>(src, n),
+                new Span<System.Half>((void*)dst, n));
         }
 
         /// <summary>
         /// Convert a contiguous block of <paramref name="n"/> half-precision
         /// values to F32. Useful when a downstream kernel only consumes F32.
+        /// Same JIT-vectorized widening the safetensors reader uses
+        /// (SafetensorsKernels.F16ToF32); widening is exact, so this is
+        /// bit-identical to the scalar loop.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void F16ToF32(float* dst, ushort* src, int n)
         {
-            for (int i = 0; i < n; i++)
-                dst[i] = (float)BitConverter.UInt16BitsToHalf(src[i]);
+            TensorPrimitives.ConvertToSingle(
+                new ReadOnlySpan<System.Half>((void*)src, n),
+                new Span<float>(dst, n));
         }
 
         /// <summary>
         /// Dot product between an F32 vector <paramref name="a"/> and an F16
-        /// vector <paramref name="b"/>. Each F16 element is converted to F32
-        /// inside the inner loop using <see cref="BitConverter.UInt16BitsToHalf"/>.
+        /// vector <paramref name="b"/>. F16 elements are widened a vector chunk
+        /// at a time with the JIT-vectorized BCL conversion (the same kernel the
+        /// safetensors reader uses), then accumulated with the 2-way unrolled
+        /// <see cref="Vector{T}"/> shape of <see cref="Dot"/>; scalar only for
+        /// the tail. Widening is exact, so the only drift vs the scalar loop is
+        /// summation order (same as <see cref="Dot"/> vs scalar).
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float DotF32F16(float* a, ushort* b, int n)
         {
-            float sum = 0;
-            for (int i = 0; i < n; i++)
+            float* buf = stackalloc float[F16VecChunk];
+            var acc0 = Vector<float>.Zero;
+            var acc1 = Vector<float>.Zero;
+            int vLen = Vector<float>.Count;
+            int i = 0;
+            for (; i + F16VecChunk <= n; i += F16VecChunk)
+            {
+                TensorPrimitives.ConvertToSingle(
+                    new ReadOnlySpan<System.Half>((void*)(b + i), F16VecChunk),
+                    new Span<float>(buf, F16VecChunk));
+                for (int j = 0; j < F16VecChunk; j += vLen * 2)
+                {
+                    acc0 += LoadVector(a + i + j) * LoadVector(buf + j);
+                    acc1 += LoadVector(a + i + j + vLen) * LoadVector(buf + j + vLen);
+                }
+            }
+            float sum = Vector.Sum(acc0 + acc1);
+            for (; i < n; i++)
                 sum += a[i] * (float)BitConverter.UInt16BitsToHalf(b[i]);
             return sum;
         }
@@ -282,8 +309,32 @@ namespace TensorSharp
             ushort* b, int n,
             out float r0, out float r1, out float r2, out float r3)
         {
-            float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-            for (int i = 0; i < n; i++)
+            float* buf = stackalloc float[F16VecChunk];
+            var acc0 = Vector<float>.Zero;
+            var acc1 = Vector<float>.Zero;
+            var acc2 = Vector<float>.Zero;
+            var acc3 = Vector<float>.Zero;
+            int vLen = Vector<float>.Count;
+            int i = 0;
+            for (; i + F16VecChunk <= n; i += F16VecChunk)
+            {
+                TensorPrimitives.ConvertToSingle(
+                    new ReadOnlySpan<System.Half>((void*)(b + i), F16VecChunk),
+                    new Span<float>(buf, F16VecChunk));
+                for (int j = 0; j < F16VecChunk; j += vLen)
+                {
+                    var f = LoadVector(buf + j);
+                    acc0 += LoadVector(a0 + i + j) * f;
+                    acc1 += LoadVector(a1 + i + j) * f;
+                    acc2 += LoadVector(a2 + i + j) * f;
+                    acc3 += LoadVector(a3 + i + j) * f;
+                }
+            }
+            float s0 = Vector.Sum(acc0);
+            float s1 = Vector.Sum(acc1);
+            float s2 = Vector.Sum(acc2);
+            float s3 = Vector.Sum(acc3);
+            for (; i < n; i++)
             {
                 float bi = (float)BitConverter.UInt16BitsToHalf(b[i]);
                 s0 += a0[i] * bi;
@@ -296,12 +347,26 @@ namespace TensorSharp
 
         /// <summary>
         /// Read F16 source values, scale by <paramref name="weight"/> (F32),
-        /// and accumulate into F32 destination buffer.
+        /// and accumulate into F32 destination buffer. Same chunked vector
+        /// widening as <see cref="DotF32F16"/>, then the <see cref="ScaleAdd"/>
+        /// vector shape; scalar only for the tail.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void ScaleAddF16(float* dst, ushort* src, float weight, int n)
         {
-            for (int i = 0; i < n; i++)
+            float* buf = stackalloc float[F16VecChunk];
+            var vw = new Vector<float>(weight);
+            int vLen = Vector<float>.Count;
+            int i = 0;
+            for (; i + F16VecChunk <= n; i += F16VecChunk)
+            {
+                TensorPrimitives.ConvertToSingle(
+                    new ReadOnlySpan<System.Half>((void*)(src + i), F16VecChunk),
+                    new Span<float>(buf, F16VecChunk));
+                for (int j = 0; j < F16VecChunk; j += vLen)
+                    StoreVector(dst + i + j, LoadVector(dst + i + j) + LoadVector(buf + j) * vw);
+            }
+            for (; i < n; i++)
                 dst[i] += weight * (float)BitConverter.UInt16BitsToHalf(src[i]);
         }
 
@@ -310,7 +375,28 @@ namespace TensorSharp
         public static void ScaleAdd4F16(float* d0, float* d1, float* d2, float* d3,
             ushort* src, float w0, float w1, float w2, float w3, int n)
         {
-            for (int i = 0; i < n; i++)
+            float* buf = stackalloc float[F16VecChunk];
+            var vw0 = new Vector<float>(w0);
+            var vw1 = new Vector<float>(w1);
+            var vw2 = new Vector<float>(w2);
+            var vw3 = new Vector<float>(w3);
+            int vLen = Vector<float>.Count;
+            int i = 0;
+            for (; i + F16VecChunk <= n; i += F16VecChunk)
+            {
+                TensorPrimitives.ConvertToSingle(
+                    new ReadOnlySpan<System.Half>((void*)(src + i), F16VecChunk),
+                    new Span<float>(buf, F16VecChunk));
+                for (int j = 0; j < F16VecChunk; j += vLen)
+                {
+                    var f = LoadVector(buf + j);
+                    StoreVector(d0 + i + j, LoadVector(d0 + i + j) + f * vw0);
+                    StoreVector(d1 + i + j, LoadVector(d1 + i + j) + f * vw1);
+                    StoreVector(d2 + i + j, LoadVector(d2 + i + j) + f * vw2);
+                    StoreVector(d3 + i + j, LoadVector(d3 + i + j) + f * vw3);
+                }
+            }
+            for (; i < n; i++)
             {
                 float s = (float)BitConverter.UInt16BitsToHalf(src[i]);
                 d0[i] += w0 * s;
@@ -319,6 +405,12 @@ namespace TensorSharp
                 d3[i] += w3 * s;
             }
         }
+
+        // Chunk size for the vectorized F16 prefix above: 64 floats = 256 bytes
+        // of stackalloc scratch, and a multiple of 2 * Vector<float>.Count on
+        // every platform (4/8/16 lanes), so the inner unrolled loops divide it
+        // evenly. The caller finishes any tail (< 64) scalarly.
+        private const int F16VecChunk = 64;
 
         public static void SelectTopKInPlace(ReadOnlySpan<float> values, int k, Span<int> indices)
         {
