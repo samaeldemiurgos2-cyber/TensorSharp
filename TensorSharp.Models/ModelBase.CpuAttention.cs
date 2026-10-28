@@ -15,6 +15,7 @@ using System.Linq;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp;
@@ -25,7 +26,8 @@ using TensorSharp.GGML;
 using TensorSharp.MLX;
 
 namespace TensorSharp.Models
-{
+{
+
     // The pure-C# decode attention kernels and the SIMD primitives they run on.
     // This is the host fallback: every accelerated backend brings its own fused
     // attention, and this path serves CPU runs and the cases a backend declines.
@@ -89,7 +91,97 @@ namespace TensorSharp.Models
         protected static unsafe void VecZero(float* data, int n) =>
             TensorComputePrimitives.Zero(data, n);
 
-        #endregion
+        /// <summary>
+        /// Vectorized exp(row[i] - max): writes e back into <paramref name="row"/> and
+        /// returns the sum. Same shape as the exp phase of
+        /// <see cref="CpuKernels.SoftmaxRow"/> (Vector512/256/128.Exp with
+        /// -inf-padded tails, scalar tail), but leaves the row un-normalized so the
+        /// k-split path can keep chunk-partial sums and the grouped paths keep their
+        /// running-max reuse plus <see cref="TensorComputePrimitives.Scale"/> step.
+        /// Up to a few ULP from scalar MathF.Exp (BCL vector-exp approximation).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static unsafe float VecExpRow(float* row, float max, int n)
+        {
+            float sum = 0f;
+            int i = 0;
+            if (CpuKernels.Use512)
+            {
+                Vector512<float> vm = Vector512.Create(max), acc = Vector512<float>.Zero;
+                for (; i + 16 <= n; i += 16)
+                {
+                    Vector512<float> ex = Vector512.Exp(Vector512.Load(row + i) - vm);
+                    Vector512.Store(ex, row + i);
+                    acc += ex;
+                }
+                if (i < n)
+                {
+                    float* t = stackalloc float[16];
+                    int rem = n - i;
+                    for (int j = 0; j < 16; j++) t[j] = j < rem ? row[i + j] : float.NegativeInfinity;
+                    Vector512<float> ex = Vector512.Exp(Vector512.Load(t) - vm);
+                    Vector512.Store(ex, t);
+                    acc += ex;
+                    for (int j = 0; j < rem; j++) row[i + j] = t[j];
+                    i = n;
+                }
+                sum = Vector512.Sum(acc);
+            }
+            else if (Vector256.IsHardwareAccelerated)
+            {
+                Vector256<float> vm = Vector256.Create(max), acc = Vector256<float>.Zero;
+                for (; i + 8 <= n; i += 8)
+                {
+                    Vector256<float> ex = Vector256.Exp(Vector256.Load(row + i) - vm);
+                    Vector256.Store(ex, row + i);
+                    acc += ex;
+                }
+                if (i < n)
+                {
+                    float* t = stackalloc float[8];
+                    int rem = n - i;
+                    for (int j = 0; j < 8; j++) t[j] = j < rem ? row[i + j] : float.NegativeInfinity;
+                    Vector256<float> ex = Vector256.Exp(Vector256.Load(t) - vm);
+                    Vector256.Store(ex, t);
+                    acc += ex;
+                    for (int j = 0; j < rem; j++) row[i + j] = t[j];
+                    i = n;
+                }
+                sum = Vector256.Sum(acc);
+            }
+            else if (Vector128.IsHardwareAccelerated)
+            {
+                Vector128<float> vm = Vector128.Create(max), acc = Vector128<float>.Zero;
+                for (; i + 4 <= n; i += 4)
+                {
+                    Vector128<float> ex = Vector128.Exp(Vector128.Load(row + i) - vm);
+                    Vector128.Store(ex, row + i);
+                    acc += ex;
+                }
+                if (i < n)
+                {
+                    float* t = stackalloc float[4];
+                    int rem = n - i;
+                    for (int j = 0; j < 4; j++) t[j] = j < rem ? row[i + j] : float.NegativeInfinity;
+                    Vector128<float> ex = Vector128.Exp(Vector128.Load(t) - vm);
+                    Vector128.Store(ex, t);
+                    acc += ex;
+                    for (int j = 0; j < rem; j++) row[i + j] = t[j];
+                    i = n;
+                }
+                sum = Vector128.Sum(acc);
+            }
+            for (; i < n; i++)
+            {
+                float e = MathF.Exp(row[i] - max);
+                row[i] = e;
+                sum += e;
+            }
+            return sum;
+        }
+
+        #endregion
+
 
         protected unsafe void AttentionDecodePureCS(Tensor q, Tensor kCache, Tensor vCache,
             Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale)
@@ -137,7 +229,8 @@ namespace TensorSharp.Models
             // standard online (log-sum-exp) update. Total parallel tasks = numKVHeads * kSplit.
 
             // Aim for enough parallel tasks to keep cores busy, but keep per-task work
-            // big enough to amortize Parallel.For dispatch overhead. Each task handles one
+            // big enough to amortize fork/join dispatch overhead on the shared
+            // CpuParallel pool. Each task handles one
             // (KV head, K-chunk) pair. Empirically, ~512 K-positions per task is the sweet
             // spot on Apple M-series: smaller chunks lose to scheduler overhead, larger
             // chunks under-utilize cores at long contexts.
@@ -168,7 +261,7 @@ namespace TensorSharp.Models
 
                 if (kSplitLocal == 1)
                 {
-                    Parallel.For(0, numKVHeadsLocal, kvHead =>
+                    CpuParallel.For(numKVHeadsLocal, kvHead =>
                     {
                         float* qP = (float*)qPtrL;
                         float* kP = (float*)kPtrL;
@@ -198,7 +291,7 @@ namespace TensorSharp.Models
                         {
                             long partialPtrL = (long)partialPtr;
 
-                            Parallel.For(0, numKVHeadsLocal * kSplitLocal, taskIdx =>
+                            CpuParallel.For(numKVHeadsLocal * kSplitLocal, taskIdx =>
                             {
                                 int kvHead = taskIdx / kSplitLocal;
                                 int chunkIdx = taskIdx % kSplitLocal;
@@ -219,7 +312,7 @@ namespace TensorSharp.Models
                                     headDimLocal, maxSeqLenLocal, groupSizeLocal, scaleLocal);
                             });
 
-                            Parallel.For(0, numKVHeadsLocal, kvHead =>
+                            CpuParallel.For(numKVHeadsLocal, kvHead =>
                             {
                                 float* rP = (float*)rPtrL;
                                 float* part = (float*)partialPtrL +
@@ -334,15 +427,8 @@ namespace TensorSharp.Models
                         if (rowG0[t] > maxS) maxS = rowG0[t];
                 }
 
-                float sum = 0;
                 float* rowG = scores + (long)g * totalSeqLen;
-                for (int t = 0; t < totalSeqLen; t++)
-                {
-                    float e = MathF.Exp(rowG[t] - maxS);
-                    rowG[t] = e;
-                    sum += e;
-                }
-                invSums[g] = 1.0f / sum;
+                invSums[g] = 1.0f / VecExpRow(rowG, maxS, totalSeqLen);
             }
             for (int g = 0; g < groupSize; g++)
             {
@@ -471,15 +557,8 @@ namespace TensorSharp.Models
             for (int g = 0; g < groupSize; g++)
             {
                 float maxS = partial[g * strideG];
-                float sum = 0;
                 float* rowG = scores + (long)g * kLen;
-                for (int t = 0; t < kLen; t++)
-                {
-                    float e = MathF.Exp(rowG[t] - maxS);
-                    rowG[t] = e;
-                    sum += e;
-                }
-                partial[g * strideG + 1] = sum;
+                partial[g * strideG + 1] = VecExpRow(rowG, maxS, kLen);
             }
 
             // Compute weighted V for this chunk
@@ -600,7 +679,7 @@ namespace TensorSharp.Models
                 int numKVHeadsLocal = numKVHeads;
                 float scaleLocal = scale;
 
-                Parallel.For(0, numKVHeadsLocal, kvHead =>
+                CpuParallel.For(numKVHeadsLocal, kvHead =>
                 {
                     float* qP = (float*)qPtrL;
                     ushort* kP = (ushort*)kPtrL;
@@ -701,15 +780,8 @@ namespace TensorSharp.Models
                         if (rowG0[t] > maxS) maxS = rowG0[t];
                 }
 
-                float sum = 0;
                 float* rowG = scores + (long)g * totalSeqLen;
-                for (int t = 0; t < totalSeqLen; t++)
-                {
-                    float e = MathF.Exp(rowG[t] - maxS);
-                    rowG[t] = e;
-                    sum += e;
-                }
-                invSums[g] = 1.0f / sum;
+                invSums[g] = 1.0f / VecExpRow(rowG, maxS, totalSeqLen);
             }
             for (int g = 0; g < groupSize; g++)
             {
@@ -753,6 +825,7 @@ namespace TensorSharp.Models
                     }
                 }
             }
-        }
+        }
+
     }
 }
