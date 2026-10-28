@@ -1059,11 +1059,22 @@ namespace TensorSharp.Runtime.Scheduling
         /// conversations reused 0 tokens on their second turn, and at 16 all but the last partial block,
         /// in 26% less time. A family with end states keeps each conversation's exact state, and its pool
         /// only accounts for reservations.
+        /// <para>
+        /// Not a page family whose pages need their recurrent state at the end
+        /// (<see cref="PrefixCache.PrefixCacheCapabilities.PagesNeedStateAtEnd"/>: Nemotron-H without its
+        /// batched route, e.g. under tensor parallelism). Its pages resume only where a prefill chunk ended,
+        /// and the chunk aligner puts that end on the last block boundary before the prompt's end. At 16 tokens
+        /// that is a few tokens short of the prompt, past what the next request shares of it (its prompt leaves
+        /// a warm-up's, or its public prefix ends, a little earlier), so nothing resumed: a tensor-parallel
+        /// Nemotron server re-prefilled its ~3.6K-token system prompt on every request. At 256 the restore point
+        /// lands on the last 256 boundary, inside the shared prefix, as on the batched route.
+        /// </para>
         /// </summary>
         internal static int PreferredBlockSize(IModelArchitecture model)
             => model is PrefixCache.IPrefixCacheModel cache
                && cache.GetPrefixCacheCapabilities() is { EndState: PrefixCache.EndStateSupport.None } caps
                && caps.Pages != PrefixCache.PageSupport.None
+               && !caps.PagesNeedStateAtEnd
                 ? SchedulerConfig.PageFamilyBlockSize
                 : SchedulerConfig.DefaultBlockSize;
 

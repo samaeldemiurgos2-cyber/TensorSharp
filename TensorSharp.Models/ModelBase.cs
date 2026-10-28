@@ -2473,7 +2473,39 @@ namespace TensorSharp.Models
         private const int TpControlShutdown      = 4;
         private const int TpControlTruncate      = 5;
 
+        /// <summary>First op number a model may use for its own mirrored operations
+        /// (<see cref="BroadcastModelControl"/> / <see cref="HandleModelControl"/>).</summary>
+        protected const int TpControlModelFirst = 100;
+
         private bool _distributedDriver;
+
+        /// <summary>True on the multi-node driver once <see cref="BeginDistributedDriver"/> has run.</summary>
+        protected bool IsDistributedDriver => _distributedDriver;
+
+        /// <summary>
+        /// Tell the worker nodes to run model-specific operation <paramref name="op"/>
+        /// (&gt;= <see cref="TpControlModelFirst"/>) next. A model whose public operation
+        /// touches sharded state or issues a collective - a KV snapshot of sharded heads,
+        /// say - broadcasts here first and then runs the same body as the workers do in
+        /// <see cref="HandleModelControl"/>, so every node joins the same collectives in
+        /// the same order. No-op unless this process is the distributed driver.
+        /// </summary>
+        protected void BroadcastModelControl(int op, int[] payload)
+        {
+            if (op < TpControlModelFirst)
+                throw new ArgumentOutOfRangeException(nameof(op), "Model control ops start at TpControlModelFirst.");
+            if (_distributedDriver)
+                DistributedControlGroup.BroadcastControl(op, payload ?? Array.Empty<int>());
+        }
+
+        /// <summary>Run a model-specific operation the driver broadcast with
+        /// <see cref="BroadcastModelControl"/>, on a worker node. Return false for an op
+        /// this model does not know.</summary>
+        protected virtual bool HandleModelControl(int op, int[] payload) => false;
+
+        /// <summary>Stop every node after a model-specific mirrored operation failed part
+        /// way: the nodes can no longer be assumed to agree.</summary>
+        protected void AbortDistributedModelControl(Exception failure) => AbortDistributedExecution(failure);
         private Exception _distributedExecutionFailure;
 
         private void AbortDistributedExecution(Exception failure)
@@ -2701,6 +2733,8 @@ namespace TensorSharp.Models
                             Console.WriteLine("[TP worker] shutdown received; exiting worker loop.");
                             return;
                         default:
+                            if (op >= TpControlModelFirst && HandleModelControl(op, payload))
+                                break;
                             throw new InvalidOperationException($"Unknown TP control op {op}.");
                     }
                 }

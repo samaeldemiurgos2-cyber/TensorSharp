@@ -1418,7 +1418,10 @@ namespace TensorSharp.Models
         // the same layout with the Mamba2 sections left out.
         public override bool RequiresPerBlockCapture => true;
 
-        public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
+        /// <summary>Single-device: the K/V caches. Under tensor parallelism: the sharded
+        /// caches, gathered into the same block layout (see TryExtractKVBlockTP).</summary>
+        public override bool SupportsKVStateSnapshot =>
+            (_kvCacheK != null && _kvCacheV != null) || (IsTensorParallel && _tpKvCacheK != null && _tpKvCacheV != null);
 
         public override string KVStateFingerprint
         {
@@ -1445,13 +1448,19 @@ namespace TensorSharp.Models
 
         private long ComputeNemotronBlockBytes(int tokenCount, bool includeRecurrentState)
         {
-            if (tokenCount <= 0 || _kvCacheK == null || _layerTypes == null) return 0;
+            if (tokenCount <= 0 || !SupportsKVStateSnapshot || _layerTypes == null) return 0;
             long total = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 switch (_layerTypes[l])
                 {
                     case LayerType.Attention:
+                        if (IsTensorParallel)
+                        {
+                            if (_tpKvCacheK[l] == null || _tpKvCacheV[l] == null) return 0;
+                            total += 2 * TpAttentionSectionBytes(l, tokenCount);
+                            break;
+                        }
                         if (_kvCacheK[l] == null || _kvCacheV[l] == null) return 0;
                         total += NemotronLayerBlockBytes(_kvCacheK[l], tokenCount);
                         total += NemotronLayerBlockBytes(_kvCacheV[l], tokenCount);
@@ -1481,6 +1490,7 @@ namespace TensorSharp.Models
         public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
         {
             if (!SupportsKVStateSnapshot) return false;
+            if (IsTensorParallel) return TryExtractKVBlockTP(startToken, tokenCount, destination);
             if (NemotronBlockFormOf(tokenCount, destination.Length) is not bool withState) return false;
             EnsureKvCacheHostSynchronized();
 
@@ -1512,6 +1522,7 @@ namespace TensorSharp.Models
         public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
         {
             if (!SupportsKVStateSnapshot) return false;
+            if (IsTensorParallel) return TryInjectKVBlockTP(destToken, tokenCount, source);
             if (destToken != _cacheSeqLen) return false;
             // The K/V-only form writes the attention rows and leaves every Mamba2
             // state (host arrays and the native decode shadow) exactly as it was.

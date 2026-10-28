@@ -60,10 +60,10 @@ __global__ void quant_strip_main(quant_strip_args a) {
             const int xo=expert*a.expert_stride+local_row*a.row_stride;
             const int yo=(low+jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
             if(partial)
-                mul_mat_q_process_tile<type,J,false,true,GGML_PREC_Q8>(a.weights,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,
+                mul_mat_q_process_tile<type,J,false,true,GGML_PREC_Q8,false>(a.weights,nullptr,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,GGML_GLU_OP_SWIGLU,0.0f,
                     a.row_stride,a.selected_rows,a.rows,a.rows-local_row-1,columns-jt*J-1,kb,stop);
             else
-                mul_mat_q_process_tile<type,J,false,false,GGML_PREC_Q8>(a.weights,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,
+                mul_mat_q_process_tile<type,J,false,false,GGML_PREC_Q8,false>(a.weights,nullptr,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,GGML_GLU_OP_SWIGLU,0.0f,
                     a.row_stride,a.selected_rows,a.rows,a.rows-local_row-1,columns-jt*J-1,kb,stop);
         }
         begin+=stop-kb;

@@ -33,7 +33,9 @@ public sealed class PoolBlockSizeTests : IDisposable
     public void AnUnsetBlockSize_IsSixteenForAPageOnlyFamily_AndTheDefaultOtherwise(string family)
     {
         using OracleModel model = OracleFakes.All.Single(f => f.Name == family).Create();
-        bool pageOnly = model.Traits.EndState == EndStateSupport.None;
+        // A recurrent page family resumes only at a prefill chunk's end, which the 16-token block put past
+        // what the next request shares (StatelessPublicPrefixReuseTests): it keeps the default.
+        bool pageOnly = model.Traits.EndState == EndStateSupport.None && !model.Traits.PagesNeedStateAtEnd;
         int expected = pageOnly ? SchedulerConfig.PageFamilyBlockSize : SchedulerConfig.DefaultBlockSize;
 
         Assert.Equal(0, SchedulerConfig.FromEnvironment().BlockSize);

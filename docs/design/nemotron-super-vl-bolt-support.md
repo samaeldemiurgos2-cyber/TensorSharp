@@ -238,14 +238,20 @@ and checks the per-rank route table; `NemotronPerLayerMoEConfigTests` covers the
 no CPU harness for the Nemotron TP forward itself, so **none of the TP forward has executed**.
 
 Limits that remain:
-- The server cannot host Nemotron under TP (single node or multi-node): the TP forward exposes neither KV
-  snapshots nor a batched forward, which the server's engine needs. Use `TensorSharp.Cli` on every node.
+- The server hosts Nemotron under TP through KV snapshots (`NemotronModel.TensorParallelSnapshot.cs`): each
+  rank's K/V heads are a contiguous run of the single-device block layout, so the block format is unchanged;
+  across nodes the driver broadcasts each extract/inject (`ModelBase.BroadcastModelControl`) and the bytes move
+  over the AllReduce (`TpByteTransport`, exact for any bytes). Run the server as node 0 and `TensorSharp.Cli` as
+  every other node. The engine serves it on the per-sequence route (one sequence's forward at a time); prompt
+  reuse uses 256-token pages, as the single-device batched route does (`InferenceEngine.PreferredBlockSize`).
 - MTP/DFlash speculation is not mirrored to worker nodes.
 - `--n-cpu-moe` with TP has not been run.
 
 #### DGX Spark test plan (two nodes, one GB10 each)
 
-Same model, backend and flags on both nodes; node 0 is the driver and prints the output.
+Same model, backend and flags on both nodes; node 0 is the driver and prints the output. For the server,
+start `TensorSharp.Server.Host` with the same `--tp 1 --tp-node-id 0 --tp-peers ...` on node 0 instead of the
+CLI driver, and the CLI worker on node 1.
 
 ```bash
 # node 0 (driver)
