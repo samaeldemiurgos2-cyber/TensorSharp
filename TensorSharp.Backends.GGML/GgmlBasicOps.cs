@@ -1687,7 +1687,7 @@ namespace TensorSharp.GGML
             int numExperts, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
             int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
             int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
-            float[] routeWeights)
+            float[] routeWeights, float[] upScales = null)
         {
             if (result.DimensionCount != 2 || input.DimensionCount != 2)
                 throw new ArgumentException("MoEExpertsForward requires 2D tensors.");
@@ -1713,7 +1713,7 @@ namespace TensorSharp.GGML
                 upDataPtrs, downDataPtrs,
                 upGgmlType, upNe0, upNe1, upRawBytesEach,
                 downGgmlType, downNe0, downNe1, downRawBytesEach,
-                routeWeights);
+                routeWeights, upScales);
         }
 
         /// <summary>

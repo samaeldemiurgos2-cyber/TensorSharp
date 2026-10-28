@@ -4354,7 +4354,8 @@ TSG_EXPORT int TSGgml_MoEExpertsForwardF32(
     std::int64_t down_ne0,        // down weight: ne0 = intermDim
     std::int64_t down_ne1,        // down weight: ne1 = outDim
     std::int64_t down_raw_bytes_each,
-    float* route_weights)         // [num_experts]
+    float* route_weights,         // [num_experts]
+    const float* up_scales)       // [num_experts] optional, null = no pre-activation scale
 {
     try
     {
@@ -4460,6 +4461,17 @@ TSG_EXPORT int TSGgml_MoEExpertsForwardF32(
         for (int e = 0; e < num_experts; e++)
         {
             ggml_tensor* up_out = ggml_mul_mat(context.value, up_w[e].t, inp_bind.tensor);
+
+            // A quantized up projection carries its NVFP4 scale2 out-of-band, so the
+            // raw matmul result is 1/up_scale too large. It has to be corrected here,
+            // BEFORE the squaring: relu^2(us*z) == us^2*relu^2(z), so deferring the
+            // correction into route_weights squares the inflated value and overflows
+            // to +Inf for scale2 ~1e-5. The down scale needs no such hook - it is a
+            // single multiply after the down matmul, which the caller folds safely
+            // into route_weights.
+            if (up_scales != nullptr && up_scales[e] != 1.0f)
+                up_out = ggml_scale(context.value, up_out, up_scales[e]);
+
             ggml_tensor* relu_out = ggml_relu(context.value, up_out);
             ggml_tensor* sq_out = ggml_sqr(context.value, relu_out);
             ggml_tensor* dn_out = ggml_mul_mat(context.value, dn_w[e].t, sq_out);

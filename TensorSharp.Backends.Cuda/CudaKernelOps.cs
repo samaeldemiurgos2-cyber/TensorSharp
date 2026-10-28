@@ -1347,6 +1347,24 @@ namespace TensorSharp.Cuda
                 resultStorage.MarkDeviceModified();
                 return true;
             }
+            // Nemotron-H / Nemotron-3.5 shape: 16 Q heads per KV head at head_dim
+            // 128. The group-4 flash kernels above structurally cannot serve it
+            // (COLS_PER_THREAD = HEAD_DIM / 256 == 0), so without this branch the
+            // shape falls through to the generic kernel - and Nemotron's managed
+            // path falls back to a materialized score matrix plus a 16x K/V
+            // expansion. windowSize is restricted to 0 on purpose: the kernel does
+            // implement sliding windows, but only full attention has been exercised.
+            if (windowSize == 0 &&
+                (long)maskStart + seqLen <= kvLen &&
+                kernels.FlashG16D128Supports(headDim, numQHeads, numKVHeads))
+            {
+                kernels.LaunchGqaPrefillFlashG16D128(
+                    queryPtr, keyPtr, valuePtr, IntPtr.Zero, resultPtr,
+                    numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize,
+                    scale, kStride, hasSinks: 0, keyIsHalf, allocator.Stream.Handle);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
             if (keyIsHalf)
             {
                 kernels.LaunchGqaPrefillAttentionF16(
@@ -1501,6 +1519,23 @@ namespace TensorSharp.Cuda
                     hasSinks,
                     keyIsHalf,
                     allocator.Stream.Handle);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
+
+            // Nemotron-H / Nemotron-3.5 shape: 16 Q heads per KV head at head_dim
+            // 128, which the group-4 flash kernels cannot serve (their
+            // COLS_PER_THREAD = HEAD_DIM / 256 is zero there). Mirrors the gate in
+            // TryGqaPrefillAttention; windowSize is restricted to 0 because only
+            // full attention has been exercised.
+            if (windowSize == 0 &&
+                (long)maskStart + seqLen <= kvLen &&
+                kernels.FlashG16D128Supports(headDim, numQHeads, numKVHeads))
+            {
+                kernels.LaunchGqaPrefillFlashG16D128(
+                    queryPtr, keyPtr, valuePtr, sinksPtr, resultPtr,
+                    numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize,
+                    scale, cacheSize, hasSinks, keyIsHalf, allocator.Stream.Handle);
                 resultStorage.MarkDeviceModified();
                 return true;
             }

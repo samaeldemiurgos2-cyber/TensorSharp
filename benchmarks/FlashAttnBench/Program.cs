@@ -29,12 +29,16 @@ if (!CudaBackend.IsAvailable())
 int[] lens = EnvIntList("TS_FLASH_LENS", new[] { 2048, 3200 });
 int iters = EnvIntList("TS_FLASH_ITERS", new[] { 30 })[0];
 
-// (name, numQHeads, numKVHeads, headDim, window)  — group ratio 4, real geometries.
+// (name, numQHeads, numKVHeads, headDim, window)  — real geometries. Group ratio
+// is 4 for Qwen/Gemma and 16 for Nemotron (which needs its own kernel: the
+// group-4 flash kernels map 256 threads over headDim columns, so headDim 128
+// gives them zero columns per thread).
 var shapes = new (string name, int nq, int nkv, int hd, int win)[]
 {
     ("qwen-full  d256 w0   ", 16, 4, 256, 0),   // Qwen3.5 full-attn layers
     ("gemma-local d256 w512", 8, 2, 256, 512),  // Gemma4 E4B SWA local layers
     ("gemma-glob  d512 w0   ", 8, 2, 512, 0),   // Gemma4 E4B global layers
+    ("nemotron   d128 w0   ", 32, 2, 128, 0),   // Nemotron-H / 3.5: 32q over 2kv
 };
 
 Console.WriteLine($"[flash-bench] iters={iters}  lens={string.Join(",", lens)}");
