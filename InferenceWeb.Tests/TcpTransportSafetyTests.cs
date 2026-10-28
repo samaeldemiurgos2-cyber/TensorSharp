@@ -151,7 +151,7 @@ public sealed class TcpTransportSafetyTests
         using var stream = raw.GetStream();
         byte[] handshake = new byte[16];
         BinaryPrimitives.WriteInt32LittleEndian(handshake, 0x54535032);
-        BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(4), 2);
+        BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(4), 3);
         BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(8), 0);
         BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(12), 2);
         await stream.WriteAsync(handshake);
@@ -320,7 +320,7 @@ public sealed class TcpTransportSafetyTests
             var stream = raw.GetStream();
             byte[] handshake = new byte[16];
             BinaryPrimitives.WriteInt32LittleEndian(handshake, 0x54535032);
-            BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(4), 2);
+            BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(4), 3);
             BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(12), 2);
             await stream.WriteAsync(handshake);
             await stream.ReadExactlyAsync(handshake);

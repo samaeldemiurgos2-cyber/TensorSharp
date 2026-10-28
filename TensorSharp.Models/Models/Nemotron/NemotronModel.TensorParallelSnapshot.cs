@@ -15,11 +15,12 @@
 //
 // Across nodes each node holds only its own ranks' heads, while the engine runs on the
 // driver. Extract and inject are therefore mirrored operations: the driver broadcasts
-// the op, then every node runs the same body and the bytes move over the group's
-// AllReduce (TpAllReduceBytes) - for an extract each node contributes its shards, for
-// an inject the driver contributes the whole block.
+// the op, then every node runs the same body and the bytes move between nodes as they
+// are - an extract gathers each node's shards on the driver (TpGatherBytesToDriver), an
+// inject sends the driver's whole block to every node (TpBroadcastBytesFromDriver).
 // ============================================================================
 using System;
+using System.Diagnostics;
 
 namespace TensorSharp.Models
 {
@@ -27,6 +28,27 @@ namespace TensorSharp.Models
     {
         private const int TpControlSnapshotExtract = TpControlModelFirst + 1; // [start, count, withState]
         private const int TpControlSnapshotInject = TpControlModelFirst + 2;  // [dest, count, withState, bytes]
+
+        // Diagnostics for the snapshot path: TS_TP_SNAPSHOT_TRACE=1 logs every extract and
+        // inject; without it a call over a second, and a running total every 64 calls, are logged.
+        private static readonly bool TpSnapshotTrace = Environment.GetEnvironmentVariable("TS_TP_SNAPSHOT_TRACE") == "1";
+        private long _tpSnapshotCalls, _tpSnapshotTicks, _tpSnapshotTransferTicks, _tpSnapshotBytes;
+
+        private void TraceTpSnapshot(string op, int start, int count, bool withState, long bytes, long ticks, long transferTicks)
+        {
+            _tpSnapshotCalls++;
+            _tpSnapshotTicks += ticks;
+            _tpSnapshotTransferTicks += transferTicks;
+            _tpSnapshotBytes += bytes;
+            double ms = ticks * 1000.0 / Stopwatch.Frequency;
+            if (TpSnapshotTrace || ms > 1000)
+                Console.WriteLine($"[tp-snapshot] {op} rows {start}..{start + count} state={withState} bytes={bytes} " +
+                    $"{ms:F1} ms (cross-node {transferTicks * 1000.0 / Stopwatch.Frequency:F1} ms) node={TpRankOffset}");
+            if (_tpSnapshotCalls % 64 == 0)
+                Console.WriteLine($"[tp-snapshot] {_tpSnapshotCalls} calls, {_tpSnapshotBytes / (1 << 20)} MiB, " +
+                    $"{_tpSnapshotTicks * 1000.0 / Stopwatch.Frequency:F0} ms total " +
+                    $"({_tpSnapshotTransferTicks * 1000.0 / Stopwatch.Frequency:F0} ms moving bytes between nodes)");
+        }
 
         /// <summary>One attention layer's K (or V) section across every rank of the cluster.</summary>
         private long TpAttentionSectionBytes(int layer, int tokenCount)
@@ -106,6 +128,8 @@ namespace TensorSharp.Models
         /// </summary>
         private void RunTpSnapshotExtract(int startToken, int tokenCount, bool withState, Span<byte> destination, bool isDriver)
         {
+            long t0 = Stopwatch.GetTimestamp();
+            long transferTicks = 0;
             var attention = new byte[TpAttentionBlockBytes(tokenCount)];
             int offset = 0;
             for (int l = 0; l < Config.NumLayers; l++)
@@ -125,9 +149,17 @@ namespace TensorSharp.Models
             }
 
             if (TpNodeCount > 1)
-                TpAllReduceBytes(attention);
+            {
+                long r0 = Stopwatch.GetTimestamp();
+                TpGatherBytesToDriver(attention);
+                transferTicks = Stopwatch.GetTimestamp() - r0;
+            }
             if (!isDriver)
+            {
+                TraceTpSnapshot("extract", startToken, tokenCount, withState, attention.Length,
+                    Stopwatch.GetTimestamp() - t0, transferTicks);
                 return;
+            }
 
             int a = 0, o = 0;
             for (int l = 0; l < Config.NumLayers; l++)
@@ -150,6 +182,8 @@ namespace TensorSharp.Models
             }
             if (o != destination.Length)
                 throw new InvalidOperationException($"Nemotron TP snapshot wrote {o} of {destination.Length} bytes.");
+            TraceTpSnapshot("extract", startToken, tokenCount, withState, destination.Length,
+                Stopwatch.GetTimestamp() - t0, transferTicks);
         }
 
         /// <summary>
@@ -160,12 +194,16 @@ namespace TensorSharp.Models
         private void RunTpSnapshotInject(int destToken, int tokenCount, bool withState, ReadOnlySpan<byte> source,
             int length, bool isDriver)
         {
+            long t0 = Stopwatch.GetTimestamp();
+            long transferTicks = 0;
             byte[] shared = null;
             if (TpNodeCount > 1)
             {
                 shared = new byte[length];
                 if (isDriver) source.CopyTo(shared);
-                TpAllReduceBytes(shared);
+                long r0 = Stopwatch.GetTimestamp();
+                TpBroadcastBytesFromDriver(shared);
+                transferTicks = Stopwatch.GetTimestamp() - r0;
             }
             ReadOnlySpan<byte> block = shared ?? source;
 
@@ -202,6 +240,7 @@ namespace TensorSharp.Models
             if (o != length)
                 throw new InvalidOperationException($"Nemotron TP snapshot read {o} of {length} bytes.");
             _cacheSeqLen = destToken + tokenCount;
+            TraceTpSnapshot("inject", destToken, tokenCount, withState, length, Stopwatch.GetTimestamp() - t0, transferTicks);
         }
     }
 }

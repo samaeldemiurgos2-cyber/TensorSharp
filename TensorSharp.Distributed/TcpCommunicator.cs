@@ -22,8 +22,9 @@ namespace TensorSharp.Distributed
     public sealed class TcpCommunicator : IDisposable
     {
         private const byte MsgAllReduceContribute = 1, MsgAllReduceResult = 2,
-            MsgBarrierAck = 3, MsgControl = 4, MsgHeartbeat = 5, MsgTensor = 6, MsgBroadcast = 7;
-        private const int ProtocolMagic = 0x54535032, ProtocolVersion = 2;
+            MsgBarrierAck = 3, MsgControl = 4, MsgHeartbeat = 5, MsgTensor = 6, MsgBroadcast = 7,
+            MsgBytesBroadcast = 8, MsgBytesGather = 9;
+        private const int ProtocolMagic = 0x54535032, ProtocolVersion = 3;
         private const int SmallFrameBytes = 4096, MaxControlBytes = 16 * 1024 * 1024;
         private readonly int _rank, _worldSize, _ioTimeoutMs, _operationTimeoutMs;
         private readonly TcpListener _listener;
@@ -33,6 +34,7 @@ namespace TensorSharp.Distributed
         private readonly object _operationLock = new();
         private Timer _heartbeatTimer;
         private float[] _reduceBuffer = Array.Empty<float>();
+        private byte[] _gatherBuffer = Array.Empty<byte>();
         private Exception _fault;
         private int _closed, _disposed;
 
@@ -378,6 +380,55 @@ namespace TensorSharp.Distributed
                     }
                     else ReceiveInto(rootRank, MsgBroadcast, bytes);
                     BarrierCore();
+                }
+                catch (Exception ex) { Fail(ex); throw; }
+            }
+        }
+
+        /// <summary>Rank 0's bytes replace every other rank's, verbatim. TCP orders it
+        /// against later operations, so no barrier follows.</summary>
+        public void BroadcastBytes(Span<byte> buffer)
+        {
+            lock (_operationLock)
+            {
+                ThrowIfUnavailable();
+                try
+                {
+                    if (_rank == 0)
+                        for (int r = 1; r < _worldSize; r++) SendMessage(r, MsgBytesBroadcast, buffer);
+                    else
+                        ReceiveInto(0, MsgBytesBroadcast, buffer);
+                }
+                catch (Exception ex) { Fail(ex); throw; }
+            }
+        }
+
+        /// <summary>Every rank passes the bytes it owns and zeros elsewhere; rank 0 ends
+        /// with the bitwise OR of them all, which is the union when the owned ranges are
+        /// disjoint. Other ranks' buffers are left as they were.</summary>
+        public void GatherBytesToRoot(Span<byte> buffer)
+        {
+            lock (_operationLock)
+            {
+                ThrowIfUnavailable();
+                try
+                {
+                    if (_rank != 0)
+                    {
+                        SendMessage(0, MsgBytesGather, buffer);
+                        return;
+                    }
+                    if (_gatherBuffer.Length < buffer.Length) _gatherBuffer = new byte[buffer.Length];
+                    var incoming = _gatherBuffer.AsSpan(0, buffer.Length);
+                    for (int r = 1; r < _worldSize; r++)
+                    {
+                        ReceiveInto(r, MsgBytesGather, incoming);
+                        int i = 0;
+                        if (Vector.IsHardwareAccelerated)
+                            for (; i <= buffer.Length - Vector<byte>.Count; i += Vector<byte>.Count)
+                                (new Vector<byte>(buffer.Slice(i)) | new Vector<byte>(incoming.Slice(i))).CopyTo(buffer.Slice(i));
+                        for (; i < buffer.Length; i++) buffer[i] |= incoming[i];
+                    }
                 }
                 catch (Exception ex) { Fail(ex); throw; }
             }

@@ -241,7 +241,10 @@ Limits that remain:
 - The server hosts Nemotron under TP through KV snapshots (`NemotronModel.TensorParallelSnapshot.cs`): each
   rank's K/V heads are a contiguous run of the single-device block layout, so the block format is unchanged;
   across nodes the driver broadcasts each extract/inject (`ModelBase.BroadcastModelControl`) and the bytes move
-  over the AllReduce (`TpByteTransport`, exact for any bytes). Run the server as node 0 and `TensorSharp.Cli` as
+  between nodes as raw bytes over the TCP mesh (`ICrossNodeByteGroup`): an inject sends the driver's block to
+  every node, an extract gathers each node's head shards on the driver. Each owner swap on the per-sequence
+  route re-injects the incoming sequence's pages, its ~50 MB Mamba2 state included (Lightning), so the
+  interconnect bandwidth bounds concurrent serving. Run the server as node 0 and `TensorSharp.Cli` as
   every other node. The engine serves it on the per-sequence route (one sequence's forward at a time); prompt
   reuse uses 256-token pages, as the single-device batched route does (`InferenceEngine.PreferredBlockSize`).
 - MTP/DFlash speculation is not mirrored to worker nodes.

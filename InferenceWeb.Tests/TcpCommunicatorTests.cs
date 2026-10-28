@@ -215,6 +215,78 @@ public class TcpCommunicatorTests
             c0.Dispose(); c1.Dispose();
         }
     }
+
+    [Fact]
+    public void BroadcastBytes_FromRank0_ArrivesVerbatim_AndKeepsLaterOperationsInOrder()
+    {
+        var (c0, c1) = CreatePair();
+        try
+        {
+            // KV snapshot sized, with bytes that read as NaN when taken as floats.
+            var sent = new byte[3 * 1024 * 1024 + 7];
+            new Random(5).NextBytes(sent);
+            sent[0] = 0xFF; sent[1] = 0xFF; sent[2] = 0xFF; sent[3] = 0x7F;
+            var buf0 = (byte[])sent.Clone();
+            var buf1 = new byte[sent.Length];
+            var sum0 = new float[] { 1f };
+            var sum1 = new float[] { 2f };
+
+            var t0 = new Thread(() => { c0.BroadcastBytes(buf0); c0.AllReduce(sum0, 1); });
+            var t1 = new Thread(() => { c1.BroadcastBytes(buf1); c1.AllReduce(sum1, 1); });
+            t0.Start(); t1.Start();
+            Assert.True(t0.Join(30_000) && t1.Join(30_000));
+
+            Assert.Equal(sent, buf0);
+            Assert.Equal(sent, buf1);
+            Assert.Equal(3f, sum0[0]);
+            Assert.Equal(3f, sum1[0]);
+        }
+        finally
+        {
+            c0.Dispose(); c1.Dispose();
+        }
+    }
+
+    [Fact]
+    public void GatherBytesToRoot_ThreeNodes_UnitesDisjointRangesOnRank0Only()
+    {
+        var endpoints = new[]
+        {
+            new IPEndPoint(IPAddress.Loopback, GetFreePort()),
+            new IPEndPoint(IPAddress.Loopback, GetFreePort()),
+            new IPEndPoint(IPAddress.Loopback, GetFreePort()),
+        };
+        var nodes = new TcpCommunicator[3];
+        var connect = Enumerable.Range(0, 3).Select(r => new Thread(() => nodes[r] = new TcpCommunicator(r, endpoints))).ToArray();
+        foreach (var t in connect) t.Start();
+        foreach (var t in connect) t.Join(10_000);
+        try
+        {
+            // Uneven ranges, not a multiple of the vector width.
+            var whole = new byte[1001];
+            new Random(9).NextBytes(whole);
+            int[] cuts = { 0, 333, 334, whole.Length };
+            var buffers = new byte[3][];
+            for (int r = 0; r < 3; r++)
+            {
+                buffers[r] = new byte[whole.Length];
+                Array.Copy(whole, cuts[r], buffers[r], cuts[r], cuts[r + 1] - cuts[r]);
+            }
+            var before = buffers.Select(b => (byte[])b.Clone()).ToArray();
+
+            var run = Enumerable.Range(0, 3).Select(r => new Thread(() => nodes[r].GatherBytesToRoot(buffers[r]))).ToArray();
+            foreach (var t in run) t.Start();
+            Assert.All(run, t => Assert.True(t.Join(10_000)));
+
+            Assert.Equal(whole, buffers[0]);
+            Assert.Equal(before[1], buffers[1]);
+            Assert.Equal(before[2], buffers[2]);
+        }
+        finally
+        {
+            foreach (var n in nodes) n?.Dispose();
+        }
+    }
 }
 
 public class DistributedTpConfigTests
