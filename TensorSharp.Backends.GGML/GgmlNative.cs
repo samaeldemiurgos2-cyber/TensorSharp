@@ -2223,6 +2223,20 @@ internal enum GgmlIndexReductionOp
             float oaiLimit,
             int runOnCpu);            // non-zero: run this layer on the host ggml CPU backend (MoE CPU offload)
 
+        // TSGgml_MoEFFNPrefillSwiGLUQuantF32 plus one pre-activation multiplier per
+        // route on the single ReLU-squared projection (Nemotron NVFP4 scale2).
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MoEFFNPrefillRouteScaledF32(
+            IntPtr hiddenIn, IntPtr hiddenOut, int seqLen, int hiddenDim, int nFf,
+            int numExperts, int nUsed, IntPtr selectedExperts, IntPtr routingWeights,
+            IntPtr gateData, int gateType, long gateNe0, long gateNe1, long gateTotalBytes,
+            IntPtr upData, int upType, long upNe0, long upNe1, long upTotalBytes,
+            IntPtr downData, int downType, long downNe0, long downNe1, long downTotalBytes,
+            IntPtr gateBias, IntPtr upBias, IntPtr downBias,
+            int activationType, float oaiAlpha, float oaiLimit, int runOnCpu,
+            IntPtr routeUpScales);       // float* [seqLen, nUsed]
+
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_MuseSparkMoEFFNQuantF32(
@@ -5857,8 +5871,23 @@ internal enum GgmlIndexReductionOp
             float oaiLimit,
             bool runOnCpu = false,
             IntPtr postExpertNorm = default,
-            float postExpertNormEps = 1e-8f)
+            float postExpertNormEps = 1e-8f,
+            IntPtr routeUpScales = default)
         {
+            if (routeUpScales != IntPtr.Zero)
+            {
+                if (postExpertNorm != IntPtr.Zero)
+                    throw new ArgumentException("Route up-scales and a post-expert norm are separate MoE entry points.");
+                CheckResult(TSGgml_MoEFFNPrefillRouteScaledF32(
+                    hiddenIn, hiddenOut, seqLen, hiddenDim, nFf,
+                    numExperts, nUsed, selectedExperts, routingWeights,
+                    gateData, gateType, gateNe0, gateNe1, gateTotalBytes,
+                    upData, upType, upNe0, upNe1, upTotalBytes,
+                    downData, downType, downNe0, downNe1, downTotalBytes,
+                    gateBias, upBias, downBias, activationType, oaiAlpha, oaiLimit,
+                    runOnCpu ? 1 : 0, routeUpScales), "moe_ffn_prefill_route_scaled");
+                return;
+            }
             if (postExpertNorm != IntPtr.Zero)
             {
                 CheckResult(TSGgml_MuseSparkMoEFFNQuantF32(

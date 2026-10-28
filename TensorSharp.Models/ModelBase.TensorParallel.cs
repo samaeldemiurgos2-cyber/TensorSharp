@@ -450,6 +450,16 @@ namespace TensorSharp.Models
                                         (IntPtr)(srcBase + (long)(srcStart + row) * rowBytes),
                                         (IntPtr)dstRowPtr,
                                         inDim);
+                                    // The blocks dequantize to weight / Scale (an NVFP4
+                                    // scale2 sidecar). The pack mixes sources, so it cannot
+                                    // carry one scale for all of them: bake each source's
+                                    // into its own rows here.
+                                    if (qw.Scale != 1.0f)
+                                    {
+                                        float sc = qw.Scale;
+                                        for (int i = 0; i < inDim; i++)
+                                            dstRowPtr[i] *= sc;
+                                    }
                                 }
                                 else
                                 {
@@ -478,8 +488,8 @@ namespace TensorSharp.Models
                     shards[r] = shard;
             }
 
-            // This pack is built from several sources; the F32 fallback already
-            // baked each source's scale into its rows, so record nothing here.
+            // This pack is built from several sources; each source's per-tensor
+            // scale was baked into its rows above, so record nothing here.
             if (requantize)
                 _tpQuantWeights[fusedName] = quantShards;
             else

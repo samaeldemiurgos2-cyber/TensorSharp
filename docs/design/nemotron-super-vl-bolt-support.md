@@ -216,6 +216,57 @@ whose projector width does not match the language model. `NemotronVisionSplitQkv
 file encodes identically to its fused twin. The Bolt mmproj itself has not been run here; the reported
 layout comes from the review of the PR on 2x A40.
 
+### G7 -- Tensor parallelism for Super VL and Bolt -- **IMPLEMENTED, NOT YET RUN**
+
+`--tp` used to be refused for both files: they carry `.scale` sidecars and Nemotron did not set
+`SupportsTensorParallelWeightScales`; Bolt's per-block MoE config was refused under TP outright; and the fast
+expert-parallel MoE path refused latent MoE (both models) and NVFP4 up-scaled experts (Super VL), leaving a
+per-expert loop of thousands of tiny matmuls per layer on `ggml_cuda`.
+
+What changed:
+
+| Piece | Change |
+|---|---|
+| Per-tensor `.scale` | Audited every TP path: attention QKV/output use the TP linears, which carry each shard's scale; Mamba2, router, latent in/out, shared expert and LM head run replicated through `LinearForward`, which applies it. `SupportsTensorParallelWeightScales => true`. `FuseQKVWeights` now keeps the scale and refuses to fuse Q/K/V with different scales; `ShardSeparateColumnParallel` (which builds `[Q|K|V]` per rank from separate sources) used to drop each source's scale despite a comment saying otherwise and now bakes it into the rows. |
+| Per-expert NVFP4 scale2 | Down scale folded into the TP routing weights (all TP expert paths); up scale applied before ReLU^2 on every path. The batched TP decode kernel takes the up scales instead of falling back to the per-expert loop. |
+| Expert-parallel (EP) MoE | Now serves latent MoE (each rank's kernel reads the latent projection) and per-block expert counts (each layer is partitioned on its own). New native entry `TSGgml_MoEFFNPrefillRouteScaledF32` (TensorSharp-owned `ggml_ops_moe.cpp`; ggml is unchanged) multiplies the ReLU^2 projection by one scale per route before the activation, so Super VL's NVFP4 experts run EP too. A route the kernel neutralises (weight 0) takes the scale of the expert it is pointed at, so it cannot overflow into `Inf * 0 = NaN`. |
+| Per-block MoE (Bolt) | Router stride, top-k, expert loops and decode tables use each layer's own counts. The refusal in `InitPerLayerMoEConfig` is gone. The per-expert (Megatron) split now refuses, naming the tensor, an expert width the TP degree cannot split between quant blocks instead of silently dropping the remainder. |
+| Across nodes | Image/audio embeddings exist only on the driver. A forward whose tokens hold `<image>`/`<so_embedding>` now syncs the driver's embedding rows to every node with one AllReduce (the driver contributes them, every other rank zeros); the decision is taken from the tokens, which every node sees. The multimodal warm-up is skipped across nodes, since only nodes given the mmproj would join its collectives. |
+
+Tests: `NemotronExpertParallelTests` runs the new kernel on the GGML CPU backend against a C# reference
+and checks the per-rank route table; `NemotronPerLayerMoEConfigTests` covers the per-block counts. There is
+no CPU harness for the Nemotron TP forward itself, so **none of the TP forward has executed**.
+
+Limits that remain:
+- The server cannot host Nemotron under TP (single node or multi-node): the TP forward exposes neither KV
+  snapshots nor a batched forward, which the server's engine needs. Use `TensorSharp.Cli` on every node.
+- MTP/DFlash speculation is not mirrored to worker nodes.
+- `--n-cpu-moe` with TP has not been run.
+
+#### DGX Spark test plan (two nodes, one GB10 each)
+
+Same model, backend and flags on both nodes; node 0 is the driver and prints the output.
+
+```bash
+# node 0 (driver)
+TensorSharp.Cli --model <model.gguf> [--mmproj <mmproj.gguf>] --backend ggml_cuda --tp 1 \
+  --tp-node-id 0 --tp-peers <spark0>:9500,<spark1>:9500 --temperature 0 --max-tokens 64 --prompt "<prompt>"
+# node 1 (worker)
+TensorSharp.Cli --model <model.gguf> --backend ggml_cuda --tp 1 \
+  --tp-node-id 1 --tp-peers <spark0>:9500,<spark1>:9500
+```
+
+1. **Load banner.** Expect `Nemotron MoE: expert-parallel across 2 GPU(s), N experts per GPU per layer` (Super VL:
+   256; Bolt: a range) and, for Bolt, `MoE per block: ...`. `per-expert tensor parallelism (<reason>)` means EP was
+   refused and gives the reason.
+2. **Logits parity, the real check.** Run the same prompt once single-device and once across the two nodes with
+   `TS_DUMP_LOGITS=<file>` on node 0, then compare the two float32 dumps (cosine ~1, same argmax). Text alone can
+   differ at near-ties.
+3. **Greedy text** on a few prompts, both models, `--temperature 0`.
+4. **Images** (Super VL, Bolt): one `--image` prompt across nodes; the worker does not need `--mmproj`.
+5. **Debugging aids:** `TS_TP_SCALE_DEBUG=1` prints each sharded weight's scale as it is applied;
+   `CUDA_LAUNCH_BLOCKING=1` for an exact failing kernel.
+
 ## 5. Summary
 
 **Validated on a DGX Spark (GB10) on 2026-10-24/25. Both models now produce correct output.** The
@@ -295,15 +346,11 @@ non-zero and fall back.
   path. Expert-parallel MoE throws `NotSupportedException` for up-scaled experts rather than routing
   garbage, because `MoEFFNPrefill` has no per-expert scale hook and building EP shards removes the
   per-expert weights the fallback needs.
-- **Tensor parallelism is refused for Super VL and Bolt.** Both ship `.scale` sidecars, and `--tp` is
-  refused for such a GGUF unless the family sets `SupportsTensorParallelWeightScales`, which Nemotron does
-  not. The TP router now folds the per-expert NVFP4 down scale into the routing weights like the
-  single-device paths (so the TP MoE math is complete), but per-tensor scales on the TP linears are not
-  audited and no TP run has validated the family, so the opt-in stays off. The per-block (Bolt) TP check
-  in `InitPerLayerMoEConfig` is therefore unreachable today.
-- **Super VL needs a GPU with more than ~73 GB.** With `--tp` refused there is no way to split it across
-  smaller cards, and `NemotronModel` logs `--n-cpu-moe` but still preloads every expert to the GPU (as
-  `main` did). On a 48 GB card it runs on `ggml_cpu` only.
+- **Tensor parallelism (G7, below) is implemented but has not run.** Nothing here has a GPU; see G7 for
+  what changed and the DGX Spark test plan.
+- **Super VL on a single GPU still needs more than ~73 GB.** `NemotronModel` logs `--n-cpu-moe` but still
+  preloads every expert to the GPU (as `main` did); on a 48 GB card it runs on `ggml_cpu`, or split it with
+  `--tp` across GPUs/nodes (G7).
 - **Vision (G5)** -- Bolt's split projections are covered by a synthetic parity test only; no Bolt image
   has been encoded end-to-end here.
 - **Direct `cuda` prefill attention changed.** Every Nemotron prefill on the direct `cuda` backend now goes

@@ -4133,6 +4133,11 @@ namespace TensorSharp.GGML
         /// Per-expert post-down-projection scales (Gemma 4's
         /// <c>ffn_down_exps.scale</c>) should be folded into
         /// <paramref name="routingWeights"/> by the caller before the call.
+        /// A scale on the projection BEFORE the activation cannot be folded that way
+        /// (Nemotron's NVFP4 up scale2: ReLU-squared would square the unscaled value
+        /// and overflow). Pass it as <paramref name="routeUpScales"/>, one multiplier
+        /// per route laid out like <paramref name="routingWeights"/>; only the
+        /// single-projection <see cref="MoEActivation.ReluSquared"/> takes it.
         /// </summary>
         public static unsafe void MoEFFNPrefill(
             Tensor hiddenIn,
@@ -4155,7 +4160,8 @@ namespace TensorSharp.GGML
             float oaiLimit = 7.0f,
             bool runOnCpu = false,
             float[] postExpertNorm = null,
-            float postExpertNormEps = 1e-8f)
+            float postExpertNormEps = 1e-8f,
+            float[] routeUpScales = null)
         {
             if (hiddenIn == null) throw new ArgumentNullException(nameof(hiddenIn));
             if (hiddenOut == null) throw new ArgumentNullException(nameof(hiddenOut));
@@ -4189,6 +4195,15 @@ namespace TensorSharp.GGML
                 throw new ArgumentException($"selectedExperts length {selectedExperts.Length} < seqLen*nUsed = {seqLen * nUsed}.");
             if (routingWeights.Length < seqLen * nUsed)
                 throw new ArgumentException($"routingWeights length {routingWeights.Length} < seqLen*nUsed = {seqLen * nUsed}.");
+            if (routeUpScales != null)
+            {
+                if (activation != MoEActivation.ReluSquared)
+                    throw new ArgumentException("routeUpScales is only defined for the single-projection ReLU-squared activation.", nameof(routeUpScales));
+                if (routeUpScales.Length < seqLen * nUsed)
+                    throw new ArgumentException($"routeUpScales length {routeUpScales.Length} < seqLen*nUsed = {seqLen * nUsed}.", nameof(routeUpScales));
+                if (postExpertNorm != null)
+                    throw new ArgumentException("routeUpScales cannot be combined with postExpertNorm.", nameof(routeUpScales));
+            }
 
             if (gateData == IntPtr.Zero || downData == IntPtr.Zero)
                 throw new ArgumentException("gate and down weight pointers must be non-null.");
@@ -4226,6 +4241,7 @@ namespace TensorSharp.GGML
             fixed (float* upBiasPtr = upBias)
             fixed (float* downBiasPtr = downBias)
             fixed (float* postExpertNormPtr = postExpertNorm)
+            fixed (float* routeUpScalesPtr = routeUpScales)
             {
                 GgmlNative.MoEFFNPrefillSwiGLUQuant(
                     hiddenInPtr, hiddenOutPtr, seqLen, hiddenDim, nFf,
@@ -4238,7 +4254,8 @@ namespace TensorSharp.GGML
                     upBias   != null ? (IntPtr)upBiasPtr   : IntPtr.Zero,
                     downBias != null ? (IntPtr)downBiasPtr : IntPtr.Zero,
                     activationType, oaiAlpha, oaiLimit, runOnCpu,
-                    (IntPtr)postExpertNormPtr, postExpertNormEps);
+                    (IntPtr)postExpertNormPtr, postExpertNormEps,
+                    (IntPtr)routeUpScalesPtr);
             }
         }
 

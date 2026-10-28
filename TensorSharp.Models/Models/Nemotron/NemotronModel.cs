@@ -307,6 +307,15 @@ namespace TensorSharp.Models
         {
             if (_visionEncoder == null || DisableMultimodalWarmup)
                 return;
+            // Across nodes every forward is a collective, and only the nodes that were
+            // given the mmproj would run this one: the others would never join its
+            // AllReduces. Image prompts do not need it (ForwardTP syncs the injected
+            // embedding rows from the driver), so the warm-up is skipped.
+            if (TpNodeCount > 1)
+            {
+                Console.WriteLine("  Nemotron multimodal warmup skipped: tensor parallelism spans nodes.");
+                return;
+            }
 
             Tensor tileEmbeddings = null;
             Tensor warmupEmbeddings = null;
@@ -521,11 +530,16 @@ namespace TensorSharp.Models
                     _quantWeights.TryGetValue(kName, out var kw) &&
                     _quantWeights.TryGetValue(vName, out var vw) &&
                     qw.GgmlType == kw.GgmlType && kw.GgmlType == vw.GgmlType &&
-                    qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
+                    qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0 &&
+                    // One fused tensor carries one per-tensor scale (NVFP4 scale2): Q, K
+                    // and V with different ones stay separate, and the TP path builds
+                    // each rank's [Q|K|V] slice from them (ShardSeparateColumnParallel).
+                    qw.Scale == kw.Scale && kw.Scale == vw.Scale)
                 {
                     if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, qw, kw, vw))
                         continue;
 
+                    fusedWeight.Scale = qw.Scale;
                     _quantWeights[qkvName] = fusedWeight;
                     _quantWeights.Remove(qName); qw.Dispose();
                     _quantWeights.Remove(kName); kw.Dispose();
@@ -832,10 +846,6 @@ namespace TensorSharp.Models
             _hasPerLayerMoEConfig = config.Varied;
             if (_numExperts <= 0)
                 return;
-
-            if (config.Varied && IsTensorParallel)
-                throw new NotSupportedException(
-                    "Nemotron per-block MoE configuration (Nemotron Puzzle/Bolt) is not yet supported under tensor parallelism.");
 
             // Grow the global backing sizes to the observed maximum so the pre-allocated
             // routing buffers (_moeProbs/_moeTopExperts/pointer tables) always fit every
@@ -1380,6 +1390,17 @@ namespace TensorSharp.Models
         }
 
         public override bool SupportsKVCacheTruncation => false;
+
+        /// <summary>
+        /// The Nemotron TP path applies NVFP4 per-tensor scales (<c>.scale</c> sidecars):
+        /// attention QKV/output go through the TP linears, which carry each shard's
+        /// scale (<see cref="ModelBase.TpApplyNamedWeightScale"/>); Mamba2, the router,
+        /// the latent projections, the shared expert and the LM head run replicated
+        /// through <see cref="ModelBase.LinearForward"/>, which applies it; the routed
+        /// experts' per-expert scale2 is applied before ReLU^2 (up) and on the routing
+        /// weight (down) on every TP expert path.
+        /// </summary>
+        protected override bool SupportsTensorParallelWeightScales => true;
 
         // Per-block snapshot for Nemotron-H (mix of attention, Mamba2 SSM, and
         // FFN-only layers). Each block bundles:

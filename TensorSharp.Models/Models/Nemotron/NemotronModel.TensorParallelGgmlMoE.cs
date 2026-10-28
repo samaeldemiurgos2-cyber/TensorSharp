@@ -32,6 +32,13 @@
 //
 // The shared expert is deliberately NOT touched here: it stays replicated on rank 0
 // and is added by NemotronMoEBlockTP after the AllReduce, exactly as before.
+//
+// Nemotron 3.5 Super VL and Bolt run their experts in a 1024-wide latent space
+// (ffn_latent_in -> experts -> ffn_latent_out): the experts then read and write the
+// latent vector, which NemotronMoEBlockTP projects once and hands every rank. Bolt
+// also gives each MoE block its own expert count and top-k, so the partition is per
+// layer. Super VL's NVFP4 experts carry a per-expert up scale2 that has to be applied
+// before ReLU^2; it goes to the kernel as one multiplier per route.
 // ============================================================================
 using System;
 using System.Diagnostics;
@@ -45,7 +52,8 @@ namespace TensorSharp.Models
         // Per-rank slices of the stacked expert weights, [layer][local rank].
         private StackedExpertWeights[][] _tpStackedUp;
         private StackedExpertWeights[][] _tpStackedDown;
-        private int _tpExpertsPerRank;
+        // Experts each rank owns on a layer (a block's expert count / global TP degree).
+        private int[] _tpExpertsPerRank;
 
         /// <summary>
         /// True when the routed experts are partitioned by whole expert rather than
@@ -58,19 +66,23 @@ namespace TensorSharp.Models
         /// Deliberately shape-based rather than reading <c>_moeLayerInfo</c>: this
         /// runs during sharding, which happens BEFORE InitLayerInfo populates that.
         /// </summary>
-        private bool CanUseNemotronExpertParallelMoE()
+        private bool CanUseNemotronExpertParallelMoE() => DescribeNemotronExpertParallelRefusal() == null;
+
+        /// <summary>
+        /// Why the routed experts cannot be partitioned by whole expert, or null when they
+        /// can. Per layer, because Bolt gives each MoE block its own expert count and top-k:
+        /// every rank must own a whole share of each layer's experts, and at least as many
+        /// as that layer routes a token to (an absent route is pointed at an unused LOCAL
+        /// expert with weight 0, so a spare must exist). The experts read and write either
+        /// the hidden vector or, for a latent MoE, the latent one.
+        /// </summary>
+        private string DescribeNemotronExpertParallelRefusal()
         {
             int tp = GlobalTpDegree;
-            if (!IsGgmlBackend || _numExperts <= 0 || _numExpertsUsed <= 0 || tp <= 1)
-                return false;
-            if ((_numExperts % tp) != 0)
-                return false;
-            // A route owned by another rank is neutralised by pointing it at an
-            // unused LOCAL expert id, which requires there to be a spare one.
-            if (_numExperts / tp < _numExpertsUsed)
-                return false;
-            if (_layerTypes == null || _stackedExpertWeights == null)
-                return false;
+            if (!IsGgmlBackend) return "expert parallelism runs on the GGML backends";
+            if (_numExperts <= 0 || tp <= 1) return "the model has no routed experts to partition";
+            if (_layerTypes == null || _stackedExpertWeights == null || _numExpertsPerLayer == null)
+                return "the stacked expert weights are not available";
 
             int hiddenSize = Config.HiddenSize;
             bool sawLayer = false;
@@ -78,27 +90,47 @@ namespace TensorSharp.Models
             {
                 if (_layerTypes[l] != LayerType.FFN)
                     continue;
-                if (!_stackedExpertWeights.TryGetValue($"blk.{l}.ffn_up_exps.weight", out var up) || up == null)
-                    return false;
-                if (!_stackedExpertWeights.TryGetValue($"blk.{l}.ffn_down_exps.weight", out var down) || down == null)
-                    return false;
-                if (up.NumExperts != _numExperts || down.NumExperts != _numExperts)
-                    return false;
-                // A latent-space MoE feeds the experts a projected vector that
-                // NemotronMoEBlockTP computes ONCE on rank 0, which the per-rank kernel
-                // below could not consume. Exclude it by NAME rather than inferring it
-                // from the expert width, so a checkpoint whose latentDim happens to
-                // equal hiddenSize cannot slip through.
-                if (_quantWeights.ContainsKey($"blk.{l}.ffn_latent_in.weight")
-                    || _weights.ContainsKey($"blk.{l}.ffn_latent_in.weight"))
-                    return false;
-                if (up.PerExpertNe0 != hiddenSize || down.PerExpertNe1 != hiddenSize)
-                    return false;
+                int experts = _numExpertsPerLayer[l];
+                int used = _numExpertsUsedPerLayer[l];
+                if (experts <= 0 || used <= 0)
+                    continue;
+                if (experts % tp != 0)
+                    return $"layer {l} has {experts} experts, not divisible by {tp} ranks";
+                if (experts / tp < used)
+                    return $"layer {l} routes to {used} experts but a rank would own only {experts / tp}";
+                if (!_stackedExpertWeights.TryGetValue($"blk.{l}.ffn_up_exps.weight", out var up) || up == null
+                    || !_stackedExpertWeights.TryGetValue($"blk.{l}.ffn_down_exps.weight", out var down) || down == null)
+                    return $"layer {l} has no stacked ffn_up_exps/ffn_down_exps";
+                if (up.NumExperts != experts || down.NumExperts != experts)
+                    return $"layer {l} stacks {up.NumExperts}/{down.NumExperts} experts, expected {experts}";
+                // The experts' input and output width: hidden, or the latent width for a
+                // latent MoE. Named by weight rather than inferred from the expert shape,
+                // so a checkpoint whose latent width happens to equal hidden still reads
+                // the latent vector.
+                int expertDim = NemotronExpertDimForSharding(l, hiddenSize);
+                if (up.PerExpertNe0 != expertDim || down.PerExpertNe1 != expertDim)
+                    return $"layer {l} experts are [{up.PerExpertNe0} -> {down.PerExpertNe1}], expected {expertDim}";
                 if (up.PerExpertNe1 != down.PerExpertNe0)
-                    return false;
+                    return $"layer {l} expert widths disagree ({up.PerExpertNe1} vs {down.PerExpertNe0})";
                 sawLayer = true;
             }
-            return sawLayer;
+            return sawLayer ? null : "no MoE layer has stacked experts";
+        }
+
+        /// <summary>
+        /// Width the routed experts of <paramref name="layer"/> read and write: the latent
+        /// width when the layer has an ffn_latent_in projection, else hidden. Runs during
+        /// sharding, before InitLayerInfo fills <c>_moeLayerInfo</c>, so it reads the
+        /// weights directly.
+        /// </summary>
+        private int NemotronExpertDimForSharding(int layer, int hiddenSize)
+        {
+            string latentIn = $"blk.{layer}.ffn_latent_in.weight";
+            if (_quantWeights.TryGetValue(latentIn, out var q) && q != null)
+                return (int)q.Ne1;
+            if (_weights.TryGetValue(latentIn, out var w) && w != null)
+                return (int)w.Sizes[0];
+            return hiddenSize;
         }
 
         /// <summary>
@@ -112,22 +144,32 @@ namespace TensorSharp.Models
         /// </summary>
         private bool BuildNemotronExpertParallelShards()
         {
-            if (!CanUseNemotronExpertParallelMoE())
+            string refusal = DescribeNemotronExpertParallelRefusal();
+            if (refusal != null)
+            {
+                if (IsGgmlBackend && _numExperts > 0)
+                    Console.WriteLine($"  Nemotron MoE: per-expert tensor parallelism ({refusal}).");
                 return false;
+            }
 
             int globalTp = GlobalTpDegree;
             int localTp = TpDegree;
             int rankOffset = TpRankOffset;
-            int perRank = _numExperts / globalTp;
             int n = Config.NumLayers;
 
             var up = new StackedExpertWeights[n][];
             var down = new StackedExpertWeights[n][];
+            var perRankByLayer = new int[n];
+            int minPerRank = int.MaxValue, maxPerRank = 0;
 
             for (int layer = 0; layer < n; layer++)
             {
-                if (_layerTypes[layer] != LayerType.FFN)
+                if (_layerTypes[layer] != LayerType.FFN || _numExpertsPerLayer[layer] <= 0)
                     continue;
+                int perRank = _numExpertsPerLayer[layer] / globalTp;
+                perRankByLayer[layer] = perRank;
+                minPerRank = Math.Min(minPerRank, perRank);
+                maxPerRank = Math.Max(maxPerRank, perRank);
 
                 var srcUp = _stackedExpertWeights[$"blk.{layer}.ffn_up_exps.weight"];
                 var srcDown = _stackedExpertWeights[$"blk.{layer}.ffn_down_exps.weight"];
@@ -144,10 +186,11 @@ namespace TensorSharp.Models
 
             _tpStackedUp = up;
             _tpStackedDown = down;
-            _tpExpertsPerRank = perRank;
+            _tpExpertsPerRank = perRankByLayer;
 
+            string share = minPerRank == maxPerRank ? $"{minPerRank}" : $"{minPerRank}-{maxPerRank}";
             Console.WriteLine(
-                $"  Nemotron MoE: expert-parallel across {globalTp} GPU(s), {perRank} of {_numExperts} experts per GPU "
+                $"  Nemotron MoE: expert-parallel across {globalTp} GPU(s), {share} experts per GPU per layer "
                 + "(one batched ggml_mul_mat_id dispatch per projection per layer).");
             return true;
         }
@@ -269,33 +312,90 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// One rank's dense route table for the expert-parallel kernel, which takes a
+        /// fixed <paramref name="nUsed"/> routes per token. A route to one of this rank's
+        /// experts (<paramref name="first"/> .. first + perRank) keeps its weight, as a
+        /// local id. A route owned by another rank still occupies its slot: it gets weight
+        /// 0 and a DISTINCT unused local id. Real top-k routing never repeats an expert
+        /// within a token and the batched kernel's per-expert gather/scatter relies on
+        /// that - the id list is collapsed per token while the slot count is not, so a
+        /// duplicate MISPLACES rows rather than being harmlessly ignored. perRank &gt;=
+        /// nUsed (checked at load) guarantees a free id exists.
+        ///
+        /// With <paramref name="upScale"/> (per global expert), every route - owned or
+        /// neutralised - takes the up scale of the expert it actually runs: a weight-0 route
+        /// left unscaled would square an un-normalised NVFP4 projection, which can overflow,
+        /// and Inf * 0 is NaN.
+        /// </summary>
+        internal static void BuildExpertParallelRoutes(
+            int[] selectedExperts, float[] routeWeights, int seqLen, int nUsed, int first, int perRank,
+            float[] upScale, out int[] ids, out float[] weights, out float[] upScales)
+        {
+            int totalRoutes = seqLen * nUsed;
+            int last = first + perRank;
+            ids = new int[totalRoutes];
+            weights = new float[totalRoutes];
+            var taken = new bool[perRank];
+
+            for (int s = 0; s < seqLen; s++)
+            {
+                int baseIdx = s * nUsed;
+                Array.Clear(taken, 0, perRank);
+
+                // Own routes first, so the filler pass can see which local experts
+                // this token already uses.
+                for (int k = 0; k < nUsed; k++)
+                {
+                    int i = baseIdx + k;
+                    int e = selectedExperts[i];
+                    if (e >= first && e < last)
+                    {
+                        int local = e - first;
+                        ids[i] = local;
+                        taken[local] = true;
+                        weights[i] = routeWeights[i];
+                    }
+                    else
+                    {
+                        ids[i] = -1;
+                        weights[i] = 0f;
+                    }
+                }
+
+                int probe = 0;
+                for (int k = 0; k < nUsed; k++)
+                {
+                    int i = baseIdx + k;
+                    if (ids[i] >= 0) continue;
+                    while (probe < perRank && taken[probe]) probe++;
+                    if (probe < perRank) { taken[probe] = true; ids[i] = probe; }
+                    else ids[i] = 0;
+                }
+            }
+
+            upScales = null;
+            if (upScale != null)
+            {
+                upScales = new float[totalRoutes];
+                for (int i = 0; i < totalRoutes; i++)
+                    upScales[i] = upScale[first + ids[i]];
+            }
+        }
+
+        /// <summary>
         /// Run one MoE layer expert-parallel: each rank dispatches the batched
         /// <c>ggml_mul_mat_id</c> kernel over the experts it owns. Every rank's result
         /// is a PARTIAL that the caller's AllReduce completes. Returns null when this
         /// model is not on the expert-parallel path.
         /// </summary>
+        /// <param name="expertInputs">Per rank: the [seqLen, expertDim] vector the experts read
+        /// (the normed hidden state, or the latent projection of it).</param>
         private Tensor[] TryNemotronMoEExpertParallel(
-            int layer, int seqLen, int expertOutDim, Tensor[] normed,
+            int layer, int seqLen, int expertDim, Tensor[] expertInputs,
             int[] selectedExperts, float[] routeWeightsAll)
         {
             if (!UsesExpertParallelMoE)
                 return null;
-
-            // MoEFFNPrefill applies ReLU^2 inside the kernel and takes no per-expert
-            // scale array, so an NVFP4 up scale cannot be applied before the squaring -
-            // deferring it overflows to +Inf and then NaN (see InitExpertScales). The
-            // per-expert fallback that could apply it is unavailable here, because
-            // building EP shards removes the per-expert weights. Refuse loudly rather
-            // than route garbage.
-            if (HasExpertUpScale(layer))
-            {
-                throw new NotSupportedException(
-                    $"Nemotron expert-parallel MoE cannot serve layer {layer}: its experts carry NVFP4 " +
-                    "scale2 sidecars whose up-projection scale must be applied before the ReLU^2 activation, " +
-                    "and MoEFFNPrefill has no per-expert pre-activation scale hook. Run without expert-parallel " +
-                    "MoE (the per-expert tensor-parallel path applies the scale correctly), or use a GGUF whose " +
-                    "expert scales are folded into the quantized blocks.");
-            }
 
             var upShards = _tpStackedUp[layer];
             var downShards = _tpStackedDown[layer];
@@ -304,82 +404,38 @@ namespace TensorSharp.Models
 
             int tp = TpDegree;
             int rankOffset = TpRankOffset;
-            int hiddenSize = Config.HiddenSize;
-            int nUsed = _numExpertsUsed;
-            int perRank = _tpExpertsPerRank;
+            int nUsed = _numExpertsUsedPerLayer[layer];
+            int perRank = _tpExpertsPerRank[layer];
             int intermediate = (int)upShards[0].PerExpertNe1;
 
             // BuildNemotronExpertParallelShards already proved these at load time, and
             // it removed the per-expert shards the fallback would need. So a mismatch
             // here is a bug, not a shape this model can serve another way - say so
             // instead of failing later with a confusing missing-weight lookup.
-            if (expertOutDim != hiddenSize)
+            if (expertDim != upShards[0].PerExpertNe0 || expertDim != downShards[0].PerExpertNe1)
             {
                 throw new InvalidOperationException(
-                    $"Nemotron expert-parallel MoE expects the routed output to be hidden-sized "
-                    + $"({hiddenSize}), got {expertOutDim}. The per-expert shards were not built, "
-                    + "so there is no fallback.");
+                    $"Nemotron expert-parallel MoE layer {layer}: the experts read and write "
+                    + $"{upShards[0].PerExpertNe0}/{downShards[0].PerExpertNe1}-wide vectors, got {expertDim}. "
+                    + "The per-expert shards were not built, so there is no fallback.");
             }
+
+            // NVFP4 experts (Super VL): the up scale2 must multiply the up projection
+            // BEFORE ReLU^2 (see InitExpertScales), so it goes to the kernel per route.
+            float[] layerUpScale = HasExpertUpScale(layer) ? _layerExpertUpScale[layer] : null;
 
             // Per-rank dense route table, built on the calling thread: the rank
             // workers below must not race on shared scratch.
-            int totalRoutes = seqLen * nUsed;
             var localExperts = new int[tp][];
             var localWeights = new float[tp][];
+            var localUpScales = layerUpScale != null ? new float[tp][] : null;
             for (int r = 0; r < tp; r++)
             {
-                int first = (rankOffset + r) * perRank;
-                int last = first + perRank;
-                var ids = new int[totalRoutes];
-                var wts = new float[totalRoutes];
-                var taken = new bool[perRank];
-
-                for (int s = 0; s < seqLen; s++)
-                {
-                    int baseIdx = s * nUsed;
-                    Array.Clear(taken, 0, perRank);
-
-                    // Own routes first, so the filler pass can see which local experts
-                    // this token already uses.
-                    for (int k = 0; k < nUsed; k++)
-                    {
-                        int i = baseIdx + k;
-                        int e = selectedExperts[i];
-                        if (e >= first && e < last)
-                        {
-                            int local = e - first;
-                            ids[i] = local;
-                            taken[local] = true;
-                            wts[i] = routeWeightsAll[i];
-                        }
-                        else
-                        {
-                            ids[i] = -1;
-                            wts[i] = 0f;
-                        }
-                    }
-
-                    // A route owned by another rank still occupies a slot in the dense
-                    // table; it is neutralised with weight 0. It must still get a
-                    // DISTINCT local expert id: real top-k routing never repeats an
-                    // expert within a token and the batched kernel's per-expert
-                    // gather/scatter relies on that: the id list is collapsed per token
-                    // while the slot count is not, so a duplicate MISPLACES rows rather
-                    // than being harmlessly ignored. perRank >= nUsed (checked at load)
-                    // guarantees a free id exists.
-                    int probe = 0;
-                    for (int k = 0; k < nUsed; k++)
-                    {
-                        int i = baseIdx + k;
-                        if (ids[i] >= 0) continue;
-                        while (probe < perRank && taken[probe]) probe++;
-                        if (probe < perRank) { taken[probe] = true; ids[i] = probe; }
-                        else ids[i] = 0;
-                    }
-                }
-
-                localExperts[r] = ids;
-                localWeights[r] = wts;
+                BuildExpertParallelRoutes(selectedExperts, routeWeightsAll, seqLen, nUsed,
+                    (rankOffset + r) * perRank, perRank, layerUpScale,
+                    out localExperts[r], out localWeights[r], out float[] scales);
+                if (localUpScales != null)
+                    localUpScales[r] = scales;
             }
 
             var results = new Tensor[tp];
@@ -388,14 +444,14 @@ namespace TensorSharp.Models
             long t0 = Stopwatch.GetTimestamp();
             _tpGroup.RunPerRank(r =>
             {
-                var output = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, seqLen, hiddenSize);
+                var output = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, seqLen, expertDim);
                 var u = upShards[r];
                 var d = downShards[r];
                 try
                 {
                     GgmlBasicOps.MoEFFNPrefill(
-                        normed[r], output,
-                        seqLen, hiddenSize, intermediate, perRank, nUsed,
+                        expertInputs[r], output,
+                        seqLen, expertDim, intermediate, perRank, nUsed,
                         localExperts[r], localWeights[r],
                         // ReLU^2 is a SINGLE projection: it goes in the gate slot and
                         // the up slot stays null.
@@ -404,7 +460,8 @@ namespace TensorSharp.Models
                         d.Data, d.GgmlType, d.PerExpertNe0, d.PerExpertNe1, d.TotalRawBytes,
                         gateBias: null, upBias: null, downBias: null,
                         activation: GgmlBasicOps.MoEActivation.ReluSquared,
-                        runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
+                        runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer),
+                        routeUpScales: localUpScales?[r]);
                     InvalidateTensorDeviceCache(output);
                     results[r] = output;
                 }
