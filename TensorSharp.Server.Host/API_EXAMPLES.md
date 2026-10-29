@@ -113,6 +113,7 @@ imports, collection rename, filters and safe previews.
 | Agent Skills | Skill directories: the `skills` folder beside the binary (where skills uploaded through `POST /api/skills` are installed; scanned first, so its skills win a name clash), then `--skills-dir` (by default, every existing `.agents/skills` from the working directory up to the Git root, nearest first), listed at `/v1/skills` and `/api/skills` and installable as a `.zip` through `POST /api/skills`. Selected per request with `"skills": [...]` on every chat endpoint. On families with both declaration and output-parser support, including Qwen 3.8 Flash Next (`qwen4exp`), the model's own skill calls are answered inside the server, so clients receive a finished completion. Families without usable tool support receive selected skill instructions inline instead. `skills_run` is off unless the server starts with `--skills-allow-exec`. |
 | Agentic code execution | `--code-exec` adds the in-process `shell`, `read_file`, `write_file`, and `apply_patch` tools on tool-capable model families. Web UI keeps one workspace per chat session; each OpenAI/Ollama HTTP request gets a private workspace across its internal rounds and the server deletes it after the response. Network and package installation are separate, off-by-default permissions. |
 | Sub-agents | On by default on `/v1/chat/completions`, `/v1/responses`, `/api/chat/ollama` and Web UI `/api/chat` for families that render tool declarations and have a tool parser (not Mistral 3, Hunyuan Dense or DiffusionGemma). The model may call `spawn_agent`, `wait_agent`, `send_input`, `close_agent` and `list_agents`; the server runs the children in process on the same loaded model; `explorer` and `reviewer` children are read-only, and a `worker` gets the parent's mutable tools only when the server starts with `--agents-allow-worker-tools`. `--no-multi-agent` disables delegation for the server and `"multi_agent": false` for one request. See [Sub-agents](#sub-agents-multi_agent). |
+| Text-LoRA adapters | Loaded from `--loras-dir` only (every top-level adapter at startup, more through `POST /v1/loras`; 403 without the directory), at most 32 at once, and chosen per request with `"lora"` on `/v1/chat/completions` and `/v1/responses` (`nemotron_h`, `mistral3`, `hunyuan-dense` on one device; anything else is a 400). See [Text-model LoRA adapters](#text-model-lora-adapters-lora-v1loras). |
 | Structured outputs | OpenAI `response_format` supports `text`, `json_object`, and `json_schema`, which `/v1/chat/completions` enforces with a JSON grammar during decoding; `response_format` (`json_object` / `json_schema`) cannot be combined with `tools`, and combines with `think` only on families that declare where reasoning ends (GPT-OSS, DeepSeek V4.1, Qwen 3.8 Flash Next, GLM-5.3-Flash, Gemma 4, Nemotron-H, Muse-Glimmer, Muse Spark) |
 
 > **Network safety:** the server listens on `0.0.0.0:5000` and has no API-key
@@ -1085,6 +1086,124 @@ admitted; requests run one at a time. Image bytes are stored
 under the upload limits, so they can also answer 413 or 507. The
 [Jev guide](../docs/models/jev.md) covers the probability semantics, image
 input, `TS_JEV_MAX_CANVAS` chunking and validation.
+
+### Text-model LoRA adapters (`lora`, `/v1/loras`)
+
+A loaded text-LoRA adapter is chosen per request with `"lora": "<name>"` on
+`/v1/chat/completions` or `/v1/responses`. It applies to that request only;
+omitted, `null` or `"none"` is the base model. Only the `nemotron_h`,
+`mistral3` and `hunyuan-dense` families on a single device apply adapters, with
+the `cpu`, `ggml_cpu`, `ggml_cuda` or `cuda` backend (Nemotron on every
+projection outside the routed experts: Mamba2 `ssm_in`/`ssm_out`, attention
+q/k/v/output, dense `ffn_up`/`ffn_down`, the shared experts, the latent
+`ffn_latent_down`/`ffn_latent_up`, the router and the LM head). Any other model,
+backend or multi-GPU mode, an unknown name, or an adapter with a module the
+loaded model cannot apply (such as a routed expert, `*_exps`) gets a 400 before
+any streamed output; an adapter is never applied in part.
+
+Adapters are files in the operator's LoRA directory, `--loras-dir <dir>` (or
+`TS_LORAS_DIR`), in either of two forms. Both name each target after the base
+GGUF's tensor with a `.lora_a` / `.lora_b` suffix (for example
+`blk.0.attn_q.weight.lora_a` `[rank, in]` and `blk.0.attn_q.weight.lora_b`
+`[out, rank]`); TensorSharp resolves `attn_q/k/v` and `ffn_gate/up` to the
+projections it fuses at load.
+
+- A llama.cpp GGUF adapter (`.gguf`), as `convert_lora_to_gguf.py` writes it:
+  `general.type = adapter`, `adapter.type = lora`, alpha from
+  `adapter.lora.alpha` (a FLOAT32 value, as llama.cpp reads it; any other type is
+  refused), F32/F16/BF16/Q8_0 factors. Its `general.architecture` must
+  match the loaded model, or the base GGUF's own label as in llama.cpp (so a `llama`
+  adapter fits a Mistral 3 base whose GGUF says `llama`).
+- A `.safetensors` file, with `r` and `lora_alpha` (and `use_rslora`) from an
+  `adapter_config.json` beside it, or from the safetensors metadata keys `rank` /
+  `alpha`.
+
+In either form an alpha of 0, or none, means scale 1, with or without `use_rslora`,
+which is how llama.cpp reads `adapter.lora.alpha`; the adapter is then listed with
+`alpha` equal to `r`.
+
+A PEFT adapter as trained (`adapter_model.safetensors`, tensors named
+`base_model.model...lora_A.weight`) is refused with a pointer to llama.cpp's
+converter: `python convert_lora_to_gguf.py <peft_adapter_dir> --base <hf_base_model_dir>`
+writes the `.gguf` to use. So are DoRA, `fan_in_fan_out`, `alpha_pattern`,
+`rank_pattern`, `modules_to_save`, `trainable_token_indices`, trained biases (`bias`
+other than `"none"`, `lora_bias`), `layer_replication`, activated LoRA
+(`alora_invocation_tokens`, the older `invocation_string`, or `adapter.alora.*` in a
+GGUF), the PEFT LoRA variants (`kasa_config`, `arrow_config` or `use_bdlora` set to
+anything but null or false; `velora_config` and `monteclora_config` load, as PEFT applies
+both as plain LoRA at inference), an `init_lora_weights` that rewrites the base weights
+(`"pissa"`, `"pissa_niter_<N>"`, `"olora"`, `"corda"`, `"astra"`, `"loftq"`, `"lora_ga"`),
+whose adapter applies on top of the rewritten weights unless PEFT converted it on save
+(`save_pretrained(..., path_initial_model_for_weight_conversion=...)`, which LoftQ does not
+support), a `use_dora`, `use_rslora`, `fan_in_fan_out` or
+`lora_bias` that is not `true` or `false` (PEFT would read `1` or `"true"` as on), any
+tensor that is not a factor, an alpha that is negative or not a finite number (never
+replaced by the rank), and a factor that holds NaN or infinity or overflows once
+`alpha / r` and `scale` are folded in.
+
+Every adapter at the top level of the directory is loaded at startup, after the
+model, under its file name without the extension. A file that does not load is
+logged with the reason and skipped.
+
+```bash
+dotnet TensorSharp.Server.Host.dll --model mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf \
+  --backend ggml_cuda --loras-dir /srv/loras
+
+# Load one more from the directory at runtime. "path" is relative to --loras-dir
+# (an absolute path is accepted only inside it); "config" and "scale" are optional.
+curl -X POST http://localhost:5000/v1/loras \
+  -H "Content-Type: application/json" \
+  -d '{"name": "math-v2", "path": "math/math-v2.safetensors", "scale": 0.8}'
+# {"id":"math-v2","rank":16,"alpha":32,"modules":96,"summary":"lora math-v2: math-v2.safetensors (r=16, alpha=32, modules=96) config=adapter_config.json"}
+
+# List them; "in_flight" counts the requests running with each one right now, and
+# "applicable" says whether the loaded model can apply it ("reason" says why not).
+# GET /v1/models lists the same "applicable" / "reason" under "loras".
+curl http://localhost:5000/v1/loras
+
+# Use one for a single request
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf", "lora": "math-v2", "messages": [{"role": "user", "content": "Integrate x^2."}]}'
+
+# Unload it; requests already running with it finish with it
+curl -X DELETE http://localhost:5000/v1/loras/math-v2
+```
+
+`POST /v1/loras` loads (or, under a name already loaded, reloads) one adapter:
+
+| Field | Rule |
+|---|---|
+| `name` | 1-64 letters, digits, `.`, `_` or `-`, starting with a letter or digit; not `none` in any case |
+| `path` | An existing `.safetensors` or `.gguf` adapter inside `--loras-dir`, relative to it |
+| `config` | Optional `.json` file inside `--loras-dir`; without it an `adapter_config.json` beside the weights is used (a `.gguf` adapter carries its own alpha and reads none) |
+| `scale` | Optional finite number that multiplies `alpha / r` |
+
+Every error uses the OpenAI shape
+`{"error": {"message", "type", "param", "code"}}`, with `type`
+`"invalid_request_error"`, or `"server_error"` for a 5xx:
+
+| Status | When |
+|---|---|
+| 403 (`code: "lora_loading_disabled"`) | The server was started without `--loras-dir` / `TS_LORAS_DIR`. Earlier builds accepted any server path here. |
+| 400 (`param: "path"` or `"config"`) | The path does not name an existing file of the right type inside the directory. Missing, outside, `..`, a directory, or a link that leaves the directory all get the same message, so it does not reveal what exists on the server. |
+| 400 (`param: "path"`) | The file is there but does not load: `LoRA adapter '<path>' could not be loaded: <reason>`. The reason names tensors, dtypes, shapes or an alpha, or says the file is truncated or could not be read, and never includes a server path. A failure reading the file that nothing anticipated says only that. The full exception goes to the server log. |
+| 503 / 500 (`code: "lora_load_failed"`) | The load failed on the server's side: 503 when host or device memory ran out for the adapter's factors, whether reading the file or binding it to the loaded model; 500 when binding it failed in a way nothing anticipated (a model unloaded during the load, say). The message says only that, never the exception or a server path; the full exception goes to the server log. Nothing is registered. |
+| 400 (`code: "lora_not_applicable"`) | The adapter loads but the loaded model cannot apply all of it, a target the model does not have included (whatever its layer number); the same message, plus `unsupported_modules` (layers collapsed, e.g. `blk.{0-27}.attn_output.weight`; a layer number too large to collapse is listed as written). Nothing is registered. |
+| 400 (`param: "name"` / `"scale"`) | An invalid name, or a scale that is not a finite number |
+| 409 (`code: "lora_limit_reached"`) | 32 adapters are already loaded. Unload one first; reloading a loaded name is always allowed. |
+| 404 (`code: "lora_not_found"`) | `DELETE` of a name that is not loaded |
+
+A chat or responses request that names an adapter it cannot run with gets the
+same shape with `param: "lora"`: `code: "lora_not_found"` for a name that is not
+loaded, or `"lora_not_applicable"` with `unsupported_modules`. It is answered
+before any output, `"stream": true` included.
+
+The routes have no authentication, like the rest of the server. Keep the LoRA
+directory writable only by the operator: the checks follow links, but cannot see
+one swapped in between the check and the read, or a hard link. An embedding
+server (`--embeddings`) refuses `--loras-dir` and answers `POST /v1/loras` with
+its embedding-mode 400.
 
 ### Utilities
 
