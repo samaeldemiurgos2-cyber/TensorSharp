@@ -149,6 +149,8 @@ public static class ServerOptionsBuilder
         if (skillOptions.Enabled)
             skillOptions.ValidateRoots(createDefault: skillDirectoriesAreDefault);
 
+        string? loraDirectory = ResolveLoraDirectory(args, embeddingsEnabled);
+
         // TS_NO_WEBUI follows the TENSORSHARP_LOG_FILE convention: set to
         // anything but "0" counts as on.
         string? noWebUiEnv = Environment.GetEnvironmentVariable("TS_NO_WEBUI");
@@ -196,7 +198,54 @@ public static class ServerOptionsBuilder
             embeddingsEnabled: embeddingsEnabled,
             embeddingThreads: embeddingThreads,
             embeddingContextSize: embeddingContextSize,
-            multiAgent: ReadMultiAgentOptions(args));
+            multiAgent: ReadMultiAgentOptions(args),
+            loraDirectory: loraDirectory);
+    }
+
+    /// <summary>
+    /// The text-model LoRA adapter directory: the last <c>--loras-dir</c>, else
+    /// <c>TS_LORAS_DIR</c>, as a canonical absolute path; null when neither is set.
+    /// A path that is not an existing directory is a startup error naming its source,
+    /// like a missing <c>--skills-dir</c>. An embedding server hosts no text model, so
+    /// the flag is refused with <c>--embeddings</c> and the environment variable is
+    /// ignored there.
+    /// </summary>
+    private static string? ResolveLoraDirectory(string[] args, bool embeddingsEnabled)
+    {
+        string? configured = null;
+        for (int i = 0; i < args.Length; i++)
+            if (TryReadOption(args, ref i, TextLoraHostOptions.DirectoryFlag, out string? value))
+                configured = value;
+
+        if (configured != null && embeddingsEnabled)
+            throw new ArgumentException(
+                $"{TextLoraHostOptions.DirectoryFlag} does not apply to --embeddings: an embedding server hosts no text model to apply LoRA adapters to.");
+
+        string? raw = configured
+            ?? (embeddingsEnabled ? null : Environment.GetEnvironmentVariable(TextLoraHostOptions.EnvironmentVariable));
+        // An empty TS_LORAS_DIR means unset, like the other path variables; an empty
+        // --loras-dir value is a mistake and is reported below.
+        if (configured == null && string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        string? full = null;
+        if (!string.IsNullOrWhiteSpace(raw))
+        {
+            try
+            {
+                full = SkillPathGuard.NormalizeDirectory(Path.GetFullPath(raw.Trim()));
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                full = null;
+            }
+        }
+        if (full == null || !Directory.Exists(full))
+        {
+            string source = configured != null ? TextLoraHostOptions.DirectoryFlag : TextLoraHostOptions.EnvironmentVariable;
+            throw new ArgumentException($"Invalid value for {source}: '{raw}' is not an existing directory.");
+        }
+        return full;
     }
 
     private static readonly string[] AgentValueFlags =
@@ -1282,6 +1331,11 @@ public static class ServerOptionsBuilder
                 continue;
             }
 
+            // Text-model LoRA directory: the value is read and validated by
+            // ResolveLoraDirectory; this only lets it past the unknown-option trap.
+            if (TryReadOption(args, ref i, TextLoraHostOptions.DirectoryFlag, out _))
+                continue;
+
             if (TryReadOption(args, ref i, "--upload-ttl-hours", out string? uploadTtlOption))
             {
                 if (!double.TryParse(uploadTtlOption, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsedTtlHours)
@@ -1488,6 +1542,7 @@ public static class ServerOptionsBuilder
             SkillHostOptions.AllowScriptsFlag, SkillHostOptions.MaxRoundsFlag,
             SkillHostOptions.SandboxFlag, SkillHostOptions.AllowNetworkFlag,
             SkillHostOptions.SelectFlag, SkillHostOptions.ListFlag,
+            TextLoraHostOptions.DirectoryFlag,
             // Without these, a typo like --code-exe fell through to a bare
             // "Unknown option" with no hint, because CodeExecOptions.Parse does not
             // match a misspelling and nothing else knew the names.

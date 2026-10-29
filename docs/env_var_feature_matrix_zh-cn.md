@@ -456,6 +456,7 @@ TestMatrix 配置中 sweep。
 |---|---|---|---|---|---|
 | `TENSORSHARP_UPLOAD_DIR` | `TensorSharp.Server` | 上传媒体与抽取出的视频帧所在目录；不可变部署时设为应用目录之外的绝对路径 | 服务端二进制旁的 `uploads` | 未注册 | 否 |
 | `TS_UPLOAD_MAX_MB` / `TS_UPLOAD_QUOTA_MB` / `TS_UPLOAD_TTL_HOURS` | `TensorSharp.Server`（也可用 `--upload-max-mb`、`--upload-quota-mb`、`--upload-ttl-hours`） | 客户端上传的单文件上限（超过返回 HTTP 413）、上传目录的总预算（用尽时返回 HTTP 507），以及该目录中文件被删除前的存留时长。Jev 内联图片同样受这些限制约束 | `500` / 关 / 关 | 未注册 | 否 |
+| `TS_LORAS_DIR` | `TensorSharp.Server`（也可用 `--loras-dir`，命令行优先） | 文本模型 LoRA 适配器目录（llama.cpp 的 `.gguf` 适配器，或张量名为 `<tensor>.lora_a` / `.lora_b` 的 `.safetensors`）。顶层的每个适配器都在启动时、模型加载之后加载；`POST /v1/loras` 可以再加载，但只能从该目录内、以相对路径给出；最多同时保留 32 个。不是已存在目录的路径会导致启动失败。空值视为未设置；嵌入服务忽略它 | 未设置（没有适配器；`POST /v1/loras` 返回 403） | 未注册 | 否 |
 | `TENSORSHARP_PREFIX_CACHE_DIR` | `TensorSharp.Server` | 共享前缀检查点文件的根目录，使重启后不必再为共享提示做 prefill；每个模型有自己的 `<模型文件名>-<哈希>` 子目录，最多两个文件。`--no-prefix-cache` 关闭持久化。TensorAgent 把自己的检查点放在应用缓存目录下；CLI 只在内存中保留检查点 | 服务端二进制旁的 `prefix-cache` | 未注册 | 否 |
 | `TS_NO_MULTI_AGENT` | `TensorSharp.Server` 聊天端点 | 取 `0` 以外的任何值都会关闭子代理委派，等同 `--no-multi-agent` | 未设置（委派开启） | 未注册 | 否 |
 | `TS_JEV_MAX_BODY_MB` / `TS_JEV_MAX_CANVAS` / `TS_JEV_MAX_PENDING` | `POST /v1/systemone`（Jev，DiffusionGemma） | 请求体上限（MiB，1-64）、每个问题分块的答案 canvas 宽度（token，8-4096，同时受检查点限制），以及同时可接纳的请求数（1-1024），超出后端点返回 HTTP 529。超出范围的值会报错而不是被截断 | `8` / `64` / `32` | 未注册 | 否 |

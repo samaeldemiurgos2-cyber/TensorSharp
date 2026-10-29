@@ -11,8 +11,12 @@
 // the UMT5 tokenizer against ids produced by the HuggingFace reference
 // tokenizer (google/umt5-xxl via Wan-AI/Wan2.1-T2V-1.3B-Diffusers).
 using System;
+using System.Collections.Generic;
 using System.IO;
+using TensorSharp.Models;
+using TensorSharp.Models.Architecture;
 using TensorSharp.Models.WanVideo;
+using TensorSharp.Runtime;
 using Xunit;
 
 namespace InferenceWeb.Tests
@@ -195,6 +199,47 @@ namespace InferenceWeb.Tests
                 MakeFrame(8, 8, i => (i % 31) / 31f), MakeFrame(8, 8, _ => 0f),
             };
             WanVideoPipeline.AssertFramesAreNotDegenerate(frames);
+        }
+
+        // ---- DiT GGUF probe ----------------------------------------------------
+
+        /// <summary>
+        /// The loader tells the Wan family apart by the DiT's 5-D patch embedding
+        /// [kw, kh, kd, ic, oc], so a GGUF reader held to ggml's four dimensions refused every
+        /// Wan DiT at probe time. A synthetic T2V DiT (ic 16) resolves to the wan architecture,
+        /// passes the model's own 5-D check and stops only at its missing companion files.
+        /// </summary>
+        [Fact]
+        public void DiTWithAFiveDimensionalPatchEmbedding_GetsPastTheProbeToItsCompanions()
+        {
+            using var env = new EnvScope();
+            foreach (string name in new[] { "TS_VIDEO_VAE", "TS_VIDEO_TEXT_ENCODER", "TS_VIDEO_DIT2" })
+                env.Set(name, null);
+            // Nested, so the companion search (the DiT's directory and its parent) stays in it.
+            string root = Directory.CreateTempSubdirectory("ts-wan-probe-").FullName;
+            string path = Path.Combine(Directory.CreateDirectory(Path.Combine(root, "dit")).FullName, "wan2.1-t2v.gguf");
+            try
+            {
+                SyntheticGguf.Write(path,
+                    new List<SyntheticGguf.Kv> { new SyntheticGguf.Str { Key = "general.architecture", V = "wan" } },
+                    new List<SyntheticGguf.Tensor> { SyntheticGguf.Gen("patch_embedding.weight", 0.1f, 2, 2, 1, 16, 8) });
+
+                using (var probe = new GgufFile(path))
+                {
+                    Assert.Equal("wan", ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe).Id);
+                    Assert.Equal(new ulong[] { 2, 2, 1, 16, 8 }, probe.Tensors["patch_embedding.weight"].Shape);
+                }
+                var ex = Assert.Throws<FileNotFoundException>(() => ModelBase.Create(path, BackendType.Cpu));
+                Assert.Contains("needs companion models", ex.Message);
+                Assert.Contains("wan_2.1_vae.safetensors", ex.Message);
+            }
+            finally
+            {
+                // The constructor that threw never disposed the DiT it opened; let its stream close.
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                try { Directory.Delete(root, recursive: true); } catch { /* best effort */ }
+            }
         }
 
         // ---- step-distilled checkpoint detection -------------------------------

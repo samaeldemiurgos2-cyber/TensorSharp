@@ -450,6 +450,16 @@ namespace TensorSharp.Models
                                         (IntPtr)(srcBase + (long)(srcStart + row) * rowBytes),
                                         (IntPtr)dstRowPtr,
                                         inDim);
+                                    // The sources keep their own per-tensor sidecar scales,
+                                    // but the pack has one name and so one recorded scale.
+                                    // Bake each source's into its rows here. Skipped at 1 so
+                                    // unscaled (UD / MXFP4 / Q*) packs stay bit-identical.
+                                    if (qw.Scale != 1.0f)
+                                    {
+                                        float sourceScale = qw.Scale;
+                                        for (int i = 0; i < inDim; i++)
+                                            dstRowPtr[i] *= sourceScale;
+                                    }
                                 }
                                 else
                                 {
@@ -478,8 +488,9 @@ namespace TensorSharp.Models
                     shards[r] = shard;
             }
 
-            // This pack is built from several sources; the F32 fallback already
-            // baked each source's scale into its rows, so record nothing here.
+            // This pack is built from several sources and every source's scale is
+            // already baked into its rows above (Q8_0 and F32 alike), so record
+            // nothing here: a recorded scale would apply a second time.
             if (requantize)
                 _tpQuantWeights[fusedName] = quantShards;
             else
@@ -847,6 +858,9 @@ namespace TensorSharp.Models
                 int seqLen = (int)inputs[0].Sizes[0];
                 if (TryTpFusedQuantLinear(inputs, qShards, partials, seqLen, allReduce: true))
                 {
+                    // The fused multi-rank linear returns here without touching the
+                    // method's normal exit, so it needs the scale applied too.
+                    TpApplyNamedWeightScale(partials, weightName);
                     _linearTicks += Stopwatch.GetTimestamp() - t0;
                     for (int r = 1; r < tp; r++)
                         partials[r].Dispose();
@@ -882,6 +896,13 @@ namespace TensorSharp.Models
             }
 
             _linearTicks += Stopwatch.GetTimestamp() - t0;
+
+            // Same as TpRowParallelLinearAllRanks: a per-tensor scale distributes over
+            // the sum, so each partial is scaled before the AllReduce. A no-op unless
+            // the family opted into SupportsTensorParallelWeightScales and this weight
+            // carries a sidecar scale; without it an NVFP4 attn_output / ffn_down
+            // under --tp came out 1/scale2 too large.
+            TpApplyNamedWeightScale(partials, weightName);
 
             _tpGroup.AllReduce(partials);
 

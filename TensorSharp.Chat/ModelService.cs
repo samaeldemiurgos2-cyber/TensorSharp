@@ -83,48 +83,214 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// Loaded text-LoRA adapters, held independently of the base model so they can be
-        /// loaded and unloaded at runtime. Populated by the host's startup directory scan
-        /// and by the adapters that consume a <c>lora</c> request field.
+        /// loaded and unloaded at runtime. Written only through <see cref="RegisterLora"/> and
+        /// <see cref="UnloadLora"/>. In the server, <c>LoraAdapterDirectory.LoadAsync</c> reads
+        /// the file (confined to <c>--loras-dir</c>) and calls <see cref="RegisterLora"/>, for
+        /// <c>POST /v1/loras</c> and for the startup load of every adapter at the top of the
+        /// directory, and <c>DELETE /v1/loras/{name}</c> calls <see cref="UnloadLora"/>.
+        /// <see cref="LoadLora"/> (read any path, then <see cref="RegisterLora"/>) has no server
+        /// caller. The protocol adapters only resolve a request's <c>lora</c> name in it
+        /// (<see cref="TryResolveLora"/>), and the adapter a request resolved travels with
+        /// that request alone.
         /// </summary>
         public TextLoraRegistry LoraRegistry { get; } = new();
 
         /// <summary>
-        /// Select the named LoRA adapter on the loaded model for subsequent inference, or
-        /// clear the selection when <paramref name="name"/> is null/empty/<c>"none"</c>.
-        /// Returns false with a reason when no model is loaded or the adapter is unknown.
+        /// Resolve a request's <c>lora</c> field to the adapter it runs with: null, empty or
+        /// <c>"none"</c> is the base model (<paramref name="adapter"/> null). False, with a
+        /// reason for a 400, when no model is loaded, the model cannot take adapters (block
+        /// diffusion, an unsupported family, backend or multi-device mode), the name is not
+        /// loaded, or any of the adapter's modules cannot be applied to the loaded model.
+        /// Nothing here changes what any other request runs with.
         /// </summary>
-        public bool TrySetActiveLora(string? name, out string? error)
+        public bool TryResolveLora(string? name, out TextLoraAdapter? adapter, out string? error)
         {
+            bool resolved = TryResolveLoraRequest(name, out adapter, out LoraRequestError? refusal);
+            error = refusal?.Message;
+            return resolved;
+        }
+
+        /// <summary>
+        /// <see cref="TryResolveLora"/> with the refusal as a structured error for the 400:
+        /// <c>lora_not_found</c> for a name that is not loaded, <c>model_not_loaded</c>, and
+        /// <c>lora_not_applicable</c> (with the modules the loaded model cannot apply) for
+        /// everything else.
+        /// </summary>
+        public bool TryResolveLoraRequest(string? name, out TextLoraAdapter? adapter, out LoraRequestError? error)
+        {
+            adapter = null;
             error = null;
-            var model = Model;
-            if (model == null)
-            {
-                error = "No model is loaded.";
-                return false;
-            }
-
             if (string.IsNullOrWhiteSpace(name) || string.Equals(name, "none", StringComparison.OrdinalIgnoreCase))
-            {
-                model.SetActiveLora(null);
                 return true;
-            }
 
-            var adapter = LoraRegistry.Get(name);
-            if (adapter == null)
+            var loaded = LoraRegistry.Get(name);
+            if (loaded == null && Model != null)
             {
-                error = $"No LoRA adapter named '{name}' is loaded.";
+                error = new LoraRequestError($"No LoRA adapter named '{name}' is loaded.", LoraRequestError.NotFound, Array.Empty<string>());
                 return false;
             }
-
-            model.SetActiveLora(adapter);
+            error = Applicability(loaded);
+            if (error != null)
+                return false;
+            adapter = loaded;
             return true;
         }
 
-        /// <summary>Detach any active LoRA from the loaded model.</summary>
-        public void ClearActiveLora() => Model?.SetActiveLora(null);
+        /// <summary>
+        /// Every loaded adapter with whether the loaded model can apply it and, when it cannot,
+        /// why (for <c>GET /v1/loras</c> and <c>GET /v1/models</c>).
+        /// </summary>
+        public IReadOnlyList<LoraListing> ListLoras()
+        {
+            var listings = new List<LoraListing>();
+            foreach (var info in LoraRegistry.List())
+            {
+                // Unloaded between the listing and this read: not listed.
+                var adapter = LoraRegistry.Get(info.Name);
+                if (adapter == null)
+                    continue;
+                var refusal = Applicability(adapter);
+                listings.Add(new LoraListing(info, refusal == null, refusal?.Message));
+            }
+            return listings;
+        }
 
-        /// <summary>The name of the LoRA adapter currently active on the loaded model, or null.</summary>
-        public string? ActiveLoraName => Model?.ActiveLoraName;
+        /// <summary>Null when the loaded model can apply <paramref name="adapter"/> in full;
+        /// otherwise the refusal. A null adapter reads as "no model" when none is loaded.</summary>
+        private LoraRequestError? Applicability(TextLoraAdapter? adapter)
+        {
+            var model = Model;
+            if (model == null)
+                return new LoraRequestError("No model is loaded.", LoraRequestError.ModelNotLoaded, Array.Empty<string>());
+            IReadOnlyList<string> allModules = adapter == null
+                ? Array.Empty<string>()
+                : adapter.Deltas.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray();
+            if (IsDiffusionModel)
+                return new LoraRequestError(
+                    "The loaded model generates by block diffusion, which does not apply LoRA adapters; remove \"lora\" from the request.",
+                    LoraRequestError.NotApplicable, allModules);
+            if (model is not IAdapterAwareModel)
+                return new LoraRequestError("The loaded model cannot apply LoRA adapters.", LoraRequestError.NotApplicable, allModules);
+
+            var plan = model.PlanTextLora(adapter!);
+            return plan.IsApplicable
+                ? null
+                : new LoraRequestError(plan.RefusalMessage!, LoraRequestError.NotApplicable, plan.UnsupportedModules);
+        }
+
+        /// <summary>
+        /// Load (or reload) a text-LoRA adapter and register it under <paramref name="name"/>.
+        /// With a model loaded the adapter is validated and its factors are materialized now,
+        /// once (a reload under the same name keeps serving the requests that hold the old
+        /// one, which is released after them); an adapter the model cannot apply in full is
+        /// refused with <see cref="TextLoraNotApplicableException"/> and nothing is registered.
+        /// </summary>
+        /// <param name="discoverSiblingConfig">Passed to <see cref="TextLoraLoader.Load"/>: false when
+        /// the caller already resolved (or ruled out) an <c>adapter_config.json</c> next to the weights.</param>
+        /// <exception cref="InvalidDataException">The file is malformed.</exception>
+        /// <exception cref="NotSupportedException">The file uses a LoRA feature that cannot be applied
+        /// exactly, or (<see cref="TextLoraNotApplicableException"/>) the loaded model cannot apply it.</exception>
+        /// <exception cref="FileNotFoundException">A named file is missing.</exception>
+        public TextLoraAdapter LoadLora(
+            string name, string path, string? configPath = null, float? scale = null, bool discoverSiblingConfig = true)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                throw new ArgumentException("A LoRA adapter name is required.", nameof(name));
+
+            return RegisterLora(TextLoraLoader.Load(name, path, configPath, scale, discoverSiblingConfig));
+        }
+
+        /// <summary>
+        /// The second half of <see cref="LoadLora"/>, for an adapter the caller has already read
+        /// with <see cref="TextLoraLoader.Load"/>: bind it to the loaded model (if any) and
+        /// register it under its name. The file was read in full before this, so apart from
+        /// <see cref="TextLoraNotApplicableException"/> (the model cannot apply the adapter; a
+        /// target it does not have, whatever its name or layer number, is one of the
+        /// unsupported modules) what this throws is a failure on the server's side, not the
+        /// file's. Whatever it throws, the adapter is left neither bound nor registered.
+        /// </summary>
+        public TextLoraAdapter RegisterLora(TextLoraAdapter adapter)
+        {
+            ArgumentNullException.ThrowIfNull(adapter);
+            string name = adapter.Name;
+            var model = Model;
+            if (model != null && !model.IsRetiring && model is IAdapterAwareModel aware)
+            {
+                bool bound;
+                string? error;
+                IReadOnlyList<string> unsupported = Array.Empty<string>();
+                GpuLockWaiters.Enter(model.GpuComputeLock);
+                lock (model.GpuComputeLock)
+                {
+                    GpuLockWaiters.Exit(model.GpuComputeLock);
+                    bool keep = false;
+                    try
+                    {
+                        bound = aware.TryBindAdapter(adapter, out error);
+                        if (!bound)
+                            unsupported = model.PlanTextLora(adapter).UnsupportedModules;
+                        keep = bound;
+                    }
+                    finally
+                    {
+                        // The plan is stored before the factors are made (a device allocation
+                        // can fail there) and before a refusal is described, and an adapter
+                        // never registered is never retired, so nothing else would ever
+                        // release it. Every way out but a successful bind releases it here.
+                        if (!keep)
+                            aware.ReleaseAdapter(adapter);
+                    }
+                }
+                if (!bound)
+                    throw new TextLoraNotApplicableException(
+                        error ?? $"LoRA adapter '{name}' cannot be applied to the loaded model.", unsupported);
+            }
+
+            LoraRegistry.Register(adapter);
+            // The instance this replaced (if any) is retired: release it once its requests end.
+            ReleaseRetiredLoras();
+            return adapter;
+        }
+
+        /// <summary>
+        /// Unload the adapter registered under <paramref name="name"/>. Requests already running
+        /// with it finish with it; its factors are released after the last of them. Returns
+        /// false when no adapter of that name is loaded.
+        /// </summary>
+        public bool UnloadLora(string name)
+        {
+            if (!LoraRegistry.Unload(name))
+                return false;
+            ReleaseRetiredLoras();
+            return true;
+        }
+
+        /// <summary>How many requests in flight run with an adapter named <paramref name="name"/>
+        /// (any load of it, including one since replaced or unloaded).</summary>
+        public int LoraInFlight(string name)
+            => _engineHost.CountInFlightRequests(
+                adapter => adapter is TextLoraAdapter lora && string.Equals(lora.Name, name, StringComparison.Ordinal));
+
+        private void ReleaseRetiredLoras()
+        {
+            // The engine releases on its own thread, between steps, once nothing it runs holds
+            // the adapter. Without an engine nothing runs, so release here.
+            if (_engineHost.ReleaseRetiredAdapters())
+                return;
+            var model = Model;
+            if (model is not IAdapterAwareModel aware)
+                return;
+            GpuLockWaiters.Enter(model.GpuComputeLock);
+            lock (model.GpuComputeLock)
+            {
+                GpuLockWaiters.Exit(model.GpuComputeLock);
+                foreach (var retired in aware.BoundAdapters)
+                {
+                    if (retired.IsRetired)
+                        aware.ReleaseAdapter(retired);
+                }
+            }
+        }
 
         /// <summary>
         /// Non-null when an explicitly requested <c>--draft-model</c> could not
@@ -416,20 +582,24 @@ namespace TensorSharp.Server
                 bool enableThinking,
                 SkillRequestPlan? skills,
                 ILogger logger = null,
-                int? thinkingTokenLimit = null)
+                int? thinkingTokenLimit = null,
+                TextLoraAdapter? lora = null)
         {
             if (skills == null || !skills.ToolsOffered)
             {
                 return _generation.ChatStreamWithMetricsAsync(
                     session, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking,
-                    thinkingTokenLimit.HasValue ? new ChatTurnContext { ThinkingTokenLimit = thinkingTokenLimit } : null);
+                    thinkingTokenLimit.HasValue || lora != null
+                        ? new ChatTurnContext { ThinkingTokenLimit = thinkingTokenLimit, Adapter = lora }
+                        : null);
             }
 
             // One turn, many generations: every round of the loop runs in the cache scope
             // its first round resolved, so round two continues round one's state even on
-            // a shared session where the scope is proved from history.
+            // a shared session where the scope is proved from history. Every round, and
+            // every sub-agent's, runs with the turn's LoRA adapter.
             var turn = new ChatTurnContext
-            { StagedAttachmentNames = skills.StagedAttachmentNames, ThinkingTokenLimit = thinkingTokenLimit };
+            { StagedAttachmentNames = skills.StagedAttachmentNames, ThinkingTokenLimit = thinkingTokenLimit, Adapter = lora };
 
             // Sampling for a turn that can run code. The runner decides, because it is
             // what knows the operator's configuration; SamplingConfig.ForCodingTurn then
@@ -504,11 +674,12 @@ namespace TensorSharp.Server
                 List<ToolFunction>? tools,
                 bool enableThinking,
                 SkillRequestPlan? skills,
-                ILogger logger = null)
+                ILogger logger = null,
+                TextLoraAdapter? lora = null)
         {
             return ChatStreamWithSkillsAsync(
                 _intrinsicSession, history, maxTokens, cancellationToken,
-                samplingConfig, tools, enableThinking, skills, logger);
+                samplingConfig, tools, enableThinking, skills, logger, lora: lora);
         }
 
         /// <summary>True when the loaded model is a DiffusionGemma block-diffusion model, which is

@@ -42,7 +42,23 @@ internal sealed class CliInferenceSession : IDisposable
         _engine ??= new InferenceEngine(_model, _config, _logger);
         // Preserve the CLI's zero-output prefill mode. The engine requires a positive
         // limit; its single sampled token is discarded and uses a separate sampler.
-        var sequence = new SequenceState(requestId, prompt, Math.Max(1, maxTokens),
+        // Ask for no more than the room the prompt leaves in the context window, as the
+        // server does (ChatGenerationPipeline.ClampGenerationReserve): the engine would
+        // stop the reply there anyway, and an honest limit keeps its K/V reservation and
+        // per-slot admission (DeepSeek V4.1) from refusing a prompt that fits. A prompt
+        // that leaves no room is left for the engine to refuse with
+        // ContextLengthExceededException, which the CLI reports in one line.
+        int replyLimit = Math.Max(1, maxTokens);
+        int context = _model.MaxContextLength;
+        if (context > 0 && prompt.Count < context && context - prompt.Count < replyLimit)
+        {
+            replyLimit = context - prompt.Count;
+            if (maxTokens > 0)
+                _logger?.LogInformation(
+                    "cli.inference reply limited to {Room} of {Requested} tokens: the prompt is {Prompt} tokens of a " +
+                    "{Context}-token context window (MAX_CONTEXT)", replyLimit, maxTokens, prompt.Count, context);
+        }
+        var sequence = new SequenceState(requestId, prompt, replyLimit,
             _engine.PoolStats.blockSize, maxTokens == 0 ? SamplingConfig.Greedy : sampling, mediaSpans: mediaSpans,
             cacheBreakpoints: enablePrefixCache ? null : Array.Empty<int>(),
             sharedPrefixTokens: enablePrefixCache ? sharedPrefixTokens : 0, cacheScope: _scope);

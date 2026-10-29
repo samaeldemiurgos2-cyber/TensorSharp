@@ -755,6 +755,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `--width <px>` / `--height <px>` | 图像请求既未指定尺寸也未指定面积时（Web UI 从不指定）Qwen-Image-2.1 的默认输出尺寸；请求自己设置了宽高或目标面积时保留它自己的几何设置。默认尺寸需要两个值都给出。不是 32 倍数的边会向下取整到 32 的倍数（最小 32），并打印一次 `[qwen-image] WARNING`；只给出一边、或值无法解析或为负数时，默认尺寸会被忽略（同样只警告一次），继续使用自动尺寸（2048×2048 面积；`cpu` 后端上为 1024×1024）。Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝启动。请求本身设置的宽高仍必须是 32 的正整数倍。环境变量：`TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`。它们同时也是 `--video-width` / `--video-height` 的别名。 LTX 2.5 视频默认输出 1024×1024，宽高必须为 64 的正整数倍；见下文两阶段配方。 |
 | `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | 所承载的 Qwen-Image-2.1 或 MiniMax-H3（FL2VA）模型的 LoRA 插件，拼写与绑定规则都与 CLI 相同（重复 `--lora` 可叠加 Qwen-Image-2.1 插件；强度与配置绑定到前一个 `--lora`）。文件在启动时检查，启动模型不接受的插件会在启动时、插件下载之前被拒绝（`--config` 仍需下载的模型在该下载完成后立即检查）；之后加载的模型不使用它不接受的插件，并记录一条写明这些插件的警告。启动日志列出这组插件（`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`）。在 Qwen-Image-2.1 上这组插件作用于每个图像请求，请求中的 `steps` / `cfg` 仍会覆盖插件的采样配方。MiniMax-H3 Turbo 插件作用于每段片段，并把 `--video-steps` 以及请求的 `steps`、`flowShift`、`sampler` 锁定为其配方。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)与 [MiniMax-H3 Turbo 插件](#minimax-h3-turbo-插件)。 |
 | `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
+| `--loras-dir <dir>` | 文本模型 LoRA 适配器目录；在 `/v1/chat/completions` 与 `/v1/responses` 上用 `"lora"` 按请求选择（只有单设备上的 `nemotron_h`、`mistral3` 与 `hunyuan-dense` 会应用；其他情况返回 400）。适配器是 llama.cpp 的 GGUF 适配器（`.gguf`，由 `convert_lora_to_gguf.py` 生成），或张量按基础 GGUF 张量名命名为 `<tensor>.lora_a` / `<tensor>.lora_b` 的 `.safetensors` 文件；训练得到的 PEFT 适配器（`base_model.model...lora_A.weight` 命名）会被拒绝，并提示使用该转换器。顶层的每个适配器都会在启动时、模型加载之后，以去掉扩展名的文件名为名称加载；加载失败的会连同原因记入日志并被跳过。`POST /v1/loras` 可以再加载，但只能是该目录内、以相对路径给出的文件（绝对路径只有位于目录内时才接受），同时最多 32 个适配器（超出返回 409）。**未配置时 `POST /v1/loras` 返回 403**：旧版本会加载服务进程可读的任意路径。该目录应只允许运维者写入。不能与 `--embeddings` 同用。环境变量：`TS_LORAS_DIR`（命令行参数优先）。见 [API_EXAMPLES](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#文本模型-lora-适配器lorav1loras)。 |
 | `--temperature <f>` | 采样温度（`0` = 贪心） |
 | `--top-k <N>` | Top-K 过滤（`0` = 关闭） |
 | `--top-p <f>` | Nucleus 采样阈值（`1.0` = 关闭） |
@@ -2156,6 +2157,7 @@ CLI 没有子智能体。参见 [Web 应用](#web-应用)一节中的子智能�
 | 上传目录 | `<binDir>/uploads` | `TENSORSHARP_UPLOAD_DIR` |
 | 持久化的共享前缀 checkpoint | 启用，`<binDir>/prefix-cache/<model>/` | `TENSORSHARP_PREFIX_CACHE_DIR` 改变根目录；`--no-prefix-cache` 关闭缓存 |
 | Jev 端点限制（`POST /v1/systemone`） | 8 MiB 请求体、64 token 画布、同时接纳 32 个请求 | `TS_JEV_MAX_BODY_MB`、`TS_JEV_MAX_CANVAS`、`TS_JEV_MAX_PENDING` |
+| 文本 LoRA 适配器目录（启动时加载 + `POST /v1/loras`，最多 32 个适配器） | 未设置：没有适配器，`POST /v1/loras` 返回 403 | `TS_LORAS_DIR`（`--loras-dir` 优先） |
 | 文本及原生数字 PDF 上传 | 保留全部提取内容；最终渲染的提示词必须能放入已加载模型的上下文 | — |
 | 视频帧抽取 | 1 fps（基于时间，不限制）。OpenAI 的 `video_url` part（DeepSeek V4.1、Qwen 3.8 Flash Next）可自带 `fps` / `max_frames`，`VIDEO_MAX_FRAMES` 未设置时上限 16 帧；Qwen 3.8 把采样到的帧两两合并并使用 Qwen-VL 时间轴坐标（见[模型卡](docs/models/qwen38-flash-next_zh-cn.md#视频输入)） | `VIDEO_SAMPLE_FPS`、`VIDEO_MAX_FRAMES` |
 | DiffusionGemma Web UI 去噪 | 48 步，最大 batch 2 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH` |
@@ -2190,7 +2192,7 @@ CLI 没有子智能体。参见 [Web 应用](#web-应用)一节中的子智能�
 | 退出码 | 含义 | stderr 输出 |
 |---|---|---|
 | `0` | 成功：运行结束、`--help` / `--list-skills` 已打印，或服务端正常关闭。 | — |
-| `1` | 配置错误：已移除的参数、服务端上的未知参数（CLI 会忽略它不认识的参数）、非法取值、带了值的开关（`--think=on`）或后面没有值的取值参数、无法读取的 `--config` 文件。 | `Configuration error: <错误说明>` |
+| `1` | 配置错误：已移除的参数、服务端上的未知参数（CLI 会忽略它不认识的参数）、非法取值、带了值的开关（`--think=on`）或后面没有值的取值参数、无法读取的 `--config` 文件。CLI 上还包括提示词在模型上下文窗口（`MAX_CONTEXT`）中已不给回复留任何空间的情况（包括 Agent Skills 某一轮让提示词超出窗口）；回复只是写到窗口末尾时则在那里结束，按长度截断处理。 | `Configuration error: <错误说明>` |
 | `2` | 模型加载被拒绝。 | 恰好一行，且是最后一行：`error: model load refused: <原因>` |
 | 其他任何值 | 不是拒绝，而是 bug 或崩溃。未处理的 .NET 异常会打印堆栈，并在 Linux 和 macOS 上以 `134`（SIGABRT）退出；被操作系统杀掉的进程返回对应信号（内存不足被杀为 `137`）。 | 堆栈信息，请提交问题报告。 |
 
@@ -2321,6 +2323,16 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 curl -X POST http://localhost:5000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "input": "说出三个质数。", "max_output_tokens": 128}'
+
+# 文本 LoRA 适配器（服务以 --loras-dir /srv/loras 启动；仅 nemotron_h、mistral3 与
+# hunyuan-dense）。POST 从该目录加载一个文件，路径相对于该目录（未配置 --loras-dir 时返回 403）；
+# 随后用 "lora" 为单个请求选择它。
+curl -X POST http://localhost:5000/v1/loras \
+  -H "Content-Type: application/json" \
+  -d '{"name": "math-v2", "path": "math/math-v2.safetensors"}'
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf", "lora": "math-v2", "messages": [{"role": "user", "content": "Integrate x^2."}]}'
 
 # 推理强度（GPT-OSS / Harmony）。模型总是先推理再作答；reasoning_effort
 # （"low" | "medium" | "high"，默认 "medium"，其他值返回 HTTP 400）设置 Harmony

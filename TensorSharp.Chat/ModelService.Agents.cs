@@ -21,8 +21,10 @@ public partial class ModelService
     {
         PublicPrefixCandidates = publicProfiles,
         // A descendant is part of the same bounded request. Keep its transcript
-        // and cache scope private while retaining the caller's reasoning policy.
+        // and cache scope private while retaining the caller's reasoning policy
+        // and LoRA adapter.
         ThinkingTokenLimit = parent.ThinkingTokenLimit,
+        Adapter = parent.Adapter,
     };
 
     private async IAsyncEnumerable<ChatStreamUpdate> MultiAgentChatStreamAsync(

@@ -840,6 +840,7 @@ of quietly losing a setting.
 | `--width <px>` / `--height <px>` | Default Qwen-Image-2.1 output size for an image request that names neither a size nor an area (the Web UI sends none); a request that sets its own width/height or target area keeps its own geometry. The default needs both values. A side that is not a multiple of 32 is rounded down to one (never below 32) with a one-time `[qwen-image] WARNING`; with only one side given, or an unparsable or negative value, the default is ignored with a one-time warning and the automatic size (a 2048×2048 area; 1024×1024 on the `cpu` backend) stays. A Qwen-Image server also warns at startup in either case; nothing is refused. A width/height set in the request itself must still be a positive multiple of 32. Env: `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`. They are also aliases of `--video-width` / `--video-height`. LTX 2.5 video defaults to 1024×1024 output with both sides positive multiples of 64; see its two-stage recipe below. |
 | `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | LoRA plug-ins for the hosted Qwen-Image-2.1 or MiniMax-H3 (FL2VA) model, same spelling and binding rules as on the CLI (repeat `--lora` to stack Qwen-Image-2.1 plug-ins; scale and config bind to the preceding `--lora`). The files are checked at startup, and a plug-in the startup model does not take is refused there, before the plug-in downloads (a model a `--config` still has to download is checked right after that download); a model loaded later runs without plug-ins it does not take and logs a warning naming them. The startup log lists the set (`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`). On Qwen-Image-2.1 the set applies to every image request, and a request's `steps` / `cfg` still override a plug-in's sampling recipe. A MiniMax-H3 Turbo plug-in applies to every clip and locks `--video-steps` and a request's `steps`, `flowShift` and `sampler` to its recipe. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins) and [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins). |
 | `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
+| `--loras-dir <dir>` | Directory of text-model LoRA adapters, chosen per request with `"lora"` on `/v1/chat/completions` and `/v1/responses` (only `nemotron_h`, `mistral3` and `hunyuan-dense` on a single device apply them; anything else is a 400). An adapter is a llama.cpp GGUF adapter (`.gguf`, from `convert_lora_to_gguf.py`) or a `.safetensors` file whose tensors are named `<tensor>.lora_a` / `<tensor>.lora_b` after the base GGUF's tensors; a PEFT adapter as trained (`base_model.model...lora_A.weight` names) is refused with a pointer to that converter. Every adapter at the top level is loaded at startup, after the model, under its file name without the extension; one that does not load is logged with the reason and skipped. `POST /v1/loras` may load more, but only files inside this directory, named relative to it (an absolute path only when it is inside), and at most 32 adapters are held at once (409 beyond that). **Without it, `POST /v1/loras` answers 403**: earlier builds loaded any path the server could read. Keep the directory writable only by the operator. Not with `--embeddings`. Env: `TS_LORAS_DIR` (the flag wins). See [API_EXAMPLES](TensorSharp.Server.Host/API_EXAMPLES.md#text-model-lora-adapters-lora-v1loras). |
 | `--temperature <f>` | Sampling temperature (`0` = greedy) |
 | `--top-k <N>` | Top-K filtering (`0` = disabled) |
 | `--top-p <f>` | Nucleus sampling threshold (`1.0` = disabled) |
@@ -2437,6 +2438,7 @@ with `--sampling-precedence request` (see [Web Application](#web-application)).
 | Upload directory | `<binDir>/uploads` | `TENSORSHARP_UPLOAD_DIR` |
 | Persisted shared-prefix checkpoints | ON, `<binDir>/prefix-cache/<model>/` | `TENSORSHARP_PREFIX_CACHE_DIR` moves the root; `--no-prefix-cache` turns caching off |
 | Jev endpoint limits (`POST /v1/systemone`) | 8 MiB body, 64-token canvas, 32 admitted requests | `TS_JEV_MAX_BODY_MB`, `TS_JEV_MAX_CANVAS`, `TS_JEV_MAX_PENDING` |
+| Text-LoRA adapter directory (startup load + `POST /v1/loras`, at most 32 adapters) | unset: no adapters, `POST /v1/loras` answers 403 | `TS_LORAS_DIR` (`--loras-dir`, which wins) |
 | Text and born-digital PDF uploads | Full extracted content; the final rendered prompt must fit the loaded model context | — |
 | Video-frame extraction | 1 fps (time-based, no cap). An OpenAI `video_url` part (DeepSeek V4.1, Qwen 3.8 Flash Next) may set its own `fps` / `max_frames` and caps at 16 frames when `VIDEO_MAX_FRAMES` is unset; Qwen 3.8 merges the sampled frames in pairs with Qwen-VL temporal coordinates (see [its card](docs/models/qwen38-flash-next.md#video-input)) | `VIDEO_SAMPLE_FPS`, `VIDEO_MAX_FRAMES` |
 | DiffusionGemma Web UI denoising | 48 steps, max batch 2 | `DIFFUSION_STEPS`, `DIFFUSION_MAX_BATCH` |
@@ -2472,7 +2474,7 @@ load here" from "this is a bug":
 | Code | Meaning | What stderr shows |
 |---|---|---|
 | `0` | Success: the run finished, `--help` / `--list-skills` printed, or the server shut down cleanly. | — |
-| `1` | Configuration error: a removed flag, an unknown flag on the server (the CLI ignores flags it does not know), a bad value, a switch given a value (`--think=on`) or a value option with nothing after it, an unreadable `--config` file. | `Configuration error: <what is wrong>` |
+| `1` | Configuration error: a removed flag, an unknown flag on the server (the CLI ignores flags it does not know), a bad value, a switch given a value (`--think=on`) or a value option with nothing after it, an unreadable `--config` file. On the CLI also a prompt that leaves no room for a reply in the model's context window (`MAX_CONTEXT`), including one an Agent Skills round grew past it; a reply that merely runs into the window ends there instead, as a length stop. | `Configuration error: <what is wrong>` |
 | `2` | Model load refused. | Exactly one line, the last one: `error: model load refused: <reason>` |
 | anything else | Not a refusal: a bug or a crash. An unhandled .NET exception prints its stack trace and, on Linux and macOS, exits `134` (SIGABRT); a process the OS killed reports its signal (`137` for an out-of-memory kill). | The stack trace. Report it. |
 
@@ -2625,6 +2627,16 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 curl -X POST http://localhost:5000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "input": "Name three prime numbers.", "max_output_tokens": 128}'
+
+# Text-LoRA adapters (server started with --loras-dir /srv/loras; nemotron_h,
+# mistral3 and hunyuan-dense only). POST loads a file from that directory, given
+# relative to it (403 without --loras-dir); "lora" then picks it for one request.
+curl -X POST http://localhost:5000/v1/loras \
+  -H "Content-Type: application/json" \
+  -d '{"name": "math-v2", "path": "math/math-v2.safetensors"}'
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf", "lora": "math-v2", "messages": [{"role": "user", "content": "Integrate x^2."}]}'
 
 # Reasoning effort (GPT-OSS / Harmony). The model always reasons before it
 # answers; reasoning_effort ("low" | "medium" | "high", default "medium",

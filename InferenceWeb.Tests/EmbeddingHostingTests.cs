@@ -206,6 +206,7 @@ public class EmbeddingHostingTests : IDisposable
     [InlineData("/api/image-edit/stream")]
     [InlineData("/api/video-generate")]
     [InlineData("/api/video-generate/stream")]
+    [InlineData("/v1/loras")]           // loads an adapter onto the (absent) generation model
     public void GenerationGuard_CoversEveryGenerationRoute(string path)
     {
         Assert.True(EmbeddingHosting.IsGenerationPath(path));
@@ -269,5 +270,16 @@ public class EmbeddingHostingTests : IDisposable
         Assert.DoesNotContain("Chat", endpoints);
         Assert.DoesNotContain("Generate", endpoints);
         Assert.DoesNotContain("index.html", endpoints);
+        Assert.DoesNotContain("/v1/loras", endpoints);
+    }
+
+    [Fact]
+    public void ChatStartupBanner_ListsTheLoraRoutes()
+    {
+        ServerHostingOptions options = ServerOptionsBuilder.Build(["--no-skills"], _directory);
+        string endpoints = string.Join('\n', StartupBanner.DescribeEndpoints(options));
+        Assert.Contains("GET  /v1/loras", endpoints);
+        Assert.Contains("POST /v1/loras", endpoints);
+        Assert.Contains("DELETE /v1/loras/{name}", endpoints);
     }
 }

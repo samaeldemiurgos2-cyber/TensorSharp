@@ -5,7 +5,8 @@ using Microsoft.AspNetCore.Http;
 namespace TensorSharp.Server.Logging;
 
 /// <summary>
-/// Maps a <see cref="PromptContextOverflowException"/> — a client input
+/// Maps a <see cref="PromptContextOverflowException"/> (or the engine's
+/// <see cref="TensorSharp.Runtime.Scheduling.ContextLengthExceededException"/>) — a client input
 /// error (the prompt does not fit the context window) — to a 400 with a
 /// protocol-appropriate JSON body. The overflow surfaces during prompt
 /// preparation, before any response body is written, so the status is still
@@ -26,6 +27,14 @@ public static class PromptOverflowMiddleware
             await next().ConfigureAwait(false);
         }
         catch (PromptContextOverflowException ex) when (!context.Response.HasStarted)
+        {
+            await WriteBadRequestAsync(context, ex.Message).ConfigureAwait(false);
+        }
+        // The engine's own refusal of a prompt that leaves no room for a reply. The chat
+        // pipeline trims or rejects such a prompt before submitting it, so this is the
+        // backstop for any caller that reaches the engine without that step: the same
+        // client error, not a 500.
+        catch (TensorSharp.Runtime.Scheduling.ContextLengthExceededException ex) when (!context.Response.HasStarted)
         {
             await WriteBadRequestAsync(context, ex.Message).ConfigureAwait(false);
         }

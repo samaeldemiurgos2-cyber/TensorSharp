@@ -206,6 +206,32 @@ namespace TensorSharp.Server
             }
         }
 
+        /// <summary>
+        /// Ask the standing engine, if there is one, to release the model's copy of every
+        /// retired LoRA adapter once no request it runs still holds it. Never constructs an
+        /// engine and never waits for the gate. Returns false only when there is no engine to
+        /// ask (none built, or it has shut down), so the caller releases them itself: then no
+        /// request is left to hold one.
+        /// </summary>
+        public bool ReleaseRetiredAdapters()
+        {
+            // Read without the gate. A submission or a status poll holds it briefly, and
+            // Reset/Dispose hold it while they join the worker; a busy gate says nothing about
+            // whether an engine stands, and reading it as "no engine" let the caller free
+            // factors that running requests still held. Posting is safe at any time and fails
+            // only once the engine has shut down.
+            InferenceEngine engine = System.Threading.Volatile.Read(ref _engine);
+            return engine != null && engine.ReleaseRetiredAdapters();
+        }
+
+        /// <summary>How many requests in flight on the standing engine run with an adapter
+        /// <paramref name="match"/> accepts; 0 without an engine. Never constructs one.</summary>
+        public int CountInFlightRequests(Func<IRequestAdapter, bool> match)
+        {
+            lock (_gate)
+                return _disposed || _engine == null ? 0 : _engine.CountInFlightRequests(match);
+        }
+
         /// <summary>Drop the engine (if any). Called by <see cref="ModelLifecycleService"/>
         /// when the model is unloaded so we don't hold onto a stale block pool.</summary>
         /// <summary>

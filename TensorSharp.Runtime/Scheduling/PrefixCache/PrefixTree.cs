@@ -87,7 +87,7 @@ internal struct PrefixTreeCounters
 {
     public long StaleMatches, StaleReceipts, MediaHashCollisions, DuplicatesDropped;
     public long Inserts, Splits, NodesCreated, NodesDeleted, Evictions, EvictScanSkips, EvictCalls;
-    public long StateDetaches, RopeCompactions, PagesRefused, PagesDuplicate, EndStatesRefused;
+    public long StateDetaches, RopeCompactions, PagesRefused, PagesDuplicate, PagesUpgraded, EndStatesRefused;
     public long Invalidations, ScopesRetired, SearchCapped;
 }
 
@@ -1288,9 +1288,9 @@ internal sealed class PrefixTree
 
     /// <summary>
     /// Attaches pages (§4.4 owner rule, §5.10): each page goes to the node on <paramref name="node"/>'s
-    /// root path whose edge contains its last token. Pages already owned there are skipped, and a page
-    /// whose store of record is not backed by the block flags is refused (I12, G-03). The tree takes
-    /// one block reference per attached page. Returns the number attached.
+    /// root path whose edge contains its last token. Pages already owned there are skipped (but see
+    /// <see cref="UpgradesPage"/>), and a page whose store of record is not backed by the block flags is
+    /// refused (I12, G-03). The tree takes one block reference per attached page. Returns the number attached.
     /// </summary>
     internal int AttachPages(RadixNode node, ReadOnlySpan<PageRef> pages)
     {
@@ -1311,10 +1311,18 @@ internal sealed class PrefixTree
             }
             RadixNode owner = node;
             while (owner.EdgeStartDepth > end - 1) owner = owner.Parent!;
-            if (OwnsPage(owner, page.PageIndex) || BlockOwnedElsewhere(page.Block))
+            int held = PageAt(owner, page.PageIndex);
+            if (BlockOwnedElsewhere(page.Block) || (held >= 0 && !UpgradesPage(owner, held, page)))
             {
                 Counters.PagesDuplicate++;
                 continue;
+            }
+            if (held >= 0)
+            {
+                // The stale page leaves as an evicted one does (bytes, owner index, the tree's block
+                // reference); a sequence that adopted its block keeps its own reference.
+                RemovePage(owner, held);
+                Counters.PagesUpgraded++;
             }
             // Charge the slab's real length where the host knows it: a recurrent family's
             // page holds its running state only at a restore point, so pages differ ~25x.
@@ -1342,12 +1350,31 @@ internal sealed class PrefixTree
 
     private bool BlockOwnedElsewhere(KvBlock block) => _blockOwners.ContainsKey(block);
 
-    private static bool OwnsPage(RadixNode owner, int pageIndex)
+    /// <summary>The slot of <paramref name="owner"/>'s page <paramref name="pageIndex"/>, or -1.</summary>
+    private static int PageAt(RadixNode owner, int pageIndex)
     {
         ReadOnlySpan<PageRef> pages = owner.PageSpan;
         for (int i = 0; i < pages.Length; i++)
-            if (pages[i].PageIndex == pageIndex) return true;
-        return false;
+            if (pages[i].PageIndex == pageIndex) return i;
+        return -1;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="incoming"/> replaces the page <paramref name="owner"/> holds in slot
+    /// <paramref name="held"/>: on a family whose pages resume only where a forward ended
+    /// (<see cref="PrefixCacheCapabilities.PagesNeedStateAtEnd"/>), a restore point takes the place of
+    /// a page without the state at its end. Both hold the same tokens (the same path), so the page
+    /// that arrived first used to win until evicted: a long prompt that ran alone past a shared
+    /// system prompt cached its pages without state, and every later lone forward that ended exactly
+    /// at the shared prefix had its restore point dropped as a duplicate - no request reused the
+    /// prefix again (kvReused=0 on every request of an A40 run). Never while a request holds the path
+    /// (a durable or materializing lock), and only by a page readable on every route the old one was.
+    /// </summary>
+    private bool UpgradesPage(RadixNode owner, int held, in PageRef incoming)
+    {
+        PageRef stale = owner.Pages![held];
+        return !Rules.PageEndResumable(stale) && Rules.PageEndResumable(incoming)
+            && owner.LockRef == 0 && (incoming.Store & stale.Store) == stale.Store;
     }
 
     internal bool StoreBacked(in PageRef page)
