@@ -93,6 +93,34 @@ namespace InferenceWeb.Tests
             finally { File.Delete(path); }
         }
 
+        /// <summary>
+        /// Header claims that would size an allocation are refused as malformed before anything is
+        /// sized from them: a header length with the top bit set (negative as a long, so it passed
+        /// the length check and failed as an OverflowException), and a shape that is negative or
+        /// whose F32 byte count wraps to the few bytes it was given. Both shapes were accepted, and
+        /// ReadFloat32 then sized its array from the shape.
+        /// </summary>
+        [Theory]
+        [InlineData("header-length", "safetensors header length 18446744073709551600 is out of range")]
+        [InlineData("shape-wraps", "safetensors tensor 't' has shape [1,4611686018427387905], which is negative or too large for F32")]
+        [InlineData("shape-negative", "safetensors tensor 't' has shape [-1,-4], which is negative or too large for F32")]
+        public void Synthetic_RejectsHeaderClaimsThatWouldSizeAnAllocation(string kind, string reason)
+        {
+            string path = Path.Combine(Path.GetTempPath(), $"ts_claims_{Guid.NewGuid():N}.safetensors");
+            // [-1,-4] counts 4 values and [1, 2^62 + 1] wraps to 1 F32 value: both match their data.
+            string shape = kind == "shape-negative" ? "[-1,-4]" : "[1,4611686018427387905]";
+            int bytes = kind == "shape-negative" ? 16 : 4;
+            byte[] hb = Encoding.UTF8.GetBytes($"{{\"t\":{{\"dtype\":\"F32\",\"shape\":{shape},\"data_offsets\":[0,{bytes}]}}}}");
+            using (var fs = File.Create(path))
+            {
+                fs.Write(BitConverter.GetBytes(kind == "header-length" ? 0xFFFF_FFFF_FFFF_FFF0UL : (ulong)hb.Length));
+                fs.Write(hb);
+                fs.Write(new byte[bytes]);
+            }
+            try { Assert.Contains(reason, Assert.Throws<InvalidDataException>(() => new SafetensorsFile(path)).Message); }
+            finally { File.Delete(path); }
+        }
+
         // ---- helpers ------------------------------------------------------------------------------
 
         private static void AssertSeqEqual(float[] expected, float[] actual)
