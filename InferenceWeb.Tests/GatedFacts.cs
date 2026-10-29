@@ -113,6 +113,34 @@ namespace InferenceWeb.Tests
             return $"Requires TS_TEST_GGML_BACKEND={name}: this test constructs {required}, and this process pins {pinned} (one GGML backend per process).";
         }
 
+        private static readonly Lazy<int> PinnedGgmlDevices = new(() =>
+        {
+            if (Environment.GetEnvironmentVariable("TS_TEACHER_TOKEN_EXPORT") == "1") return 0;
+            try { return TensorSharp.GGML.GgmlBasicOps.GetGpuDeviceCount(PinnedGgmlBackendType); }
+            catch { return 0; }
+        });
+
+        /// <summary>
+        /// Skip reason for a test that spreads a <paramref name="backend"/> model over
+        /// <paramref name="count"/> devices (a tensor-parallel group), or null to run. The
+        /// process must pin that backend (<see cref="GgmlPinSkip"/>), which must address that
+        /// many devices - the count ModelBase checks before it builds the group. Unlike
+        /// <see cref="CudaDevicesSkip"/> this follows ggml-cuda's GGML_CUDA_DEVICES=N, which
+        /// emulates N devices on fewer GPUs, so one GPU can run such a test.
+        /// </summary>
+        public static string GgmlDevicesSkip(BackendType backend, int count)
+        {
+            string skip = GgmlPinSkip(backend);
+            if (skip != null)
+                return skip;
+            int visible = PinnedGgmlDevices.Value;
+            if (visible >= count)
+                return null;
+            return backend == BackendType.GgmlCuda
+                ? $"Requires {count} ggml-cuda devices; {visible} visible (GGML_CUDA_DEVICES={count} emulates them on one GPU)."
+                : $"Requires {count} {backend} devices; {visible} visible.";
+        }
+
         /// <summary>
         /// Skip reason for weight-gated tests, or null to run. The env var may
         /// name a file or a directory; with <paramref name="ggufContains"/> the
@@ -391,6 +419,15 @@ namespace InferenceWeb.Tests
             RequiresValue = backend.ToString();
             Skip = TestGates.GgmlPinSkip(backend);
         }
+
+        /// <summary>Devices the test spreads the model over (a tensor-parallel group); also skips
+        /// unless the pinned backend addresses that many (<see cref="TestGates.GgmlDevicesSkip"/>).</summary>
+        public int Devices
+        {
+            get => _devices;
+            set { _devices = value; Skip ??= TestGates.GgmlDevicesSkip(GgmlBackend, value); }
+        }
+        private int _devices;
     }
 
     /// <summary>

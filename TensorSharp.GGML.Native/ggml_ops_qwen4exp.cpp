@@ -104,6 +104,7 @@ namespace
     thread_local bool g_q4e_prefill_combine = false;
     // Populated only while building a tensor-sliced FFN span.
     thread_local std::vector<ggml_tensor*>* g_q4e_tp_partials = nullptr;
+    thread_local int g_q4e_tp_degree = 1, g_q4e_tp_rank = 0;
     thread_local std::deque<tsg_dsv4_fused_desc>* g_q4e_tp_matmuls = nullptr;
 
     // MMVQ's single-column reduction is architecture- and type-dependent. Turing
@@ -258,6 +259,7 @@ namespace
     {
         bool valid = false;
         tsg::TpRankPlan tp_plan;
+        int tp_degree = 1, tp_rank = 0;
         ggml_context* ctx = nullptr;
         ggml_cgraph* graph = nullptr;
         ggml_gallocr_t alloc = nullptr;
@@ -908,10 +910,10 @@ ggml_tensor* q4e_nodes_ffn(
     if (cpu_moe && g_q4e_tp_partials)
         throw std::invalid_argument("qwen4exp FFN: host-offloaded experts and tensor parallelism cannot be combined");
     const int hc_dim = hc * n_embd;
-    const int tp_degree = g_q4e_tp_partials ? tsg::g_device_count.load(std::memory_order_acquire) : 1;
+    const int tp_degree = g_q4e_tp_partials ? g_q4e_tp_degree : 1;
     const int output_rows = n_embd / tp_degree;
     const int full_ff = n_ff * tp_degree, full_shared_ff = n_ff_sh * tp_degree;
-    const int rank = g_q4e_tp_partials ? tsg::g_active_rank : 0;
+    const int rank = g_q4e_tp_partials ? g_q4e_tp_rank : 0;
     if (n_embd % tp_degree) throw std::invalid_argument("qwen4exp TP: output rows must divide across ranks");
     ggml_tensor* w_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
     ggml_tensor* w_down = ggml_new_tensor_2d(ctx, (ggml_type)a->hc_down_type, hc_dim, hc_low_rank);
@@ -1067,7 +1069,7 @@ ggml_tensor* q4e_nodes_ffn(
             // those dots changes their F32 summation order; subsequent activation
             // quantization can amplify even a one-ULP change through the MoE stack.
             // Each rank contributes disjoint channels, so summing zeros is exact.
-            const int rank = tsg::g_active_rank;
+            const int rank = g_q4e_tp_rank;
             auto* routed = ggml_pad_ext(ctx, par, rank * n_ff, (tp_degree - rank - 1) * n_ff,
                 0, 0, 0, 0, 0, 0);
             auto* shared = ggml_pad_ext(ctx, shared_activation, rank * n_ff_sh, (tp_degree - rank - 1) * n_ff_sh,
@@ -1124,7 +1126,7 @@ ggml_tensor* q4e_nodes_ffn(
     {
         // Down projections own disjoint OUTPUT rows and retain the original
         // full-width dot product. Gather those rows before HC scatter.
-        const int rank = tsg::g_active_rank;
+        const int rank = g_q4e_tp_rank;
         ffn_out = ggml_pad_ext(ctx, ffn_out, rank * output_rows, (tp_degree - rank - 1) * output_rows,
             0, 0, 0, 0, 0, 0);
         ggml_set_output(ffn_out);
@@ -2201,7 +2203,7 @@ static int q4e_token_span_impl(
     const int* mrope_pos, const int* mrope_sections, int rope_position,
     int device, void* hidden_out, int logits_rows,
     const TSGgmlQwen4ExpQsaArgs* qsa, const int32_t* qsa_positions, int qsa_position_count,
-    void** tp_plan_out = nullptr)
+    void** tp_plan_out = nullptr, int global_degree = 0, int rank_offset = 0)
 {
     try
     {
@@ -2235,7 +2237,7 @@ static int q4e_token_span_impl(
         tsg::SuppressGraphReorder keep_order(tp_mode || !cpu_moe_layers.empty());
         std::vector<ggml_tensor*> tp_partials;
         struct TpBuildScope {
-            ~TpBuildScope() { g_q4e_tp_partials = nullptr; g_q4e_tp_matmuls = nullptr; }
+            ~TpBuildScope() { g_q4e_tp_partials = nullptr; g_q4e_tp_matmuls = nullptr; g_q4e_tp_degree = 1; g_q4e_tp_rank = 0; }
         } tp_build_scope;
         if (tp_mode) g_q4e_tp_partials = &tp_partials;
         // LAYER SPLIT: run this span's layers on their own GPU. Everything the
@@ -2244,6 +2246,15 @@ static int q4e_token_span_impl(
         // is selected by the active rank, so the scope is the whole mechanism.
         tsg::ScopedRank q4e_rank(q4e_resolve_device(device));
         if (!ensure_backend()) return 0;
+        if (tp_mode)
+        {
+            const int local_degree = tsg::g_device_count.load();
+            g_q4e_tp_degree = global_degree ? global_degree : local_degree;
+            g_q4e_tp_rank = rank_offset + tsg::g_active_rank;
+            if (g_q4e_tp_degree < 2 || rank_offset < 0 || rank_offset + local_degree > g_q4e_tp_degree
+                || g_q4e_tp_degree % local_degree || rank_offset % local_degree)
+                throw std::invalid_argument("qwen4exp TP: invalid global rank topology");
+        }
         // Retire any arena slots holding this holder's caches or recurrent
         // state: the span reads the resident KV copies and the seq-state
         // buffers, whose newest truth lives in the arena until flushed. Any
@@ -2377,6 +2388,7 @@ static int q4e_token_span_impl(
         } row_kernel_scope;
         if (!q4e_dump_nodes
             && slot->valid && slot->tp_plan.valid() == tp_mode
+            && slot->tp_degree == g_q4e_tp_degree && slot->tp_rank == g_q4e_tp_rank
             && slot->row_scope == row_scope && slot->row_kv_count == row_kv_count
             && std::equal(row_kv.begin(), row_kv.begin() + row_kv_count, slot->row_kv.begin())
             && q4e_refresh_bindings(slot, ggml_backend_get_device(g_backend))
@@ -2661,6 +2673,12 @@ static int q4e_token_span_impl(
                     n_embd, hc, hc_low_rank, T,
                     n_expert, n_expert_used, n_ff, n_ff_sh, eps,
                     graph, &host_moe, il);
+            // A verify-width span runs the one-token device kernels (Q4eRowKernels);
+            // its host-offloaded experts must keep the one-token host arithmetic as
+            // well, as the arena does. Otherwise the rows take the multi-token host
+            // graph (different SiLU and down-projection rounding) and a chunk of
+            // 2..8 rows - a speculative verify - no longer reproduces decode.
+            if (ffn[il].cpu_moe && verify_rows) host_moe.back().independent_decode_rows = true;
             ggml_build_forward_expand(graph, res);
             if (q4e_span_trace()) { ggml_set_output(res); trace_res.push_back(res); }
         }
@@ -2875,6 +2893,7 @@ static int q4e_token_span_impl(
         slot->sig5 = (const void*)(has_ple ? ple : nullptr);
         slot->ple_emb_in = ple_emb_in;
         slot->layer_begin = layer_begin; slot->layer_end = layer_end;
+        slot->tp_degree = g_q4e_tp_degree; slot->tp_rank = g_q4e_tp_rank;
         slot->kv_capacity = kv_capacity; slot->n_kv = n_kv_pad;
         slot->row_kv = row_kv; slot->row_kv_count = row_kv_count; slot->row_scope = row_scope;
         slot->use_mrope = use_mrope ? 1 : 0;
@@ -2950,7 +2969,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
 // Metadata-only capability check, before mapping/copying/uploading FFN data.
 // A dtype alone does not establish support: the CUDA architecture and the
 // complete logical/stored row geometry must support the exact MMQ path.
-TSG_EXPORT int TSGgml_Qwen4ExpTpWeightSupported(int type, int input, int rows, int experts, int degree, int expand_tiles)
+static int q4e_tp_weight_supported(int type, int input, int rows, int experts, int degree, int expand_tiles, int rank_offset)
 {
     try
     {
@@ -2958,11 +2977,14 @@ TSG_EXPORT int TSGgml_Qwen4ExpTpWeightSupported(int type, int input, int rows, i
         if (!tsg_matmul_id_quant_strip_type_supported((ggml_type)type))
             throw std::invalid_argument("qwen4exp TP: FFN dtype has no exact CUDA MMQ output-strip kernel");
         if (input <= 0 || input % ggml_blck_size((ggml_type)type) || rows <= 0 || rows % 128
-            || experts <= 0 || degree <= 1 || rows % degree || degree != tsg::g_device_count.load())
+            || experts <= 0 || degree <= 1 || rows % degree
+            || rank_offset < 0 || rank_offset + tsg::g_device_count.load() > degree
+            || degree % tsg::g_device_count.load() || rank_offset % tsg::g_device_count.load())
             throw std::invalid_argument("qwen4exp TP: unsupported FFN dimensions");
-        for (int rank = 0; rank < degree; ++rank)
+        for (int local_rank = 0; local_rank < tsg::g_device_count.load(); ++local_rank)
         {
-            tsg::ScopedRank scope(rank);
+            const int rank = rank_offset + local_rank;
+            tsg::ScopedRank scope(local_rank);
             if (!ensure_backend()) return 0;
             const int first = rows / degree * rank, end = first + rows / degree;
             const int stored_first = expand_tiles ? first / 128 * 128 : first;
@@ -2984,6 +3006,16 @@ TSG_EXPORT int TSGgml_Qwen4ExpTpWeightSupported(int type, int input, int rows, i
     catch (const std::exception& e) { set_last_error(e.what()); return 0; }
 }
 
+TSG_EXPORT int TSGgml_Qwen4ExpTpWeightSupported(int type, int input, int rows, int experts, int degree, int expand_tiles)
+{
+    if (degree != tsg::g_device_count.load()) { set_last_error("qwen4exp TP: local degree mismatch"); return 0; }
+    return q4e_tp_weight_supported(type, input, rows, experts, degree, expand_tiles, 0);
+}
+TSG_EXPORT int TSGgml_Qwen4ExpTpWeightSupportedGlobal(int type, int input, int rows, int experts, int degree, int expand_tiles, int rank_offset)
+{
+    return q4e_tp_weight_supported(type, input, rows, experts, degree, expand_tiles, rank_offset);
+}
+
 // Explicit plan ABI: never infer TP from the process-global device count.
 TSG_EXPORT int TSGgml_Qwen4ExpTokenSpanTp(
     Q4E_SPAN_PARAMETERS, void* hidden_out, int logits_rows,
@@ -2993,6 +3025,16 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpanTp(
     if (!tp_plan_out) { set_last_error("qwen4exp TP: missing plan output"); return 0; }
     return q4e_token_span_impl(Q4E_SPAN_ARGUMENTS, hidden_out, logits_rows,
                               qsa, qsa_positions, qsa_position_count, tp_plan_out);
+}
+
+TSG_EXPORT int TSGgml_Qwen4ExpTokenSpanTpGlobal(
+    Q4E_SPAN_PARAMETERS, void* hidden_out, int logits_rows,
+    const TSGgmlQwen4ExpQsaArgs* qsa, const int32_t* qsa_positions, int qsa_position_count,
+    int global_degree, int rank_offset, void** tp_plan_out)
+{
+    if (!tp_plan_out) { set_last_error("qwen4exp TP: missing plan output"); return 0; }
+    return q4e_token_span_impl(Q4E_SPAN_ARGUMENTS, hidden_out, logits_rows,
+        qsa, qsa_positions, qsa_position_count, tp_plan_out, global_degree, rank_offset);
 }
 
 #undef Q4E_SPAN_ARGUMENTS

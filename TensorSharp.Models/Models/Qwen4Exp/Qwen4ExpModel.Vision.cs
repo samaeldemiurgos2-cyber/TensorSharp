@@ -47,6 +47,7 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
+            if (HasDistributedQwen) throw new NotSupportedException("Distributed Qwen currently supports text input; media positions and embeddings need distributed control.");
             // The published Qwen4ExpVisionPatchMerger uses nn.GELU() (erf),
             // independently of the block MLP's gelu_pytorch_tanh. Preserve the
             // supplied GGUF path's existing tanh default; erf is an explicit
@@ -60,6 +61,12 @@ namespace TensorSharp.Models
 
         public void SetVisionEmbeddings(Tensor visionEmbeddings, int startPosition)
         {
+            if (HasDistributedQwen)
+            {
+                // This API transfers ownership of the queued embedding tensor.
+                visionEmbeddings?.Dispose();
+                RefuseUnmirroredQwenOperation("vision embedding overrides");
+            }
             _visionEmbeddingsList.Add((visionEmbeddings, startPosition));
         }
 
@@ -115,6 +122,7 @@ namespace TensorSharp.Models
 
         public void SetMRoPEPositions(int[] flatThw)
         {
+            if (flatThw != null) RefuseUnmirroredQwenOperation("multimodal rotary positions");
             _pendingMRoPEPositions = flatThw;
         }
 

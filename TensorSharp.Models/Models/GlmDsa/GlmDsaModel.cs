@@ -171,65 +171,76 @@ namespace TensorSharp.Models
                     : ValidateParallelism(backend, tpDegree, tpGroup, layerSplitDegree),
                 NativeRequested(backend) || directCuda ? 1 : tpDegree, directCuda ? null : tpGroup)
         {
-            string arch = _gguf.GetString("general.architecture") ?? "glm-dsa";
-            Config = new ModelConfig { Architecture = arch };
-            ParseBaseConfig();
-            ParseGlmDsaConfig(arch);
-            ParseTokenizer();
-
-            Console.WriteLine($"Model: {arch}, Layers={_numTrunkLayers}" +
-                (_numNextnLayers > 0 ? $" (+{_numNextnLayers} NextN/MTP block in the file)" : "") +
-                $", Hidden={Config.HiddenSize}, " +
-                $"Heads={Config.NumHeads}, MLA(q_lora={_qLoraRank}, kv_lora={_kvLoraRank}, head_k={_headDimK}, head_v={_headDimV}, rope={_ropeDim}), " +
-                $"Vocab={Config.VocabSize}");
-            Console.WriteLine($"  MoE: {_numExperts} experts, top-{_numExpertsUsed}, ffn={_expertFfnLength}, shared={_numSharedExperts}, " +
-                $"scale={_expertWeightsScale}, norm={_expertWeightsNorm}, gating={(_expertGatingFunc == 2 ? "sigmoid" : "softmax")}, dense_lead={_numDenseLead}");
-            Console.WriteLine($"  DSA indexer: {_indexerHeads} heads x {_indexerHeadDim}, top-k={_indexerTopK}, " +
-                $"full layers={CountIndexerFull()}/{_numTrunkLayers}");
-            Console.WriteLine($"RoPE base={Config.RopeBase}, scale={Config.RopeScale}, eps={Config.Eps}");
-
-            int maxContextLength = ResolveConfiguredContextLength();
-
-            if (directCuda)
+            try
             {
-                InitCudaExecutor(ggufPath, layerSplitDegree, maxContextLength);
-                return;
-            }
+                string arch = _gguf.GetString("general.architecture") ?? "glm-dsa";
+                Config = new ModelConfig { Architecture = arch };
+                ParseBaseConfig();
+                ParseGlmDsaConfig(arch);
+                ParseTokenizer();
 
-            if (NativeRequested(backend))
+                Console.WriteLine($"Model: {arch}, Layers={_numTrunkLayers}" +
+                    (_numNextnLayers > 0 ? $" (+{_numNextnLayers} NextN/MTP block in the file)" : "") +
+                    $", Hidden={Config.HiddenSize}, " +
+                    $"Heads={Config.NumHeads}, MLA(q_lora={_qLoraRank}, kv_lora={_kvLoraRank}, head_k={_headDimK}, head_v={_headDimV}, rope={_ropeDim}), " +
+                    $"Vocab={Config.VocabSize}");
+                Console.WriteLine($"  MoE: {_numExperts} experts, top-{_numExpertsUsed}, ffn={_expertFfnLength}, shared={_numSharedExperts}, " +
+                    $"scale={_expertWeightsScale}, norm={_expertWeightsNorm}, gating={(_expertGatingFunc == 2 ? "sigmoid" : "softmax")}, dense_lead={_numDenseLead}");
+                Console.WriteLine($"  DSA indexer: {_indexerHeads} heads x {_indexerHeadDim}, top-k={_indexerTopK}, " +
+                    $"full layers={CountIndexerFull()}/{_numTrunkLayers}");
+                Console.WriteLine($"RoPE base={Config.RopeBase}, scale={Config.RopeScale}, eps={Config.Eps}");
+
+                int maxContextLength = ResolveConfiguredContextLength();
+                // Preserve the GGUF's raw metadata prefix during parsing, then expose
+                // the canonical family id to chat protocols and runtime capability checks.
+                if (IsFlashArchitecture(arch)) Config.Architecture = "glm5next";
+
+                if (directCuda)
+                {
+                    InitCudaExecutor(ggufPath, layerSplitDegree, maxContextLength);
+                    return;
+                }
+
+                if (NativeRequested(backend))
+                {
+                    // The whole model lives in the native executor: no managed weight
+                    // tensors, no managed caches.
+                    InitNativeExecutor(ggufPath, backend, tpDegree, layerSplitDegree, maxContextLength);
+                    return;
+                }
+
+                // glm5next now has a managed per-op path (GlmDsaModel.Glm5Next.cs): KDA
+                // linear attention and Sinkhorn hyper-connections both run in C#, so the
+                // pure-C# `cpu` backend serves this family too.
+                ParseGlm5NextConfig(arch, _numTrunkLayers);
+
+                LoadWeights();
+                BuildLayerNames();
+                CacheMoeWeightHandles();
+                ResolveMtpLayer();
+
+                if (IsTensorParallel)
+                {
+                    ShardGlmDsaWeightsForTP();
+                    PrepareCudaQuantizedWeightsForInferenceTP();
+                }
+                else
+                {
+                    PrepareCudaQuantizedWeightsForInference();
+                }
+
+                int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
+                if (initialCacheLength < maxContextLength)
+                    Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
+
+                InitCaches(initialCacheLength, maxContextLength);
+                AllocateScratch();
+            }
+            catch (Exception error)
             {
-                // The whole model lives in the native executor: no managed weight
-                // tensors, no managed caches.
-                InitNativeExecutor(ggufPath, backend, tpDegree, layerSplitDegree, maxContextLength);
-                return;
+                CleanupFailedConstruction(error);
+                throw;
             }
-
-            // glm5next now has a managed per-op path (GlmDsaModel.Glm5Next.cs): KDA
-            // linear attention and Sinkhorn hyper-connections both run in C#, so the
-            // pure-C# `cpu` backend serves this family too.
-            ParseGlm5NextConfig(arch, _numTrunkLayers);
-
-            LoadWeights();
-            BuildLayerNames();
-            CacheMoeWeightHandles();
-            ResolveMtpLayer();
-
-            if (IsTensorParallel)
-            {
-                ShardGlmDsaWeightsForTP();
-                PrepareCudaQuantizedWeightsForInferenceTP();
-            }
-            else
-            {
-                PrepareCudaQuantizedWeightsForInference();
-            }
-
-            int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
-            if (initialCacheLength < maxContextLength)
-                Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
-
-            InitCaches(initialCacheLength, maxContextLength);
-            AllocateScratch();
         }
 
         /// <summary>
@@ -238,7 +249,7 @@ namespace TensorSharp.Models
         /// (same contract as the retained Qwen hybrid GDN models). glm-dsa proper has no
         /// recurrent state and keeps the base behaviour.
         /// </summary>
-        public override bool SupportsKVCacheTruncation => Config.Architecture != "glm5next";
+        public override bool SupportsKVCacheTruncation => !IsGlm5NextArch;
 
         /// <summary>
         /// The dtype a slot's MLA and indexer rows are actually allocated in: F16 in the
@@ -356,7 +367,7 @@ namespace TensorSharp.Models
         {
             var full = new bool[_numTrunkLayers];
 
-            if (arch == "glm5next")
+            if (IsFlashArchitecture(arch))
             {
                 // GLM-5.3-Flash: attention.head_count_kv is a per-layer array,
                 // 0 on KDA (linear-attention) layers and 1 on MLA+DSA layers.

@@ -2,6 +2,11 @@
 
 [← 返回模型索引](README_zh-cn.md) | [English](qwen38-flash-next.md)
 
+> **多节点执行：** `ggml_cuda` 下，在 `--layer-split N` 或 `--tp N` 后加
+> `--tp-node-id` 和 `--tp-peers`，其中 N 是每个节点的 GPU 数量。所有节点需使用相同
+> 的检查点、构建及数值配置。启动顺序和限制见[多节点指南](../multi-node-inference.md)。
+> 下文历史上的单机测量不代表多节点性能。
+
 Qwen3.8-Flash-Next 是一个混合型 MoE：GatedDeltaNet 递归层与全注意力层交错
 （其中一部分全注意力层挂在 Qwen Sparse Attention 的 indexer 后面），再加上一个
 PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF 架构 id 是
@@ -271,7 +276,7 @@ embedding，并保留其 MRoPE 位置。prefill 后为重试保留的图像片�
 不包含同步图像准备与编码；这些短文本复制检查不代表通用质量或完整媒体请求延迟。
 另外，普通/MTP HTTP 两种模式各通过 24/24 文本请求与 3/3 图像场景，包含附件顺序与
 历史图像。该配置因余量不足拒绝保留缓存，因此后续轮次重新 prefill。本地证据：
-`docs/validation/model-matrix-20260927/qwen38/SUMMARY.md`（不提交）。该架构现支持下文所述的本地张量并行；跨节点执行仍不支持。
+`docs/validation/model-matrix-20260927/qwen38/SUMMARY.md`（不提交）。这批历史测试未验证跨节点执行；当前支持范围见[多节点指南](../multi-node-inference.md)。
 
 `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` 挂上逐 token 的 MTP 块（仅限 GGML 后端；该头必须是单个 GGUF 文件，并在模型加载时挂上）；它只为从位置 0 开始
 prefill 的单独请求做投机（与其他序列共享的步，以及延续保留 holder 或共享前缀克隆的轮次，都按普通
@@ -477,7 +482,15 @@ Qwen/MoE 回归通过 CUDA 327 项（跳过 17）和 CPU 319 项（跳过 22）�
 直接 `cuda` 引擎能运行 UD-Q2_K_XL 的 IQ2_XS 与 IQ3_XXS 专家：decode 用从 ggml 点积移植来的逐 token
 kernel，仍以捕获的 CUDA 图运行；prefill 则把这两种布局解码进它的 tensor-core 与寄存器暂存
 （register-staged）分组 kernel。在分组 kernel 接手之前，它对这个文件的 prefill 走最慢的回退路径，
-约 500 tok/s。该引擎没有主机专家接缝，所以 `--n-cpu-moe` 在它上面只打印警告，专家仍留在 GPU 上。
+约 500 tok/s。它也能运行 UD-Q4_K_XL：该文件 48 层路由 down 投影中有 43 层存为 Q5_1（另外 5 层为
+Q8_0），gate/up 为 Q4_K/Q5_K。decode 像 ggml 的 `vec_dot_q5_1_q8_1` 一样用 dp4a 把 Q5_1 与 q8_1 激活
+做点积（偏移项取自 int8 激活之和），prefill 则把它解码进同样的分组 kernel，全部以 ggml 的
+`dequantize_row_q5_1` 为准。此前引擎在加载时拒绝
+这个文件，而在 `--layer-split 2` 下两个设备各自的拒绝以未处理的 `AggregateException` 中止了 CLI；
+现在它不能解码的专家布局会在任何上传之前被拒绝，只输出一行点名该张量的 `error: model load refused:`。
+尚未在直接引擎上测量 UD-Q4_K_XL 的吞吐。没有 nvcc 的构建使用已提交的 PTX，它需要重新生成才包含 Q5_1
+解码器；在此之前引擎会拒绝 Q5_1 专家，而不是把它们当作 Q8_0 解码。
+该引擎没有主机专家接缝，所以 `--n-cpu-moe` 在它上面只打印警告，专家仍留在 GPU 上。
 直接 `cuda` 引擎使用 `--layer-split N` 分配多个 GPU，并拒绝 `--tp N`。
 `ggml_cuda` 已支持对 UD-Q2_K_XL 使用 `--tp 2`，保留原始量化权重；支持的格式及设备/布局要求见
 [多 GPU](#多-gpu)。
@@ -505,7 +518,10 @@ down 按输出行切分，再汇集输出供 hyper-connection 写回。每个 ra
 down 点积保持原始完整宽度，避免求和顺序的微小差异被后续激活量化放大。
 注意力、GDN、QSA、PLE 使用复制的权重及各 rank 独立状态，
 输出头仅在 rank 0 执行。图像与工具调用沿用同一目标图；投机回滚会恢复每个 rank
-的 GDN/PLE 状态。TP 下仍不支持共享前缀检查点，也不支持跨节点执行。
+的 GDN/PLE 状态。TP 下仍不支持共享前缀检查点。`ggml_cuda` 下可使用
+`--tp-node-id` 和 `--tp-peers` 扩展到多个节点，FFN 行切分依据全局 rank 数量。
+分布式按层切分则传递完整的 F32 超连接残差，GDN、卷积、PLE 与 QSA 状态留在所属层。
+分布式模式当前仅支持串行文本请求，不支持媒体、投机解码及保留序列快照。
 两次汇集使用 TensorSharp CUDA FP32 collective；回退路径以零复制切片避开
 上游 CUDA 自动 BF16 阈值，设备 collective 不可用时使用 FP32 主机归约。
 两次通信增加数据量以保持数值精度，无需修改 ggml。
@@ -514,7 +530,8 @@ FFN 中间宽度和输出宽度必须能被并行度整除；投影按完整输�
 量化 prefill 保留原始 MMQ tile 和归约几何，gate/up 切片保留重叠的 128 行边界 tile，再裁剪输出。
 在中间宽度 640 的检查点上，TP2 每个 rank 为逻辑 320 行保存 384 行，TP4 为逻辑 160 行保存 256 行。
 不支持的配置会在批量加载权重前依据 GGUF 元数据拒绝。当前模型路径要求 CUDA MMQ stream-K，
-FFN 类型限于 Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ1_S、IQ3_S、IQ4_XS、IQ4_NL 和 Q8_0。
+FFN 类型限于 Q5_1、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ1_S、IQ3_S、IQ4_XS、IQ4_NL 和 Q8_0。
+UD-Q4_K_XL 的 Q5_1 down 权重使用 TensorSharp 自有的精确输出行切分内核。
 这包含 UD-Q2_K_XL 的 IQ2_XS/IQ3_XXS 路由 gate/up 权重、Q5_K/Q6_K 共享权重和 IQ4_NL/Q8_0 down 权重。
 完整输出行数及 down 输出切片须为 128 的倍数。IQ1_M 仍被拒绝，因为上游 ggml 没有该格式的 MMQ tile kernel。
 其他 FFN 类型（包括 F32/F16/BF16）、设备或无法保持归约顺序的布局会明确拒绝。

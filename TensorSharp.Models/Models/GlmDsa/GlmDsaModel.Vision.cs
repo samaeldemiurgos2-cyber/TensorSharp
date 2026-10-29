@@ -26,6 +26,7 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
+            RefuseUnmirroredGlmOperation("vision embedding overrides");
             if (Config.Architecture != "glm5next")
             {
                 Console.WriteLine($"Warning: {Config.Architecture} has no vision tower; ignoring mmproj {mmProjPath}.");
@@ -46,6 +47,7 @@ namespace TensorSharp.Models
                 return;
             try
             {
+                RefuseUnmirroredGlmOperation("vision embedding overrides");
                 if (startPosition < 0)
                     return;
                 if (!UsesNativeExecutor)

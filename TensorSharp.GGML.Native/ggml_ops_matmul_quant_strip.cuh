@@ -12,6 +12,7 @@
 #include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/quantize.cuh"
+#include <type_traits>
 namespace {
 struct quant_strip_args {
     const char * weights;
@@ -27,6 +28,28 @@ struct quant_strip_args {
     const char * weights2 = nullptr;
     float * out2 = nullptr, * partial2 = nullptr;
 };
+
+// Upstream mul_mat_q_process_tile gained a has_fusion template parameter and
+// x_gate/glu_op/glu_limit arguments for its fused gate/up path (ggml after
+// da8e2a54). Detect which form the fetched ggml has and call that one without
+// fusion, so this builds against either checkout.
+template<ggml_type type, int J, bool fixup, typename = void>
+struct quant_strip_tile_has_fusion_arg : std::false_type {};
+template<ggml_type type, int J, bool fixup>
+struct quant_strip_tile_has_fusion_arg<type, J, fixup,
+    std::void_t<decltype(&mul_mat_q_process_tile<type, J, false, fixup, GGML_PREC_Q8, false>)>> : std::true_type {};
+
+template<ggml_type type, int J, bool fixup>
+static __device__ __forceinline__ void quant_strip_process_tile(
+        const char * x, int offset_x, const int * y, const int * ids_dst, float * dst, float * tmp_fixup,
+        int stride_row_x, int ncols_y, int stride_col_dst, int tile_x_max_i, int tile_y_max_j, int kb0_start, int kb0_stop) {
+    if constexpr (quant_strip_tile_has_fusion_arg<type, J, fixup>::value)
+        mul_mat_q_process_tile<type, J, false, fixup, GGML_PREC_Q8, false>(x, nullptr, offset_x, y, ids_dst, dst, tmp_fixup,
+            nullptr, ggml_glu_op{}, 0.0f, stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+    else
+        mul_mat_q_process_tile<type, J, false, fixup, GGML_PREC_Q8>(x, offset_x, y, ids_dst, dst, tmp_fixup,
+            nullptr, stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+}
 
 template<ggml_type type, int J>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false, GGML_PREC_Q8), ggml_cuda_mmq_get_occupancy(type, J, false, GGML_PREC_Q8))
@@ -60,10 +83,10 @@ __global__ void quant_strip_main(quant_strip_args a) {
             const int xo=expert*a.expert_stride+local_row*a.row_stride;
             const int yo=(low+jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
             if(partial)
-                mul_mat_q_process_tile<type,J,false,true,GGML_PREC_Q8,false>(a.weights,nullptr,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,GGML_GLU_OP_SWIGLU,0.0f,
+                quant_strip_process_tile<type,J,true>(a.weights,xo,a.input+yo,selected,a.out+local_row,a.partial,
                     a.row_stride,a.selected_rows,a.rows,a.rows-local_row-1,columns-jt*J-1,kb,stop);
             else
-                mul_mat_q_process_tile<type,J,false,false,GGML_PREC_Q8,false>(a.weights,nullptr,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,GGML_GLU_OP_SWIGLU,0.0f,
+                quant_strip_process_tile<type,J,false>(a.weights,xo,a.input+yo,selected,a.out+local_row,a.partial,
                     a.row_stride,a.selected_rows,a.rows,a.rows-local_row-1,columns-jt*J-1,kb,stop);
         }
         begin+=stop-kb;

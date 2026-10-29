@@ -120,8 +120,8 @@ revision and all shard hashes with every new validation result.
 
 [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/60ad3651641b5c97679c807e064ab1d7a3ca1455)
 packages the 1017 checkpoint for llama.cpp. TensorSharp loads the tested
-`UD-IQ2_XXS` files as published. Their layout differs from the one above in
-four ways handled by the loader:
+`UD-IQ2_XXS` files as published on `--backend ggml_cuda` (and `ggml_cpu`). Their
+layout differs from the one above in four ways, handled by the native loader:
 
 - The Engram tables are one tensor, `per_layer_token_embd.weight` (Q5_K, in its
   own shard), described by `deepseek41.ple.*` metadata. The loader slices it
@@ -137,8 +137,10 @@ four ways handled by the loader:
   (`clip`, projector `deepseek41v`), which `--mmproj` loads directly; the image
   tokens' routing biases come from the text shards (`blk.N.exp_probs_b_vl.bias`).
 
-The completed loading and distributed controls cover `UD-IQ2_XXS`; other
-quantizations need separate validation. At revision `60ad3651…`, `UD-Q4_K_XL` contains Engram type 43,
+The managed executors, `--backend cuda` and `--backend cpu`, do not read this
+layout and refuse these files from the header, before any weight is mapped; see
+[Backends](#backends). The completed loading and distributed controls cover
+`UD-IQ2_XXS` on `ggml_cuda`; other quantizations need separate validation. At revision `60ad3651…`, `UD-Q4_K_XL` contains Engram type 43,
 which the tested unchanged ggml `3612c0af…` rejects. Its load failed; see the
 [validation report](../deepseek41_validation.md).
 
@@ -524,7 +526,11 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model /models/F
 
 Each GPU holds its global routed-expert gate/up and down-output strips. The
 existing cross-node F32 AllReduce assembles disjoint activations and output
-rows twice per GPU-resident MoE layer. Attention, shared experts, Engram and
+rows twice per GPU-resident MoE layer. Across nodes this exchange is
+host-driven: the device-resident exchange described below is local only, so
+each rank's strips go through host F32 buffers and two blocking collectives per
+layer (see [Current limits](#current-limits-and-tensor-parallel-work) for their
+size). Attention, shared experts, Engram and
 CPU-offloaded expert layers are computed on each node. This preserves the
 existing tensor-parallel computation and makes network latency material to
 decode speed; use the measured transport and matched controls when assessing
@@ -539,8 +545,10 @@ the driver and matching CLI workers together to change that configuration.
 Requests for the already loaded model remain available. Local multi-GPU
 behavior retains its existing paths. Distributed
 automatic prefill uses microbatches of 256; explicit positive
-`TS_DSV4_UBATCH` remains configurable. `--layer-split` cannot be combined with
-distributed groups. Use the [fixed-token validation procedure](../../eng/validation/DeepSeek41DistributedProbe/README.md)
+`TS_DSV4_UBATCH` remains configurable. For distributed whole-layer placement,
+replace `--tp N` with `--layer-split N` on every node and retain the peer
+arguments; see the [multi-node guide](../multi-node-inference.md).
+Use the [fixed-token validation procedure](../../eng/validation/DeepSeek41DistributedProbe/README.md)
 for numerical controls and the HTTP suites for actual checkpoint quality.
 
 The following device-resident exchange description applies to local TP.
@@ -855,6 +863,51 @@ yet. Like `ggml_cpu`, both are correctness and portability paths, not serving
 ones; the end of
 [Running on the ggml CPU backend](#running-on-the-ggml-cpu-backend) has the
 detail. `--backend mlx` remains refused.
+
+| `--backend` | Engram GGUF layouts | One node, several GPUs | Across nodes (`--tp-node-id`/`--tp-peers`) | Role |
+|---|---|---|---|---|
+| `ggml_cuda` | TensorSharp's and llama.cpp's (unsloth 1017) | `--layer-split N`, routed-MoE `--tp 2..8` | layer split (1-8 GPUs per node) and routed-MoE TP (2-16 global ranks) | serving |
+| `ggml_cpu` | both | n/a (one CPU device) | refused | correctness, portability |
+| `cuda` | TensorSharp's only | `--layer-split N`; `--tp` refused | refused | correctness, portability |
+| `cpu` | TensorSharp's only | n/a | refused | correctness, portability |
+| `ggml_vulkan`, `ggml_metal` (`TS_DSV41_ALLOW_NON_CUDA_GPU=1`) | both | one GPU | refused | portability |
+
+The two managed executors, `cuda` and `cpu`, read Engram only in TensorSharp's
+per-layer layout: `deepseek41.engram.*` metadata (layer ids, multipliers,
+primes, offsets, the compressed pad id) with `blk.N.engram_embd`,
+`engram_wkv`, `engram_q` and `engram_k` tensors, which is what
+`eng/dsv41-fixture.py` writes. llama.cpp's combined layout, which unsloth's
+DeepSeek-V4.1-Flash-1017 GGUFs use (`deepseek41.ple.*` metadata, one
+`per_layer_token_embd.weight` table, `engram_kv` and the fused `engram_gate`),
+is read only by the native loader behind `ggml_cuda` and `ggml_cpu`. `cuda` and
+`cpu` refuse it from the header, before any weight is mapped, with
+`This DeepSeek V4.1 GGUF stores its Engram tables in llama.cpp's combined
+layout ... Use --backend ggml_cuda, which loads both layouts`. They used to fail
+inside the executor with `Missing or invalid DeepSeek V4.1 GGUF metadata:
+deepseek41.engram.pad_id` instead.
+
+The direct-CUDA engine also checks every routed-expert tensor before it uploads
+anything, against the code that will run it. Its GPU expert kernels implement
+Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q2_K, IQ3_S, IQ2_XXS and MXFP4 (IQ2_XXS only through
+the per-token kernels, not the tensor-core or register-staged prefill ones); layers offloaded with
+`--n-cpu-moe` run on the managed host matmul, which implements a different set
+(IQ2_XS and IQ3_XXS, but not IQ2_XXS or Q3_K). A tensor that cannot run where
+the layer split puts it is refused by name, for example `blk.0.ffn_gate_exps.weight
+is IQ1_S (GPU-resident)`. Before, the whole checkpoint streamed into VRAM and
+the first token through that layer failed with a bare type number. The 1017
+`UD-IQ2_XXS` experts would be refused on `cuda` even in TensorSharp's layout:
+their gate/up tensors are IQ1_S (10 layers), IQ2_S (15) and IQ2_XXS (15), and
+their down tensors IQ2_S (15), IQ3_XXS (15), IQ2_XS (6), IQ2_XXS (3) and Q2_K (1).
+IQ1_S and IQ2_S run in neither place, so no `--n-cpu-moe` value makes that file
+loadable on `cuda`.
+
+Multi-node DeepSeek V4.1 is `ggml_cuda` only, for both distributed layer split
+and distributed routed-MoE TP. The direct-CUDA engine has no cross-node stage
+executor or collectives, so `--backend cuda` with `--tp-node-id`/`--tp-peers`
+is refused before any peer is contacted: `Architecture 'deepseek41' does not
+implement distributed --layer-split on --backend cuda. Its distributed stage
+executor runs on --backend ggml_cuda; ...` (and the matching tensor-parallel
+message).
 
 ### One backend per GPU
 
@@ -1449,7 +1502,8 @@ encoder is a native ggml component, and `LoadVisionEncoder` throws here, so
 image and video input are not available. The native loader's Engram and
 attention knobs — `TS_DSV41_ENGRAM_WARM`, `_THREADS`, `_RANDOM`,
 `TS_DSV41_SPARSE_FA`, `TS_DSV41_COMPACT_RAW_GATHER` — are inert on it.
-Engram configuration comes directly from the GGUF;
+Engram configuration comes directly from the GGUF, in TensorSharp's layout only
+(see [Backends](#backends));
 `TS_DSV4_THREADS` defaults to `ProcessorCount` here rather than
 min(cores, 32); and `TS_DSV4_CPU_TRACE_DIR` writes the same per-tensor files
 that `eng/dsv41-reference.py --output` writes, so the two directories diff
@@ -1458,7 +1512,7 @@ path, not a serving one: no throughput, load time or resident footprint has been
 measured for a full checkpoint on it.
 
 `--backend cuda`, the direct-CUDA engine, also runs V4.1 with its own kernels and
-no ggml. It has per-sequence slots, batched decode, retained conversation state and
+no ggml, on TensorSharp-layout GGUFs only (see [Backends](#backends)). It has per-sequence slots, batched decode, retained conversation state and
 local whole-layer placement through `--layer-split N`; routed-expert `--tp N`
 remains a `ggml_cuda` mode. The source includes targeted numerical contracts:
 [`Dsv4ExpertKernelTests`](../../InferenceWeb.Tests/Dsv4ExpertKernelTests.cs)
@@ -1606,6 +1660,73 @@ original output limit retain precedence.
   which has targeted kernel/slot contracts but no independent full-checkpoint numerical gate; both are correctness and portability paths
   rather than serving ones. `mlx` fails before the weights are read, rather
   than loading V4.1 weights into a graph that does not implement it.
+- `cuda` and `cpu` need a GGUF in TensorSharp's Engram layout. They refuse
+  llama.cpp's combined layout, which includes unsloth's
+  DeepSeek-V4.1-Flash-1017 GGUFs, from the header; run those on `ggml_cuda`.
+  On `cuda`, the 1017 `UD-IQ2_XXS` routed experts are also refused at load:
+  IQ1_S, IQ2_S, IQ2_XS and IQ3_XXS have no GPU expert kernel, and the host
+  matmul behind `--n-cpu-moe` runs neither IQ1_S, IQ2_S nor IQ2_XXS. Porting
+  the combined layout to the managed executors would therefore not make that
+  file run on `cuda`. The `cuda` backend is uncovered for the 1017 checkpoint.
+- Distributed layer split and distributed routed-MoE TP run only on
+  `ggml_cuda`. `cuda`, `cpu`, `ggml_cpu` and the opt-in non-CUDA ggml backends
+  refuse `--tp-node-id`/`--tp-peers` before contacting a peer.
+- Distributed routed-MoE TP uses the host-driven exchange, not local TP's
+  device-resident one. Per GPU-resident MoE layer and per token, each node
+  enters two blocking F32 AllReduce collectives over the cross-node transport:
+  the gathered expert activations, 2304 x 6 values (54 KiB), and the
+  disjoint output rows, 5120 values (20 KiB). With every layer's experts on
+  the GPUs that is 80 collectives and about 3 MiB of payload per decoded
+  token (`--n-cpu-moe` layers run on every node instead), so decode
+  speed is bounded by the network round trip rather than by the GPUs, and the
+  local TP figures in this card do not apply. Attention, shared experts,
+  Engram and CPU-offloaded expert layers run in full on every node.
+- When the host-mapped Engram tables are larger than the host or container
+  memory limit, they can never become resident. The 1017 `UD-IQ2_XXS` table is
+  125.9 GiB, larger than a 100 GB cgroup, and on 46 GB A40s each layer's
+  roughly 63 GiB slice cannot be placed on a GPU either. Background warming is
+  then skipped (the mapped host weights plus 8 GiB exceed the allowance), and every
+  token reads 24 rows per table, two tables, as random page faults. On network
+  storage each uncached row is a storage round trip: the measurements under
+  [Host-mapped Engram tables](#host-mapped-engram-tables) are 5-15 ms of input
+  preparation per decoded token and 1.4-2.6 s per 1,024-token prefill chunk
+  cold, against 0.9 ms and 56-81 ms warm. Page cache counts against the
+  container limit, so rows keep being evicted and the cost does not go away
+  over a session, and random-token benchmarks never warm at all. Under
+  distributed layer split only the stage that owns the two Engram layers pays
+  it; under distributed TP every node does.
+- Measured on two RunPod pods with two 46 GB A40s each (sm_86, driver 595.91,
+  CUDA 12.8), a 100 GB container limit and per-pod network storage, over an SSH
+  tunnel (`eng/validation/multinode-ssh-tunnel.sh`; chained all-reduce 0.61 ms
+  at 10 KiB, 2.6 ms at 1 MiB), F16 KV, `TS_DSV4_UBATCH=256`,
+  `TS_DSV41_ENGRAM_DEVICE=0` and `TS_DSV41_ENGRAM_WARM=0` (the table never fits
+  the cgroup). Both placements fit with `--n-cpu-moe 0`: layer split holds
+  77.9 GiB per node (layers 0-21 with Engram on node 1, 22-39 on node 0), TP
+  80.8 GiB per node. Medians of runs 2-4, random tokens (Engram cold):
+
+  | 2 nodes x 2 A40, `ggml_cuda` | Prefill tok/s | Decode tok/s |
+  | --- | ---: | ---: |
+  | Layer split, 512 / 2,048 tokens | 148 / 163-179 | 24.2 / 25.2-25.9 |
+  | Layer split, decode at 20K context | | 26.4 |
+  | TP, exact prefill, 2,048 tokens | 56-58 | 9.4-9.7 |
+  | TP, default YOCO, 2,048 tokens | 139 | 9.2 |
+
+  The first run after a warm page cache reached 406 / 31.7 tok/s, close to the
+  local five-A40 figures: on this storage, cold Engram reads dominate layer
+  split. TP is network-bound (above). Distributed TP and layer split gave
+  bit-identical logits on a 3,400-token teacher-forced probe (82 vectors) and,
+  with the selection fix below, on a 23,357-token probe (126 vectors), where
+  each placement is also bit-identical from run to run. The HTTP suites
+  (answers, JSON, multi-turn, tool calls) passed in both placements except
+  one strict check that rejects a correct JSON answer inside a code fence.
+- Index and candidate selections use `ggml_argsort_top_k`. ggml-cuda's radix
+  top-k (`ggml_top_k` on wide rows) resolves ties and orders its output by
+  atomic arrival, so above 4,096 index rows gathered decode summed its keys
+  in a different order on every token, and above 16,384 rows the candidate
+  selection could keep a different tied block: long contexts differed from run
+  to run, and under distributed TP the two nodes, which each run every
+  selection, drifted apart. The sort is deterministic, with no measurable
+  decode cost at a 20K context.
 - Execution uses one GPU by default. `--layer-split N` selects whole-layer
   placement; `--tp N` selects routed-MoE tensor parallelism with F32 activation/output gathers.
   The existing distributed groups extend routed-MoE TP across nodes on

@@ -1542,7 +1542,10 @@ namespace
             context = PooledContextHandle();
         }
     };
-    G4MoEVerifyTpPending g_g4moev_tp[tsg::TSG_MAX_DEVICES];
+    // Deliberately leaked, like g_mg_tp in ggml_ops_muse_glimmer.cpp: a static
+    // destructor freeing a parked buffer at process exit aborts on ggml_cuda.
+    // TSGgml_Gemma4MoEReleaseVerifyTpGraphs is the release path.
+    G4MoEVerifyTpPending* const g_g4moev_tp = new G4MoEVerifyTpPending[tsg::TSG_MAX_DEVICES];
 }
 
 // Release every rank's parked tensor-parallel MoE verify graph.

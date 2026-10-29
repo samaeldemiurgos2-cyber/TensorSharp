@@ -40,6 +40,7 @@ namespace TensorSharp.Models
 
         public void LoadMtpDraftWeights(string path)
         {
+            if (HasDistributedQwen) throw new NotSupportedException("Distributed Qwen does not yet coordinate an MTP draft cache; omit the draft model.");
             ArgumentException.ThrowIfNullOrWhiteSpace(path);
             path = Path.GetFullPath(path);
             if (_mtpFile != null)

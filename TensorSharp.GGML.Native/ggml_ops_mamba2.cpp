@@ -309,16 +309,21 @@ namespace
                        Mamba2DecodeCacheKeyHash,
                        Mamba2DecodeCacheKeyEq> g_mamba2_decode_cache;
 
+    // Whatever a model unload (TSGgml_ClearHostBufferCache and the model's own
+    // TSGgml_NemotronMamba2DecodeClear) or TSGgml_Shutdown left is given up here
+    // without being freed (see release_cache_at_exit): a host that reached
+    // neither, such as one that never disposes its model, used to abort at exit
+    // on ggml_cuda after a finished run.
     void ensure_mamba2_prefill_cache_cleanup_registered()
     {
         static std::once_flag flag;
         std::call_once(flag, []() {
             std::atexit([]() {
                 std::lock_guard<std::mutex> lk(g_mamba2_prefill_cache_mutex);
-                g_mamba2_prefill_cache.clear();
+                release_cache_at_exit(g_mamba2_prefill_cache);
                 g_mamba2_prefill_cache_bytes = 0;
                 std::lock_guard<std::mutex> lk_decode(g_mamba2_decode_cache_mutex);
-                g_mamba2_decode_cache.clear();
+                release_cache_at_exit(g_mamba2_decode_cache);
             });
         });
     }
@@ -1282,6 +1287,23 @@ TSG_EXPORT int TSGgml_NemotronMamba2DecodeReadState(
         set_last_error("Unknown error in NemotronMamba2DecodeReadState.");
         return 0;
     }
+}
+
+// Drop every cached prefill graph. They carry nothing between calls (each call
+// uploads its inputs and state and downloads its outputs), so a model unload
+// (TSGgml_ClearHostBufferCache) and TSGgml_Shutdown release them while their
+// backend and the CUDA driver are alive. They used to wait for the atexit handler
+// above, which on Windows runs inside the DLL's process detach, where cudaFree
+// fails: ggml aborted a process that had finished its work (any Nemotron-H prompt
+// of NativeMamba2PrefillMinTokens or more on ggml_cuda, the CLI included, which
+// shuts GGML down but never reached these).
+// A graph another thread is computing on stays alive until that call returns.
+TSG_EXPORT void TSGgml_NemotronMamba2PrefillClear()
+{
+    host_read_barrier();
+    std::lock_guard<std::mutex> lk(g_mamba2_prefill_cache_mutex);
+    g_mamba2_prefill_cache.clear();
+    g_mamba2_prefill_cache_bytes = 0;
 }
 
 TSG_EXPORT void TSGgml_NemotronMamba2DecodeClear(std::uint64_t model_key)

@@ -99,6 +99,22 @@ public class ModelLoadRefusalTests : IDisposable
         Assert.Equal(inner.Message, b);
         // Two different failures are not one refusal.
         Assert.False(ModelLoadRefusal.TryDescribe(new AggregateException(inner, new NullReferenceException()), out _));
+        Assert.False(ModelLoadRefusal.TryDescribe(new AggregateException(new NullReferenceException(), inner), out _));
+    }
+
+    [Fact]
+    public void ParallelUploadsThatAllRefuse_AreOneRefusal()
+    {
+        // A loader uploading to each device in parallel (Parallel.For) whose every device declines
+        // the same weights surfaces as an aggregate of refusals: still the operator's to fix, and
+        // reported by its first reason instead of crashing the host.
+        var first = new NotSupportedException("[q4e-cuda] blk.0.ffn_down_exps.weight is Q4_0");
+        var second = new NotSupportedException("[q4e-cuda] blk.24.ffn_down_exps.weight is Q4_0");
+        Assert.True(ModelLoadRefusal.TryDescribe(new AggregateException(first, second), out string reason));
+        Assert.Equal(first.Message, reason);
+        Assert.True(ModelLoadRefusal.TryDescribe(
+            new TargetInvocationException(new AggregateException(first, new AggregateException(second))), out reason));
+        Assert.Equal(first.Message, reason);
     }
 
     [Fact]

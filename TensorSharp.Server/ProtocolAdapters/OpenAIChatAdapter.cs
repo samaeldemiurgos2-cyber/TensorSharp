@@ -92,13 +92,22 @@ public sealed partial class OpenAIChatAdapter
                 ["id"] = Path.GetFileNameWithoutExtension(_options.StartupModelPath),
                 ["object"] = "model",
                 ["owned_by"] = "local",
-                ["loras"] = _svc.LoraRegistry.List()
-                    .Select(a => new Dictionary<string, object>
+                ["loras"] = _svc.ListLoras()
+                    .Select(l =>
                     {
-                        ["id"] = a.Name,
-                        ["rank"] = a.Rank,
-                        ["alpha"] = a.Alpha,
-                        ["modules"] = a.Modules,
+                        var entry = new Dictionary<string, object>
+                        {
+                            ["id"] = l.Info.Name,
+                            ["rank"] = l.Info.Rank,
+                            ["alpha"] = l.Info.Alpha,
+                            ["modules"] = l.Info.Modules,
+                            // Whether the loaded model can apply it; a request naming one it
+                            // cannot is a 400 with this reason.
+                            ["applicable"] = l.Applicable,
+                        };
+                        if (!l.Applicable)
+                            entry["reason"] = l.Reason ?? string.Empty;
+                        return entry;
                     })
                     .ToList(),
             }];
@@ -305,14 +314,12 @@ public sealed partial class OpenAIChatAdapter
                     skillPlan.Prompt.Catalog.Count, skillPlan.ToolsOffered, skillPlan.Prompt.ApproximateTokens);
         }
 
-        inferenceMessages = await knowledge.PrepareAsync(ctx, inferenceMessages, skillPlan?.ToolsOffered == true,
-            completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxTokens, effectiveTools, openaiThink)).ConfigureAwait(false);
-        if (inferenceMessages == null) return;
-
-        // LoRA selection: an explicit `lora` field names an adapter, or "none"/empty for the
-        // base model. The adapter rides on this request's sampling config down to its
-        // sequence; the engine applies it to that sequence's forward passes only.
-        if (body.TryGetProperty("lora", out var loraProp))
+        // LoRA: an explicit `lora` field names a loaded adapter (null, "none" or empty = the
+        // base model, as when it is omitted). It is resolved once, here, before any output,
+        // and travels with this request alone; a request that cannot run with it gets a 400,
+        // never a reply from the base model or from part of the adapter.
+        TextLoraAdapter? lora = null;
+        if (body.TryGetProperty("lora", out var loraProp) && loraProp.ValueKind != JsonValueKind.Null)
         {
             if (loraProp.ValueKind != JsonValueKind.String)
             {
@@ -325,35 +332,38 @@ public sealed partial class OpenAIChatAdapter
                     {
                         message = "lora must be a string naming a loaded adapter, or \"none\"",
                         type = "invalid_request_error",
+                        param = "lora",
                     },
                 }).ConfigureAwait(false);
                 return;
             }
 
-            string? loraName = loraProp.GetString();
-            if (!_svc.TryResolveLora(loraName, out var loraAdapter, out string? loraError))
+            if (!_svc.TryResolveLoraRequest(loraProp.GetString(), out lora, out LoraRequestError? loraError))
             {
                 openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
-                    "/v1/chat/completions rejected: {LoraError} (id={ChatcmplId})", loraError, requestId);
+                    "/v1/chat/completions rejected: {LoraError} (id={ChatcmplId})", loraError!.Message, requestId);
                 ctx.Response.StatusCode = 400;
-                await ctx.Response.WriteAsJsonAsync(new
-                {
-                    error = new { message = loraError, type = "invalid_request_error" },
-                }).ConfigureAwait(false);
+                await ctx.Response.WriteAsJsonAsync(new { error = loraError.ToOpenAIError() }).ConfigureAwait(false);
                 return;
             }
-            samplingConfig.LoraAdapter = loraAdapter;
+            if (lora != null)
+                openaiLogger.LogInformation(LogEventIds.ChatStarted,
+                    "/v1/chat/completions lora: id={ChatcmplId} adapter={Adapter}", requestId, lora.Id);
         }
+
+        inferenceMessages = await knowledge.PrepareAsync(ctx, inferenceMessages, skillPlan?.ToolsOffered == true,
+            completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxTokens, effectiveTools, openaiThink)).ConfigureAwait(false);
+        if (inferenceMessages == null) return;
 
         if (stream)
         {
             await StreamCompletionAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
-                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge).ConfigureAwait(false);
+                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge, lora).ConfigureAwait(false);
         }
         else
         {
             await CompleteSyncAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
-                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge).ConfigureAwait(false);
+                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge, lora).ConfigureAwait(false);
         }
     }
 
@@ -537,7 +547,8 @@ public sealed partial class OpenAIChatAdapter
         SkillRequestPlan? skillPlan,
         ILogger skillLogger,
         TensorSharp.Runtime.Grammar.IToolCallGrammar? toolGrammar,
-        KnowledgeProtocolRequest knowledge)
+        KnowledgeProtocolRequest knowledge,
+        TextLoraAdapter? lora)
     {
         // Only the strict json_schema path must buffer the whole response so it
         // can be schema-normalized before anything is sent to the client. Plain
@@ -605,7 +616,7 @@ public sealed partial class OpenAIChatAdapter
             ? new StreamingJsonObjectFilter() : null;
 
         await foreach (var update in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxTokens,
-            ctx.RequestAborted, samplingConfig, openaiTools, openaiThink, skillPlan, skillLogger).ConfigureAwait(false))
+            ctx.RequestAborted, samplingConfig, openaiTools, openaiThink, skillPlan, skillLogger, lora).ConfigureAwait(false))
         {
             knowledge.Observe(update);
             string piece = update.Piece;
@@ -826,7 +837,8 @@ public sealed partial class OpenAIChatAdapter
         SkillRequestPlan? skillPlan,
         ILogger skillLogger,
         Runtime.Grammar.IToolCallGrammar? toolGrammar,
-        KnowledgeProtocolRequest knowledge)
+        KnowledgeProtocolRequest knowledge,
+        TextLoraAdapter? lora)
     {
         if (!HostedModelGuard.TryEnsureHostedModelLoaded(_svc, modelName,
                 _options.StartupModelPath, _options.StartupMmProjPath, _options.DefaultBackend, out string loadError))
@@ -846,7 +858,7 @@ public sealed partial class OpenAIChatAdapter
         string? pipelineFinishReason = null;
 
         await foreach (var update in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxTokens,
-            ctx.RequestAborted, samplingConfig, openaiTools, openaiThink, skillPlan, skillLogger).ConfigureAwait(false))
+            ctx.RequestAborted, samplingConfig, openaiTools, openaiThink, skillPlan, skillLogger, lora).ConfigureAwait(false))
         {
             knowledge.Observe(update);
             if (!update.Done)

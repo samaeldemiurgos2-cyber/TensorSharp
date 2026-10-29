@@ -889,6 +889,77 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Fuse <c>blk.{layer}.attn_q/k/v.weight</c> into <c>blk.{layer}.attn_qkv.weight</c>
+        /// ([Q | K | V] output rows), removing the sources. Quantized sources fuse only
+        /// when they share a type, an input width AND a per-tensor sidecar scale: one
+        /// fused tensor carries a single <see cref="QuantizedWeight.Scale"/>, which is
+        /// propagated to it, so q/k/v with different NVFP4 scale2 values stay separate
+        /// and run through the scale-aware per-projection path instead of silently
+        /// losing two of their scales. F32 sources (no scale) always fuse. Returns
+        /// false, leaving the sources in place, when the layer cannot be fused.
+        /// </summary>
+        protected bool TryFuseQkvWeights(int layer)
+        {
+            string qName = $"blk.{layer}.attn_q.weight";
+            string kName = $"blk.{layer}.attn_k.weight";
+            string vName = $"blk.{layer}.attn_v.weight";
+            string qkvName = $"blk.{layer}.attn_qkv.weight";
+
+            if (_quantWeights.TryGetValue(qName, out var qw) &&
+                _quantWeights.TryGetValue(kName, out var kw) &&
+                _quantWeights.TryGetValue(vName, out var vw))
+            {
+                if (qw.GgmlType != kw.GgmlType || kw.GgmlType != vw.GgmlType ||
+                    qw.Ne0 != kw.Ne0 || kw.Ne0 != vw.Ne0 ||
+                    qw.Scale != kw.Scale || kw.Scale != vw.Scale)
+                    return false;
+                if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, qw, kw, vw))
+                    return false;
+
+                fusedWeight.Scale = qw.Scale;
+                var members = new[] { (qName, qw.Ne1), (kName, kw.Ne1), (vName, vw.Ne1) };
+                _quantWeights[qkvName] = fusedWeight;
+                _quantWeights.Remove(qName); qw.Dispose();
+                _quantWeights.Remove(kName); kw.Dispose();
+                _quantWeights.Remove(vName); vw.Dispose();
+                OnFusedProjectionCreated(qkvName, members);
+                return true;
+            }
+
+            if (_weights.TryGetValue(qName, out var qf) &&
+                _weights.TryGetValue(kName, out var kf) &&
+                _weights.TryGetValue(vName, out var vf))
+            {
+                int qDim = (int)qf.Sizes[0], kDim = (int)kf.Sizes[0], vDim = (int)vf.Sizes[0];
+                int inDim = (int)qf.Sizes[1];
+                var fusedTensor = new Tensor(AllocatorForWeight(qkvName), DType.Float32, qDim + kDim + vDim, inDim);
+                using (var s0 = fusedTensor.Narrow(0, 0, qDim)) Ops.Copy(s0, qf);
+                using (var s1 = fusedTensor.Narrow(0, qDim, kDim)) Ops.Copy(s1, kf);
+                using (var s2 = fusedTensor.Narrow(0, qDim + kDim, vDim)) Ops.Copy(s2, vf);
+                _weights[qkvName] = fusedTensor;
+                _weights.Remove(qName); qf.Dispose();
+                _weights.Remove(kName); kf.Dispose();
+                _weights.Remove(vName); vf.Dispose();
+                OnFusedProjectionCreated(qkvName, new[] { (qName, (long)qDim), (kName, (long)kDim), (vName, (long)vDim) });
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Called once for every fused projection a load creates (QKV via
+        /// <see cref="TryFuseQkvWeights"/>, gate/up via <see cref="FuseGateUpWeights"/>),
+        /// for both quantized and F32 results, after the fused weight is stored and its
+        /// sources removed. <paramref name="members"/> lists each source weight name with
+        /// its output-row count, in the fused row order. The base implementation records
+        /// where each source's rows now live, which text LoRA reads to apply an adapter that
+        /// names the sources (see <see cref="Lora.TextLoraBinding"/>); an override must call it.
+        /// </summary>
+        protected virtual void OnFusedProjectionCreated(string fusedName, IReadOnlyList<(string Member, long Rows)> members)
+            => RecordFusedProjection(fusedName, members);
+
+        /// <summary>
         /// Print the fusion copies this load declined, once, after all fusion has run.
         /// Silent when none were declined (the desktop default).
         /// </summary>
@@ -1158,11 +1229,13 @@ namespace TensorSharp.Models
                     }
 
                     fusedWeight.Scale = gw.Scale;
+                    var members = new[] { (gateName, gw.Ne1), (upName, uw.Ne1) };
                     _quantWeights[guName] = fusedWeight;
                     _quantWeights.Remove(gateName); gw.Dispose();
                     _quantWeights.Remove(upName); uw.Dispose();
                     if (requant != null && !ReferenceEquals(requant, fusedWeight))
                         requant.Dispose();
+                    OnFusedProjectionCreated(guName, members);
                     fused++;
                 }
                 else if (_weights.TryGetValue(gateName, out var gf) &&
@@ -1176,6 +1249,7 @@ namespace TensorSharp.Models
                     _weights[guName] = fusedTensor;
                     _weights.Remove(gateName); gf.Dispose();
                     _weights.Remove(upName); uf.Dispose();
+                    OnFusedProjectionCreated(guName, new[] { (gateName, (long)gateDim), (upName, (long)upDim) });
                     fused++;
                 }
             }

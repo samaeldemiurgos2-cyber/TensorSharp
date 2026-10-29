@@ -7,7 +7,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -36,6 +35,9 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly ILogger _logger;
         private readonly bool _stopRepetition;
         private readonly int _nativeSlotContextLimit;
+        // The model's context window (MAX_CONTEXT), or 0 when it advertises none. A request
+        // must leave its prompt one token of room and stops generating where it ends.
+        private readonly int _contextLimit;
         private readonly BlockPool _pool;
         private readonly ContinuousBatchScheduler _scheduler;
         private readonly BatchExecutor _executor;
@@ -75,6 +77,7 @@ namespace TensorSharp.Runtime.Scheduling
             }
             _stopRepetition = cfg.StopRepetition;   // cfg is null-checked above
             _nativeSlotContextLimit = UsesNativeDeepSeek41Slots(model) ? Math.Max(0, model.MaxContextLength) : 0;
+            _contextLimit = Math.Max(0, model.MaxContextLength);
 
             long blockBytes = ComputeBlockByteSize(model, cfg.BlockSize);
             int numBlocks = ResolveEffectiveNumBlocks(model, cfg, _logger);
@@ -270,6 +273,31 @@ namespace TensorSharp.Runtime.Scheduling
             });
         }
 
+        /// <summary>
+        /// Release the model's copy of every retired request adapter (see
+        /// <see cref="IRequestAdapter.IsRetired"/>) that no request in flight still runs with;
+        /// the rest go as their last request finishes. Queued like a trim and applied on the
+        /// engine thread between steps, because a step may be reading the adapter's factors
+        /// right now. Safe to call at any time. Returns false once the engine has shut down,
+        /// when nothing it ran is left to finish.
+        /// </summary>
+        public bool ReleaseRetiredAdapters()
+            => _commands.Writer.TryWrite(new EngineCommand { Kind = EngineCommandKind.ReleaseAdapters });
+
+        /// <summary>How many submitted, unfinished requests run with an adapter that
+        /// <paramref name="match"/> accepts. Safe from any thread.</summary>
+        public int CountInFlightRequests(Func<IRequestAdapter, bool> match)
+        {
+            ArgumentNullException.ThrowIfNull(match);
+            int count = 0;
+            foreach (var entry in _handles)
+            {
+                if (entry.Value.Sequence.Adapter is { } adapter && match(adapter))
+                    count++;
+            }
+            return count;
+        }
+
         public void Dispose()
         {
             lock (_submissionGate)
@@ -330,6 +358,14 @@ namespace TensorSharp.Runtime.Scheduling
                         ApplyCommand(cmd);
                 }
 
+                // A retired adapter's factors go once its last request has left (finished,
+                // failed or aborted); base-only traffic never sets the flag.
+                if (_adapterSweepPending)
+                {
+                    lock (_model.GpuComputeLock)
+                        SweepRetiredAdapters();
+                }
+
                 // If there's nothing in flight, block on command channel.
                 if (_scheduler.RunningCount == 0 && _scheduler.WaitingCount == 0)
                 {
@@ -375,6 +411,11 @@ namespace TensorSharp.Runtime.Scheduling
                         continue;
                     }
 
+                    // A request that resolved an adapter before it was unloaded binds it
+                    // again for its own steps; sweep it once that request is done.
+                    if (output.Adapter is { IsRetired: true })
+                        _adapterSweepPending = true;
+
                     if (output.IsEmpty)
                     {
                         // A preemption may have happened while trying to make room.
@@ -395,18 +436,6 @@ namespace TensorSharp.Runtime.Scheduling
                         continue;
                     }
 
-                    ILoraAdapterHandle? stepAdapter;
-                    IReadOnlyCollection<string>? stepLoraTargets;
-                    try
-                    {
-                        stepAdapter = ActivateStepLoraAdapter(output, out stepLoraTargets);
-                    }
-                    catch (Exception ex)
-                    {
-                        FailStepSequences(ex, output, "LoRA");
-                        continue;
-                    }
-
                     try
                     {
                         results = _executor.ExecuteStep(output);
@@ -416,16 +445,6 @@ namespace TensorSharp.Runtime.Scheduling
                         FailStepSequences(ex, output, "executor");
                         continue;
                     }
-                    finally
-                    {
-                        // Nothing outside this step - a media encode, a warm-up, the next
-                        // step's scheduling - may run under this step's adapter.
-                        if (stepAdapter != null)
-                            ((ILoraAdapterModel)_model).ActivateLoraAdapter(null);
-                    }
-
-                    if (stepAdapter != null)
-                        VerifyLoraTargets(stepAdapter, stepLoraTargets!, results);
 
                     Interlocked.Increment(ref _totalStepsRun);
                     Interlocked.Add(ref _totalForwardTicks, sw.ElapsedTicks);
@@ -442,99 +461,6 @@ namespace TensorSharp.Runtime.Scheduling
                     NotifyReleasedSequences(output);
                 }
             }
-        }
-
-        /// <summary>
-        /// Select the text-LoRA adapter of the sequences <paramref name="output"/> runs, on
-        /// the model, for this step only. The scheduler admits only sequences with the same
-        /// adapter beside each other (<see cref="ContinuousBatchScheduler.LoraBarrierHolds"/>);
-        /// a mixed step is refused rather than run under one of them.
-        /// </summary>
-        private ILoraAdapterHandle? ActivateStepLoraAdapter(SchedulerOutput output, out IReadOnlyCollection<string>? targets)
-        {
-            targets = null;
-            ILoraAdapterHandle? adapter = null;
-            bool first = true;
-            foreach (var work in output.ScheduledWork)
-            {
-                var seqAdapter = work.Sequence.LoraAdapter;
-                if (first) { adapter = seqAdapter; first = false; }
-                else if (!ReferenceEquals(adapter, seqAdapter))
-                    throw new InvalidOperationException(
-                        "A scheduler step mixed sequences under different LoRA adapters; refusing to run it.");
-            }
-            if (adapter == null) return null;
-            if (_model is not ILoraAdapterModel loraModel)
-                throw new NotSupportedException(
-                    $"LoRA adapter '{adapter.Name}' was requested, but this model cannot apply text-LoRA adapters.");
-            loraModel.ActivateLoraAdapter(adapter);
-            // Read while it is active (an adapter unloaded mid-request is materialized for this
-            // step only), and start the step's applied set empty: a failed step may have left some.
-            targets = loraModel.GetLoraTargets(adapter);
-            loraModel.TakeAppliedLoraTargets();
-            return adapter;
-        }
-
-        /// <summary>
-        /// Refuse a LoRA request whose prompt ran without one of its adapter's targets. A
-        /// target is skipped when the model's forward for this backend never goes through the
-        /// LoRA-aware projection for that weight (a fused or native kernel); answering anyway
-        /// would return the base model's text as though it were the adapter's. The check runs
-        /// at the sequence's first sampled token, before anything is published to the client:
-        /// by then every layer has run over the whole prompt.
-        /// </summary>
-        private void VerifyLoraTargets(ILoraAdapterHandle adapter, IReadOnlyCollection<string> targets,
-            List<SequenceStepResult> results)
-        {
-            var loraModel = (ILoraAdapterModel)_model;
-            var applied = loraModel.TakeAppliedLoraTargets();
-            for (int i = 0; i < results.Count; i++)
-            {
-                var r = results[i];
-                var seq = r.Sequence;
-                if (seq.LoraTargetsVerified || r.Error != null || r.SlotUnavailable) continue;
-                if (r.TokensForwarded > 0)
-                {
-                    seq.LoraTargetsApplied ??= new HashSet<string>(StringComparer.Ordinal);
-                    seq.LoraTargetsApplied.UnionWith(applied);
-                }
-                if (r.SampledToken < 0) continue;
-
-                var missing = new List<string>();
-                foreach (string target in targets)
-                    if (seq.LoraTargetsApplied == null || !seq.LoraTargetsApplied.Contains(target))
-                        missing.Add(target);
-                if (missing.Count == 0)
-                {
-                    seq.LoraTargetsVerified = true;
-                    seq.LoraTargetsApplied = null;
-                    continue;
-                }
-
-                loraModel.MarkLoraUnsupported(adapter, missing);
-                _logger.LogError(
-                    "LoRA adapter '{Adapter}' was not applied to {Missing} of its {Targets} target weight(s) by this " +
-                    "model's forward pass (first: {First}); failing request {RequestId} rather than returning base-model output.",
-                    adapter.Name, missing.Count, targets.Count, missing[0], seq.RequestId);
-                results[i] = new SequenceStepResult
-                {
-                    Sequence = seq,
-                    TokensForwarded = r.TokensForwarded,
-                    IsPrefill = r.IsPrefill,
-                    ForwardElapsedTicks = r.ForwardElapsedTicks,
-                    Error = new NotSupportedException(LoraNotAppliedMessage(adapter.Name, missing)),
-                };
-            }
-        }
-
-        /// <summary>The error a client sees when the model's forward skipped adapter targets.</summary>
-        public static string LoraNotAppliedMessage(string adapterName, IReadOnlyList<string> missing)
-        {
-            const int shown = 8;
-            string list = string.Join(", ", missing.Count <= shown ? missing : missing.Take(shown));
-            if (missing.Count > shown) list += $" and {missing.Count - shown} more";
-            return $"LoRA adapter '{adapterName}' cannot be applied by this model on this backend: its forward pass " +
-                $"does not apply the adapter to {list}.";
         }
 
         private void NotifyReleasedSequences(SchedulerOutput output)
@@ -753,19 +679,24 @@ namespace TensorSharp.Runtime.Scheduling
                 case EngineCommandKind.Submit:
                     try
                     {
+                        // Every model: the prompt must leave room for one generated token.
+                        // The pool check in Submit below cannot catch this - the pool is
+                        // sized for the whole context or more - so a 6k-token prompt under
+                        // MAX_CONTEXT=4096 used to be admitted and fail inside the model's
+                        // prefill ("Requested sequence length ... exceeds configured max
+                        // context"), after spending a forward on it.
+                        int promptTokens = cmd.Sequence.PromptTokens.Count;
+                        if (_contextLimit > 0 && promptTokens >= _contextLimit)
+                            throw RefuseForContext(cmd.Sequence,
+                                new ContextLengthExceededException(promptTokens, _contextLimit));
                         // A larger metadata pool accounts for independent native
                         // slots; it must not enlarge any individual slot's context.
-                        long requested = (long)cmd.Sequence.PromptTokens.Count + cmd.Sequence.MaxNewTokens;
+                        long requested = (long)promptTokens + cmd.Sequence.MaxNewTokens;
                         if (_nativeSlotContextLimit > 0 && requested > _nativeSlotContextLimit)
-                        {
-                            var error = new InvalidOperationException(
+                            throw RefuseForContext(cmd.Sequence, new ContextLengthExceededException(
+                                promptTokens, _nativeSlotContextLimit,
                                 $"DeepSeek V4.1 request requires {requested} tokens, but each native sequence slot " +
-                                $"has a context limit of {_nativeSlotContextLimit}. Shorten the prompt or output allowance.");
-                            cmd.Sequence.Status = SequenceStatus.FinishedError;
-                            cmd.Sequence.FinishReason = "error";
-                            cmd.Sequence.Error = error;
-                            throw error;
-                        }
+                                $"has a context limit of {_nativeSlotContextLimit}. Shorten the prompt or output allowance."));
                         _scheduler.Submit(cmd.Sequence);
                     }
                     catch (Exception ex)
@@ -785,6 +716,10 @@ namespace TensorSharp.Runtime.Scheduling
                     {
                         _logger.LogWarning(ex, "Trimming idle memory failed");
                     }
+                    break;
+
+                case EngineCommandKind.ReleaseAdapters:
+                    SweepRetiredAdapters();
                     break;
 
                 case EngineCommandKind.Speculation:
@@ -814,6 +749,60 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                     break;
             }
+        }
+
+        /// <summary>Mark a sequence refused at submission (nothing was scheduled for it) and
+        /// return the error for the submit path to deliver to its handle.</summary>
+        private static ContextLengthExceededException RefuseForContext(
+            SequenceState seq, ContextLengthExceededException error)
+        {
+            seq.Status = SequenceStatus.FinishedError;
+            seq.FinishReason = "error";
+            seq.Error = error;
+            return error;
+        }
+
+        // Set when an adapter was retired (ReleaseRetiredAdapters) or a retired one ran a
+        // step, and cleared once no retired adapter is still bound. Engine thread only.
+        private bool _adapterSweepPending;
+
+        /// <summary>Release the model's state for every retired adapter that no request in
+        /// flight runs with. Engine thread, under the GPU compute lock, between steps.</summary>
+        private void SweepRetiredAdapters()
+        {
+            _adapterSweepPending = false;
+            if (_model is not IAdapterAwareModel aware)
+                return;
+            foreach (var adapter in aware.BoundAdapters)
+            {
+                if (!adapter.IsRetired)
+                    continue;
+                if (_scheduler.ReferencesAdapter(adapter) || HandlesReference(adapter))
+                {
+                    _adapterSweepPending = true;
+                    continue;
+                }
+                try
+                {
+                    aware.ReleaseAdapter(adapter);
+                    _logger.LogInformation("Released LoRA adapter {Adapter}: unloaded, and no request runs with it.", adapter.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Releasing LoRA adapter {Adapter} failed", adapter.Id);
+                }
+            }
+        }
+
+        // Submissions still queued as commands are in _handles before the scheduler sees them.
+        private bool HandlesReference(IRequestAdapter adapter)
+        {
+            foreach (var entry in _handles)
+            {
+                if (ReferenceEquals(entry.Value.Sequence.Adapter, adapter))
+                    return true;
+            }
+            return false;
         }
 
         private void ApplyResults(List<SequenceStepResult> results, SchedulerOutput output)
@@ -879,9 +868,23 @@ namespace TensorSharp.Runtime.Scheduling
 
                         handle?.PublishToken(token);
 
-                        // Stop on max-new-tokens.
-                        if (emittedCount >= seq.MaxNewTokens)
+                        // Stop on max-new-tokens, or where the context window ends. Every
+                        // path forwards a decode token in the step that samples it, so the
+                        // token after this one would be written at position prompt+emitted:
+                        // past the window once that reaches it, which the model refuses
+                        // ("Requested sequence length N+1 exceeds configured max context N")
+                        // and which used to fail the request mid-reply. Reported as the
+                        // length cap it is, the same "max_tokens" a host clamping the reply
+                        // to the room its prompt leaves (ClampGenerationReserve) would see.
+                        bool contextFull = _contextLimit > 0
+                            && (long)seq.PromptTokens.Count + emittedCount >= _contextLimit;
+                        if (emittedCount >= seq.MaxNewTokens || contextFull)
                         {
+                            if (emittedCount < seq.MaxNewTokens)
+                                _logger.LogInformation(
+                                    "Request {RequestId} reached the model's {Context}-token context window after " +
+                                    "{Emitted} of {Requested} requested tokens; finishing it as a length stop",
+                                    seq.RequestId, _contextLimit, emittedCount, seq.MaxNewTokens);
                             TruncateUnpublishedTail(seq, emittedCount);
                             LogSpeculationStatsIfAny(seq);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedLengthCapped, "max_tokens", output);
@@ -1059,22 +1062,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// conversations reused 0 tokens on their second turn, and at 16 all but the last partial block,
         /// in 26% less time. A family with end states keeps each conversation's exact state, and its pool
         /// only accounts for reservations.
-        /// <para>
-        /// Not a page family whose pages need their recurrent state at the end
-        /// (<see cref="PrefixCache.PrefixCacheCapabilities.PagesNeedStateAtEnd"/>: Nemotron-H without its
-        /// batched route, e.g. under tensor parallelism). Its pages resume only where a prefill chunk ended,
-        /// and the chunk aligner puts that end on the last block boundary before the prompt's end. At 16 tokens
-        /// that is a few tokens short of the prompt, past what the next request shares of it (its prompt leaves
-        /// a warm-up's, or its public prefix ends, a little earlier), so nothing resumed: a tensor-parallel
-        /// Nemotron server re-prefilled its ~3.6K-token system prompt on every request. At 256 the restore point
-        /// lands on the last 256 boundary, inside the shared prefix, as on the batched route.
-        /// </para>
         /// </summary>
         internal static int PreferredBlockSize(IModelArchitecture model)
             => model is PrefixCache.IPrefixCacheModel cache
                && cache.GetPrefixCacheCapabilities() is { EndState: PrefixCache.EndStateSupport.None } caps
                && caps.Pages != PrefixCache.PageSupport.None
-               && !caps.PagesNeedStateAtEnd
                 ? SchedulerConfig.PageFamilyBlockSize
                 : SchedulerConfig.DefaultBlockSize;
 
@@ -1097,6 +1089,7 @@ namespace TensorSharp.Runtime.Scheduling
             Abort,
             Trim,
             Speculation,
+            ReleaseAdapters,
         }
     }
 }

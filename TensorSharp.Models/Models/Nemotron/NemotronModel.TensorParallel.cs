@@ -50,15 +50,47 @@ namespace TensorSharp.Models
         private QuantizedWeight[][][] _tpExpertDownQW;
         private IntPtr[][] _tpMoeUpPtrs;
         private IntPtr[][] _tpMoeDownPtrs;
-        // Per rank: the routed experts' NVFP4 up scales and one chunk's routing weights,
-        // reused across tokens (MoEExpertsPerKernelCall caps a kernel call).
+        // Per rank because RunPerRank runs the ranks concurrently: the routed experts'
+        // up scales (shard-invariant - a column-parallel up shard keeps whole output
+        // rows, so every rank applies the same value), the slices RunMoEExpertsChunked
+        // hands to later kernel calls, and the per-call result.
         private float[][] _tpMoeUpScales;
+        private IntPtr[][] _tpMoeChunkUpPtrs;
+        private IntPtr[][] _tpMoeChunkDownPtrs;
         private float[][] _tpMoeChunkRouteW;
+        private float[][] _tpMoeChunkUpScales;
+        private Tensor[] _tpMoeScratch;
         private bool _tpMoeBatchedDecodeReady;
+
+        /// <summary>MoE layers TryTpMoeBatchedExpertDecode has run (one per layer per decode
+        /// token it served), so a test can tell the batched kernel from the per-expert loop.</summary>
+        internal long TpMoeBatchedDecodeCallCount { get; private set; }
 
         private Tensor[][] _tpKvCacheK;
         private Tensor[][] _tpKvCacheV;
         private int _tpKvCacheCapacity;
+
+        /// <summary>
+        /// Every tensor-parallel linear in this family applies a per-tensor sidecar
+        /// scale (<see cref="QuantizedWeight.Scale"/>, NVFP4 scale2):
+        /// <list type="bullet">
+        /// <item>attn_qkv: TpColumnParallelLinear, through the scale recorded at sharding.</item>
+        /// <item>q/k/v that could not fuse (mixed types, or unequal scales - the fusion
+        /// refuses those): ShardSeparateColumnParallel bakes each source's scale into its
+        /// rows.</item>
+        /// <item>attn_output and the dense ffn_up/ffn_down: TpRowParallelLinear /
+        /// TpColumnParallelLinear, as for attn_qkv.</item>
+        /// <item>Router, latent in/out, shared experts, LM head and the replicated Mamba2
+        /// layers: rank-0 LinearForward / LinearForwardInto / TryLinearAddInto, which
+        /// apply or decline on the scale exactly as on one device.</item>
+        /// <item>Routed experts: the per-expert down scale is folded into the route weights
+        /// (FoldExpertDownScale) for every TP MoE path, and the per-expert up scale is
+        /// applied before ReLU^2 by the batched decode kernel (up_scales), the per-expert
+        /// loop (ApplyExpertUpScale) and expert parallelism, whose MoEFFNPrefill kernel
+        /// takes each route's up scale (route_up_scales, BuildExpertParallelRoutes).</item>
+        /// </list>
+        /// </summary>
+        protected override bool SupportsTensorParallelWeightScales => true;
 
         // ====================================================================
         // TP constraint validation
@@ -101,8 +133,13 @@ namespace TensorSharp.Models
             }
 
             // Tensor parallelism runs on the multi-GPU backends: direct CUDA and
-            // the GGML CUDA/Vulkan backends (one ggml backend per GPU).
-            if (_backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
+            // the GGML CUDA/Vulkan backends (one ggml backend per GPU). The managed
+            // cpu backend with a caller-supplied group is the model-free test seam
+            // (as for Muse Spark): on cpu ModelBase only holds a group that a caller
+            // passed in, and ResolveTensorParallelSupport refuses --tp on cpu, so
+            // users cannot reach it.
+            bool cpuTestGroup = _backend == BackendType.Cpu && _tpGroup != null;
+            if (_backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan) && !cpuTestGroup)
                 errors.Add($"TP requires a multi-GPU backend (cuda, ggml-cuda, ggml-vulkan), got {_backend}");
 
             if (errors.Count > 0)
@@ -207,7 +244,7 @@ namespace TensorSharp.Models
             if (BuildNemotronExpertParallelShards())
                 return;
 
-            int tp = TpDegree;
+            ValidateNemotronExpertShardShapes();
 
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
@@ -223,6 +260,58 @@ namespace TensorSharp.Models
                 {
                     ShardNemotronExpertColumnParallel(prefix + $"ffn_up_exps.{e}.weight");
                     ShardNemotronExpertRowParallel(prefix + $"ffn_down_exps.{e}.weight");
+                }
+            }
+        }
+
+        /// <summary>
+        /// The per-expert (Megatron) split cuts every expert's up projection by output
+        /// rows and its down projection by input columns. A quantized row can only be cut
+        /// on block boundaries, and the row-parallel slicer used to drop the remainder
+        /// silently: an expert whose width did not divide ran with its tail columns
+        /// missing on every rank. Refuse such a layout, naming the tensor, before any
+        /// expert is sliced. Example: an n_ff_exp of 1856 under --tp 4 is 58 blocks of 32
+        /// for 4 ranks (--tp 2 divides). Expert parallelism, which hands each rank whole
+        /// experts, never gets here.
+        /// </summary>
+        private void ValidateNemotronExpertShardShapes()
+        {
+            int globalTp = GlobalTpDegree;
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                if (_layerTypes[layer] != LayerType.FFN)
+                    continue;
+                for (int e = 0; e < _numExpertsPerLayer[layer]; e++)
+                {
+                    string upName = $"blk.{layer}.ffn_up_exps.{e}.weight";
+                    string downName = $"blk.{layer}.ffn_down_exps.{e}.weight";
+                    _quantWeights.TryGetValue(upName, out var uq);
+                    _quantWeights.TryGetValue(downName, out var dq);
+                    long upRows = uq != null ? uq.Ne1
+                        : _weights.TryGetValue(upName, out var uf) ? uf.Sizes[0] : -1;
+                    long downCols = dq != null ? dq.Ne0
+                        : _weights.TryGetValue(downName, out var df) ? df.Sizes[1] : -1;
+                    if (upRows < 0 || downCols < 0)
+                        continue;
+                    if (upRows != downCols)
+                        throw new NotSupportedException(
+                            $"Nemotron TP: {upName} has {upRows} output rows but {downName} has {downCols} input " +
+                            "columns, so the expert cannot be split consistently across ranks. Run this model without --tp.");
+                    if (upRows % globalTp != 0)
+                        throw new NotSupportedException(
+                            $"Nemotron TP: {upName} has {upRows} output rows, which do not split evenly over " +
+                            $"{globalTp} ranks. Use a --tp degree that divides the expert FF width, or run without --tp.");
+                    if (dq != null)
+                    {
+                        var type = (GgmlTensorType)dq.GgmlType;
+                        long blockSize = GgufFile.GetBlockSize(type);
+                        if (downCols % blockSize != 0 || (downCols / blockSize) % globalTp != 0)
+                            throw new NotSupportedException(
+                                $"Nemotron TP: {downName} rows are {downCols} values, {downCols / blockSize} blocks of " +
+                                $"{blockSize} ({type}), for {globalTp} ranks. A quantized row splits only on block " +
+                                $"boundaries, so the width must be a multiple of {blockSize * globalTp}. Use a smaller " +
+                                "--tp degree, or run without --tp.");
+                    }
                 }
             }
         }
@@ -252,6 +341,9 @@ namespace TensorSharp.Models
                     IntPtr shardPtr = IntPtr.Add(qw.Data, (int)(globalRank * bytesPerShard));
                     shards[r] = QuantizedWeight.CreateExternalView(
                         shardPtr, bytesPerShard, qw.GgmlType, qw.Ne0, rowsPerShard, qw);
+                    // A per-tensor scale is shard-invariant (see ShardWeightsForTensorParallelism),
+                    // and TpNemotronExpertLinear applies it.
+                    shards[r].Scale = qw.Scale;
                 }
 
                 _tpQuantWeights[weightName] = shards;
@@ -326,6 +418,7 @@ namespace TensorSharp.Models
                     }
                     shards[r] = new QuantizedWeight(shardPtr, totalBytesPerShard,
                         qw.GgmlType, ne0PerShard, qw.Ne1);
+                    shards[r].Scale = qw.Scale;
                 }
 
                 _tpQuantWeights[weightName] = shards;
@@ -845,43 +938,39 @@ namespace TensorSharp.Models
                 expertInputs[r] = hasLatent ? ReplicateTensorToRank(latentIn, r) : normed[r];
 
             // 2. Router (replicated — identical routing on every rank): computed
-            //    ONCE on rank 0 where the unsharded router weight lives, then each
-            //    token routes independently. SelectNemotronTopKExperts treats its
-            //    whole input as ONE token's logits, so it must be fed exactly one
-            //    numExperts-length row — the previous code passed the flattened
-            //    [seqLen, numExperts] batch, which indexed the router bias out of
-            //    bounds for seqLen > 1 (TP prefill crashed) and applied a single
-            //    expert set to the whole chunk.
+            //    ONCE on rank 0 where the unsharded router weight lives, through the
+            //    single-device router itself (RouteMoEToken: sigmoid, bias-adjusted
+            //    top-k, renormalisation, expert_weights_scale, the non-finite-logit
+            //    guard), so a token takes the same experts, in the same order, with
+            //    bit-identical weights as on one device. Then the per-expert NVFP4
+            //    down scale is folded into each route's weight (a no-op without
+            //    sidecars). That fold is what the TP path used to skip, so --tp
+            //    served scaled experts without their down scale. Row s of the routes
+            //    holds token s's top-k. Per token this is an O(numExperts) scan with
+            //    no allocation; the router it replaced sorted every expert through a
+            //    comparison delegate and allocated five arrays per token per layer.
             Tensor routerLogitsT = LinearForward(normed[0], prefix + "ffn_gate_inp.weight");
             float[] routePtr = TensorToFloatArray(routerLogitsT);
             routerLogitsT.Dispose();
 
-            // Bolt gives each MoE block its own expert count and top-k; the router's
-            // output width is this layer's expert count.
             int numExperts = _numExpertsPerLayer[layer];
             int nUsed = _numExpertsUsedPerLayer[layer];
-            if (routePtr.Length != seqLen * numExperts)
-                throw new InvalidOperationException(
-                    $"Nemotron TP layer {layer}: the router produced {routePtr.Length} logits for {seqLen} token(s) " +
-                    $"of {numExperts} experts.");
             int totalAssignments = seqLen * nUsed;
-            var selectedExperts = new int[totalAssignments];
-            var routeWeightsAll = new float[totalAssignments];
-            var tokenLogits = new float[numExperts];
-            // The per-expert NVFP4 down scale2 rides on the routing weight, exactly as in the
-            // single-device MoE paths (see InitExpertScales): every TP expert path below
-            // consumes routeWeightsAll and applies only the up scale itself.
-            float[] downScale = _layerExpertScale?[layer];
-            for (int s = 0; s < seqLen; s++)
+            EnsureMoEPrefillRouteBuffers(totalAssignments);
+            int[] selectedExperts = _moePrefillSelectedExperts;
+            float[] routeWeightsAll = _moePrefillRoutingWeights;
+            unsafe
             {
-                Array.Copy(routePtr, s * numExperts, tokenLogits, 0, numExperts);
-                var (te, tw) = SelectNemotronTopKExperts(tokenLogits, routerBias, nUsed);
-                for (int k = 0; k < nUsed; k++)
+                fixed (float* routerPtr = routePtr)
+                fixed (float* biasPtr = routerBias)
                 {
-                    selectedExperts[s * nUsed + k] = te[k];
-                    routeWeightsAll[s * nUsed + k] = downScale != null ? tw[k] * downScale[te[k]] : tw[k];
+                    RouteMoEPrefillTokens(
+                        routerPtr, biasPtr, seqLen, numExperts, nUsed, _expertWeightsNorm, _expertWeightsScale, layer,
+                        _moeProbs, _moeSelectionProbs, _moeTopExperts, selectedExperts, routeWeightsAll);
                 }
             }
+            FoldExpertDownScale(LayerExpertDownScale(layer), selectedExperts, routeWeightsAll, totalAssignments);
+            ObserveMoERoutes(layer, seqLen, nUsed, selectedExperts, routeWeightsAll);
 
             // 3. Decode fast path: ONE GGML dispatch per rank covering every routed
             //    expert, reusing the kernel the non-TP decode path already uses. The
@@ -893,7 +982,7 @@ namespace TensorSharp.Models
                 TryNemotronMoEExpertParallel(layer, seqLen, expertOutDim, expertInputs,
                     selectedExperts, routeWeightsAll)
                 ?? TryTpMoeBatchedExpertDecode(
-                    layer, seqLen, expertOutDim, expertInputs,
+                    layer, seqLen, expertOutDim, hasLatent, latentIn, normed,
                     selectedExperts, routeWeightsAll);
 
             if (results == null)
@@ -1042,7 +1131,15 @@ namespace TensorSharp.Models
                 var qw = qShards[rank];
                 int outDim = (int)qw.Ne1;
                 var result = new Tensor(alloc, DType.Float32, seqLen, outDim);
-                AddmmQuantManaged(result, ReplicateTensorToRank(input, rank), qw);
+                var localInput = ReplicateTensorToRank(input, rank);
+                AddmmQuantManaged(result, localInput, qw);
+                // ReplicateTensorToRank copies for rank > 0 off the GGML backends; this
+                // used to leak that copy per expert per call.
+                if (!ReferenceEquals(localInput, input)) localInput.Dispose();
+                // AddmmQuantManaged never applies a per-tensor sidecar scale; the shard
+                // carries its parent's (shard-invariant) value.
+                if (qw.Scale != 1.0f)
+                    Ops.Mul(result, result, qw.Scale);
                 return result;
             }
             else if (_tpWeights.TryGetValue(weightName, out var wShards))
@@ -1058,52 +1155,6 @@ namespace TensorSharp.Models
             }
 
             throw new KeyNotFoundException($"TP expert weight '{weightName}' not found.");
-        }
-
-        private (int[] experts, float[] weights) SelectNemotronTopKExperts(float[] routerLogits, float[] bias, int nUsed)
-        {
-            int numExperts = routerLogits.Length;
-
-            // Router logits -> sigmoid probabilities; top-K selection uses the
-            // bias-adjusted probabilities (matches the non-TP MoEForward).
-            var probs = new float[numExperts];
-            var selectionProbs = new float[numExperts];
-            for (int e = 0; e < numExperts; e++)
-            {
-                probs[e] = SigmoidScalar(routerLogits[e]);
-                selectionProbs[e] = bias != null ? probs[e] + bias[e] : probs[e];
-            }
-
-            var indices = new int[numExperts];
-            for (int i = 0; i < numExperts; i++) indices[i] = i;
-            Array.Sort(indices, (a, b) => selectionProbs[b].CompareTo(selectionProbs[a]));
-
-            var topExperts = new int[nUsed];
-            var topWeights = new float[nUsed];
-            float sum = 0;
-            for (int k = 0; k < nUsed; k++)
-            {
-                topExperts[k] = indices[k];
-                // Routing weight is the SIGMOID probability (not the raw logit and
-                // not the bias-adjusted selection probability).
-                topWeights[k] = probs[topExperts[k]];
-                sum += topWeights[k];
-            }
-
-            // Nemotron normalizes expert weights.
-            if (_expertWeightsNorm)
-            {
-                if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
-                for (int k = 0; k < nUsed; k++)
-                    topWeights[k] /= sum;
-            }
-
-            // Apply global expert scale.
-            if (_expertWeightsScale != 1.0f)
-                for (int k = 0; k < nUsed; k++)
-                    topWeights[k] *= _expertWeightsScale;
-
-            return (topExperts, topWeights);
         }
 
         // ====================================================================
@@ -1160,13 +1211,20 @@ namespace TensorSharp.Models
             _tpMoeUpPtrs = new IntPtr[tp][];
             _tpMoeDownPtrs = new IntPtr[tp][];
             _tpMoeUpScales = new float[tp][];
+            _tpMoeChunkUpPtrs = new IntPtr[tp][];
+            _tpMoeChunkDownPtrs = new IntPtr[tp][];
             _tpMoeChunkRouteW = new float[tp][];
+            _tpMoeChunkUpScales = new float[tp][];
+            _tpMoeScratch = new Tensor[tp];
             for (int r = 0; r < tp; r++)
             {
                 _tpMoeUpPtrs[r] = new IntPtr[_numExpertsUsed];
                 _tpMoeDownPtrs[r] = new IntPtr[_numExpertsUsed];
                 _tpMoeUpScales[r] = new float[_numExpertsUsed];
+                _tpMoeChunkUpPtrs[r] = new IntPtr[MoEExpertsPerKernelCall];
+                _tpMoeChunkDownPtrs[r] = new IntPtr[MoEExpertsPerKernelCall];
                 _tpMoeChunkRouteW[r] = new float[MoEExpertsPerKernelCall];
+                _tpMoeChunkUpScales[r] = new float[MoEExpertsPerKernelCall];
             }
 
             _tpMoeBatchedDecodeReady = true;
@@ -1176,18 +1234,19 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// Decode (seqLen == 1) fast path for the routed experts: ONE GGML graph
-        /// per rank covering all top-K experts - up, ReLU^2, down, route-weighted
-        /// accumulate - over that rank's column/row shards. Returns one partial
-        /// [1, expertOutDim] tensor per rank for the caller to AllReduce, or null
-        /// when this layer is not eligible and the caller must fall back to the
-        /// per-expert host loop.
+        /// per rank covering all top-K experts - up, per-expert NVFP4 up scale,
+        /// ReLU^2, down, route-weighted accumulate - over that rank's column/row
+        /// shards. Returns one partial [1, expertOutDim] tensor per rank for the
+        /// caller to AllReduce, or null when this layer is not eligible and the
+        /// caller must fall back to the per-expert host loop.
         ///
-        /// This is the same kernel the non-TP decode path uses. The fallback costs
-        /// two device dispatches plus a host gather/scatter PER EXPERT PER RANK.
+        /// This is the same kernel, through the same chunk loop, as the non-TP
+        /// decode path. The fallback costs two device dispatches plus a host
+        /// gather/scatter PER EXPERT PER RANK.
         /// </summary>
-        private Tensor[] TryTpMoeBatchedExpertDecode(
-            int layer, int seqLen, int expertOutDim, Tensor[] expertInputs,
-            int[] selectedExperts, float[] routeWeightsAll)
+        private unsafe Tensor[] TryTpMoeBatchedExpertDecode(
+            int layer, int seqLen, int expertOutDim, bool hasLatent,
+            Tensor latentIn, Tensor[] normed, int[] selectedExperts, float[] routeWeightsAll)
         {
             if (!_tpMoeBatchedDecodeReady || seqLen != 1)
                 return null;
@@ -1198,13 +1257,15 @@ namespace TensorSharp.Models
                 return null;
 
             int tp = TpDegree;
-            int nUsed = _numExpertsUsedPerLayer[layer];
             int numExperts = _numExpertsPerLayer[layer];
+            int nUsed = _numExpertsUsedPerLayer[layer];
 
-            // NVFP4 experts (Super VL): the kernel applies each routed expert's up scale
-            // between the up matmul and the squaring (see InitExpertScales); the down
-            // scale is already folded into routeWeightsAll.
-            float[] layerUpScale = HasExpertUpScale(layer) ? _layerExpertUpScale[layer] : null;
+            // The kernel applies a per-expert up scale inside its graph, before the
+            // squaring (TSGgml_MoEExpertsForwardF32's up_scales), so an NVFP4 layer
+            // stays on this path; the down scale is already folded into the route
+            // weights. Each rank passes the same values: the up scale multiplies whole
+            // output rows, which a column-parallel up shard keeps intact.
+            float[] layerUpScale = LayerExpertUpScale(layer);
 
             // Validate and collect every shard pointer BEFORE allocating anything,
             // so a bail-out cannot leak a partially built result set.
@@ -1217,7 +1278,8 @@ namespace TensorSharp.Models
                         return null;
                     QuantizedWeight uq = upShards[e]?[r];
                     QuantizedWeight dq = downShards[e]?[r];
-                    if (uq == null || dq == null || dq.Ne1 != expertOutDim)
+                    if (uq == null || dq == null || dq.Ne1 != expertOutDim
+                        || uq.Scale != 1.0f || dq.Scale != 1.0f)
                         return null;
                     _tpMoeUpPtrs[r][k] = uq.CacheKey;
                     _tpMoeDownPtrs[r][k] = dq.CacheKey;
@@ -1225,12 +1287,6 @@ namespace TensorSharp.Models
                         _tpMoeUpScales[r][k] = layerUpScale[e];
                 }
             }
-
-            // The GGML MoE kernel rejects numExperts outside [1, 16]; models routing
-            // more than that per token (Nemotron Super VL: 22) are split across calls
-            // with the partial results accumulated, mirroring the non-TP decode path.
-            const int MAX_EXPERTS_PER_CALL = MoEExpertsPerKernelCall;
-            bool needsChunking = nUsed > MAX_EXPERTS_PER_CALL;
 
             var results = new Tensor[tp];
             // Fan the ranks out instead of walking them: GGML ops submit AND
@@ -1241,58 +1297,44 @@ namespace TensorSharp.Models
             // their own rank selection.
             _tpGroup.RunPerRank(r =>
             {
+                // Shapes are shard-uniform, so the first selected expert describes them all.
                 QuantizedWeight up0 = upShards[selectedExperts[0]][r];
                 QuantizedWeight dn0 = downShards[selectedExperts[0]][r];
 
-                var output = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, 1, expertOutDim);
-                Tensor chunkOut = needsChunking
-                    ? new Tensor(_tpGroup.GetAllocator(r), DType.Float32, 1, expertOutDim)
-                    : null;
-                float[] upScales = layerUpScale != null ? _tpMoeUpScales[r] : null;
-                float[] chunkRouteW = _tpMoeChunkRouteW[r];
+                // Each call's result lands in this rank's scratch and is summed into
+                // output. The scratch lives across calls; only a change of the routed
+                // output width (latent vs hidden) replaces it.
+                Tensor scratch = _tpMoeScratch[r];
+                if (scratch == null || scratch.Sizes[1] != expertOutDim)
+                {
+                    scratch?.Dispose();
+                    scratch = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, 1, expertOutDim);
+                    _tpMoeScratch[r] = scratch;
+                }
 
+                var output = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, 1, expertOutDim);
                 try
                 {
-                    for (int chunkStart = 0; chunkStart < nUsed; chunkStart += MAX_EXPERTS_PER_CALL)
-                    {
-                        int chunkSize = Math.Min(MAX_EXPERTS_PER_CALL, nUsed - chunkStart);
-
-                        // The kernel reads the first chunkSize entries of each array, so
-                        // shift this chunk into position. Safe to mutate: the collection
-                        // loop above repopulates the pointer and scale arrays in full on
-                        // every call, and each rank owns its own arrays.
-                        if (chunkStart > 0)
-                        {
-                            Array.Copy(_tpMoeUpPtrs[r], chunkStart, _tpMoeUpPtrs[r], 0, chunkSize);
-                            Array.Copy(_tpMoeDownPtrs[r], chunkStart, _tpMoeDownPtrs[r], 0, chunkSize);
-                            if (upScales != null)
-                                Array.Copy(upScales, chunkStart, upScales, 0, chunkSize);
-                        }
-                        Array.Copy(routeWeightsAll, chunkStart, chunkRouteW, 0, chunkSize);
-
-                        GgmlBasicOps.MoEExpertsForward(
-                            chunkStart == 0 ? output : chunkOut,
-                            expertInputs[r],
-                            chunkSize, _tpMoeUpPtrs[r], _tpMoeDownPtrs[r],
-                            up0.GgmlType, up0.Ne0, up0.Ne1, up0.RawBytes,
-                            dn0.GgmlType, dn0.Ne0, dn0.Ne1, dn0.RawBytes,
-                            chunkRouteW, upScales);
-
-                        if (chunkStart > 0)
-                            Ops.Add(output, output, chunkOut);
-                    }
+                    RunMoEExpertsChunked(
+                        scratch, hasLatent ? latentIn : normed[r], GetFloatPtr(output), expertOutDim, nUsed,
+                        _tpMoeUpPtrs[r], _tpMoeDownPtrs[r], routeWeightsAll,
+                        layerUpScale != null ? _tpMoeUpScales[r] : null,
+                        _tpMoeChunkUpPtrs[r], _tpMoeChunkDownPtrs[r], _tpMoeChunkRouteW[r], _tpMoeChunkUpScales[r],
+                        up0, dn0);
+                    // Written through the host pointer: the AllReduce must not read a
+                    // stale device copy.
+                    InvalidateTensorDeviceCache(output);
                 }
                 catch
                 {
                     output.Dispose();
-                    chunkOut?.Dispose();
                     throw;
                 }
 
-                chunkOut?.Dispose();
                 results[r] = output;
             });
 
+            TpMoeBatchedDecodeCallCount++;
             return results;
         }
 
@@ -1302,6 +1344,15 @@ namespace TensorSharp.Models
 
         private void DisposeNemotronTpState()
         {
+            if (_tpMoeScratch != null)
+            {
+                for (int r = 0; r < _tpMoeScratch.Length; r++)
+                {
+                    _tpMoeScratch[r]?.Dispose();
+                    _tpMoeScratch[r] = null;
+                }
+            }
+
             if (_tpKvCacheK != null)
             {
                 for (int l = 0; l < _tpKvCacheK.Length; l++)

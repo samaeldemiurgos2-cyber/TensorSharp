@@ -41,6 +41,22 @@ namespace TensorSharp.Models
 
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
         {
+            // A step with a text-LoRA adapter selected must apply it to every planned weight.
+            bool loraAudit = OpenLoraForwardAudit();
+            try
+            {
+                var logits = ForwardBatchCore(ctx);
+                if (loraAudit) VerifyLoraForwardAudit(logits);
+                return logits;
+            }
+            finally
+            {
+                if (loraAudit) CloseLoraForwardAudit();
+            }
+        }
+
+        private IReadOnlyList<float[]> ForwardBatchCore(BatchedForwardContext ctx)
+        {
             if (ctx == null) throw new ArgumentNullException(nameof(ctx));
 
             int numSeqs = ctx.Sequences.Count;

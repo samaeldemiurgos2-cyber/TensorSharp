@@ -265,7 +265,11 @@ namespace
     // buffers, deferred snapshot authority, and parked TP plans under that id is
     // what makes two live models safe to interleave. Owner 0 remains a compatibility
     // bucket for older direct callers of GgmlBasicOps.
-    std::unordered_map<std::uint64_t, std::unique_ptr<Q35VerifyOwnerState>> g_q35v_owners;
+    // Deliberately leaked: an owner's parked TP buffers must not be freed by a
+    // static destructor at process exit, which aborts on ggml_cuda.
+    // TSGgml_Qwen35ReleaseVerifyTpGraphs is the release path.
+    std::unordered_map<std::uint64_t, std::unique_ptr<Q35VerifyOwnerState>>& g_q35v_owners =
+        *new std::unordered_map<std::uint64_t, std::unique_ptr<Q35VerifyOwnerState>>();
 
     // ggml's backend globals and the fixed verify graph cache are process-global too.
     // Serialize complete verify/snapshot operations so an owner cannot be released
@@ -578,6 +582,8 @@ namespace
 
         const std::size_t convStateBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
         const std::size_t deltaStateBytes = static_cast<std::size_t>(head_k_dim) * head_v_dim * num_v_heads * sizeof(float);
+        // static: the persist_stride initializer below reads it without a
+        // capture, which MSVC rejects for an automatic constexpr (C3493).
         static constexpr int kVerifyKvStride = 256;
         // Persist mode pads the attention window to a fixed stride so one cached graph
         // serves every start_pos in that stride (the mask masks the unused tail).

@@ -63,6 +63,8 @@ namespace TensorSharp.Cuda
         private Q35Kernels(CudaModule module)
         {
             this.module = module;
+            if (!RunsTensorCoreKernels(module))
+                throw new NotSupportedException(NoTensorCoreCode);
             CudaDriverApi.cuDeviceGetAttribute(out sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, 0).ThrowOnError();
             repack = module.GetFunction("ts_q35_repack_nvfp4");
             quantQ81 = module.GetFunction("ts_q35_quantize_q81_f32");
@@ -160,7 +162,77 @@ namespace TensorSharp.Cuda
                     "tensorsharp_q35_kernels.ptx could not be located next to the application or under " +
                     "a 'cuda_kernels' folder. Build TensorSharp.Backends.Cuda with nvcc on the PATH.");
             }
-            return new Q35Kernels(CudaModule.LoadFromFile(path));
+            return FromModule(CudaModule.LoadFromFile(path));
+        }
+
+        /// <summary>Kernels over an already loaded module, which they own (and unload when they
+        /// refuse it). Requires the module's context to be current.</summary>
+        internal static Q35Kernels FromModule(CudaModule module)
+        {
+            try
+            {
+                return new Q35Kernels(module);
+            }
+            catch
+            {
+                module.Dispose();
+                throw;
+            }
+        }
+
+        private const string NoTensorCoreCode =
+            "the loaded tensorsharp_q35_kernels image has no FP4 tensor-core code for this GPU: every GEMM needs " +
+            "sm_120a / sm_121a SASS, and PTX-only or other-architecture code traps there. Build " +
+            "TensorSharp.Backends.Cuda with nvcc on this GPU with the fatbin enabled (CudaEmitFatbin, the default)";
+
+        /// <summary>
+        /// Whether the code the driver loaded for <paramref name="module"/> carries the tensor-core
+        /// bodies the GEMMs need (ts_q35_caps): sm_120a / sm_121a SASS does. The plain compute_12x
+        /// PTX, or sm_8x / sm_9x code JIT-compiled for a CC 12 device, has <c>__trap()</c> there,
+        /// so the first prompt would kill the context instead of being refused. A launch rather
+        /// than a symbol lookup, since a fatbin holds both kinds of image. A module built before
+        /// the marker existed counts as not. Requires the module's context to be current.
+        /// </summary>
+        internal static bool RunsTensorCoreKernels(CudaModule module)
+        {
+            IntPtr caps;
+            try { caps = module.GetFunction("ts_q35_caps"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { return false; } // CUDA_ERROR_NOT_FOUND
+            CudaDriverApi.cuMemAlloc(out IntPtr probe, new UIntPtr(4)).ThrowOnError();
+            try
+            {
+                IntPtr p = probe;
+                void** args = stackalloc void*[] { &p };
+                Launch(caps, 1, 1, 1, 1, 0, IntPtr.Zero, args);
+                int value = 0;
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)(&value), probe, new UIntPtr(4)).ThrowOnError();
+                return value == 1;
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree(probe);
+            }
+        }
+
+        /// <summary>
+        /// <see cref="RunsTensorCoreKernels"/> for the module at <paramref name="path"/> on device 0,
+        /// before any engine exists (the support check), leaving this thread's current context as
+        /// it was. <paramref name="reason"/> says why not.
+        /// </summary>
+        internal static bool ProbeTensorCoreKernels(string path, out string reason)
+        {
+            CudaDriverApi.cuCtxGetCurrent(out IntPtr previous);
+            try
+            {
+                using var context = CudaContext.Create(0);
+                using var module = CudaModule.LoadFromFile(path);
+                reason = RunsTensorCoreKernels(module) ? null : NoTensorCoreCode;
+                return reason == null;
+            }
+            finally
+            {
+                CudaDriverApi.cuCtxSetCurrent(previous);
+            }
         }
 
         private static void Launch(IntPtr fn, uint gx, uint gy, uint gz, int block, int smem, IntPtr stream, void** args)

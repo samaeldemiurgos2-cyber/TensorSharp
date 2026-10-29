@@ -30,6 +30,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp.Cuda.Interop;
@@ -246,6 +247,11 @@ namespace TensorSharp.Cuda
                 throw new NotSupportedException($"DSV4 CUDA engine requires indexer key_length 128, got {m.IdxHeadSize}.");
             if (m.NExpertUsed > 16)
                 throw new NotSupportedException($"DSV4 CUDA engine supports at most 16 experts per token, got {m.NExpertUsed}.");
+            // An explicit offload puts exactly the leading min(nCpuMoe, NLayer) layers' experts on the
+            // host, so their types can be checked before any device is touched; an automatic one is
+            // checked once the split has chosen it, still before anything is uploaded.
+            if (nCpuMoe >= 0)
+                ValidateRoutedExpertTypes(m, Math.Min(nCpuMoe, m.NLayer));
 
             _perf = EnvInt("TS_DSV4_PERF", 0);
             _stages = new CudaStageTimer("dsv4-cuda", _perf, StageNames);
@@ -363,6 +369,8 @@ namespace TensorSharp.Cuda
                 throw new InvalidOperationException(
                     "[dsv4-cuda] routed-expert CPU offload is required to fit this model but no host matmul was " +
                     "supplied (ModelDesc.HostMatMul).");
+            if (nCpuMoe < 0)
+                ValidateRoutedExpertTypes(m, _nCpuMoe);
             _lastDev = useDevs - 1;
             PlanBoundaries(m, assignment);
 
@@ -1824,7 +1832,7 @@ namespace TensorSharp.Cuda
             // computes exactly what it computes alone. Longer ubatches group the slots by expert and
             // run on tensor cores when the widths allow, else through the register-staged kernels.
             bool perSlot = nt <= MaxBatchedDecodeRows;
-            bool mma = !perSlot
+            bool mma = !perSlot && dev.DK.HasMoeMma
                 && StagedSupportsType(guType) && StagedSupportsType(downType)
                 && e % Dsv4Kernels.MoeMmaK == 0 && ff % Dsv4Kernels.MoeMmaK == 0;
             bool staged = !perSlot && !mma
@@ -1906,14 +1914,78 @@ namespace TensorSharp.Cuda
             return flat.Narrow(0, 0, n);
         }
 
+        private const string ResidentExpertTypes = "Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q2_K, IQ3_S, IQ2_XXS, MXFP4";
+
         private static void RequireExpertType(int type)
         {
-            if (!StagedSupportsType(type) && type != TIQ2_XXS)
+            if (!SupportsResidentExpertType(type))
             {
                 throw new NotSupportedException(
-                    $"[dsv4-cuda] unsupported expert quant type {type} (supported: Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q2_K, IQ3_S, IQ2_XXS, MXFP4)");
+                    $"[dsv4-cuda] unsupported expert quant type {GgmlTypeName(type)} (supported: {ResidentExpertTypes})");
             }
         }
+
+        /// <summary>The routed-expert layouts the GPU MoE kernels decode.</summary>
+        internal static bool SupportsResidentExpertType(int type) => StagedSupportsType(type) || type == TIQ2_XXS;
+
+        /// <summary>
+        /// Checks every routed-expert tensor against the code that will run it, before a byte is
+        /// uploaded: a GPU-resident layer's against the expert kernels, an offloaded layer's (the
+        /// leading <paramref name="nCpuMoe"/>) against <see cref="ModelDesc.HostMatMul"/>, and gate
+        /// against up, which both paths dispatch as one type. The DSpark drafter's stages are never
+        /// offloaded. Without this, a checkpoint the engine cannot run -- unsloth's UD quants put
+        /// IQ1_S, IQ2_S, IQ2_XS and IQ3_XXS into the experts -- streamed every expert into VRAM
+        /// first and then failed on the first token through such a layer, with a bare type number.
+        /// </summary>
+        internal static void ValidateRoutedExpertTypes(ModelDesc m, int nCpuMoe)
+        {
+            var refused = new List<string>();
+            void Check(LayerDesc layer, string prefix, bool host)
+            {
+                CudaWeightDesc gate = layer.GateExps, up = layer.UpExps;
+                if (gate.GgmlType != up.GgmlType)
+                    refused.Add($"{gate.Name ?? prefix + "ffn_gate_exps.weight"} ({GgmlTypeName(gate.GgmlType)}) and " +
+                        $"{up.Name ?? prefix + "ffn_up_exps.weight"} ({GgmlTypeName(up.GgmlType)}) differ, but gate and up " +
+                        "run as one type");
+                foreach ((CudaWeightDesc w, string tensor) in new[]
+                    { (gate, "ffn_gate_exps"), (up, "ffn_up_exps"), (layer.DownExps, "ffn_down_exps") })
+                {
+                    // Without a host matmul an offload is refused by the constructor, with its own reason.
+                    if (host ? m.HostMatMul == null || m.HostMatMul.SupportsType(w.GgmlType, w.Ne0)
+                             : SupportsResidentExpertType(w.GgmlType))
+                        continue;
+                    refused.Add($"{w.Name ?? prefix + tensor + ".weight"} is {GgmlTypeName(w.GgmlType)} " +
+                        (host ? "(offloaded by --n-cpu-moe)" : "(GPU-resident)"));
+                }
+            }
+            for (int il = 0; il < m.NLayer; il++)
+                Check(m.Layers[il], $"blk.{il}.", host: il < nCpuMoe);
+            if (m.Dspark?.Stages != null)
+                for (int s = 0; s < m.Dspark.Stages.Length; s++)
+                    Check(m.Dspark.Stages[s], $"dspark.{s}.", host: false);
+            if (refused.Count == 0)
+                return;
+            const int Shown = 6;
+            throw new NotSupportedException(
+                $"[dsv4-cuda] the direct-CUDA engine cannot run {refused.Count} routed-expert tensor(s) of this " +
+                "checkpoint where the layer split places them: " + string.Join("; ", refused.Take(Shown)) +
+                (refused.Count > Shown ? $"; and {refused.Count - Shown} more" : string.Empty) +
+                $". The GPU expert kernels implement {ResidentExpertTypes}; layers offloaded with --n-cpu-moe run " +
+                "on the host's quantized matmul, which implements its own set. Use --backend ggml_cuda, which runs " +
+                "the experts through ggml's kernels instead.");
+        }
+
+        /// <summary>ggml's name for a tensor type id, for messages.</summary>
+        internal static string GgmlTypeName(int type) => type switch
+        {
+            0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1", 8 => "Q8_0", 9 => "Q8_1",
+            10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K", 14 => "Q6_K", 15 => "Q8_K",
+            16 => "IQ2_XXS", 17 => "IQ2_XS", 18 => "IQ3_XXS", 19 => "IQ1_S", 20 => "IQ4_NL", 21 => "IQ3_S",
+            22 => "IQ2_S", 23 => "IQ4_XS", 24 => "I8", 25 => "I16", 26 => "I32", 27 => "I64", 28 => "F64",
+            29 => "IQ1_M", 30 => "BF16", 34 => "TQ1_0", 35 => "TQ2_0", 39 => "MXFP4", 40 => "NVFP4",
+            41 => "Q1_0", 42 => "Q2_0",
+            _ => $"type {type}",
+        };
 
         /// <summary>The layouts the grouped expert kernels (tensor-core and register-staged)
         /// decode; IQ2_XXS, used by the DSpark drafter, only has the per-token path.</summary>

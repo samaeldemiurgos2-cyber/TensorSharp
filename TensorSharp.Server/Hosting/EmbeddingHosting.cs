@@ -98,10 +98,11 @@ public static class EmbeddingHosting
     /// exist: the image, video and Jev routes were missing, so in embedding mode they fell
     /// through to adapters that answered "the loaded model is not a Qwen-Image-2.1 model"
     /// about a server that had loaded an encoder, while a /v1/completions entry guarded a
-    /// route the server never maps.
+    /// route the server never maps. <c>POST /v1/loras</c> loads an adapter onto the
+    /// generation model, which an embedding server does not have.
     /// </summary>
     internal static bool IsGenerationPath(PathString path) => path.Value?.TrimEnd('/').ToLowerInvariant() is
-        "/v1/chat/completions" or "/v1/responses" or "/v1/systemone" or "/v1/videos/generations"
+        "/v1/chat/completions" or "/v1/responses" or "/v1/systemone" or "/v1/videos/generations" or "/v1/loras"
         or "/api/generate" or "/api/chat" or "/api/chat/ollama" or "/api/models/load"
         or "/api/image-generate" or "/api/image-generate/stream"
         or "/api/image-edit" or "/api/image-edit/stream"

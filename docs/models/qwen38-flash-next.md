@@ -2,6 +2,12 @@
 
 [← back to model index](README.md) | [中文](qwen38-flash-next_zh-cn.md)
 
+> **Multi-node execution:** on `ggml_cuda`, add `--tp-node-id` and `--tp-peers`
+> to `--layer-split N` or `--tp N`; N is the GPU count on each node. Use the
+> same checkpoint, build and numerical settings everywhere. See the
+> [multi-node guide](../multi-node-inference.md) for launch order and limits.
+> Historical local measurements below do not qualify distributed performance.
+
 Qwen3.8-Flash-Next is a hybrid MoE: GatedDeltaNet recurrent layers interleaved
 with full-attention layers (some behind Qwen Sparse Attention's indexer), a
 PLE n-gram embedding block, ×4 hyper-connection streams and a 512-expert MoE.
@@ -489,7 +495,9 @@ plain/MTP HTTP checks passed 24/24 text requests and 3/3 image scenarios per mod
 including attachment order and image history. This configuration refused retained
 cache admission for lack of headroom, so those follow-ups re-prefilled. Local
 evidence: `docs/validation/model-matrix-20260927/qwen38/SUMMARY.md` (not committed).
-Local tensor parallelism is now available as described below; multi-node execution remains unsupported.
+Local tensor parallelism and distributed text execution are now available as
+described below. These historical media/speculation checks do not qualify the
+distributed modes, which require ordinary text prefill and decode.
 
 `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` attaches the per-token
 MTP block (GGML backends only, and the head must be a single GGUF file, attached
@@ -765,7 +773,17 @@ The direct `cuda` engine runs UD-Q2_K_XL's IQ2_XS and IQ3_XXS experts: per-token
 ported from ggml's dot products for decode, which still runs as a captured CUDA graph, and
 the same two layouts decoded into its tensor-core and register-staged grouped kernels for
 prefill. Before the grouped kernels took them, its prefill of this file ran on the slowest
-fallback at about 500 tok/s. The engine has no host-expert seam, so `--n-cpu-moe` there
+fallback at about 500 tok/s. It also runs UD-Q4_K_XL, which stores 43 of its 48 routed down
+projections as Q5_1 (the other five Q8_0) under Q4_K/Q5_K gate/up: decode dots Q5_1 against
+q8_1 activations with dp4a as ggml's `vec_dot_q5_1_q8_1` does (the offset term from the int8
+activation sum), and prefill decodes it into the same grouped kernels, all held to ggml's
+`dequantize_row_q5_1`. Before that the engine refused the file at load, and under
+`--layer-split 2` the two devices' refusals aborted the CLI with an unhandled
+`AggregateException`; an expert layout it does not decode is now refused before any upload,
+with one `error: model load refused:` line naming the tensor. No UD-Q4_K_XL throughput has
+been measured on the direct engine yet. A build without nvcc uses the committed PTX, which must
+be regenerated to include the Q5_1 decoder; until then the engine refuses Q5_1 experts rather
+than decode them as Q8_0. The engine has no host-expert seam, so `--n-cpu-moe` there
 prints a warning and keeps the experts on the GPU. The direct `cuda` engine uses
 `--layer-split N` for multiple GPUs and refuses `--tp N`. On `ggml_cuda`,
 UD-Q2_K_XL supports `--tp 2` with its original quantized weights; see
@@ -814,11 +832,12 @@ For the checkpoint's 640 intermediate channels, TP2 stores 384 rows per rank
 for each logical 320-row slice; TP4 stores 256 for each logical 160-row slice.
 Unsupported degrees are refused from GGUF
 metadata before bulk weight loading. The current model path requires CUDA MMQ
-stream-K support and FFN weights in Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS,
+stream-K support and FFN weights in Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS,
 IQ2_XS, IQ2_S, IQ3_XXS, IQ1_S, IQ3_S, IQ4_XS, IQ4_NL or Q8_0. This includes
 UD-Q2_K_XL's IQ2_XS/IQ3_XXS routed gate/up weights, Q5_K/Q6_K shared weights,
-and IQ4_NL/Q8_0 down weights. Full output row counts must be multiples of 128,
-and down output slices must also be multiples of 128. IQ1_M remains refused
+and IQ4_NL/Q8_0 down weights. UD-Q4_K_XL's Q5_1 down weights use TensorSharp's
+exact output-row kernels. Full output row counts and down output slices must
+be multiples of 128. IQ1_M remains refused
 because upstream ggml has no MMQ tile kernel for it. Other FFN types, including
 F32/F16/BF16, and devices/layouts without exact strip kernels are refused.
 The historical physical GPU validation below uses NVIDIA A40 GPUs and the
@@ -829,9 +848,16 @@ of the sparse PLE table, whose rows are gathered on demand.
 
 `--layer-split N` remains a separate option: each GPU holds a contiguous run of
 whole layers. It is available on `ggml_cuda`, `ggml_vulkan` and the direct `cuda`
-engine. Do not combine `--tp` and `--layer-split`; distributed
-`--tp-node-id`/`--tp-peers` groups are
-unsupported. Older layer-split commands should use `--layer-split N` or
+engine. Do not combine `--tp` and `--layer-split`. On `ggml_cuda`, either mode
+can span nodes using `--tp-node-id` and `--tp-peers`.
+The layer pipeline transfers the complete F32 hyper-connection residual;
+GDN, convolution, PLE and QSA state remain with the layers that own them.
+Distributed TP partitions expert and shared-FFN output rows across the global
+rank count and gathers the complete activations before the next operation.
+The weight-format and row-alignment checks above apply to the global degree.
+Distributed execution currently serves serialized text forwards; media,
+speculation and retained sequence snapshots are unavailable.
+Older layer-split commands should use `--layer-split N` or
 `TENSORSHARP_LAYER_SPLIT_DEGREE=N`.
 
 The numerical fixture `eng/tests/qwen4exp-tensor-parallel.py` compares two-layer

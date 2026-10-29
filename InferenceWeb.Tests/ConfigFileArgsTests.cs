@@ -126,6 +126,8 @@ public class ConfigFileArgsTests : IDisposable
         // Qwen-Image-2.1 LoRA plug-ins (LoraCliFlags.Flags): applied by the companion
         // pass and let through the unknown-option trap, spelled the same by the CLI.
         "lora", "lora-scale", "lora-config",
+        // Text-model LoRA directory (TextLoraHostOptions): server-only.
+        "loras-dir",
         "upload-max-mb", "upload-quota-mb", "upload-ttl-hours",
         "skills-dir", "skill", "list-skills", "no-skills", "skills-no-discovery",
         "skills-allow-exec", "skills-max-rounds", "skills-sandbox", "skills-allow-network",

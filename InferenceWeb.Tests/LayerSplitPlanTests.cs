@@ -86,6 +86,49 @@ public sealed class LayerSplitPlanTests
         }
     }
 
+    [Theory]
+    [InlineData(2, 1)]
+    [InlineData(2, 3)]
+    [InlineData(3, 2)]
+    [InlineData(4, 1)]
+    public void DriverLastOrderRunsTheSameStagesOnRotatedNodes(int nodes, int devices)
+    {
+        long[] bytes = Enumerable.Range(0, 40).Select(i => (long)(i * 37 % 11 + 1)).ToArray();
+        for (int node = 0; node < nodes; node++)
+        {
+            var rotated = LayerSplitPlan.CreateWeighted(bytes, devices, node, nodes, 50, 70, true);
+            int stage = (node + nodes - 1) % nodes;
+            // A stage owns the same layers and device split whichever node runs it.
+            var reference = LayerSplitPlan.CreateWeighted(bytes, devices, stage, nodes, 50, 70);
+            Assert.Equal(stage, rotated.StageIndex);
+            Assert.Equal(reference.FirstLayer, rotated.FirstLayer);
+            Assert.Equal(reference.EndLayer, rotated.EndLayer);
+            for (int layer = rotated.FirstLayer; layer < rotated.EndLayer; layer++)
+                Assert.Equal(reference.LocalRank(layer), rotated.LocalRank(layer));
+            Assert.Equal(stage == 0, rotated.IsFirst);
+            Assert.Equal(stage == nodes - 1, rotated.IsLast);
+            Assert.Equal(node == 0, rotated.IsLast);
+            if (!rotated.IsFirst) Assert.Equal((node + nodes - 1) % nodes, rotated.PreviousNode);
+            if (!rotated.IsLast) Assert.Equal((node + 1) % nodes, rotated.NextNode);
+        }
+        Assert.Equal(1, LayerSplitPlan.NodeOfStage(0, nodes, true));
+        Assert.Equal(0, LayerSplitPlan.NodeOfStage(nodes - 1, nodes, true));
+        Assert.Equal(nodes - 1, LayerSplitPlan.StageOf(0, nodes, true));
+    }
+
+    [Fact]
+    public void LegacyOrderAndSingleNodePlansAreUnchanged()
+    {
+        var legacy = new LayerSplitPlan(12, 2, 1, 3);
+        Assert.False(legacy.DriverRunsLastStage);
+        Assert.Equal(1, legacy.StageIndex);
+        Assert.Equal(0, legacy.PreviousNode);
+        Assert.Equal(2, legacy.NextNode);
+        var single = new LayerSplitPlan(12, 3, 0, 1, true);
+        Assert.False(single.DriverRunsLastStage);
+        Assert.True(single.IsFirst && single.IsLast);
+    }
+
     [Fact]
     public void PartitionRejectsInvalidCostsAndPreservesMaximumRepresentableCost()
     {

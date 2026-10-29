@@ -10,9 +10,64 @@ namespace TensorSharp.Cuda
         private readonly Dictionary<string, IntPtr> functions = new Dictionary<string, IntPtr>(StringComparer.Ordinal);
         private IntPtr module;
 
-        private CudaModule(IntPtr module)
+        // The .target of the PTX this module was loaded from or beside: only the fallback for
+        // CompiledArchOf, since a fatbin's SASS is usually built for higher targets.
+        private readonly int ptxTargetArch;
+
+        private CudaModule(IntPtr module, int ptxTargetArch)
         {
             this.module = module;
+            this.ptxTargetArch = ptxTargetArch;
+        }
+
+        /// <summary>
+        /// The SM architecture the code the driver loaded for <paramref name="kernel"/> was
+        /// compiled for, as an integer (61, 75, 86, 120): the <c>__CUDA_ARCH__</c> its body saw,
+        /// over 10. 0 when unknown. Kernels whose bodies are guarded by
+        /// <c>__CUDA_ARCH__ &gt;= N</c> compile to a trap or an empty body below N, and a symbol
+        /// lookup cannot tell: the committed portable baseline is compute_61, so on an sm_80+ GPU
+        /// its tensor-core kernels resolve fine and then trap or write nothing. Callers gate such
+        /// kernels on this.
+        /// It is read from the loaded code (CU_FUNC_ATTRIBUTE_PTX_VERSION), not from the PTX
+        /// header: a fatbin is built beside a PTX of a lower target (the release archives pair
+        /// compute_75 PTX with SASS for sm_75 to sm_120), and the driver runs the SASS for this
+        /// GPU (86 on an sm_86 device) or, when there is none, JIT-compiles the fatbin's PTX
+        /// (75). PTX loaded directly reports its own target. One module holds one loaded image,
+        /// so any of its kernels answers for all of them.
+        /// </summary>
+        public int CompiledArchOf(string kernel)
+        {
+            int result = CudaDriverApi.cuFuncGetAttribute(
+                out int arch, CudaDriverApi.CU_FUNC_ATTRIBUTE_PTX_VERSION, GetFunction(kernel));
+            // The PTX target is a lower bound for anything loaded from or beside it.
+            return result == 0 && arch > 0 ? arch : ptxTargetArch;
+        }
+
+        /// <summary>
+        /// The <c>sm_NN</c> number of a PTX image's <c>.target</c> directive (the header
+        /// nvcc writes before any code), or 0 when there is none.
+        /// </summary>
+        internal static int ParsePtxTargetArch(byte[] ptx)
+        {
+            if (ptx == null)
+                return 0;
+            // The directive sits in the first few lines; never scan a whole module.
+            int length = Math.Min(ptx.Length, 64 * 1024);
+            string head = System.Text.Encoding.ASCII.GetString(ptx, 0, length);
+            const string directive = ".target sm_";
+            int at = 0;
+            while ((at = head.IndexOf(directive, at, StringComparison.Ordinal)) >= 0)
+            {
+                bool lineStart = at == 0 || head[at - 1] == '\n' || head[at - 1] == '\r';
+                int digits = at + directive.Length;
+                int end = digits;
+                while (end < head.Length && char.IsAsciiDigit(head[end]))
+                    end++;
+                if (lineStart && end > digits && int.TryParse(head.AsSpan(digits, end - digits), out int arch))
+                    return arch;
+                at = digits;
+            }
+            return 0;
         }
 
         /// <summary>
@@ -35,7 +90,7 @@ namespace TensorSharp.Cuda
             {
                 try
                 {
-                    return LoadImage(fatbin);
+                    return LoadImage(fatbin, ParsePtxTargetArch(bytes));
                 }
                 catch (CudaException)
                 {
@@ -67,12 +122,12 @@ namespace TensorSharp.Cuda
             }
         }
 
-        private static unsafe CudaModule LoadImage(byte[] image)
+        private static unsafe CudaModule LoadImage(byte[] image, int ptxTargetArch)
         {
             fixed (byte* data = image)
             {
                 CudaDriverApi.cuModuleLoadData(out IntPtr module, (IntPtr)data).ThrowOnError();
-                return new CudaModule(module);
+                return new CudaModule(module, ptxTargetArch);
             }
         }
 
@@ -91,7 +146,7 @@ namespace TensorSharp.Cuda
             fixed (byte* ptx = terminated)
             {
                 CudaDriverApi.cuModuleLoadData(out IntPtr module, (IntPtr)ptx).ThrowOnError();
-                return new CudaModule(module);
+                return new CudaModule(module, ParsePtxTargetArch(ptxBytes));
             }
         }
 

@@ -112,8 +112,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>Block size in tokens; 0 leaves it to the model
         /// (<see cref="InferenceEngine"/> picks <see cref="PageFamilyBlockSize"/> for a family whose
-        /// only cross-request reuse is its pages, unless those pages need recurrent state at their end,
-        /// and <see cref="DefaultBlockSize"/> otherwise), which is
+        /// only cross-request reuse is its pages, <see cref="DefaultBlockSize"/> otherwise), which is
         /// what <see cref="FromEnvironment"/> reports when <c>TS_SCHED_BLOCK_SIZE</c> is unset.</summary>
         public int BlockSize { get; init; } = DefaultBlockSize;
 

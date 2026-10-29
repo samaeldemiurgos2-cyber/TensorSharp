@@ -1601,7 +1601,10 @@ namespace
             context = PooledContextHandle();
         }
     };
-    Q35AttnTpPending g_q35attn_tp[tsg::TSG_MAX_DEVICES];
+    // Deliberately leaked, like g_mg_tp in ggml_ops_muse_glimmer.cpp: a static
+    // destructor freeing a parked buffer at process exit aborts on ggml_cuda.
+    // TSGgml_Qwen35ReleaseAttentionTpGraphs is the release path.
+    Q35AttnTpPending* const g_q35attn_tp = new Q35AttnTpPending[tsg::TSG_MAX_DEVICES];
 }
 
 // Release every rank's parked tensor-parallel attention graph.

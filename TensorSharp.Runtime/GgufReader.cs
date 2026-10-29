@@ -96,6 +96,14 @@ namespace TensorSharp.Runtime
         /// </summary>
         private readonly Dictionary<string, GgufFile> _tensorOwner = new(StringComparer.Ordinal);
 
+        /// <summary>
+        /// The most dimensions a tensor may declare. ggml's GGML_MAX_DIMS is 4, but this reader
+        /// also serves files ggml cannot open: Wan's DiT keeps its conv3d patch embedding as one
+        /// 5-D tensor [kw, kh, kd, ic, oc]. The bound only has to keep a corrupt count from
+        /// sizing the shape array.
+        /// </summary>
+        private const int MaxDims = 8;
+
         public GgufFile(string path) : this(path, isShard: false) { }
 
         /// <summary>
@@ -403,10 +411,22 @@ namespace TensorSharp.Runtime
             {
                 var info = new GgufTensorInfo();
                 info.Name = ReadString(reader);
+                // Checked before the shape is sized from the count: a corrupt n_dims would
+                // otherwise allocate an array of its own choosing (an OutOfMemoryException,
+                // which reads as the host's fault rather than the file's).
                 uint dims = reader.ReadUInt32();
+                if (dims > MaxDims)
+                    throw new InvalidDataException($"GGUF tensor '{info.Name}' has {dims} dimensions; at most {MaxDims} are supported");
                 info.Shape = new ulong[dims];
+                long elements = 1;
                 for (uint d = 0; d < dims; d++)
-                    info.Shape[d] = reader.ReadUInt64();
+                {
+                    ulong ne = reader.ReadUInt64();
+                    if (ne > long.MaxValue || (ne > 0 && elements > long.MaxValue / (long)ne))
+                        throw new InvalidDataException($"GGUF tensor '{info.Name}' has more elements than an int64 can count");
+                    elements *= (long)ne;
+                    info.Shape[d] = ne;
+                }
                 info.Type = (GgmlTensorType)reader.ReadUInt32();
                 info.Offset = reader.ReadUInt64();
                 Tensors[info.Name] = info;
@@ -416,6 +436,9 @@ namespace TensorSharp.Runtime
             int alignment = 32;
             if (Metadata.TryGetValue("general.alignment", out var a))
                 alignment = Convert.ToInt32(a);
+            // ggml's check: the padding below divides by it.
+            if (alignment <= 0 || (alignment & (alignment - 1)) != 0)
+                throw new InvalidDataException($"GGUF general.alignment {alignment} is not a power of 2");
             _tableEnd = pos;
             DataOffset = pos + (alignment - pos % alignment) % alignment;
         }
@@ -604,11 +627,38 @@ namespace TensorSharp.Runtime
             if (!ReferenceEquals(owner, this))
                 return owner.ReadTensorData(tensorInfo);
 
-            long byteCount = GetTensorByteCount(tensorInfo);
+            long byteCount = CheckedTensorByteCount(tensorInfo);
             byte[] data = new byte[byteCount];
             _stream.Seek(DataOffset + (long)tensorInfo.Offset, SeekOrigin.Begin);
             _stream.ReadExactly(data, 0, data.Length);
             return data;
+        }
+
+        /// <summary>
+        /// The tensor's byte count, once its whole extent is known to lie in this file. The
+        /// buffer is sized from the header, so a corrupt one (an inflated ne0, an offset past
+        /// the end) would otherwise allocate whatever it declares - an OutOfMemoryException,
+        /// which reads as the host's fault - before the short read could report the file.
+        /// </summary>
+        private long CheckedTensorByteCount(GgufTensorInfo tensorInfo)
+        {
+            long length = _stream.Length;
+            try
+            {
+                long rows = 1;
+                for (int i = 1; i < tensorInfo.Shape.Length; i++)
+                    rows = checked(rows * (long)tensorInfo.Shape[i]);
+                // The row's bytes are checked too: an ne0 whose byte count wraps to the few bytes
+                // the file holds would pass, and the caller then sizes its values from ne0.
+                long rowBytes = checked((long)tensorInfo.Shape[0] / GetBlockSize(tensorInfo.Type) * GetTypeSize(tensorInfo.Type));
+                long byteCount = checked(rowBytes * rows);
+                if (tensorInfo.Offset <= (ulong)length && checked(DataOffset + (long)tensorInfo.Offset + byteCount) <= length)
+                    return byteCount;
+            }
+            catch (OverflowException) { }
+            throw new InvalidDataException(
+                $"GGUF tensor '{tensorInfo.Name}' ({tensorInfo.Type}, ne [{string.Join(", ", tensorInfo.Shape)}] at data offset " +
+                $"{tensorInfo.Offset}) does not fit in the file's {length} bytes");
         }
 
         /// <summary>
@@ -842,7 +892,13 @@ namespace TensorSharp.Runtime
             if (n == 0)
                 return string.Empty;
             if (_stringScratch.Length < n)
+            {
+                // Only a string longer than any before it grows the buffer, so only then is
+                // its length checked against the file before it sizes the allocation.
+                if (n > reader.BaseStream.Length - reader.BaseStream.Position)
+                    throw new InvalidDataException($"GGUF string length {len} runs past the end of the file");
                 _stringScratch = new byte[Math.Max(n, _stringScratch.Length * 2)];
+            }
             reader.BaseStream.ReadExactly(_stringScratch, 0, n);
             return Encoding.UTF8.GetString(_stringScratch, 0, n);
         }
@@ -873,6 +929,18 @@ namespace TensorSharp.Runtime
         {
             var elemType = (GgufValueType)reader.ReadUInt32();
             ulong count = reader.ReadUInt64();
+            // Every element takes at least this many bytes of the file (a string, its length),
+            // so a count the rest of the file cannot hold is refused before the array is sized
+            // from it.
+            long elementBytes = elemType switch
+            {
+                GgufValueType.Uint8 or GgufValueType.Int8 or GgufValueType.Bool => 1,
+                GgufValueType.Uint16 or GgufValueType.Int16 => 2,
+                GgufValueType.Uint32 or GgufValueType.Int32 or GgufValueType.Float32 => 4,
+                _ => 8,
+            };
+            if (count > (ulong)((reader.BaseStream.Length - reader.BaseStream.Position) / elementBytes))
+                throw new InvalidDataException($"GGUF array of {count} {elemType} values runs past the end of the file");
 
             switch (elemType)
             {

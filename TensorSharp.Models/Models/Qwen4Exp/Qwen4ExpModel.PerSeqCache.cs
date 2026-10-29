@@ -125,7 +125,7 @@ namespace TensorSharp.Models
         /// where the per-holder graph/state keying lives. The managed op-by-op
         /// path shares scratch that is not per-sequence.</summary>
         public bool SupportsPerSequenceFusedForward =>
-            IsGgmlBackend && !_tokenGraphUnsupported;
+            IsGgmlBackend && !_tokenGraphUnsupported && !HasDistributedQwen;
 
         public bool HasFusedSequenceCache(string requestId)
             => requestId != null && _fusedHolders != null && _fusedHolders.ContainsKey(requestId);
@@ -276,6 +276,7 @@ namespace TensorSharp.Models
 
         public bool BindSequenceCache(string requestId)
         {
+            RefuseUnmirroredQwenOperation("per-sequence cache switching");
             if (string.IsNullOrEmpty(requestId))
                 throw new ArgumentException("RequestId required", nameof(requestId));
             _fusedHolders ??= new Dictionary<string, Qwen4ExpKvCacheHolder>(StringComparer.Ordinal);
@@ -306,6 +307,7 @@ namespace TensorSharp.Models
 
         public void AdoptPrimaryCacheToFused(string requestId)
         {
+            RefuseUnmirroredQwenOperation("per-sequence cache switching");
             if (string.IsNullOrEmpty(requestId)) return;
             _fusedHolders ??= new Dictionary<string, Qwen4ExpKvCacheHolder>(StringComparer.Ordinal);
             if (_activeFusedKey != null) return;

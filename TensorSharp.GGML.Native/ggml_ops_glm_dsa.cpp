@@ -48,6 +48,11 @@
 #include "ggml_ops_internal.h"
 #include "dsv4_file_warm.h"
 #include "ggml_ops_precision_policy.h"
+#include "ggml_ops_matmul_precision.h"
+#include "ggml_ops_dsv4_fused.h"
+#ifdef TSG_GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 #include "glm_file_strip.h"
 
 #include "gguf.h"
@@ -63,12 +68,16 @@
 #include <algorithm>
 #include <atomic>
 #include <list>
+#include <deque>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
+#include "ggml_ops_layer_pipeline.h"
+#include "ggml_ops_graph_optimize.h"
+#include "layer_partition.h"
 
 #if !defined(_WIN32)
 #include <sys/mman.h>
@@ -430,6 +439,8 @@ struct graph_build_result
     ggml_backend_sched_t sched = nullptr;
     graph_inputs inp;
     ggml_tensor * logits = nullptr;
+    ggml_tensor * pipeline_input = nullptr;
+    ggml_tensor * pipeline_output = nullptr;
     /// Post-final-norm hidden state, one row per token, when want_h. This is
     /// llama.cpp's `h_nextn`: what the trunk hands the draft head, and what the
     /// draft head hands its own next step.
@@ -449,13 +460,16 @@ struct graph_build_result
     std::vector<bd_token> bd;
     std::vector<trace_entry> traces;
 
-    // Fast glm5next TP: one independently allocated graph per rank, cut at the
-    // attention and routed-FFN row-parallel outputs. Rank 0 is this object and
+    // Fast glm5next TP: one independently allocated graph per rank, cut at its
+    // collective boundaries. Distributed FFNs gather disjoint activation and
+    // final FFN rows; local legacy TP reduces partial dots. Rank 0 is this object and
     // the other ranks live in tp_peers; keeping them under the same cache entry
     // makes graph-shape eviction atomic across the group.
     bool tp_fused = false;
     int tp_rank = -1;
     ggml_gallocr_t galloc = nullptr;
+    ggml_backend_t precise_backend = nullptr;
+    std::deque<tsg_dsv4_fused_desc> tp_matmuls;
     tsg::TpRankPlan tp_plan;
     std::vector<ggml_tensor *> tp_boundary;
     std::vector<std::unique_ptr<graph_build_result>> tp_peers;
@@ -463,6 +477,11 @@ struct graph_build_result
     ~graph_build_result()
     {
         tp_peers.clear();
+        if (precise_backend)
+        {
+            ggml_backend_synchronize(precise_backend);
+            ggml_backend_free(precise_backend);
+        }
         if (galloc) ggml_gallocr_free(galloc);
         if (sched) ggml_backend_sched_free(sched);
         if (ctx) ggml_free(ctx);
@@ -471,6 +490,10 @@ struct graph_build_result
 
 struct glm_model
 {
+    struct expert_row_slice { int64_t first = 0, count = 0; };
+    // Physical output rows, including complete MMQ tiles when necessary.
+    // Small unsupported strip geometries retain a full projection and crop it.
+    std::map<std::string, std::vector<expert_row_slice>> exact_expert_rows;
     glm_hparams hp;
 
     ggml_backend_t backends[MAX_GPUS + 1] = {};
@@ -521,13 +544,35 @@ struct glm_model
     /// matrices, and the two row-parallel outputs per layer are summed across
     /// ranks.
     int tp = 1;
+    // Local rank storage remains bounded by MAX_GPUS. Weight slices use the
+    // global rank count/offset, independently of the local device ordinals.
+    int global_tp = 1, rank_offset = 0;
+    using cross_reduce = bool (*)(void *, float *, int);
+    cross_reduce cross_node = nullptr;
+    void * cross_node_user = nullptr;
+    tsg_layer_pipeline::channel pipeline;
+    int layer_begin = 0, layer_end = 0;
+    bool terminal_failure = false;
+    bool parallel() const { return global_tp > 1; }
+    bool distributed() const { return cross_node || pipeline.active(); }
+    bool owns_layer(int layer) const { return !pipeline.active() || (layer >= layer_begin && layer < layer_end); }
+    void abort_distributed() {
+        terminal_failure = true;
+        if (cross_node) cross_node(cross_node_user, nullptr, -1);
+        if (pipeline.exchange) pipeline.exchange(pipeline.user, -1, -1, nullptr, -1);
+    }
 
     /// Which tensors the tensor-parallel mode actually shards, as a bitmask
     /// (1 = attention heads, 2 = routed experts). Both by default;
     /// TS_GLM_TP_SHARD exists so either half can be turned off to attribute a
     /// regression or measure what each contributes.
     int tp_shard = 3;
-    bool tp_heads() const { return (tp_shard & 1) != 0; }
+    // Cross-node GLM keeps attention's full head geometry. Quantized MLA
+    // projections and attention kernels need not round identically when the
+    // head grid changes; tiny local fixtures do not bound that accumulated
+    // error on a full checkpoint. Routed experts remain sharded below.
+    bool replicated_tp_attention() const { return hp.g5n && cross_node != nullptr; }
+    bool tp_heads() const { return (tp_shard & 1) != 0 && !replicated_tp_attention(); }
     /// Number of adjacent attention heads that must stay together so every
     /// row-parallel output-projection slice starts and ends on a quantization
     /// block boundary. GLM-5.3's 128-wide heads and K-quantized output weights
@@ -1343,18 +1388,19 @@ static glm_slot * slot_alloc(glm_model & m, bool admit = false)
 
     for (int il = 0; il < n_cache_layers; il++)
     {
+        if (!m.owns_layer(il)) continue;
         const bool recr = il < m.hp.n_layer && m.layers[il].recurrent;
         for (int r = 0; r < m.tp; r++)
         {
-            const int d = m.tp > 1 ? m.rank_device(r) : m.layers[il].device;
+            const int d = m.parallel() ? m.rank_device(r) : m.layers[il].device;
             if (recr)
             {
                 // KDA linear attention keeps a fixed-size recurrent state per
                 // sequence instead of KV rows: the short-conv tail and the
                 // per-head delta-net state, both updated in place by the graph.
-                // KDA heads are independent, so TP keeps only this rank's heads
-                // instead of replicating the full recurrent state on every GPU.
-                const int64_t n_head = m.tp > 1 && m.tp_heads()
+                // Local head-sharded TP keeps this rank's heads. Distributed
+                // TP replicates attention and its complete recurrent state.
+                const int64_t n_head = m.parallel() && m.tp_heads()
                     ? m.layers[(size_t) il].head_first[r + 1] - m.layers[(size_t) il].head_first[r]
                     : m.hp.kda_n_head;
                 const int64_t d_inner = (int64_t) m.hp.kda_head_dim * n_head;
@@ -1477,6 +1523,22 @@ TSG_TEST_EXPORT void TSGgml_GlmTestFailGraphAllocs(int n)
     glm_test_graph_alloc_failures = n;
 }
 #endif
+// TP rank graphs bypass ggml_backend_sched, which calls the backend's
+// graph_optimize before allocating. ggml-cuda uses that call to register
+// allocation dependencies for its fused MoE weighted-reduction, top-k router
+// and shared-expert kernels; without them gallocr may alias those inputs, the
+// fusion is skipped at run time, and a rank computes different (unfused)
+// arithmetic from the layer-split and single-device graphs. Default on;
+// TS_GLM_TP_GRAPH_OPTIMIZE=0 restores the previous allocation for comparison.
+static bool glm_tp_graph_optimize()
+{
+    static const bool enabled = [] {
+        const char * value = std::getenv("TS_GLM_TP_GRAPH_OPTIMIZE");
+        return !(value && value[0] == '0' && value[1] == '\0');
+    }();
+    return enabled;
+}
+
 static bool glm_test_graph_alloc_fault()
 {
 #if defined(TSG_GGML_TEST_HOOKS)
@@ -1535,10 +1597,24 @@ static std::string akey(const char * arch, const char * suffix)
 
 static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubatch,
                             int n_threads, int n_cpu_moe_req, const char * backend_name, int tp_req,
-                            bool ctx_is_hard_limit, bool load_mtp)
+                            bool ctx_is_hard_limit, bool load_mtp, int global_tp = 0, int rank_offset = 0,
+                            glm_model::cross_reduce cross_node = nullptr, void * cross_user = nullptr,
+                            int pipeline_node = 0, int pipeline_nodes = 1,
+                            tsg_layer_pipeline::transfer exchange = nullptr, void * exchange_user = nullptr)
 {
     auto t_start = std::chrono::steady_clock::now();
     std::unique_ptr<glm_model> m(new glm_model());
+
+    if ((cross_node && exchange) || (cross_node && (tp_req < 1 || global_tp <= tp_req || rank_offset < 0 ||
+        rank_offset > global_tp - tp_req || global_tp % tp_req != 0 || rank_offset % tp_req != 0)) ||
+        (exchange && (tp_req != 1 || pipeline_nodes < 2 || pipeline_node < 0 || pipeline_node >= pipeline_nodes)) ||
+        ((cross_node || exchange) && (load_mtp || n_cpu_moe_req < 0 || n_gpu_req < 1 || n_gpu_req > MAX_GPUS)))
+        throw std::invalid_argument("Invalid GLM distributed topology, automatic offload or speculative draft request");
+    m->global_tp = cross_node ? global_tp : std::max(tp_req, 1);
+    m->rank_offset = rank_offset;
+    m->cross_node = cross_node;
+    m->cross_node_user = cross_user;
+    m->pipeline = { pipeline_node, pipeline_nodes, exchange, exchange_user, {} };
 
     // --- backends ---------------------------------------------------------
     // "CPU" is an explicit request for a host-only run (--backend ggml_cpu):
@@ -1566,11 +1642,13 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             fprintf(stderr, "[glm] no %s GPU devices found; falling back to any available GPU backend\n", backend_name);
     }
     m->n_gpu = n_gpu;
+    if (m->distributed() && !cpu_only && n_gpu != n_gpu_req)
+        throw std::invalid_argument("Distributed GLM requires exactly the requested local GPU count; device capping or oversubscription is not supported");
 
     // Tensor parallelism uses exactly `tp` devices, each running every layer on
     // its own slice of the head- and expert-sharded matrices. Anything else is
     // the layer split, where each layer lives on one device.
-    if (tp_req > 1)
+    if (tp_req > 1 || cross_node)
     {
         if (tp_req > MAX_GPUS)
         {
@@ -1653,12 +1731,16 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // GLM-5.3-Flash ("glm5next") loads through this same executor: it keeps the
     // MLA+DSA+MoE core and adds KDA layers, pooled indexing and Sinkhorn
     // hyper-connections on top.
+    const char * AP = "glm-dsa";
     {
         const int64_t ai = gguf_find_key(g0, "general.architecture");
         if (ai >= 0 && gguf_get_kv_type(g0, ai) == GGUF_TYPE_STRING)
-            hp.g5n = strcmp(gguf_get_val_str(g0, ai), "glm5next") == 0;
+        {
+            const char * arch = gguf_get_val_str(g0, ai);
+            hp.g5n = strcmp(arch, "glm5next") == 0 || strcmp(arch, "glm5-next") == 0;
+            if (hp.g5n) AP = arch;
+        }
     }
-    const char * AP = hp.g5n ? "glm5next" : "glm-dsa";
     bool ok = true;
     ok &= kv_u32(g0, akey(AP, "block_count").c_str(), &hp.n_layer_all);
     ok &= kv_u32(g0, akey(AP, "embedding_length").c_str(), &hp.n_embd);
@@ -1759,6 +1841,12 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         return nullptr;
     }
 
+    if (m->distributed() && !hp.g5n)
+        throw std::invalid_argument("Distributed GLM native execution requires glm5next (GLM-5.3-Flash)");
+    if (cross_node && (n_cpu_moe_req != 0 || m->tp_shard != 3))
+        throw std::invalid_argument("Distributed GLM TP requires the standard routed-expert sharding policy (TS_GLM_TP_SHARD=3) and no CPU expert offload; attention is replicated for numerical stability");
+    m->layer_end = hp.n_layer;
+
     // --- tensor sources across shards -------------------------------------
     std::map<std::string, tensor_source> sources;
     std::vector<size_t> layer_bytes((size_t) hp.n_layer, 0);
@@ -1825,6 +1913,10 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         embd_bytes = it->second.size;
     }
     size_t head_bytes = root_bytes > embd_bytes ? root_bytes - embd_bytes : 0;
+    // A pipeline's final stage loads its own embedding matrix when the output
+    // projection is tied, even though only stage zero embeds input tokens.
+    if (exchange && sources.find("output.weight") == sources.end())
+        head_bytes += embd_bytes;
 
     // --- NextN/MTP draft block -------------------------------------------
     // Loading it costs a whole extra decoder layer (~3 GiB of GLM-5.2 at
@@ -1854,7 +1946,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         // A draft block with no head of its own borrows the trunk's, which is
         // column-parallel under tensor parallelism — the draft would read one
         // rank's strip of the vocabulary and produce nonsense.
-        const bool borrows_split_head = !has_src("nextn.shared_head_head.weight") && m->tp > 1;
+        const bool borrows_split_head = !has_src("nextn.shared_head_head.weight") && m->parallel();
 
         if (hp.n_layer_nextn > 1)
             fprintf(stderr, "[glm] %d NextN blocks declared; only 1 is supported. Serving standard decode\n",
@@ -1917,7 +2009,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // its K-quantized output matrices use 256-element blocks, so those heads
     // travel in pairs. Compute the requirement from the file instead of baking
     // either model's current dimensions into the executor.
-    if (m->tp > 1 && m->tp_heads())
+    if (m->parallel() && m->tp_heads())
     {
         int group = 1;
         const int n_loaded_layers = hp.n_layer + (m->has_mtp ? 1 : 0);
@@ -1932,15 +2024,103 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             const int need = block / std::gcd(block, head_width);
             group = std::lcm(group, need);
         }
-        if (hp.n_head % group != 0 || hp.n_head / group < m->tp)
+        if (hp.n_head % group != 0 || hp.n_head / group < m->global_tp)
         {
             tsg::report_load_refusal(
                     "[glm] --tp %d cannot split %d heads in the %d-head groups required by the "
                     "output weights' quantization blocks\n",
-                    m->tp, hp.n_head, group);
+                    m->global_tp, hp.n_head, group);
             return nullptr;
         }
         m->tp_head_group = group;
+    }
+
+    int moe_ff_blck = 1;
+    for (int il = 0; il < hp.n_layer && m->parallel() && m->tp_experts() && !m->replicated_tp_attention(); il++)
+    {
+        char nm[256];
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_down_exps.weight", il);
+        auto it = sources.find(nm);
+        if (it == sources.end()) continue;
+        moe_ff_blck = std::max(moe_ff_blck, (int) ggml_blck_size(it->second.type));
+        if (hp.n_ff_exp % moe_ff_blck != 0 || hp.n_ff_exp / moe_ff_blck < m->global_tp)
+        {
+            m->tp_moe_rows = false;
+            fprintf(stderr, "[glm] %d expert rows cannot feed %d ranks in whole %d-element blocks\n",
+                    hp.n_ff_exp, m->global_tp, moe_ff_blck);
+        }
+    }
+
+    // Decide physical row ownership before allocating or uploading weights.
+    // Preserve the original MMQ row grid for qualified CUDA strips. Other
+    // Small fixtures can retain a full projection and crop after computing it.
+    // Large unsupported layouts are refused rather than silently replicating
+    // production expert weights or approximating sliced MMQ arithmetic.
+    if (m->replicated_tp_attention())
+    {
+        if (!m->tp_experts() || hp.n_embd < m->global_tp || hp.n_ff_exp < m->global_tp)
+            throw std::invalid_argument("Distributed GLM TP cannot assign nonempty routed-expert channels and output rows to every rank");
+        ggml_init_params ip = { 64 * ggml_tensor_overhead() + 4096, nullptr, true };
+        int replicated = 0;
+        size_t replicated_bytes = 0;
+        for (int il = hp.n_dense_lead; il < hp.n_layer; ++il)
+        for (const char * kind : { "gate", "up", "down" })
+        {
+            char name[256];
+            snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", il, kind);
+            auto source = sources.find(name);
+            if (source == sources.end())
+                throw std::invalid_argument(std::string("Missing distributed GLM expert tensor: ") + name);
+            const tensor_source & s = source->second;
+            const bool down = strcmp(kind, "down") == 0;
+            const int64_t full_rows = down ? hp.n_embd : hp.n_ff_exp;
+            const int64_t input = down ? hp.n_ff_exp : hp.n_embd;
+            if (s.ne[0] != input || s.ne[1] != full_rows || s.ne[2] != hp.n_expert || s.ne[3] != 1
+                || input % ggml_blck_size(s.type) != 0)
+                throw std::invalid_argument(std::string("Invalid distributed GLM expert shape: ") + name);
+            auto & plans = m->exact_expert_rows[name];
+            for (int r = 0; r < m->tp; ++r)
+            {
+                const int global = m->rank_offset + r;
+                const int64_t first = down ? shard_first(hp.n_embd, m->global_tp, global)
+                    : shard_first_rot(hp.n_ff_exp / moe_ff_blck, m->global_tp, global, il) * moe_ff_blck;
+                const int64_t end = down ? shard_first(hp.n_embd, m->global_tp, global + 1)
+                    : shard_first_rot(hp.n_ff_exp / moe_ff_blck, m->global_tp, global + 1, il) * moe_ff_blck;
+                int64_t stored_first = 0, stored_count = full_rows;
+                ggml_context * probe = ggml_init(ip);
+                if (!probe) throw std::bad_alloc();
+                std::unique_ptr<ggml_context, decltype(&ggml_free)> owned_probe(probe, ggml_free);
+                ggml_backend_t backend = m->backends[m->rank_device(r)];
+#ifdef TSG_GGML_USE_CUDA
+                if (ggml_backend_is_cuda(backend) && tsg_matmul_id_quant_strip_type_supported(s.type)
+                    && full_rows % 128 == 0)
+                {
+                    const int64_t begin_tile = first / 128 * 128;
+                    const int64_t tile_count = std::min(full_rows, ((end + 127) / 128) * 128) - begin_tile;
+                    ggml_tensor * w = ggml_new_tensor_3d(probe, s.type, input, tile_count, hp.n_expert);
+                    if (tsg_matmul_id_quant_strip_supported(backend, w,
+                            std::max<int64_t>(m->n_ubatch, TSG_PRECISION_DECODE_COLUMNS + 1), full_rows, begin_tile))
+                    {
+                        stored_first = begin_tile;
+                        stored_count = tile_count;
+                    }
+                }
+#endif
+                const size_t full_bytes = ggml_row_size(s.type, input) * (size_t) full_rows * (size_t) hp.n_expert;
+                if (stored_count == full_rows && full_bytes > 64 * 1024 * 1024)
+                    throw std::invalid_argument(std::string("Distributed GLM expert projection has no exact physically sharded kernel for this shape/type/device: ") + name);
+                // The CPU fixture path can also use a full projection. This
+                // matches its reference arithmetic without CUDA assumptions.
+                ggml_tensor * w = ggml_new_tensor_3d(probe, s.type, input, stored_count, hp.n_expert);
+                ggml_tensor * x = ggml_new_tensor_3d(probe, GGML_TYPE_F32, input, down ? hp.n_expert_used : 1, 1);
+                ggml_tensor * ids = ggml_new_tensor_2d(probe, GGML_TYPE_I32, hp.n_expert_used, 1);
+                if (!ggml_backend_supports_op(backend, ggml_mul_mat_id(probe, w, x, ids)))
+                    throw std::invalid_argument(std::string("Backend cannot execute distributed GLM expert projection: ") + name);
+                plans.push_back({ stored_first, stored_count });
+                if (stored_count == full_rows) { ++replicated; replicated_bytes += full_bytes; }
+            }
+        }
+        fprintf(stderr, "[glm] exact distributed expert projections: full-row MMQ geometry; %d full-weight/crop fallbacks, %.2f MiB across local ranks (at most 64 MiB per tensor, charged in placement)\n", replicated, replicated_bytes / 1048576.0);
     }
 
     // What one layer's caches cost the device that hosts it. Priced into the
@@ -1948,6 +2128,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // slot allocation instead of at load.
     auto layer_cache_bytes = [&](int il) -> size_t
     {
+        if (!m->owns_layer(il)) return 0;
         // A glm5next KDA layer keeps a fixed-size recurrent state instead of
         // per-position rows; an MLA layer's indexer cache holds [key | gate]
         // pairs when the indexer is pooled.
@@ -1959,6 +2140,29 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             b += (size_t) (hp.indexer_kpool > 0 ? 2 : 1) * hp.indexer_head_size * m->n_ctx * 2;
         return b + 4 * 256;
     };
+
+    if (m->pipeline.active())
+    {
+        std::vector<size_t> resident(layer_bytes), fixed((size_t) pipeline_nodes, 0);
+        fixed.front() = embd_bytes;
+        fixed.back() = head_bytes;
+        for (int il = 0; il < hp.n_layer; ++il)
+        {
+            if (il < n_cpu_moe_req) resident[il] -= layer_exps_bytes[il];
+            resident[il] = tsg_layer_partition::checked_add(resident[il], layer_cache_bytes(il));
+        }
+        const auto plan = tsg_layer_partition::balance(resident, fixed, std::max(1, n_gpu_req));
+        m->layer_begin = plan.boundaries[pipeline_node];
+        m->layer_end = plan.boundaries[pipeline_node + 1];
+        for (int il = 0; il < hp.n_layer; ++il)
+            if (!m->owns_layer(il)) layer_bytes[il] = layer_exps_bytes[il] = 0;
+        if (pipeline_node != 0) embd_bytes = 0;
+        if (pipeline_node + 1 != pipeline_nodes) head_bytes = 0;
+        root_bytes = embd_bytes + head_bytes;
+        fprintf(stderr, "[glm] distributed layer stage %d/%d owns layers %d..%d; planned resident %.3f GiB\n",
+                pipeline_node, pipeline_nodes, m->layer_begin, m->layer_end - 1,
+                plan.resident[pipeline_node] / 1073741824.0);
+    }
 
     // --- per-device budget + layer split ----------------------------------
     std::vector<size_t> dev_budget((size_t) std::max(n_gpu, 1), 0);
@@ -1988,8 +2192,8 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // state instead of per-token rows.
     const size_t idx_row_bytes = (hp.indexer_kpool > 0 ? 2 * (size_t) hp.indexer_head_size
                                                        : (size_t) hp.indexer_head_size) * 2;
-    const int max_kda_heads_per_rank = hp.g5n && m->tp > 1 && m->tp_heads()
-        ? shard_first(hp.kda_n_head / m->tp_head_group, m->tp, 1) * m->tp_head_group
+    const int max_kda_heads_per_rank = hp.g5n && m->parallel() && m->tp_heads()
+        ? shard_first(hp.kda_n_head / m->tp_head_group, m->global_tp, 1) * m->tp_head_group
         : hp.kda_n_head;
     const size_t kda_state_bytes = hp.g5n
         ? ((size_t) (hp.d_conv - 1) * 3 * hp.kda_head_dim * max_kda_heads_per_rank
@@ -1999,6 +2203,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     size_t kv_bytes_fixed = 0;
     for (int il = 0; il < hp.n_layer; il++)
     {
+        if (!m->owns_layer(il)) continue;
         if (hp.g5n && hp.is_recr[(size_t) il] != 0) { kv_bytes_fixed += kda_state_bytes; continue; }
         kv_bytes_per_token += (size_t) hp.n_kv_row * 2;
         if (hp.indexer_full[il]) kv_bytes_per_token += idx_row_bytes;
@@ -2011,10 +2216,16 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // fixed per ubatch and dominated by the LM head's [n_vocab, n_ubatch] output.
     // Counted twice over because the graph cache keeps several built graphs
     // alive, each holding its own allocation.
-    const int n_full_indexer = (int) std::count(hp.indexer_full.begin(), hp.indexer_full.end(), (uint8_t) 1);
+    int n_full_indexer = 0;
+    for (int il = m->layer_begin; il < m->layer_end; ++il) n_full_indexer += hp.indexer_full[il] != 0;
     const size_t graph_bytes_per_token = 2 * (size_t) n_full_indexer * (size_t) m->n_ubatch * 2;
+    // The exact distributed path also materializes complete routed activations
+    // and expert outputs at its two seams. Their lifetimes end at the next
+    // projection/sum, so the allocator reuses this storage across layers.
+    const size_t expert_gather_floats = m->replicated_tp_attention()
+        ? (size_t) hp.n_expert_used * ((size_t) hp.n_ff_exp + (size_t) hp.n_embd) : 0;
     const size_t graph_bytes_fixed =
-        2 * (size_t) m->n_ubatch * ((size_t) hp.n_vocab + 16 * (size_t) hp.n_embd) * 4
+        2 * (size_t) m->n_ubatch * ((size_t) hp.n_vocab + 16 * (size_t) hp.n_embd + expert_gather_floats) * 4
         + kv_bytes_fixed;
 
     /// Largest context whose caches AND graphs still fit in `avail`, in whole
@@ -2041,7 +2252,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     const bool remeasure_ctx = !ctx_is_hard_limit && n_gpu > 0;
 
     int n_cpu_moe = 0;
-    if (m->tp > 1)
+    if (m->parallel())
     {
         // Every rank runs every layer, so the budget is per rank: the routed
         // experts are the only weights that shrink with `tp`, and the MLA and
@@ -2057,7 +2268,30 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             {
                 const size_t e = layer_exps_bytes[il];
                 b += layer_bytes[il] - e;                    // dense half: replicated (upper bound)
-                if (il >= n_cpu) b += e / (size_t) m->tp;    // this rank's expert rows
+                if (il >= n_cpu)
+                {
+                    if (m->replicated_tp_attention())
+                    {
+                        size_t largest_rank = 0;
+                        for (int rank = 0; rank < m->tp; ++rank)
+                        {
+                            size_t owned = 0;
+                            for (const char * kind : { "gate", "up", "down" })
+                            {
+                                char name[256];
+                                snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", il, kind);
+                                auto plan = m->exact_expert_rows.find(name);
+                                if (plan == m->exact_expert_rows.end()) continue; // dense layer
+                                const tensor_source & source = sources.at(name);
+                                owned += ggml_row_size(source.type, source.ne[0])
+                                    * (size_t) plan->second[(size_t) rank].count * (size_t) source.ne[2];
+                            }
+                            largest_rank = std::max(largest_rank, owned);
+                        }
+                        b += largest_rank; // includes tile overlap and full-weight fallbacks
+                    }
+                    else b += (e + (size_t) m->global_tp - 1) / (size_t) m->global_tp;
+                }
             }
             return b;
         };
@@ -2172,6 +2406,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
 
         auto layer_cost = [&](int il, int n_cpu) -> size_t
         {
+            if (!m->owns_layer(il)) return 0;
             size_t w = layer_bytes[il];
             if (il < n_cpu) w -= layer_exps_bytes[il];
             return w + layer_cache_bytes(il);
@@ -2182,19 +2417,32 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         auto pack = [&](double frac, int n_cpu, std::vector<int> * out) -> bool
         {
             int dev = 0;
+            int layers_on_device = 0;
             size_t used = fixed_bytes[0];
-            for (int il = 0; il < hp.n_layer; il++)
+            for (int il = m->layer_begin; il < m->layer_end; il++)
             {
                 const size_t cost = layer_cost(il, n_cpu);
+                // A distributed stage reserves at least one layer per selected
+                // local GPU. Leave enough layers for the remaining devices and
+                // never skip a device because its fixed endpoint cost is high.
+                if (m->pipeline.active() && layers_on_device > 0 &&
+                    m->layer_end - il == n_gpu - dev - 1)
+                {
+                    used = fixed_bytes[++dev];
+                    layers_on_device = 0;
+                }
                 while (used + cost > (size_t) (dev_budget[dev] * frac))
                 {
+                    if (m->pipeline.active() && layers_on_device == 0) return false;
                     if (dev + 1 >= n_gpu) return false;
                     used = fixed_bytes[++dev];
+                    layers_on_device = 0;
                 }
                 used += cost;
+                ++layers_on_device;
                 if (out) (*out)[il] = dev;
             }
-            return true;
+            return !m->pipeline.active() || dev + 1 == n_gpu;
         };
 
         // An advertised context that does not fit is capped, not refused — the
@@ -2267,6 +2515,11 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         }
         else
         {
+            if (m->pipeline.active())
+            {
+                tsg::report_load_refusal("[glm] distributed stage cannot fit at least one contiguous layer per selected local GPU\n");
+                return nullptr;
+            }
             size_t acc = 0;
             for (int il = 0; il < hp.n_layer; il++)
             {
@@ -2318,55 +2571,33 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // rank its own embedding table so the independent graphs can construct the
     // initial residual locally; the scheduler fallback still reads rank 0's
     // copy exactly as before.
-    const int dev_first = m->tp > 1 ? 0 : m->layers[0].device;
-    const int dev_last = m->tp > 1 ? 0 : m->layers[(size_t) hp.n_layer - 1].device;
+    const int dev_first = m->parallel() ? 0 : m->layers[m->layer_begin].device;
+    const int dev_last = m->parallel() ? 0 : m->layers[(size_t) m->layer_end - 1].device;
 
     weight_loader WL(*m, sources);
 
-    m->tok_embd = WL.full(dev_first, true, "token_embd.weight");
+    if (!m->pipeline.active() || pipeline_node == 0)
+        m->tok_embd = WL.full(dev_first, true, "token_embd.weight");
     m->tok_embd_rank[0] = m->tok_embd;
-    const bool load_rank_embeddings = hp.g5n && m->tp > 1 && m->tp <= n_gpu && m->tp_shard == 3 &&
+    const bool load_rank_embeddings = hp.g5n && m->parallel() && (m->tp <= n_gpu || (cross_node && cpu_only)) && m->tp_shard == 3 &&
         n_cpu_moe == 0 && !(getenv("TS_GLM_TRACE") && *getenv("TS_GLM_TRACE"));
     if (load_rank_embeddings)
     {
         for (int r = 1; r < m->tp; r++)
             m->tok_embd_rank[r] = WL.full(m->rank_device(r), true, "token_embd.weight");
     }
-    m->output_norm = WL.full(dev_last, true, "output_norm.weight");
-    m->output = WL.full(dev_last, false, "output.weight");
-    if (!m->output)   // tied embeddings
-        m->output = WL.full(dev_last, true, "token_embd.weight");
-    if (!m->tok_embd || !m->output_norm || !m->output) return nullptr;
+    if (!m->pipeline.active() || pipeline_node + 1 == pipeline_nodes)
+    {
+        m->output_norm = WL.full(dev_last, true, "output_norm.weight");
+        m->output = WL.full(dev_last, false, "output.weight");
+        if (!m->output) m->output = WL.full(dev_last, true, "token_embd.weight");
+        if (!m->output_norm || !m->output) return nullptr;
+    }
+    if ((!m->pipeline.active() || pipeline_node == 0) && !m->tok_embd) return nullptr;
     if (load_rank_embeddings)
         for (int r = 0; r < m->tp; r++) if (!m->tok_embd_rank[r]) return nullptr;
 
     const int n_rank = m->tp;
-    // Splitting the routed experts row-wise cuts every down-projection ROW, so a
-    // rank's strip has to start and end on a quantization block boundary: the
-    // split is counted in blocks, not elements. A model whose expert hidden size
-    // is not a whole number of blocks, or one with fewer blocks than ranks, keeps
-    // its experts whole and splits only the attention heads — slower, still exact.
-    int moe_ff_blck = 1;
-    {
-        bool & ok = m->tp_moe_rows;
-        for (int il = 0; il < hp.n_layer && n_rank > 1 && m->tp_experts(); il++)
-        {
-            char nm[256];
-            snprintf(nm, sizeof(nm), "blk.%d.ffn_down_exps.weight", il);
-            auto it = sources.find(nm);
-            if (it == sources.end()) continue;
-            const int b = (int) ggml_blck_size(it->second.type);
-            moe_ff_blck = std::max(moe_ff_blck, b);
-            if (hp.n_ff_exp % moe_ff_blck != 0 || hp.n_ff_exp / moe_ff_blck < n_rank)
-            {
-                ok = false;
-                fprintf(stderr, "[glm] %d expert rows are not %d whole %d-element %s blocks: keeping the experts "
-                        "whole and splitting only the attention heads\n",
-                        hp.n_ff_exp, n_rank, moe_ff_blck, ggml_type_name(it->second.type));
-            }
-        }
-    }
-
     // The draft block is an ordinary glm-dsa decoder block, so it loads through
     // exactly the same code — head sharding, expert sharding and CPU offload
     // included. The only differences are that its indexer weights are skipped
@@ -2374,23 +2605,24 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     const int n_load_layers = hp.n_layer + (m->has_mtp ? 1 : 0);
     for (int il = 0; il < n_load_layers; il++)
     {
+        if (!m->owns_layer(il)) continue;
         glm_layer & L = m->layers[il];
 
         for (int r = 0; r <= n_rank; r++)
         {
-            const bool sh = n_rank > 1 && m->tp_heads();
-            const bool se = n_rank > 1 && m->tp_experts();
+            const bool sh = m->parallel() && m->tp_heads();
+            const bool se = m->parallel() && m->tp_experts();
             L.head_first[r] = sh
-                ? shard_first(hp.n_head / m->tp_head_group, n_rank, r) * m->tp_head_group
+                ? shard_first(hp.n_head / m->tp_head_group, m->global_tp, m->rank_offset + r) * m->tp_head_group
                 : (r == 0 ? 0 : hp.n_head);
-            L.moe_ff_first[r] = se ? shard_first_rot(hp.n_ff_exp / moe_ff_blck, n_rank, r, il) * moe_ff_blck
+            L.moe_ff_first[r] = se ? shard_first_rot(hp.n_ff_exp / moe_ff_blck, m->global_tp, m->rank_offset + r, il) * moe_ff_blck
                                    : (r == 0 ? 0 : hp.n_ff_exp);
         }
 
         for (int r = 0; r < n_rank; r++)
         {
             glm_layer_weights & W = L.w[r];
-            const int d = n_rank > 1 ? m->rank_device(r) : L.device;
+            const int d = m->parallel() ? m->rank_device(r) : L.device;
             const int64_t h0 = L.head_first[r];
             const int64_t hn = L.head_first[r + 1] - h0;
 
@@ -2422,7 +2654,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 // and its rank partials are reduced before the hyper-connection.
                 const int64_t c0 = h0 * hp.kda_head_dim;
                 const int64_t cn = hn * hp.kda_head_dim;
-                if (n_rank > 1 && m->tp_heads())
+                if (m->parallel() && m->tp_heads())
                 {
                     W.kda_wq     = WL.slice_hi(d, 1, c0, cn, true, "blk.%d.attn_q.weight", il);
                     W.kda_wk     = WL.slice_hi(d, 1, c0, cn, true, "blk.%d.attn_k.weight", il);
@@ -2481,7 +2713,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             }
 
             // --- attention, sharded by head ------------------------------------
-            if (n_rank > 1 && m->tp_heads())
+            if (m->parallel() && m->tp_heads())
             {
                 W.wq_b = WL.slice_hi(d, 1, h0 * hp.n_embd_head_k, hn * hp.n_embd_head_k, true,
                                      "blk.%d.attn_q_b.weight", il);
@@ -2529,15 +2761,29 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 // a strided strip cannot be served in place from the GGUF
                 // mapping, so it would turn a mapped file into a private copy of
                 // 200+ GiB of anonymous memory. Rank 0 evaluates these layers.
-                if (n_rank > 1 && m->tp_experts() && !L.cpu_moe)
+                if (m->parallel() && m->tp_experts() && !L.cpu_moe)
                 {
-                    // Column-parallel gate/up (a strip of the hidden dimension)
-                    // feeding a row-parallel down, exactly as for a dense MLP —
-                    // only here every one of the n_expert matrices is split the
-                    // same way, so the ranks' outputs sum to the dense result.
-                    W.ffn_gate_exps = WL.slice_mid(de, f0, fn, true, "blk.%d.ffn_gate_exps.weight", il);
-                    W.ffn_up_exps   = WL.slice_mid(de, f0, fn, true, "blk.%d.ffn_up_exps.weight", il);
-                    W.ffn_down_exps = WL.slice_lo(de, f0, fn, true, "blk.%d.ffn_down_exps.weight", il);
+                    // Distributed projections own output rows of all three
+                    // matrices. Local legacy TP retains input-sliced down dots.
+                    if (m->replicated_tp_attention())
+                    {
+                        auto load_rows = [&](const char * kind)
+                        {
+                            char name[256];
+                            snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", il, kind);
+                            const auto & rows = m->exact_expert_rows.at(name)[(size_t) r];
+                            return WL.slice_mid(de, rows.first, rows.count, true, "%s", name);
+                        };
+                        W.ffn_gate_exps = load_rows("gate");
+                        W.ffn_up_exps = load_rows("up");
+                        W.ffn_down_exps = load_rows("down");
+                    }
+                    else
+                    {
+                        W.ffn_gate_exps = WL.slice_mid(de, f0, fn, true, "blk.%d.ffn_gate_exps.weight", il);
+                        W.ffn_up_exps   = WL.slice_mid(de, f0, fn, true, "blk.%d.ffn_up_exps.weight", il);
+                        W.ffn_down_exps = WL.slice_lo(de, f0, fn, true, "blk.%d.ffn_down_exps.weight", il);
+                    }
                 }
                 else
                 {
@@ -2770,8 +3016,9 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         std::vector<uint8_t> dev_needs((size_t) n_gpu + 1, 0);
         for (int il = 0; il < hp.n_layer; il++)
         {
+            if (!m->owns_layer(il)) continue;
             if (!hp.indexer_full[il]) continue;
-            if (m->tp > 1) { for (int r = 0; r < m->tp; r++) dev_needs[(size_t) m->rank_device(r)] = 1; }
+            if (m->parallel()) { for (int r = 0; r < m->tp; r++) dev_needs[(size_t) m->rank_device(r)] = 1; }
             else dev_needs[(size_t) m->layers[il].device] = 1;
         }
 
@@ -2857,11 +3104,13 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 m->hc_native ? "native" : "decomposed (backend has no fused kernel)");
     }
 
-    if (hp.g5n && m->tp > 1)
+    if (hp.g5n && m->parallel())
     {
         const char * why = nullptr;
-        if (m->tp > n_gpu) why = "ranks are oversubscribed on the visible GPUs";
-        else if (m->tp_shard != 3 || !m->tp_experts()) why = "heads and routed-expert rows are not both sharded";
+        if (m->tp > n_gpu && !(cross_node && cpu_only)) why = "ranks are oversubscribed on the visible GPUs";
+        else if (m->tp_shard != 3 || !m->tp_experts()) why = cross_node
+            ? "the standard routed-expert sharding policy is unavailable"
+            : "heads and routed-expert rows are not both sharded";
         else if (n_cpu_moe != 0) why = "CPU MoE offload is active";
         else if (!m->hc_native) why = "the backend lacks native hyper-connection kernels";
         else if (getenv("TS_GLM_TRACE") && *getenv("TS_GLM_TRACE")) why = "tensor tracing is active";
@@ -2872,6 +3121,14 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             fprintf(stderr,
                     "[glm] TP executor: segmented rank-local graphs, concurrent submission, AllReduce=%s\n",
                     device_comm ? "backend collective (verified on first use)" : "host staging fallback");
+            if (m->replicated_tp_attention())
+                fprintf(stderr, "[glm] distributed TP placement: full attention replicated; routed experts sharded across %d global ranks (%d local)\n",
+                        m->global_tp, m->tp);
+        }
+        if (why && cross_node)
+        {
+            tsg::report_load_refusal("[glm] distributed TP requires segmented rank-local graphs: %s\n", why);
+            return nullptr;
         }
         if (why)
             fprintf(stderr, "[glm] TP executor: combined scheduler fallback (%s)\n", why);
@@ -2895,7 +3152,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         if (const char * e = getenv("TS_GLM_PLAN_SLOTS")) { long v = atol(e); if (v >= 1 && v <= 256) plan_slots = (size_t) v; }
         const size_t reserve = (size_t) 1024 * 1024 * 1024;   // leave the driver room to breathe
         int fit = 0;
-        if (m->tp > 1)
+        if (m->parallel())
         {
             // Every rank holds a full-length copy of every cache.
             size_t free_min = SIZE_MAX;
@@ -2927,6 +3184,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             std::vector<size_t> gtok_b((size_t) n_gpu, 0);     // shared graph, per-token
             for (int il = 0; il < n_cache_layers; il++)
             {
+                if (!m->owns_layer(il)) continue;
                 const int d = m->layers[(size_t) il].device;
                 if (d < 0 || d >= n_gpu) continue;
                 if (il < hp.n_layer && m->layers[(size_t) il].recurrent)
@@ -2948,7 +3206,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             // (the MTP block follows it there). The KDA state share of that
             // constant is per-slot and already charged via fix_slot_b, so
             // subtract it back out.
-            const int dev_head = m->layers[(size_t) hp.n_layer - 1].device;
+            const int dev_head = m->layers[(size_t) m->layer_end - 1].device;
             const size_t graph_fixed_head = graph_bytes_fixed > kv_bytes_fixed
                                           ? graph_bytes_fixed - kv_bytes_fixed : 0;
             fit = ctx_requested;
@@ -3029,24 +3287,27 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 uploaded / 1073741824.0, n_gpu, secs, secs > 0 ? uploaded / 1073741824.0 / secs : 0.0,
                 m->mmap_weight_bytes > 0 ? ", host experts mmapped" : "",
                 m->n_ctx, m->n_ubatch, m->flash_attn ? "on" : "off", m->fused_lid ? "on" : "off");
-        if (m->tp > 1)
+        if (m->parallel())
         {
-            // The expert rows are split in whole quantization blocks and the
-            // remainder rotates by layer, so quote the per-rank average rather
-            // than one layer's slice.
+            // The remainder rotates by layer, so quote the per-rank average
+            // rather than one layer's slice. Local legacy TP uses whole input
+            // blocks; distributed TP owns logical output rows inside MMQ tiles.
             int rows0 = 0;
             for (int il = 0; il < hp.n_layer; il++)
-                if (m->layers[il].is_moe) rows0 += m->layers[il].moe_ff_first[1];
+                if (m->layers[il].is_moe) rows0 += m->layers[il].moe_ff_first[1] - m->layers[il].moe_ff_first[0];
             const int moe_layers = std::max(1, hp.n_layer - hp.n_dense_lead);
-            fprintf(stderr, "[glm] tensor parallel across %d rank(s): every layer on every rank, "
-                    "heads %d/%d and ~%d/%d expert rows per rank, 2 reductions per layer\n",
-                    m->tp, m->layers[0].head_first[1], hp.n_head, rows0 / moe_layers, hp.n_ff_exp);
+            fprintf(stderr, "[glm] tensor parallel across %d global rank(s), %d local at offset %d: every layer on every rank, "
+                    "heads %d/%d and ~%d/%d expert rows per rank; %s\n",
+                    m->global_tp, m->tp, m->rank_offset,
+                    m->layers[0].head_first[1] - m->layers[0].head_first[0], hp.n_head, rows0 / moe_layers, hp.n_ff_exp,
+                    m->replicated_tp_attention() ? "attention replicated, two exact row gathers per routed-expert layer"
+                                                : "attention and routed-expert reductions");
         }
         for (int d = 0; d < n_gpu; d++)
         {
             size_t free_b = 0, total_b = 0;
             ggml_backend_dev_memory(ggml_backend_get_device(m->backends[d]), &free_b, &total_b);
-            if (m->tp > 1)
+            if (m->parallel())
             {
                 if (d < m->tp)
                     fprintf(stderr, "[glm]   rank %d: all %d layers, %.1f GiB free after load\n",
@@ -3091,7 +3352,7 @@ struct graph_builder
 
     /// Device that runs layer `il` for rank `r`: the rank's device under tensor
     /// parallelism, the layer's home device under a layer split.
-    int device_of(int il, int r) const { return m.tp > 1 ? m.rank_device(r) : m.layers[il].device; }
+    int device_of(int il, int r) const { return m.parallel() ? m.rank_device(r) : m.layers[il].device; }
 
     // A verify window must commit the same arithmetic as single-token decode.
     // On the real IQ1_S glm5next model the first four-row verify changed logits
@@ -4022,7 +4283,7 @@ struct graph_builder
         // Under tensor parallelism this rank owns a contiguous run of heads; the
         // key/value cache row is head-independent, so it is computed (identically)
         // and stored by every rank instead of being shared through a collective.
-        const int64_t n_head = (m.tp > 1 && m.tp_heads()) ? (L.head_first[rank + 1] - L.head_first[rank])
+        const int64_t n_head = (m.parallel() && m.tp_heads()) ? (L.head_first[rank + 1] - L.head_first[rank])
                                                           : hp.n_head;
 
         ggml_tensor * q = decode_mul_mat(ctx, LW.wq_b, qr);                       // [n_head*head_k, nt]
@@ -4187,8 +4448,67 @@ struct graph_builder
         return decode_mul_mat(ctx, LW.ffn_down_shexp, h);
     }
 
-    /// Routed-expert FFN for one rank. Returns this rank's PARTIAL sum; the
-    /// caller reduces across ranks and adds the (replicated) shared expert.
+    // Preserve the unsharded indexed matmul's output-row grid and stream-K
+    // reduction. Physical rows can overlap at a tile boundary; only the
+    // disjoint logical rows enter a collective. A full-weight fixture fallback
+    // computes the original projection before cropping, never a sliced MMQ.
+    ggml_tensor * exact_expert_projection(int il, int rank, const char * kind,
+            ggml_tensor * weight, ggml_tensor * input, ggml_tensor * ids,
+            int64_t full_rows, int64_t first, int64_t count)
+    {
+        char name[256];
+        snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", il, kind);
+        const auto & stored = m.exact_expert_rows.at(name).at((size_t) rank);
+        const int64_t crop = first - stored.first;
+        if (count <= 0 || crop < 0 || crop + count > stored.count || weight->ne[1] != stored.count)
+            throw std::runtime_error("Distributed GLM expert row plan does not cover its logical slice");
+        ggml_tensor * result = nullptr;
+        if (stored.first == 0 && stored.count == full_rows)
+            result = decode_mul_mat_id(ctx, weight, input, ids);
+        else if (nt > TSG_PRECISION_DECODE_COLUMNS)
+        {
+#ifdef TSG_GGML_USE_CUDA
+            ggml_backend_t backend = m.backends[m.rank_device(rank)];
+            if (!res.precise_backend || !tsg_matmul_id_quant_strip_supported(backend, weight, nt, full_rows, stored.first))
+                throw std::runtime_error("Distributed GLM expert projection has no exact MMQ output-strip kernel for this token shape");
+            res.tp_matmuls.emplace_back();
+            auto * desc = &res.tp_matmuls.back();
+            desc->kind = TSG_MATMUL_ID_QUANT_STRIP;
+            desc->i0 = full_rows;
+            desc->i1 = stored.first;
+            result = tsg_matmul_id_quant_strip(ctx, weight, input, ids, desc);
+#else
+            throw std::runtime_error("Distributed GLM output-strip projection requires the CUDA backend");
+#endif
+        }
+        else
+        {
+            // Decode/verify retains the established per-token MMVQ dot. The
+            // expert stride still spans its stored, possibly overlapping tile.
+            if (crop || weight->ne[1] != count)
+                weight = ggml_view_3d(ctx, weight, weight->ne[0], count, weight->ne[2],
+                        weight->nb[1], weight->nb[2], (size_t) crop * weight->nb[1]);
+            return decode_mul_mat_id(ctx, weight, input, ids);
+        }
+        if (crop || result->ne[0] != count)
+            result = ggml_cont(ctx, ggml_view_3d(ctx, result, count, result->ne[1], result->ne[2],
+                    result->nb[1], result->nb[2], (size_t) crop * sizeof(float)));
+        return result;
+    }
+
+    ggml_tensor * gather_expert_rows(ggml_tensor * rows, int64_t first, int64_t full_rows)
+    {
+        ggml_tensor * padded = ggml_pad_ext(ctx, rows, (int) first,
+                (int) (full_rows - first - rows->ne[0]), 0, 0, 0, 0, 0, 0);
+        ggml_build_forward_expand(gf, padded);
+        res.tp_plan.ar_tensor.push_back(padded);
+        res.tp_boundary.push_back(padded);
+        return padded;
+    }
+
+    /// Local legacy TP returns a partial sum. Distributed TP gathers complete
+    /// activations, computes full-input down dots and retains the original
+    /// full-shape weighted reduction before gathering disjoint final rows.
     ggml_tensor * build_moe(int il, int rank, ggml_tensor * cur)
     {
         const glm_layer & L = m.layers[il];
@@ -4233,10 +4553,32 @@ struct graph_builder
 
         ggml_tensor * cur3 = ggml_reshape_3d(ctx, cur, hp.n_embd, 1, nt);
 
-        ggml_tensor * up = decode_mul_mat_id(ctx, LW.ffn_up_exps, cur3, selected);    // [n_ff_exp, n_used, nt]
-        ggml_tensor * gate = decode_mul_mat_id(ctx, LW.ffn_gate_exps, cur3, selected);
+        const bool exact = m.replicated_tp_attention();
+        const int64_t ff_first = exact ? L.moe_ff_first[rank] : 0;
+        const int64_t ff_count = exact ? L.moe_ff_first[rank + 1] - ff_first : 0;
+        ggml_tensor * up = exact
+            ? exact_expert_projection(il, rank, "up", LW.ffn_up_exps, cur3, selected, hp.n_ff_exp, ff_first, ff_count)
+            : decode_mul_mat_id(ctx, LW.ffn_up_exps, cur3, selected);
+        ggml_tensor * gate = exact
+            ? exact_expert_projection(il, rank, "gate", LW.ffn_gate_exps, cur3, selected, hp.n_ff_exp, ff_first, ff_count)
+            : decode_mul_mat_id(ctx, LW.ffn_gate_exps, cur3, selected);
         ggml_tensor * h = swiglu(gate, up);
-        ggml_tensor * experts = decode_mul_mat_id(ctx, LW.ffn_down_exps, h, selected); // [n_embd, n_used, nt]
+        ggml_tensor * experts = nullptr;
+        if (exact)
+        {
+            h = gather_expert_rows(h, ff_first, hp.n_ff_exp);
+            const int global = m.rank_offset + rank;
+            const int64_t first = shard_first(hp.n_embd, m.global_tp, global);
+            const int64_t count = shard_first(hp.n_embd, m.global_tp, global + 1) - first;
+            experts = exact_expert_projection(il, rank, "down", LW.ffn_down_exps, h, selected, hp.n_embd, first, count);
+            // Keep the original full expert-output shape and weighted sum.
+            // Unowned rows remain zero; only the final disjoint hidden rows
+            // need communication after that unchanged per-row reduction.
+            experts = ggml_pad_ext(ctx, experts, (int) first,
+                    (int) (hp.n_embd - first - count), 0, 0, 0, 0, 0, 0);
+        }
+        else
+            experts = decode_mul_mat_id(ctx, LW.ffn_down_exps, h, selected);
         if (hp.g5n && nt <= TSG_PRECISION_DECODE_COLUMNS)
             ggml_set_output(experts); // keep the weighted-reduction fusion's input from aliasing its output
 
@@ -4256,6 +4598,12 @@ struct graph_builder
             moe_out = moe_out ? ggml_add(ctx, moe_out, v) : v;
         }
         if (n_used == 1) moe_out = ggml_cont(ctx, moe_out);
+        if (exact)
+        {
+            ggml_build_forward_expand(gf, moe_out);
+            res.tp_plan.ar_tensor.push_back(moe_out);
+            res.tp_boundary.push_back(moe_out);
+        }
         return moe_out;
     }
 
@@ -4391,7 +4739,7 @@ struct graph_builder
         const glm_layer & L = m.layers[il];
         const glm_layer_weights & LW = L.w[rank];
         const int64_t hd = hp.kda_head_dim;
-        const int64_t H = m.tp > 1 && m.tp_heads()
+        const int64_t H = m.parallel() && m.tp_heads()
             ? L.head_first[rank + 1] - L.head_first[rank]
             : hp.kda_n_head;
         const int64_t d_inner = hd * H;
@@ -4637,8 +4985,9 @@ struct graph_builder
     // ---- the glm5next trunk ----
 
     /// One wholly rank-local copy of the glm5next trunk. Every nonlinear and
-    /// hyper-connection operation is replicated; only the row-parallel
-    /// attention projection and routed-expert down projection stop the graph.
+    /// hyper-connection operation is replicated. Local head-sharded TP stops
+    /// at attention projections; distributed TP replicates attention and only
+    /// the routed-expert down projection stops the graph.
     /// The segmented driver AllReduces those F32 partials in place before it
     /// resumes the following hyper-connection segment on every rank.
     void build_g5n_rank(int rank)
@@ -4727,8 +5076,11 @@ struct graph_builder
                 }
                 partial = build_attention(il, rank, cur, qr, inp.pos[dev], mask, inp.kv_idxs[dev]);
             }
-            res.tp_plan.ar_tensor.push_back(partial);
-            res.tp_boundary.push_back(partial);
+            if (m.tp_heads())
+            {
+                res.tp_plan.ar_tensor.push_back(partial);
+                res.tp_boundary.push_back(partial);
+            }
             inpL = build_hc_post(partial, residual, post, comb);
 
             // ---- FFN crossing -------------------------------------------
@@ -4749,13 +5101,15 @@ struct graph_builder
             else
             {
                 ffn = build_moe(il, rank, cur);
-                // Cut after the routed partial itself. Expanding it now keeps
-                // the replicated shared expert in the following segment, so
-                // every rank evaluates the established arithmetic order:
-                // (routed rank 0 + routed rank 1 + ...) + shared.
-                ggml_build_forward_expand(gf, ffn);
-                res.tp_plan.ar_tensor.push_back(ffn);
-                res.tp_boundary.push_back(ffn);
+                // Legacy local TP reduces its routed partial here. Distributed
+                // TP already gathered final rows inside build_moe after the
+                // original full-shape weighted sum, before adding shared.
+                if (!m.replicated_tp_attention())
+                {
+                    ggml_build_forward_expand(gf, ffn);
+                    res.tp_plan.ar_tensor.push_back(ffn);
+                    res.tp_boundary.push_back(ffn);
+                }
                 ggml_tensor * shared = build_shexp(il, rank, cur);
                 if (shared) ffn = ggml_add(ctx, ffn, shared);
             }
@@ -4795,23 +5149,23 @@ struct graph_builder
         const int64_t n_pools = n_kv / r;
 
         std::vector<uint8_t> used_dev((size_t) m.n_gpu + 1, 0);
-        if (m.tp > 1)
+        if (m.parallel())
             for (int rank = 0; rank < m.tp; rank++) used_dev[(size_t) m.rank_device(rank)] = 1;
         else
-            for (int il = 0; il < hp.n_layer; il++) used_dev[(size_t) m.layers[il].device] = 1;
+            for (int il = m.layer_begin; il < m.layer_end; il++) used_dev[(size_t) m.layers[il].device] = 1;
 
         // Only MLA layers read the mask, the cache indices and the pool inputs;
         // a KDA-only device gets none (an input no node reads is never
         // allocated, and writing to it would fault).
         const ggml_type mask_type = m.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
         std::vector<uint8_t> dev_mla((size_t) m.n_gpu + 1, 0);
-        for (int il = 0; il < hp.n_layer; il++)
+        for (int il = m.layer_begin; il < m.layer_end; il++)
         {
             if (m.layers[il].recurrent) continue;
-            if (m.tp > 1 && m.tp_heads())
+            if (m.parallel() && m.tp_heads())
                 for (int rank = 0; rank < m.tp; rank++) dev_mla[(size_t) m.rank_device(rank)] = 1;
             else
-                dev_mla[(size_t) (m.tp > 1 ? m.rank_device(0) : m.layers[il].device)] = 1;
+                dev_mla[(size_t) (m.parallel() ? m.rank_device(0) : m.layers[il].device)] = 1;
         }
 
         for (int d = 0; d <= m.n_gpu; d++)
@@ -4835,16 +5189,25 @@ struct graph_builder
             }
         }
 
-        const int dev_embd = m.tp > 1 ? m.rank_device(0) : m.layers[0].device;
+        const int dev_embd = m.parallel() ? m.rank_device(0) : m.layers[m.layer_begin].device;
         {
             char nb[64];
             snprintf(nb, sizeof(nb), "inp_tokens.%d", dev_embd);
             inp.tokens[dev_embd] = new_input(GGML_TYPE_I32, nt, 0, nb, dev_embd);
         }
-        const int dev_last = m.tp > 1 ? m.rank_device(0) : m.layers[(size_t) hp.n_layer - 1].device;
-        if (res.want_logits)
+        const int dev_last = m.parallel() ? m.rank_device(0) : m.layers[(size_t) m.layer_end - 1].device;
+        if (res.want_logits && (!m.pipeline.active() || m.pipeline.node + 1 == m.pipeline.nodes))
             inp.out_ids = new_input(GGML_TYPE_I32, res.n_out, 0, "inp_out_ids", dev_last);
 
+        ggml_tensor * inpL = nullptr;
+        if (m.pipeline.active() && m.pipeline.node != 0)
+        {
+            res.pipeline_input = new_input_3d(GGML_TYPE_F32, hp.n_embd, hcm, nt,
+                                              "pipeline_hidden", dev_embd);
+            inpL = res.pipeline_input;
+        }
+        else
+        {
         // hc_mult exact copies of the embedding: no scaling, no one-hot.
         ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[dev_embd]);
         if (res.n_ovr > 0)
@@ -4857,21 +5220,23 @@ struct graph_builder
             inp.embd_idx = new_input(GGML_TYPE_I64, res.n_ovr, 0, "embd_idx", dev_embd);
             emb = ggml_set_rows(ctx, emb, inp.embd_rows, inp.embd_idx);
         }
-        ggml_tensor * inpL = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, emb, hp.n_embd, 1, nt),
+        inpL = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, emb, hp.n_embd, 1, nt),
                                             hp.n_embd, hcm, nt, 1);
+
+        }
 
         ggml_tensor * part[MAX_GPUS] = {};
         ggml_tensor * shexp[MAX_GPUS] = {};
-        const int n_attn = m.tp > 1 && m.tp_heads() ? m.tp : 1;
-        const int n_moe = m.tp > 1 && m.tp_experts() ? m.tp : 1;
+        const int n_attn = m.parallel() && m.tp_heads() ? m.tp : 1;
+        const int n_moe = m.parallel() && m.tp_experts() ? m.tp : 1;
 
-        for (int il = 0; il < hp.n_layer; il++)
+        for (int il = m.layer_begin; il < m.layer_end; il++)
         {
             const glm_layer & L = m.layers[il];
             const glm_layer_weights & LW = L.w[0];
             const int dev = device_of(il, 0);
 
-            if (m.tp == 1 && il > 0 && dev != m.layers[il - 1].device)
+            if (!m.parallel() && il > m.layer_begin && dev != m.layers[il - 1].device)
                 pin(inpL, dev);
 
             // ---- attention crossing ----
@@ -4960,6 +5325,15 @@ struct graph_builder
             trace("l_out", il, 0, inpL);
         }
 
+        if (m.pipeline.active() && m.pipeline.node + 1 < m.pipeline.nodes)
+        {
+            res.pipeline_output = ggml_cont(ctx, inpL);
+            ggml_set_output(res.pipeline_output);
+            ggml_set_name(res.pipeline_output, "pipeline_hidden_out");
+            ggml_build_forward_expand(gf, res.pipeline_output);
+            return;
+        }
+
         if (!res.want_logits && !res.want_h)
         {
             // A non-final prefill chunk only has to leave its caches and
@@ -5019,7 +5393,7 @@ struct graph_builder
         // scheduler never inserts a synchronized cross-backend input copy
         // inside the per-token compute.
         std::vector<uint8_t> used_dev((size_t) m.n_gpu + 1, 0);
-        if (m.tp > 1)
+        if (m.parallel())
             for (int r = 0; r < m.tp; r++) used_dev[(size_t) m.rank_device(r)] = 1;
         else
             for (int il = 0; il < hp.n_layer; il++) used_dev[(size_t) m.layers[il].device] = 1;
@@ -5039,7 +5413,7 @@ struct graph_builder
         for (int il = 0; il < hp.n_layer; il++)
         {
             if (!m.layers[il].indexer_full) continue;
-            if (m.tp > 1) { for (int r = 0; r < m.tp; r++) dev_has_indexer[(size_t) m.rank_device(r)] = 1; }
+            if (m.parallel()) { for (int r = 0; r < m.tp; r++) dev_has_indexer[(size_t) m.rank_device(r)] = 1; }
             else dev_has_indexer[(size_t) m.layers[il].device] = 1;
         }
 
@@ -5060,18 +5434,18 @@ struct graph_builder
             }
         }
         {
-            const int dev_embd = m.tp > 1 ? 0 : m.layers[0].device;
+            const int dev_embd = m.parallel() ? 0 : m.layers[0].device;
             char nb[64];
             snprintf(nb, sizeof(nb), "inp_tokens.%d", dev_embd);
             inp.tokens[dev_embd] = new_input(GGML_TYPE_I32, nt, 0, nb, dev_embd);
         }
-        const int dev_last = m.tp > 1 ? 0 : m.layers[(size_t) hp.n_layer - 1].device;
+        const int dev_last = m.parallel() ? 0 : m.layers[(size_t) hp.n_layer - 1].device;
         // Only when the LM head runs: an input no node reads is never allocated,
         // and writing to it would fault.
         if (res.want_logits)
             inp.out_ids = new_input(GGML_TYPE_I32, res.n_out, 0, "inp_out_ids", dev_last);
 
-        ggml_tensor * inpL = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.tp > 1 ? 0 : m.layers[0].device]);
+        ggml_tensor * inpL = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.parallel() ? 0 : m.layers[0].device]);
 
         // `top_k` deliberately survives a device (or rank) change. A "shared"
         // indexer layer must see the selection of the last FULL layer wherever
@@ -5086,14 +5460,14 @@ struct graph_builder
         // A half that is not sharded is computed once, on rank 0: every rank
         // holds the same weights there, so summing N identical partials would
         // multiply the result by N.
-        const int n_attn = (m.tp > 1 && m.tp_heads()) ? m.tp : 1;
-        const int n_moe = (m.tp > 1 && m.tp_experts()) ? m.tp : 1;
+        const int n_attn = (m.parallel() && m.tp_heads()) ? m.tp : 1;
+        const int n_moe = (m.parallel() && m.tp_experts()) ? m.tp : 1;
 
         for (int il = 0; il < hp.n_layer; il++)
         {
             const glm_layer & L = m.layers[il];
 
-            if (m.tp == 1 && il > 0 && L.device != m.layers[il - 1].device)
+            if (!m.parallel() && il > 0 && L.device != m.layers[il - 1].device)
                 pin(inpL, L.device);
 
             // ---- attention: every rank runs its own heads ----------------------
@@ -5226,7 +5600,7 @@ struct graph_builder
         const ggml_type mask_type = m.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
         std::vector<uint8_t> used_dev((size_t) m.n_gpu + 1, 0);
-        if (m.tp > 1) { for (int r = 0; r < m.tp; r++) used_dev[(size_t) m.rank_device(r)] = 1; }
+        if (m.parallel()) { for (int r = 0; r < m.tp; r++) used_dev[(size_t) m.rank_device(r)] = 1; }
         else used_dev[(size_t) L.device] = 1;
 
         for (int d = 0; d <= m.n_gpu; d++)
@@ -5241,7 +5615,7 @@ struct graph_builder
             inp.kv_idxs[d] = new_input(GGML_TYPE_I64, nt, 0, nb, d);
         }
 
-        const int dev0 = m.tp > 1 ? 0 : L.device;
+        const int dev0 = m.parallel() ? 0 : L.device;
         inp.tokens[dev0] = new_input(GGML_TYPE_I32, nt, 0, "mtp_tokens", dev0);
         inp.h_in[dev0] = new_input(GGML_TYPE_F32, hp.n_embd, nt, "mtp_h_in", dev0);
         if (res.want_logits)
@@ -5258,7 +5632,7 @@ struct graph_builder
 
         // ---- attention: every rank runs its own heads ---------------------
         ggml_tensor * part[MAX_GPUS] = {};
-        const int n_attn = (m.tp > 1 && m.tp_heads()) ? m.tp : 1;
+        const int n_attn = (m.parallel() && m.tp_heads()) ? m.tp : 1;
         for (int r = 0; r < n_attn; r++)
         {
             const int dev = device_of(il, r);
@@ -5279,7 +5653,7 @@ struct graph_builder
         {
             ggml_tensor * mpart[MAX_GPUS] = {};
             ggml_tensor * shexp0 = nullptr;
-            const int n_moe_l = L.cpu_moe ? 1 : ((m.tp > 1 && m.tp_experts()) ? m.tp : 1);
+            const int n_moe_l = L.cpu_moe ? 1 : ((m.parallel() && m.tp_experts()) ? m.tp : 1);
             for (int r = 0; r < n_moe_l; r++)
             {
                 ggml_tensor * cur = rms(ffn_inp, L.w[r].ffn_norm);
@@ -5689,6 +6063,14 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
             rg.n_ovr = n_ovr;
             rg.tp_fused = true;
             rg.tp_rank = rank;
+            ggml_backend_t native_backend = m.backends[m.rank_device(rank)];
+#ifdef TSG_GGML_USE_CUDA
+            if (m.replicated_tp_attention() && ggml_backend_is_cuda(native_backend))
+            {
+                rg.precise_backend = tsg_dsv4_fused_backend_init(native_backend);
+                if (!rg.precise_backend) return false;
+            }
+#endif
 
             ggml_init_params rp = {
                 ggml_tensor_overhead() * rank_nodes + ggml_graph_overhead_custom(rank_nodes, false),
@@ -5701,6 +6083,11 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
 
             graph_builder gb(m, rg, slot, nt, p0, n_kv, sparse);
             gb.build();
+#ifdef TSG_GGML_USE_CUDA
+            // CUDA only: other backends keep their established node order.
+            if (glm_tp_graph_optimize() && ggml_backend_is_cuda(native_backend))
+                tsg_optimize_graph_with_alloc_dependencies(native_backend, rg.ctx, rg.gf);
+#endif
 
             rg.tp_plan.graph = rg.gf;
             if (!tsg::tp_plan_segments(rg.tp_plan, rg.tp_boundary))
@@ -5709,7 +6096,7 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
                 return false;
             }
 
-            ggml_backend_t backend = m.backends[m.rank_device(rank)];
+            ggml_backend_t backend = rg.precise_backend ? rg.precise_backend : native_backend;
             const int nn = ggml_graph_n_nodes(rg.gf);
             for (int i = 0; i < nn; i++)
             {
@@ -5768,6 +6155,12 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         // A backend capability can differ from the load-time probes. Fall back
         // once for the model instead of failing the request or rebuilding the
         // same unusable rank graphs for every cache shape.
+        if (m.cross_node)
+        {
+            m.abort_distributed();
+            fprintf(stderr, "[glm] distributed TP graph unavailable; session aborted instead of executing incomplete local shards\n");
+            return nullptr;
+        }
         fprintf(stderr, "[glm] segmented TP graph is unavailable; switching to combined scheduler fallback\n");
         m.tp_fused = false;
         m.tp_comm.reset();
@@ -5839,22 +6232,46 @@ static bool glm_tp_host_reduce(glm_model & m, ggml_tensor ** tensors)
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(tensors[rank], ptrs[(size_t) rank], 0, bytes);
     };
+    // Overlap the per-GPU copies only for prefill-sized payloads. A decode
+    // reduction is tens of KiB; creating and joining a thread per rank on
+    // every collective cost more than the copies themselves.
+    constexpr size_t parallel_copy_bytes = 1u << 20;
+    const bool parallel_copies = bytes >= parallel_copy_bytes;
     std::vector<std::thread> workers;
     workers.reserve((size_t) ranks - 1);
-    for (int r = 1; r < ranks; r++) workers.emplace_back(download, r);
-    download(0);
-    for (auto & worker : workers) worker.join();
+    if (parallel_copies)
+    {
+        for (int r = 1; r < ranks; r++) workers.emplace_back(download, r);
+        download(0);
+        for (auto & worker : workers) worker.join();
+    }
+    else
+        for (int r = 0; r < ranks; r++) download(r);
 
     tsg::tp_host_allreduce_mt(ptrs.data(), ranks, count);
+    if (m.cross_node)
+    {
+        if (count > INT32_MAX || !m.cross_node(m.cross_node_user, ptrs[0], (int) count))
+        {
+            m.abort_distributed();
+            return false;
+        }
+        for (int r = 1; r < ranks; ++r) std::copy(ptrs[0], ptrs[0] + count, ptrs[r]);
+    }
 
     workers.clear();
     auto upload = [&](int rank)
     {
         ggml_backend_tensor_set(tensors[rank], ptrs[(size_t) rank], 0, bytes);
     };
-    for (int r = 1; r < ranks; r++) workers.emplace_back(upload, r);
-    upload(0);
-    for (auto & worker : workers) worker.join();
+    if (parallel_copies)
+    {
+        for (int r = 1; r < ranks; r++) workers.emplace_back(upload, r);
+        upload(0);
+        for (auto & worker : workers) worker.join();
+    }
+    else
+        for (int r = 0; r < ranks; r++) upload(r);
     return true;
 }
 
@@ -5863,7 +6280,7 @@ static bool glm_tp_host_reduce(glm_model & m, ggml_tensor ** tensors)
 /// it completes, every rank resumes from the same reduced residual stream.
 static bool execute_fused_tp(glm_model & m, graph_build_result & root)
 {
-    if (!root.tp_fused || m.tp < 2 || root.tp_peers.size() + 1 != (size_t) m.tp) return false;
+    if (!root.tp_fused || !m.parallel() || root.tp_peers.size() + 1 != (size_t) m.tp) return false;
     const size_t n_seg = root.tp_plan.seg_end.size();
     std::vector<int> begin((size_t) m.tp, 0);
     std::vector<ggml_tensor *> partial((size_t) m.tp, nullptr);
@@ -5879,7 +6296,7 @@ static bool execute_fused_tp(glm_model & m, graph_build_result & root)
             begin[(size_t) rank] = end;
             if (end <= start) continue;
             ggml_cgraph view = ggml_graph_view(rg->gf, start, end);
-            ggml_backend_t backend = m.backends[m.rank_device(rank)];
+            ggml_backend_t backend = rg->precise_backend ? rg->precise_backend : m.backends[m.rank_device(rank)];
             if (ggml_backend_graph_compute_async(backend, &view) != GGML_STATUS_SUCCESS)
             {
                 fprintf(stderr, "[glm] rank %d TP segment %zu compute failed\n", rank, s);
@@ -5901,7 +6318,7 @@ static bool execute_fused_tp(glm_model & m, graph_build_result & root)
             }
         }
 
-        bool device = m.tp_comm && m.tp_comm->allreduce(partial.data());
+        bool device = !m.cross_node && m.tp_comm && m.tp_comm->allreduce(partial.data());
         if (!device)
         {
             // A communicator can decline an unsupported payload. Stop probing
@@ -5921,6 +6338,34 @@ static bool execute_fused_tp(glm_model & m, graph_build_result & root)
     for (int rank = 0; rank < m.tp; rank++)
         ggml_backend_synchronize(m.backends[m.rank_device(rank)]);
     return true;
+}
+
+// Each boundary carries all hyperconnection streams exactly as F32 bytes.
+// KDA recurrence and pooled indexer/MLA histories stay with their owning layer.
+// Metadata binds the payload to the mirrored call and rejects divergent cache
+// positions or token schedules before a remote activation can enter a graph.
+static void glm_pipeline_hidden(glm_model & m, graph_build_result & graph,
+                                const int32_t * tokens, int64_t nt, int64_t past, bool send)
+{
+    ggml_tensor * tensor = send ? graph.pipeline_output : graph.pipeline_input;
+    if (!tensor) throw std::runtime_error("GLM distributed stage boundary tensor is missing");
+    if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor))
+        throw std::runtime_error("GLM distributed stage boundary must be contiguous F32");
+    const size_t bytes = ggml_nbytes(tensor);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (int64_t i = 0; i < nt; ++i) { hash ^= (uint32_t) tokens[i]; hash *= UINT64_C(1099511628211); }
+    const uint64_t expected[] = { UINT64_C(0x474c4d5049504501), (uint64_t) past, (uint64_t) nt,
+        (uint64_t) graph.n_out, (uint64_t) m.hp.n_embd, (uint64_t) m.hp.hc_mult, (uint64_t) bytes, hash };
+    uint64_t header[8];
+    std::memcpy(header, expected, sizeof(header));
+    const int peer = m.pipeline.node + (send ? 1 : -1);
+    m.pipeline.move(peer, send, header, sizeof(header));
+    if (std::memcmp(header, expected, sizeof(header)) != 0)
+        throw std::runtime_error("GLM distributed stage call/cache metadata mismatch");
+    m.pipeline.staging.resize(bytes);
+    if (send) ggml_backend_tensor_get(tensor, m.pipeline.staging.data(), 0, bytes);
+    m.pipeline.move(peer, send, m.pipeline.staging.data(), bytes);
+    if (!send) ggml_backend_tensor_set(tensor, m.pipeline.staging.data(), 0, bytes);
 }
 
 /// One trunk ubatch.
@@ -6089,6 +6534,8 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     // _async, not the synchronous entry point: the graph is already allocated
     // above (which the synchronous one asserts against), and the explicit
     // synchronize below is where the logits read waits.
+    if (m.pipeline.active() && m.pipeline.node > 0)
+        glm_pipeline_hidden(m, *gr, tokens, nt, p0, false);
     if (gr->tp_fused)
     {
         if (!execute_fused_tp(m, *gr))
@@ -6108,8 +6555,19 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
 
     slot.n_past += nt;
 
+    if (m.pipeline.active() && m.pipeline.node + 1 < m.pipeline.nodes)
+        glm_pipeline_hidden(m, *gr, tokens, nt, p0, true);
     if (want_logits && logits_out && gr->logits)
         ggml_backend_tensor_get(gr->logits, logits_out, 0, (size_t) n_out * m.hp.n_vocab * sizeof(float));
+    if (m.pipeline.active() && want_logits && logits_out)
+    {
+        const size_t bytes = (size_t) n_out * m.hp.n_vocab * sizeof(float);
+        if (m.pipeline.node + 1 == m.pipeline.nodes)
+        {
+            if (m.pipeline.driver != m.pipeline.node) m.pipeline.move(m.pipeline.driver, true, logits_out, bytes);
+        }
+        else if (m.pipeline.node == m.pipeline.driver) m.pipeline.move(m.pipeline.nodes - 1, false, logits_out, bytes);
+    }
     if (h_out && gr->h_nextn)
         ggml_backend_tensor_get(gr->h_nextn, h_out, 0, (size_t) nt * m.hp.n_embd * sizeof(float));
     return true;
@@ -6229,6 +6687,48 @@ TSG_EXPORT void * TSGgml_GlmLoadModel(const char * gguf_path, int n_gpu, int n_c
     }
 }
 
+TSG_EXPORT void * TSGgml_GlmLoadModelDistributed(const char * path, int local_ranks, int global_ranks,
+    int rank_offset, int n_ctx, int n_ubatch, int n_threads, const char * backend,
+    glm_model::cross_reduce reduce, void * user)
+{
+    tsg::clear_last_error();
+    try
+    {
+        if (!reduce) throw std::invalid_argument("GLM distributed TP requires a reduction callback");
+        auto * model = glm_load(path, local_ranks, n_ctx, n_ubatch, n_threads, 0, backend, local_ranks,
+                        true, false, global_ranks, rank_offset, reduce, user);
+        if (!model) reduce(user, nullptr, -1);
+        return model;
+    }
+    catch (const std::exception & error)
+    {
+        if (reduce) reduce(user, nullptr, -1);
+        tsg::report_load_refusal("[glm] distributed TP load failed: %s\n", error.what());
+        return nullptr;
+    }
+}
+
+TSG_EXPORT void * TSGgml_GlmLoadModelLayerPipeline(const char * path, int local_devices, int node, int nodes,
+    int n_ctx, int n_ubatch, int n_threads, int n_cpu_moe, const char * backend,
+    tsg_layer_pipeline::transfer transfer, void * user)
+{
+    tsg::clear_last_error();
+    try
+    {
+        if (!transfer) throw std::invalid_argument("GLM layer pipeline requires a transfer callback");
+        auto * model = glm_load(path, local_devices, n_ctx, n_ubatch, n_threads, n_cpu_moe, backend, 1,
+                        true, false, 0, 0, nullptr, nullptr, node, nodes, transfer, user);
+        if (!model) transfer(user, -1, -1, nullptr, -1);
+        return model;
+    }
+    catch (const std::exception & error)
+    {
+        if (transfer) transfer(user, -1, -1, nullptr, -1);
+        tsg::report_load_refusal("[glm] layer pipeline load failed: %s\n", error.what());
+        return nullptr;
+    }
+}
+
 TSG_EXPORT int TSGgml_GlmVocabSize(void * handle)
 {
     glm_model * m = (glm_model *) handle;
@@ -6252,7 +6752,9 @@ TSG_EXPORT int TSGgml_GlmNPast(void * handle)
 TSG_EXPORT int TSGgml_GlmForward(void * handle, const int32_t * tokens, int n_tokens, float * logits_out)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0) return 0;
+    if (!m || m->terminal_failure || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0) return 0;
+    try
+    {
 
     const int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
     int done = 0;
@@ -6291,12 +6793,21 @@ TSG_EXPORT int TSGgml_GlmForward(void * handle, const int32_t * tokens, int n_to
                             (int64_t) ovr_idx.size()))
         {
             m->embd_ovr.clear();
+            if (m->distributed()) m->abort_distributed();
             return 0;
         }
         done += take;
     }
     m->embd_ovr.clear();
     return 1;
+    }
+    catch (const std::exception & error)
+    {
+        m->embd_ovr.clear();
+        if (m->distributed()) m->abort_distributed();
+        fprintf(stderr, "[glm] native forward failed: %s\n", error.what());
+        return 0;
+    }
 }
 
 /// Queue projected vision-embedding rows to override the token embeddings of
@@ -6306,7 +6817,7 @@ TSG_EXPORT int TSGgml_GlmForward(void * handle, const int32_t * tokens, int n_to
 TSG_EXPORT int TSGgml_GlmQueueVisionRows(void * handle, const float * rows, int n_rows, int index)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !rows || n_rows <= 0 || index < 0) return 0;
+    if (!m || m->distributed() || !rows || n_rows <= 0 || index < 0) return 0;
     if (!m->hp.g5n)
     {
         fprintf(stderr, "[glm] vision embedding rows are only supported for glm5next\n");
@@ -6334,7 +6845,7 @@ TSG_EXPORT int TSGgml_GlmForwardBatchedDecode(void * handle, int n, const int32_
                                               float * logits_out)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || n < 2 || !slot_ids || !tokens || !positions || !logits_out) return 0;
+    if (!m || m->distributed() || n < 2 || !slot_ids || !tokens || !positions || !logits_out) return 0;
     if (n > MAX_BATCHED_DECODE) return 0;
     for (int i = 0; i < n; ++i)
     {
@@ -6344,7 +6855,7 @@ TSG_EXPORT int TSGgml_GlmForwardBatchedDecode(void * handle, int n, const int32_
     // Tensor parallelism splits the batch's work across ranks a second time; the
     // per-sequence path already handles that case correctly, so the batched
     // graph stays single-rank rather than duplicating the reduction plumbing.
-    if (m->tp > 1) return 0;
+    if (m->parallel()) return 0;
     try
     {
         return forward_batched_decode(*m, n, slot_ids, tokens, positions, logits_out) ? 1 : 0;
@@ -6359,7 +6870,7 @@ TSG_EXPORT int TSGgml_GlmForwardBatchedDecode(void * handle, int n, const int32_
 TSG_EXPORT int TSGgml_GlmResetChecked(void * handle)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !m->active_slot) return 0;
+    if (!m || m->terminal_failure || !m->active_slot) return 0;
     auto & slot = *m->active_slot;
     slot.kda_restore_failed = true;
     if (m->kda_snap.slot_id == slot.id) m->kda_snap.valid = false;
@@ -6389,7 +6900,7 @@ TSG_EXPORT void TSGgml_GlmReset(void * handle)
 TSG_EXPORT int TSGgml_GlmRewind(void * handle, int n_past)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_past < 0 || n_past > m->active_slot->n_past) return 0;
+    if (!m || m->terminal_failure || !m->active_slot || m->active_slot->kda_restore_failed || n_past < 0 || n_past > m->active_slot->n_past) return 0;
     // The KDA recurrence cannot be rewound to an earlier position: a cached
     // prefix is reusable only when the new prompt EXTENDS it (no rewind), and
     // anything else must restart from zero with a cleared state.
@@ -6405,7 +6916,7 @@ TSG_EXPORT int TSGgml_GlmRewind(void * handle, int n_past)
 TSG_EXPORT int TSGgml_GlmSlotAlloc(void * handle)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m) return -1;
+    if (!m || m->distributed()) return -1;
     glm_slot * s = slot_alloc(*m, /*admit=*/ true);
     return s ? s->id : -1;
 }
@@ -6413,7 +6924,7 @@ TSG_EXPORT int TSGgml_GlmSlotAlloc(void * handle)
 TSG_EXPORT int TSGgml_GlmSetActiveSlot(void * handle, int slot_id)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m) return 0;
+    if (!m || m->distributed()) return 0;
     auto it = m->slots.find(slot_id);
     if (it == m->slots.end()) return 0;
     m->active_slot = it->second.get();
@@ -6423,7 +6934,7 @@ TSG_EXPORT int TSGgml_GlmSetActiveSlot(void * handle, int slot_id)
 TSG_EXPORT int TSGgml_GlmSlotFree(void * handle, int slot_id)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m) return 0;
+    if (!m || m->distributed()) return 0;
     auto it = m->slots.find(slot_id);
     if (it == m->slots.end()) return 0;
     if (m->active_slot == it->second.get())
@@ -6486,7 +6997,7 @@ TSG_EXPORT int TSGgml_GlmSpecForward(void * handle, const int32_t * tokens, int 
                                      float * h_out, float * logits_out, int all_logits_rows)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0) return 0;
+    if (!m || m->distributed() || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0) return 0;
 
     int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
     // A fresh recurrent snapshot identifies a verification (or the accepted
@@ -6783,7 +7294,7 @@ static int glm_kda_state_restore(void * handle)
 TSG_EXPORT int TSGgml_GlmKdaStateCapture(void * handle)
 {
     auto * m = (glm_model *) handle;
-    if (!m || !m->active_slot || m->active_slot->kda_restore_failed) return 0;
+    if (!m || m->distributed() || !m->active_slot || m->active_slot->kda_restore_failed) return 0;
     try { return glm_kda_state_capture(handle); }
     catch (const std::exception & error)
     {
@@ -6797,7 +7308,7 @@ TSG_EXPORT int TSGgml_GlmKdaStateCapture(void * handle)
 TSG_EXPORT int TSGgml_GlmKdaStateRestore(void * handle)
 {
     auto * m = (glm_model *) handle;
-    if (!m || !m->active_slot || m->active_slot->kda_restore_failed) return -1;
+    if (!m || m->distributed() || !m->active_slot || m->active_slot->kda_restore_failed) return -1;
     try { return glm_kda_state_restore(handle); }
     catch (const std::exception & error)
     {
@@ -6812,4 +7323,14 @@ TSG_EXPORT int TSGgml_GlmKdaStateRestore(void * handle)
 TSG_EXPORT void TSGgml_GlmFree(void * handle)
 {
     delete (glm_model *) handle;
+}
+
+// Stage whose host samples (default 0). Set before the first forward; every
+// node must pass the same value. Returns 1 on success, 0 when not a pipeline.
+TSG_EXPORT int TSGgml_GlmSetPipelineDriver(void * handle, int driver)
+{
+    auto * m = (glm_model *) handle;
+    if (!m || !m->pipeline.active() || driver < 0 || driver >= m->pipeline.nodes) return 0;
+    m->pipeline.driver = driver;
+    return 1;
 }

@@ -84,6 +84,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// model's linear KV cache, so serving this one per-sequence requires
         /// an ownership swap (needs KV snapshot support).</summary>
         public bool SoloRequiresOwnershipSwap { get; init; }
+
+        /// <summary>The step runs with a request adapter (a text LoRA, see
+        /// <see cref="SchedulerOutput.Adapter"/>). Speculation is off for such a step:
+        /// the drafters and verify trunks do not apply the adapter. Always false for
+        /// base-model steps, so it never changes how base traffic is served.</summary>
+        public bool AdapterActive { get; init; }
     }
 
     /// <summary>A path that was considered but not selected, with the reason —

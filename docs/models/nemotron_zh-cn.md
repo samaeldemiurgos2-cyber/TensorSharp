@@ -11,7 +11,7 @@
 | 图像处理器 | [`NemotronImageProcessor`](../../TensorSharp.Models/Models/Nemotron/NemotronImageProcessor.cs) |
 | 音频前端 | [`NemotronAudioPreprocessor`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioPreprocessor.cs)（Parakeet 风格 log-mel） |
 | 音频编码器 | [`NemotronAudioEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioEncoder.cs)（Parakeet/FastConformer + 声音投影器；需要任何公开仓库都不提供的配套 GGUF，见 §4.7） |
-| 示例模型 | Nemotron-H-8B-Reasoning-128K、Nemotron-H-47B-Reasoning-128K、Nemotron 3 Nano Omni |
+| 示例模型 | Nemotron-H-8B-Reasoning-128K、Nemotron-H-47B-Reasoning-128K、Nemotron 3 Nano Omni、Nemotron 3.5 Bolt 74B-A9B 与 Super VL 120B-A12B（见[下文](#nemotron-35-super-vl-与-bolt)） |
 | 模态 | 文本、图像（Omni 版本配合 `mmproj`）。只有加载了带 Parakeet 音频塔的配套 GGUF 时才支持音频（§4.7）；否则音频会被**拒绝**（HTTP 400 / CLI 错误，消息为 `NemotronModel.AudioInputUnsupportedMessage`）：公开的 Omni GGUF 不带音频塔，`mmproj` 里只有 RADIO 视觉塔（见 §4.6）。 |
 | 思维链模式 | 是（`<think> ... </think>`） |
 | 工具调用 | 是：Reasoning-128K 用 `<TOOLCALL>[...]</TOOLCALL>`（JSON 或 Python 风格的调用），Nemotron 3 Nano / Omni 用调用体为 XML `<function=...>` 的 `<tool_call>`（§12）；可使用 skills、代码工具以及服务端的[子智能体委派](../multi_agent.md) |
@@ -27,6 +27,8 @@
 | Nemotron-H-8B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) | `nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf`（4.983 GB）或 `nvidia_Nemotron-H-8B-Reasoning-128K-Q8_0.gguf`（8.620 GB） | —（仅文本） |
 | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) | `nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf`（28.188 GB） | —（仅文本） |
 | Nemotron 3 Nano Omni 30B-A3B | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) | `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf`（23.927 GB） | `mmproj-BF16.gguf`（1.590 GB；同仓库）—— **图像输入必需** |
+| Nemotron 3.5 Bolt 74B-A9B | [nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF) | `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`（22.018 GB） | `mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`（1.734 GB；同仓库） |
+| Nemotron 3.5 Super VL 120B-A12B | [ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF](https://huggingface.co/ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF) | `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4.gguf`（76.919 GB）或 `-Q4_0.gguf`（71.934 GB） | `mmproj-NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Q8_0.gguf`（0.967 GB）或 `-BF16.gguf`（1.734 GB；同仓库） |
 
 Omni 的 `mmproj` 只启用**图像输入**：它只包含 32 层 RADIO 视觉塔
 （`v.blk.*`、`v.patch_embd`、`v.position_embd`）和 `nemotron_v2_vl` 的 MLP
@@ -61,6 +63,65 @@ dotnet run --project TensorSharp.Cli -c Release -- --model models/NVIDIA-Nemotro
 ```bash
 dotnet run --project TensorSharp.Server.Host -c Release -- --model models/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf \
   --mmproj models/mmproj-BF16.gguf --backend ggml_cuda --max-tokens 4096
+```
+
+### Nemotron 3.5 Super VL 与 Bolt
+
+两者都是 `nemotron_h_moe` checkpoint，共 88 层：40 层 Mamba2、8 层注意力（32 个 query 头对应 2 个 KV 头，
+head_dim 128）、40 层 latent MoE（hidden 4096，MoE latent 1024，带共享 expert），并都附带 RADIO 视觉
+mmproj。支持的来龙去脉与验证情况见[设计说明](../design/nemotron-super-vl-bolt-support.md)。
+
+| | Bolt 74B-A9B | Super VL 120B-A12B |
+|---|---|---|
+| 路由 expert | 逐层配置（"Puzzle"）：240-496 个 expert、top-9、n_ff 1536-2560 | 512 个 expert、top-22、n_ff 2688 |
+| 语言模型 GGUF | `...-Bolt-74B-A9B-24GB.gguf` **22.018 GB**（IQ2_XXS expert；Mamba2 投影为 NVFP4，带 `.scale` sidecar） | `...-NVFP4.gguf` **76.919 GB**（NVFP4 expert，带逐 expert scale）；`...-Q4_0.gguf` **71.934 GB**（无 sidecar） |
+| mmproj | 1.734 GB；q/k/v **分开存放**（加载时融合） | Q8_0 0.967 GB 或 BF16 1.734 GB；融合 q/k/v，另有本编码器不应用的 `v.post_ln` |
+
+**内存。** 语言模型 GGUF 必须放进设备，并给 KV cache 和工作区留出空间：
+- **Super VL NVFP4** 单设备约需 71.6 GiB（76.919 GB）权重。它在 128 GB 的 DGX Spark（GB10）上运行过，放不进
+  48 GB GPU，所以 PR #282 的评审在 `ggml_cpu` 上运行它。单张 96 GB GPU 应能容纳，但未验证。
+- **Bolt-24GB** 在 DGX Spark 上以 `ggml_cuda` 和 `cuda` 运行过；PR #282 的评审在一张开启 ECC 的 48 GB A40（约 45.0 GiB 可用）上运行过它。
+- **视觉塔**在加载时另需约 3.2 GiB F32 权重，首次编码（服务端的多模态预热，或第一张图像）时再生成约 3.1 GiB 的
+  F32 转置副本。这些数字按张量
+  形状估算，未实测。在 GGML 后端上它们使用语言模型的 allocator；直接 `cuda` 后端在 CPU allocator（主机内存）上
+  运行视觉塔。
+
+**`--tp`。** 注意力层只有 2 个 KV 头，因此只有 `--tp 2` 可用。
+- **Super VL** 在 `--tp 2` 下两个文件都会被接受。NVFP4 文件过去会被拒绝，因为 TP 不应用它的 `.scale`
+  sidecar；Q4_0 文件没有 sidecar，从未被拒绝。TP 现在会应用 NVFP4 scale：逐张量的 `.scale`、
+  折叠进路由权重的逐 expert down scale，以及在 ReLU^2 之前应用的逐 expert up scale。
+  - 它的 MoE 走逐 expert 的行切分，不走 expert parallelism，因为 latent MoE 不使用 expert parallelism。
+  - 行切分会拒绝无法按每 rank 整数个量化块切开的 expert 宽度。2688 在 `--tp 2` 下对 NVFP4（64 值一块）和
+    Q4_0 都没问题。
+  - 这条路径只有合成测试覆盖（`NemotronExpertScaleTests`）。除 CPU 上的测试外，还有一个受门控的 `ggml_cuda`
+    `--tp 2` 测试（`GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin`），覆盖 TP 批量 expert decode（up scale
+    经 `TSGgml_MoEExpertsForwardF32` 在 ReLU^2 之前应用）和 expert-parallel 的 down scale 路径（仅非 latent 层）。它需要
+    `TS_TEST_GGML_BACKEND=cuda`，并且需要两张 GPU 或 `GGML_CUDA_DEVICES=2`（在一张 GPU
+    上模拟两个设备）；本地验证用的是模拟模式。Super VL 的真实 `--tp 2` 生成还没有在 GPU 上完整跑通过。
+  - 切分并不均匀：除了一半的路由 expert，rank 0 还持有全部 Mamba2、latent、共享 expert、router 与 LM head 权重。
+    NVFP4 文件放不进两张开启 ECC 的 A40（48 GB，每张 46,068 MiB，约 45.0 GiB 可用）：rank 0 在预加载权重时显存
+    不足。按张量形状估算，rank 0 仅权重就约 41.8 GiB，只给 KV cache、工作区和加载时的其他分配留下约 3 GiB；
+    rank 1 的权重约 29.8 GiB。关闭 ECC 时，48 GB 显卡（A40、RTX A6000 或 RTX 6000 Ada）报告约 49,140 MiB
+    （约 48.0 GiB 可用），rank 0 会剩下约 6 GiB；这类显卡均未实测，能否放下未知。Q4_0 文件在 `--tp 2` 下能否
+    放下尚未实测。
+- **Bolt** 在 `--tp` 下会被拒绝："Nemotron per-block MoE configuration (Nemotron Puzzle/Bolt) is not yet
+  supported under tensor parallelism."
+
+**`--n-cpu-moe` / `--cpu-moe` 对这两个模型都节省不了显存。** Nemotron 的单设备 MoE 路径没有实现该卸载，也没有任何
+警告提示，而 CLI 和服务端仍会打印 "MoE CPU offload active"。
+- 在 `ggml_cuda` 上，所选层的 expert 只是跳过加载时上传，在 MoE kernel 首次使用时仍会上传。
+- 在 `cuda` 上，加载时会上传全部量化权重。
+- 在 `--tp` 下，只有 `ggml_cuda` 上的 expert-parallel MoE 会把 expert 留在主机端，而 latent MoE 从不使用
+  expert parallelism。
+
+因此 Super VL NVFP4 需要一块足够大的设备。在 `--tp 2` 下，它的 rank 0 需要一张可用显存多于开启 ECC 的 A40
+（约 45.0 GiB）的 GPU，而这样的配置尚未验证。Q4_0 文件在 `--tp 2` 下能否放下尚未实测。卸载无济于事。
+
+```bash
+hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --local-dir models
+hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --local-dir models
+dotnet run --project TensorSharp.Cli -c Release -- --model models/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf \
+  --mmproj models/mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --image photo.png --backend ggml_cuda
 ```
 
 ## 1. 来源与目标
@@ -222,7 +283,15 @@ y   += x * ssm_d                                         # 当 `ssm_d` 存在时
 
 ### 4.4 FFN 层（MoE）
 
-- **Routing**：`sigmoid(logits) + exp_probs_b`（per-expert 加性 bias）→ TopK → 可选归一化 → 可选全局 scale。
+- **Routing**：`sigmoid(logits) + exp_probs_b`（per-expert 加性 bias）→ TopK → 可选归一化（除以权重和）→ 可选全局 scale。
+  所有路径共用同一个 router（`RouteMoEToken`）：单设备逐 token 循环、batched-by-expert prefill 和 `--tp` router。
+  它们选出相同的 expert、顺序相同，权重逐位一致。顺序有影响，因为 MoE kernel 按这个顺序累加各路由。
+  此前 `--tp` 按概率对 top-k 排序，后来又改为乘以 `1/sum` 归一化，两次改动都改变了 `--tp` 的贪心输出。
+  `NemotronTensorParallelRoutingTests` 在 cpu 后端的 TP 测试接缝上验证这一点。
+- **`--tp` 下的 host decode attention**：每个 rank 的 attention 在 C# 中运行（`AttentionDecodePureCS`）。
+  其 softmax 会把低于 `exp(-50)` 的项置零。否则，峰值很尖的行会把尾部留在 subnormal 范围，
+  每次涉及 subnormal 的乘法都会触发微码辅助。在 i7-11800H 上这最多慢 20 倍，
+  因此 `--tp` 的 decode 速度取决于生成的文本。
 - **Latent bottleneck**（可选）：`ffn_latent_in` 把 hidden 投影到更小的 `latentDim`，experts 在 latent 空间运行，然后 `ffn_latent_out` 投回 hidden。
 - **Shared experts**（可选）：`ffn_up_shexp` 与 `ffn_down_shexp` 构成的并行 SwiGLU 分支。
 - **批量 MoE GPU 派发**：GGML 后端（Metal / CUDA）上一次 `MoEExpertsForward` 在单张 GGML 图调度中处理所有被选 expert。预缓存的 `QuantizedWeight` 引用（`_expertUpQW`、`_expertDownQW`）和预分配 `IntPtr[]` 数组（`_moeUpPtrs`、`_moeDownPtrs`）避免字典查询与 per-token 分配。
@@ -234,9 +303,11 @@ y   += x * ssm_d                                         # 当 `ssm_d` 存在时
 - **Linear patch embedding**，可选 bias。
 - **Position embedding** 存为 `[hidden, posTokens]` 网格，源 patch 网格不同时按 align-corners=false 的双线性 resize。Resize 后的 embedding 按 `(gridW, gridH)` 在 `_resizedPositionEmbeddings` 缓存。
 - **Class embedding**（可选）前置到序列。
-- **32 个 encoder block**（Nemotron Omni 默认）：LayerNorm → 融合 QKV self-attention → residual → LayerNorm → up linear → GELU → down linear → residual。
+- **32 个 encoder block**（Nemotron Omni 默认）：LayerNorm → 融合 QKV self-attention → residual → LayerNorm → up linear → GELU → down linear → residual。Bolt 的 mmproj 把 Q、K、V（权重和 bias）分开存为 `attn_q` / `attn_k` / `attn_v`。加载时按 Q、K、V 的行顺序把它们拼接成 `attn_qkv`，所以分开存放和融合存放的文件运行的是相同的权重。同一 block 同时有两种布局，或者分开的三元组缺了一部分，都会被拒绝。
 - encoder 之后 class token 被剥离，按 `scaleFactor` pixel-shuffle 降低空间分辨率。
 - projector（RMSNorm → Linear → ReLU² → Linear）输出 LM hidden 维度的 embedding。
+- **加载时检查。** forward 读取的每个张量都必须存在，且与 `clip.vision.*` 元数据一致。projector 的输出宽度必须等于语言模型的 hidden size（Nano Omni 的 mmproj 投影到 2688，Bolt 和 Super VL 投影到 4096）。否则加载以 `InvalidDataException` 失败，消息中给出文件名、出问题的张量和期望的布局。带 `--mmproj` 启动的服务端或 CLI 会拒绝启动（退出码 2）。增加这项检查之前，这样的文件能加载，但之后每个图像请求都会失败。
+- **不使用：** 视频塔的 `v.patch_embd.weight.1`（加载时跳过，打印一行日志），以及 Super VL 的 `v.post_ln`（llama.cpp 会在 block 之后应用它；后续工作）。因此 Super VL 的图像 embedding 与 llama.cpp 的不同。
 
 `NemotronImageProcessor`（镜像 `nemotronh.ImageProcessor`）：
 
@@ -291,8 +362,8 @@ Parakeet 风格 log-mel 频谱提取（镜像 ollama 的 `process_audio.go`）�
 | `nemotron_h.attention.head_count` | uint32[] | Per-layer Q head 数 |
 | `nemotron_h.feed_forward_length` | uint32[] | Per-layer FFN size（0 表示无 FFN） |
 | `nemotron_h.attention.scale` | float32 | Attention scale 因子（0 表示自动） |
-| `nemotron_h.expert_count` | uint32 | MoE expert 数（0 表示 dense） |
-| `nemotron_h.expert_used_count` | uint32 | 每 token 选用 expert 数 |
+| `nemotron_h.expert_count` | uint32 | MoE expert 数（0 表示 dense）；每层的数目取自该层堆叠的 expert 张量，Bolt 上它在 240 到 496 之间（这个标量是其中最大值） |
+| `nemotron_h.expert_used_count` | uint32 或 uint32[] | 每 token 选用 expert 数；Bolt 存为逐层数组（非 FFN 层为 0），每个 FFN 层使用自己的值 |
 | `nemotron_h.expert_weights_norm` | bool | 是否将选中 expert 权重归一为和 1 |
 | `nemotron_h.expert_weights_scale` | float32 | 应用到 expert 权重的全局 scale |
 
@@ -354,13 +425,20 @@ blk.{L}.ffn_down_shexp.weight
 10. `InitLayerInfo()` 预算 layer-prefix 字符串与 per-MoE-layer 标志（`HasLatentIn`、`HasSharedExperts`、`LatentDim`）。
 11. `InitMoEBuffers()` 预分配 routing 与 expert 指针数组。
 
-`Forward(int[] tokens)` 跑 per-op 托管循环。每层根据 `_layerTypes[l]` 派发到 `Mamba2Block` / `AttentionBlock` / `FFNBlock`。可选 CPU 卸载（`CPU_MATMUL_THRESHOLD`，Apple Silicon 默认关）让小 matmul 走托管 CPU 路径，即使后端是 GPU。
+`Forward(int[] tokens)` 跑 per-op 托管循环。每层根据 `_layerTypes[l]` 派发到 `Mamba2Block` / `AttentionBlock` / `FFNBlock`。
 
 ## 8. Prefill 优化
 
 - **Per-layer 派发表**（`_layerPrefixes`、`_layerWeightNames`）避免热循环里的字符串拼接。
 - **MoE prefill** 仍然 per token 迭代。每 token 用批量 MoE GPU kernel（`MoEExpertsForward`），所以一次派发跑完所有被选 expert，但 token 循环还是托管 C# —— 见下方优化机会。
 - **Attention prefill** 在有界工作集内让每个 prompt chunk 与已驻留的 K/V 做注意力。GGML 后端且 cache 为 F32 / F16 时走融合 prefill kernel（`GgmlBasicOps.FusedPrefillAttention` / `FusedPrefillAttentionF16KV`），它直接读取分组 cache，得分张量较大时切换到 `ggml_flash_attn_ext`。其他情况（非 GGML 后端、块量化 cache）按 query 子块计算，使单个 `[heads, rows, context]` 得分张量不超过 `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB`（默认 1024）。此前每层都物化整个 `[heads, chunk, context]` 得分张量：8B 上 32k prompt 深处的 4,096 token chunk 向 ggml-cuda 申请 37 GB（47B 在 8k 时 12.5 GB），所有长请求都以 HTTP 500 失败。同一份代码也服务 `nemotron_h_moe`（Nemotron 3.5、Nemotron 3 Nano Omni）。
+- **直接 `cuda` 后端上的 Attention prefill** 在 PR #282 中发生了变化。单序列 prefill 路径在上下文不超过 8,192 token、且 K/V cache 为连续的 F32 或 F16 张量时调用 `CudaFusedOps.TryGqaPrefillAttention`（批处理 / 分页前向不使用它）。该 kernel 原地读取实时的 `[kvHeads, cacheLen, headDim]` cache，并把每个 KV 头广播给它的 query 组，不再把 K/V 扩展到每个 query 头（Nemotron 3.x 上为 16 倍），也不再物化 `[heads, rows, context]` 得分张量。
+  - **kernel 选择。** Nemotron 3.x 的注意力形状（32 个 query 头对应 2 个 KV 头，head_dim 128，全注意力）使用 group-16 flash kernel `ts_gqa_prefill_flash_g16d128_{f16,f32}`。用 nvcc 在本地编译 kernel 的构建包含它，没有 nvcc 时使用的仓库内 compute_61 基线 PTX（已用 CUDA 12.8 刷新）也包含它。只有已加载的模块缺少它时（例如过时或自定义的 PTX），才会运行通用 GQA prefill kernel。`benchmarks/FlashAttnBench` 会打印实际运行的 kernel。
+  - **回退。** 更长的上下文和其他 cache 布局仍走上面的物化子块路径。
+  - **数值。** 两种 kernel 的 softmax 累加顺序都与物化路径不同，所以与 PR #282 之前的构建相比，greedy 输出可能在接近平局的 token 上改变。
+  - **评审的测量结果（2x A40，CUDA 12.8；此处未重新测量）。** group-16 kernel 相对 CPU 参考的最大误差为 1.21e-4，在 2K-8K token 时快 1.7-3.6 倍。这一收益没有体现在 Nemotron 3.5 Lightning 约 6K token 的端到端 prefill 中。在 Nemotron-H 8B 上，7 个 greedy 回答中有 2 个措辞改变，两者仍然正确。
+
+  测试中可用 `NemotronModel.MaterializedPrefillAttentionForTest` 强制走旧路径。
 - **Mamba2 prefill** 顺序处理 token（按 `seqLen` 循环）跑 SSM scan；分块并行扫描在优化清单上。
 - **Mamba2 prefill 计算图**（`TSGgml_NemotronMamba2PrefillF32`）按 chunk 长度缓存，计算图的所有中间张量都驻留在缓存的 buffer 中：8B 上 4,096 token 的 chunk 约 2.7 GB，47B 上约 5.5 GB。缓存受字节预算 `TS_MAMBA2_PREFILL_CACHE_MB`（默认 1024）约束，按最近最少使用淘汰；大于整个预算的计算图只服务当次调用后即释放。此前每种不同的 chunk 长度都会永久保留，47B 处理完 32k prompt 后设备内存耗尽，下一个并发 decode 步骤分配失败并返回 HTTP 500。
 - **多模态 prefill** 支持按 prompt chunk 切片已准备好的图像 / 音频 embedding span，因此长图像 prompt 不再必须作为一个超大的 forward pass 执行。
@@ -375,10 +453,6 @@ GGML 后端（Metal / CUDA）上 MoE FFN 层的全部被选 expert 在单次 GGM
 - 预缓存的 `QuantizedWeight[]` 数组（`_expertUpQW[layer][e]`、`_expertDownQW[layer][e]`）—— init 时一次性填充。
 - 预分配的 `IntPtr[] _moeUpPtrs` / `_moeDownPtrs` 数组，长度 `_numExpertsUsed`。
 - 预分配可复用的结果 tensor（`_expertUpResult`、`_expertDownResult`、`_latentAccumTensor`、`_latentOutResult`）。
-
-### 小算子的 CPU 卸载
-
-decode 热路径上的小算子（RMSNorm、residual add、expert / router matmul）即使后端是 GPU 也可以通过 CPU SIMD kernel 执行。这避免了 per-dispatch GPU 开销（Metal 上每次 ~1 ms+）。大 matmul（SSM in/out、attention QKV/output、LM head）仍留在 GPU。阈值是 `CPU_MATMUL_THRESHOLD`（Apple Silicon 统一内存默认 0；分立 GPU 系统可调高）。
 
 ### SIMD ReLU² 与 bias add
 
@@ -508,6 +582,16 @@ flash-attention decode 内核）和不同的 MoE 内核（按专家批处理 vs.
 足以翻转低置信度的贪心选择（2026-09-16 验证中每个单序列 DSpark 请求都发生了偏离）。Mamba-2 的快照 / 回滚是精确的。
 把注意力和 MoE 逐行运行可以让 verify 精确，但 4 行需要 116 ms，而一个 decode 步只要 28 ms（另加每个 DSpark 块 70 ms），
 因此精确的 verify 无法快过普通解码。详见 [投机解码](../speculative_decoding.md#nemotron-h-refuses-speculation)。
+
+### 文本 LoRA 适配器
+
+Nemotron-H 在单设备的 `cpu`、`ggml_cpu`、`ggml_cuda` 或 `cuda` 上接受文本 LoRA 适配器（`--lora`、`/v1/loras`、请求中的 `lora`）；
+`--tp` 下会被拒绝。除路由 expert 外的所有投影都会被适配：Mamba2 的 `ssm_in` 与 `ssm_out`、
+`attn_q/k/v`（加载时融合为 `attn_qkv`）与 `attn_output`、dense 的 `ffn_up` 与 `ffn_down`、共享 expert、latent 的
+`ffn_latent_down` / `ffn_latent_up`、router 以及 LM head。作用于路由 expert（`*_exps`）的适配器会被 400 拒绝并列出其名称。
+某一步带着适配器运行时，decode 快速路径（`FusedMatMulQuantAdd` 残差加与 MoE decode 残差）会对被适配的权重让路，
+而喂给原生 Mamba2 decode 的投影会自行加上增量；不带适配器的请求保留全部快速路径。已在合成模型上与合并权重的孪生模型对比验证
+（cpu、ggml_cpu、ggml_cuda），尚未在真实 checkpoint 或 `cuda` 后端上验证。详见[设计文档](../design/logprobs-lora-moe-runtime-features.md) §2.2。
 
 ## 12. 输出解析器与聊天模板
 

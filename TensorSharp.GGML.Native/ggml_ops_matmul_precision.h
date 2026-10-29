@@ -21,6 +21,7 @@ struct tsg_dsv4_fused_desc;
 // IQ1_M has MMVQ support but no MMQ tiles and is deliberately absent.
 constexpr bool tsg_matmul_id_quant_strip_type_supported(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:

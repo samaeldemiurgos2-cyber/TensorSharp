@@ -1,6 +1,6 @@
-# GLM-5.x (`glm-dsa`, `glm5next`)
+# GLM-5.x (`glm-dsa`, `glm5next` / `glm5-next`)
 
-> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Older commands and measurements below predate that default: migrate multi-GPU launches by adding `--layer-split N`. Layer split is single-node only.
+> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. GLM-5.3-Flash (`glm5next`) supports both modes across nodes on `ggml_cuda`: add `--tp-node-id` and `--tp-peers`, with N GPUs per node. Older `glm-dsa` variants retain local execution. See the [multi-node guide](../multi-node-inference.md). Historical local measurements below do not qualify distributed performance.
 
 [← back to model index](README.md) | [中文](glm_zh-cn.md)
 
@@ -12,6 +12,8 @@ id is `glm-dsa` (the loader also accepts `glm_dsa`). **GLM-5.3** is the same blo
 shares this whole page - see [its section below](#glm-53-glm-dsa). **GLM-5.3-Flash**
 (`glm5next`) runs through the same executor - see
 [its section below](#glm-53-flash-glm5next).
+The newer `glm5-next` GGUF architecture spelling is accepted and uses the same
+GLM-5.3-Flash chat protocol; metadata is read using the file's actual prefix.
 
 ## The block
 
@@ -154,11 +156,10 @@ keeps its experts intact and splits only the heads (still exact, just slower).
 3 = both) and `TS_GLM_TP_OVERSUBSCRIBE=1` lets several ranks share one GPU,
 which is how the split is checked for correctness on a single-GPU machine.
 
-The native GLM 5.x tensor-parallel executor is **local and single-process** for
-GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike. It does not join the cross-node
-`ITensorParallelGroup`, so `--tp-node-id` / `--tp-peers` do not make this path
-distributed — they are refused for the whole GLM family before the model is
-built.
+GLM-5.2 and GLM-5.3 (`glm-dsa`) retain a **local, single-process** native TP
+executor and reject `--tp-node-id` / `--tp-peers`. GLM-5.3-Flash (`glm5next`)
+has a separate distributed adapter for its hybrid KDA/MLA graph; see
+[its tensor-parallel section](#native-tensor-parallelism).
 
 ### Serving concurrent requests
 
@@ -732,7 +733,7 @@ failed) reaches the caller as a refusal on both glm-dsa and glm5next:
 and the non-refusable `TruncateKVCache` throws. It used to report success with
 the head unmoved (`GlmTruncateRefusalTests`).
 
-### Native local tensor parallelism
+### Native tensor parallelism
 
 Use `--layer-split N` for whole-layer placement across N local GPUs.
 On the GGML GPU backends, `--tp N` instead runs GLM-5.3-Flash through the
@@ -746,18 +747,40 @@ native executor's local, single-process tensor-parallel plan:
 | Rank joins | Attention partial hidden vectors are reduced **before** the nonlinear Sinkhorn hyper-connection crossing. On the segmented fast path, routed-expert partials reduce first, then every rank computes and adds its replicated shared expert locally before the hyper-connection |
 | Unsharded work | Hyper-connections, pooled indexer, router, norms, dense layers, shared expert and embedding remain unsharded. The segmented path replicates their computation per rank; output norm and LM head stay on rank 0. The combined scheduler fallback instead computes and adds the shared expert once on rank 0 |
 
-The native GLM 5.x TP path is local/single-process on GGML GPU backends for
-GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike; it does not support distributed or
-cross-node execution.
+On `ggml_cuda`, GLM-5.3-Flash can extend this execution across nodes with
+`--tp-node-id` and `--tp-peers`. Routed-expert shards use the global rank count;
+cross-node reductions complete before nonlinear hyper-connection operations.
+Distributed TP replicates attention and its caches to preserve the complete
+head geometry and avoid the numerical drift observed with sharded attention.
+Each rank graph also runs the CUDA backend's graph optimizer before allocation,
+as the layer-split scheduler does: it registers the allocation dependencies of
+the fused MoE weighted-sum, top-k router and shared-expert kernels. Without it
+the allocator could alias those buffers, the fusions were skipped at run time,
+and ranks computed slightly different arithmetic that top-8-of-288 routing
+amplified over 42 layers. On the UD-IQ3_XXS checkpoint across two nodes with
+two A40s each, distributed TP now reproduces distributed layer split bit for bit
+on all 521 full-vocabulary vectors of a 3,366-token prefill, 512-token chunked
+prefill, 256 decodes and refills. `TS_GLM_TP_GRAPH_OPTIMIZE=0` restores the
+previous allocation for comparison; every node must use the same value.
+`--layer-split N` instead assigns whole layers
+to each node and transfers the F32 hyper-connection residual between stages.
+KDA and pooled-DSA caches remain with their owning layers. Distributed serving
+uses one mirrored text sequence; media, speculation and sequence slots are
+unavailable. See the [multi-node guide](../multi-node-inference.md).
 
-With GLM-5.3-Flash's default full sharding (heads and routed-expert rows), one
+For local TP with GLM-5.3-Flash's default full sharding (heads and routed-expert rows), one
 rank per local GPU, no CPU MoE or tracing, and native hyper-connection kernels,
 the executor builds segmented rank-local graphs and submits the ranks
 concurrently. Routed MoE is reduced first, after which each rank computes and
 adds its replicated shared expert locally. CPU MoE, tensor tracing, partial `TS_GLM_TP_SHARD` settings,
 oversubscribed ranks, or a backend without native hyper-connection kernels use
-the combined scheduler fallback instead; that path computes and adds the shared
-expert once on rank 0.
+the combined scheduler fallback for local execution; that path computes and adds
+the shared expert once on rank 0. Distributed TP refuses these configurations,
+because that local fallback cannot execute global shards correctly. Use
+`--n-cpu-moe 0`, leave `TS_GLM_TP_SHARD` unset and disable `TS_GLM_TRACE` for
+distributed TP. The native executor supports 1–8 local GPUs; the selected
+checkpoint's routed-expert dimensions and quantization blocks also constrain
+the distributed degree. Local head sharding has additional head-count constraints.
 
 ### Direct-CUDA GLM-5.3-Flash
 
@@ -770,7 +793,8 @@ GGML local tensor-parallel path above.
 defines the numerical scope: a four-layer synthetic fixture with production
 kernel widths, KDA/MLA attention and dense/MoE FFNs, a 40-token prefill and six
 forced decode rows compared with `ggml_cuda`. It requires matching argmax and
-relative L2 error no greater than 2e-2. Separate checks cover two-device layer
+normalized maximum error no greater than 2e-2, where the maximum absolute
+logit difference is divided by `max(1, max(abs(reference)))`. Separate checks cover two-device layer
 split, sparse-indexer rules, reset, interleaved slots, captured decode, batched
 decode and verify rollback. These targeted contracts do not establish full
 checkpoint numerical parity, model quality or a speedup; CUDA-dependent cases

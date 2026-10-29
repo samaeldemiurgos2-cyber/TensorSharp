@@ -21,6 +21,7 @@ using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Models.Lora;
+using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Cuda;
 using TensorSharp.GGML;
 using TensorSharp.MLX;
@@ -28,7 +29,7 @@ using TensorSharp.MLX;
 namespace TensorSharp.Models
 {
 
-    public abstract partial class ModelBase : IModelArchitecture, ILoraAdapterModel
+    public abstract partial class ModelBase : IModelArchitecture, IAdapterAwareModel
     {
         public ModelConfig Config { get; protected set; }
         public ITokenizer Tokenizer { get; protected set; }
@@ -108,14 +109,24 @@ namespace TensorSharp.Models
         protected readonly HashSet<string> _stackedExpertMemberNames = new();
 
         // ---- LoRA (text adapters) ----
-        // Adapters prepared on this model (PrepareLora), each materialized once into device
-        // tensors keyed by the loaded weight it updates. The adapter's own deltas are
-        // immutable and owned by the registry. The engine selects one for a step
-        // (ActivateLoraAdapter) and clears it afterwards; LinearForward applies it.
-        private readonly Dictionary<TextLoraAdapter, MaterializedLora> _preparedLoras = new(ReferenceEqualityComparer.Instance);
-        private MaterializedLora? _activeLora;
-        // Weights a delta was applied to since the engine last asked (TakeAppliedLoraTargets).
-        private readonly HashSet<string> _loraApplied = new(StringComparer.Ordinal);
+        // One TextLoraBinding per adapter this model was asked about: its plan (decided once,
+        // so its log line prints once) and, once bound, its factor tensors (materialized once
+        // per model, not per request). The dictionary is guarded by _loraGate; the tensors are
+        // created, selected and released under GpuComputeLock (see IAdapterAwareModel).
+        private readonly object _loraGate = new();
+        private readonly Dictionary<TextLoraAdapter, TextLoraBinding> _loraBindings = new(ReferenceEqualityComparer.Instance);
+        // The binding the current engine step runs with (SelectStepAdapter), or null for base.
+        private TextLoraBinding? _stepLora;
+        // Where each source weight fused away at load now lives (OnFusedProjectionCreated): an
+        // adapter names attn_q/k/v and ffn_gate/up, the forward runs attn_qkv and ffn_gate_up.
+        private readonly Dictionary<string, (string Fused, long RowOffset, long Rows)> _fusedMembers = new(StringComparer.Ordinal);
+        // The forward audit (OpenLoraForwardAudit): the serial the hook stamps on every weight
+        // it applies, and whether an outermost forward is being audited.
+        private long _loraForwardSerial;
+        private bool _loraAuditOpen;
+        // The tensor-parallel degree asked for at construction, including the native TP of an
+        // executor that creates no managed group.
+        private readonly int _requestedTpDegree = 1;
 
         private bool _quantBackendReady;
         private bool _cudaQuantWeightsPrepared;
@@ -308,6 +319,7 @@ namespace TensorSharp.Models
                 (tpDegree > 1 || (tpGroup != null && LayerSplitGroup == null)))
                 throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
             LayerSplitDegree = layerSplitDegree;
+            _requestedTpDegree = tpDegree;
             _backend = backend;
             UseFloatKvCacheOnMlx();
             // The pure-C# CPU backend must never touch native (ggml P/Invoke) dequant — route
@@ -1528,182 +1540,255 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// The device-resident form of one adapter on this model: one <c>(AT, BT)</c> pair per
-        /// loaded weight it updates (fused targets composed, see <see cref="TextLoraBinder"/>).
+        /// Whether this family's projections reach the LoRA hook in <see cref="LinearForward"/>
+        /// by weight name on a single device. False here, so every family refuses text LoRA
+        /// until it opts in, together with <see cref="TextLoraWeightRefusal"/> naming exactly the
+        /// weights it applies a delta to on every forward path (nemotron_h, mistral3 and
+        /// hunyuan-dense do).
         /// </summary>
-        private sealed class MaterializedLora : IDisposable
-        {
-            public required TextLoraAdapter Adapter { get; init; }
-            public required Dictionary<string, (Tensor AT, Tensor BT)> Tensors { get; init; }
-            /// <summary>Not kept in <see cref="_preparedLoras"/>: built for one step and released after it.</summary>
-            public bool Transient { get; init; }
-            /// <summary>Why this model's forward cannot apply the adapter, once a request found out.</summary>
-            public string? Unsupported { get; set; }
+        protected virtual bool SupportsTextLora => false;
 
-            public void Dispose()
-            {
-                foreach (var (_, pair) in Tensors)
-                {
-                    pair.AT.Dispose();
-                    pair.BT.Dispose();
-                }
-                Tensors.Clear();
-            }
+        /// <summary>
+        /// Null when every forward path of this family runs <paramref name="weightName"/> (a
+        /// weight as loaded, after fusion) through <see cref="LinearForward"/>, so a LoRA delta
+        /// on it is always applied; otherwise why not. Deny-by-default: a family that opts in
+        /// lists its weights, and a weight it does not list is refused.
+        /// </summary>
+        protected virtual string? TextLoraWeightRefusal(string weightName)
+            => "is not run through the LoRA hook by this model";
+
+        /// <summary>The model's own name for an adapter target, for a family that renames
+        /// tensors at load. The default keeps the GGUF name.</summary>
+        protected virtual string NormalizeTextLoraTarget(string target) => target;
+
+        /// <summary>
+        /// For <see cref="TextLoraWeightRefusal"/>: whether <paramref name="weightName"/> is
+        /// <c>blk.N.&lt;projection&gt;.weight</c> of a decoder layer (<c>N</c> below
+        /// <c>Config.NumLayers</c>, so never a draft or MTP block) with a projection in
+        /// <paramref name="projections"/>.
+        /// </summary>
+        protected bool IsDecoderLayerProjection(string weightName, IReadOnlySet<string> projections)
+        {
+            if (!weightName.StartsWith("blk.", StringComparison.Ordinal) || !weightName.EndsWith(".weight", StringComparison.Ordinal))
+                return false;
+            int dot = weightName.IndexOf('.', 4);
+            int projectionLength = weightName.Length - dot - 1 - ".weight".Length;
+            if (dot < 0 || projectionLength <= 0
+                || !int.TryParse(weightName.AsSpan(4, dot - 4), System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out int layer)
+                || layer >= (Config?.NumLayers ?? 0))
+                return false;
+            return projections.Contains(weightName.Substring(dot + 1, projectionLength));
+        }
+
+        /// <summary>Why this model cannot apply <paramref name="adapter"/> at all, or null.</summary>
+        private string? TextLoraModelRefusal(TextLoraAdapter adapter)
+            => DescribeTextLoraModelRefusal(Config?.Architecture ?? GetType().Name, _backend,
+                multiDevice: _tpGroup != null || _requestedTpDegree > 1 || LayerSplitGroup != null || LayerSplitDegree > 1
+                             || DistributedControlGroup?.NodeCount > 1,
+                SupportsTextLora, adapter.Architecture, fileArchitecture: MetadataArchitecture);
+
+        /// <summary>
+        /// The model-level text-LoRA decision: refused on more than one device or node (managed
+        /// or native tensor parallelism, layer split, distributed), on any backend but cpu,
+        /// ggml_cpu, ggml_cuda and cuda, for a family that has not opted in, and for an adapter
+        /// converted for another architecture. Null when none applies.
+        /// </summary>
+        /// <param name="fileArchitecture">The base GGUF's own <c>general.architecture</c> when it
+        /// differs from <paramref name="arch"/> (<see cref="MetadataArchitecture"/>). An adapter
+        /// with that label fits too, as in llama.cpp, which compares the adapter's label with
+        /// the base file's: a Mistral 3 file labelled <c>llama</c>, served as mistral3, takes
+        /// the <c>llama</c> adapter a converter writes for it. Only labels are compared, so an
+        /// adapter made for another checkpoint with that label is accepted whenever its shapes
+        /// match (the per-weight checks refuse only one whose shapes differ), which llama.cpp
+        /// does too.</param>
+        internal static string? DescribeTextLoraModelRefusal(string arch, BackendType backend, bool multiDevice,
+            bool supportsFamily, string? adapterArchitecture, string? fileArchitecture = null)
+        {
+            if (multiDevice)
+                return $"{arch} runs on more than one device or node here (--tp, --layer-split or distributed), " +
+                       "where its projections are sharded or split and do not pass through the LoRA hook";
+            if (backend is not (BackendType.Cpu or BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.Cuda))
+                return $"text LoRA is not supported on the {backend} backend (supported: cpu, ggml_cpu, ggml_cuda, cuda)";
+            if (!supportsFamily)
+                return $"{arch} runs its projections in fused or native graphs that do not apply a LoRA delta " +
+                       "(text LoRA is supported on nemotron_h, mistral3 and hunyuan-dense)";
+            if (adapterArchitecture != null && !SameArchitecture(adapterArchitecture, arch)
+                && (fileArchitecture == null || !SameArchitecture(adapterArchitecture, fileArchitecture)))
+                return $"it was converted for a '{adapterArchitecture}' model, and the loaded model is '{arch}'"
+                       + (fileArchitecture != null ? $" (its GGUF is labelled '{fileArchitecture}')" : "");
+            return null;
+
+            static bool SameArchitecture(string a, string b)
+                => string.Equals(a, b, StringComparison.OrdinalIgnoreCase)
+                   || (ModelArchitectureRegistry.TryGet(a, out var da) && ModelArchitectureRegistry.TryGet(b, out var db)
+                       && string.Equals(da.Id, db.Id, StringComparison.Ordinal));
         }
 
         /// <summary>
-        /// Bind <paramref name="adapter"/> to this model's loaded weights and upload its factors
-        /// once, so selecting it for a step costs nothing. Idempotent. Refuses, naming every
-        /// module, an adapter any of whose modules is not a weight of this model or has another
-        /// shape: half an adapter is neither the base model nor the adapter.
-        /// Call under <see cref="GpuComputeLock"/>; it allocates device tensors.
+        /// Record where a fused projection's sources now live, for text LoRA: an adapter names
+        /// <c>attn_q/k/v</c> or <c>ffn_gate/up</c> as the GGUF stores them, and its plan finds
+        /// their rows in the fused weight. Called by <see cref="OnFusedProjectionCreated"/>.
         /// </summary>
-        /// <exception cref="System.IO.InvalidDataException">A module cannot be applied to this model.</exception>
-        public IReadOnlyCollection<string> PrepareLora(TextLoraAdapter adapter)
+        private void RecordFusedProjection(string fusedName, IReadOnlyList<(string Member, long Rows)> members)
+        {
+            // A model built without its constructor (some tests) has no table.
+            if (_fusedMembers == null)
+                return;
+            long offset = 0;
+            foreach (var (member, rows) in members)
+            {
+                _fusedMembers[member] = (fusedName, offset, rows);
+                offset += rows;
+            }
+        }
+
+        /// <summary>What a text-LoRA plan reads from this model.</summary>
+        private sealed class TextLoraView(ModelBase model) : ITextLoraModelView
+        {
+            public bool TryGetWeightDims(string weightName, out long inDim, out long outDim)
+                => model.TryGetWeightDims(weightName, out inDim, out outDim);
+
+            public bool HasWeight(string weightName)
+                => model._quantWeights.ContainsKey(weightName) || model._weights.ContainsKey(weightName);
+
+            public bool TryGetFusedMember(string member, out string fusedName, out long rowOffset, out long rows)
+            {
+                if (model._fusedMembers.TryGetValue(member, out var at))
+                {
+                    (fusedName, rowOffset, rows) = at;
+                    return true;
+                }
+                fusedName = null!;
+                rowOffset = rows = 0;
+                return false;
+            }
+
+            public string? WeightRefusal(string weightName) => model.TextLoraWeightRefusal(weightName);
+
+            public string NormalizeTarget(string target) => model.NormalizeTextLoraTarget(target);
+        }
+
+        /// <summary>
+        /// Where <paramref name="adapter"/> applies on this model (see
+        /// <see cref="TextLoraBinding"/>), decided once per adapter and kept until the adapter
+        /// is released. Safe from a request thread: a plan not made yet is made between engine
+        /// steps, because it reads the weight tables a step may still extend.
+        /// </summary>
+        public TextLoraBinding PlanTextLora(TextLoraAdapter adapter)
         {
             ArgumentNullException.ThrowIfNull(adapter);
-            if (!_preparedLoras.TryGetValue(adapter, out var prepared))
+            lock (_loraGate)
             {
-                prepared = Materialize(adapter, transient: false);
-                _preparedLoras[adapter] = prepared;
+                if (_loraBindings.TryGetValue(adapter, out var cached))
+                    return cached;
             }
-            return prepared.Tensors.Keys.ToArray();
-        }
-
-        /// <summary>Release the device tensors <see cref="PrepareLora"/> made for
-        /// <paramref name="adapter"/>. A request still running under it re-materializes it for
-        /// each of its remaining steps. Call under <see cref="GpuComputeLock"/>.</summary>
-        public void ReleaseLora(TextLoraAdapter adapter)
-        {
-            if (adapter == null || !_preparedLoras.Remove(adapter, out var prepared)) return;
-            if (ReferenceEquals(_activeLora, prepared)) _activeLora = null;
-            prepared.Dispose();
-        }
-
-        /// <summary>Whether <paramref name="adapter"/> is prepared on this model.</summary>
-        public bool IsLoraPrepared(TextLoraAdapter adapter) => adapter != null && _preparedLoras.ContainsKey(adapter);
-
-        /// <summary>Why this model cannot apply <paramref name="adapter"/>, or null when nothing
-        /// has shown that it cannot (<see cref="ILoraAdapterModel.MarkLoraUnsupported"/>).</summary>
-        public string? GetLoraUnsupportedReason(TextLoraAdapter adapter)
-            => adapter != null && _preparedLoras.TryGetValue(adapter, out var prepared) ? prepared.Unsupported : null;
-
-        /// <summary>
-        /// Whether this architecture can serve text-LoRA adapters at all. A family whose
-        /// forward never routes its projections through <see cref="LinearForward"/> overrides
-        /// this to false. A family that routes only some of them is still caught per request:
-        /// the engine refuses a LoRA request whose prompt ran without one of the adapter's
-        /// targets (<see cref="ILoraAdapterModel.TakeAppliedLoraTargets"/>).
-        /// </summary>
-        public virtual bool SupportsTextLora => true;
-
-        void ILoraAdapterModel.ActivateLoraAdapter(ILoraAdapterHandle? handle)
-        {
-            if (_activeLora is { Transient: true } transient && !ReferenceEquals(transient.Adapter, handle))
-                transient.Dispose();
-            if (handle == null)
+            // Lock order: GpuComputeLock, then _loraGate (as under an engine step).
+            GpuLockWaiters.Enter(GpuComputeLock);
+            lock (GpuComputeLock)
             {
-                _activeLora = null;
-                return;
-            }
-            if (handle is not TextLoraAdapter adapter)
-                throw new ArgumentException($"'{handle.Name}' is not a text-LoRA adapter.", nameof(handle));
-            if (ReferenceEquals(_activeLora?.Adapter, adapter))
-                return;
-            _activeLora = _preparedLoras.TryGetValue(adapter, out var prepared)
-                ? prepared
-                : Materialize(adapter, transient: true);
-        }
-
-        IReadOnlyCollection<string> ILoraAdapterModel.GetLoraTargets(ILoraAdapterHandle adapter)
-        {
-            if (_activeLora != null && ReferenceEquals(_activeLora.Adapter, adapter))
-                return _activeLora.Tensors.Keys.ToArray();
-            if (adapter is TextLoraAdapter text && _preparedLoras.TryGetValue(text, out var prepared))
-                return prepared.Tensors.Keys.ToArray();
-            return Array.Empty<string>();
-        }
-
-        IReadOnlyCollection<string> ILoraAdapterModel.TakeAppliedLoraTargets()
-        {
-            lock (_loraApplied)
-            {
-                var applied = _loraApplied.ToArray();
-                _loraApplied.Clear();
-                return applied;
-            }
-        }
-
-        void ILoraAdapterModel.MarkLoraUnsupported(ILoraAdapterHandle adapter, IReadOnlyCollection<string> missing)
-        {
-            if (adapter is TextLoraAdapter text && _preparedLoras.TryGetValue(text, out var prepared))
-                prepared.Unsupported ??= TensorSharp.Runtime.Scheduling.InferenceEngine.LoraNotAppliedMessage(text.Name, missing.ToList());
-        }
-
-        private MaterializedLora Materialize(TextLoraAdapter adapter, bool transient)
-        {
-            if (!SupportsTextLora)
-                throw new System.IO.InvalidDataException(
-                    $"LoRA adapter '{adapter.Name}' cannot be applied: {Config?.Architecture ?? GetType().Name} does not " +
-                    "route its projections through the LoRA-aware linear path.");
-            if (IsTensorParallel)
-                throw new System.IO.InvalidDataException(
-                    $"LoRA adapter '{adapter.Name}' cannot be applied while the model is sharded for tensor parallelism.");
-
-            var binding = TextLoraBinder.Bind(adapter, LoadedWeightDims, FileWeightDims);
-            if (binding.Errors.Count > 0)
-            {
-                const int shown = 8;
-                string list = string.Join("; ", binding.Errors.Take(shown));
-                if (binding.Errors.Count > shown) list += $"; and {binding.Errors.Count - shown} more";
-                throw new System.IO.InvalidDataException(
-                    $"LoRA adapter '{adapter.Name}' does not fit the loaded model ({binding.Errors.Count} of " +
-                    $"{adapter.Deltas.Count} module(s)): {list}.");
-            }
-
-            var tensors = new Dictionary<string, (Tensor AT, Tensor BT)>(StringComparer.Ordinal);
-            try
-            {
-                foreach (var target in binding.Targets)
+                GpuLockWaiters.Exit(GpuComputeLock);
+                lock (_loraGate)
                 {
-                    Tensor at = CreateFloatTensor(target.AT, target.In, target.Rank);  // [in, rank]
-                    Tensor bt;
-                    try { bt = CreateFloatTensor(target.BT, target.Rank, target.Out); } // [rank, out]
-                    catch { at.Dispose(); throw; }
-                    tensors[target.WeightName] = (at, bt);
+                    if (_loraBindings.TryGetValue(adapter, out var existing))
+                        return existing;
+                    var binding = TextLoraBinding.Plan(adapter, TextLoraModelRefusal(adapter), new TextLoraView(this));
+                    _loraBindings[adapter] = binding;
+                    Console.WriteLine("  " + binding.DescribePlan(Config?.Architecture ?? GetType().Name));
+                    return binding;
                 }
             }
-            catch
+        }
+
+        /// <inheritdoc/>
+        public bool TryBindAdapter(IRequestAdapter adapter, out string? error)
+        {
+            if (adapter is not TextLoraAdapter lora)
             {
-                foreach (var (_, pair) in tensors) { pair.AT.Dispose(); pair.BT.Dispose(); }
-                throw;
+                error = $"{adapter?.Id ?? "(null)"} is not a text LoRA adapter.";
+                return false;
             }
-            return new MaterializedLora { Adapter = adapter, Tensors = tensors, Transient = transient };
+            TextLoraBinding binding = PlanTextLora(lora);
+            if (!binding.IsApplicable)
+            {
+                error = binding.RefusalMessage;
+                return false;
+            }
+            lock (_loraGate)
+                binding.Materialize((data, rows, cols) => CreateFloatTensor(data, rows, cols));
+            error = null;
+            return true;
         }
 
-        private (long In, long Out)? LoadedWeightDims(string weightName)
-            => TryGetWeightDims(weightName, out long inDim, out long outDim) ? (inDim, outDim) : null;
-
-        private (long In, long Out)? FileWeightDims(string weightName)
+        /// <inheritdoc/>
+        public void SelectStepAdapter(IRequestAdapter? adapter)
         {
-            if (_gguf == null || !_gguf.Tensors.TryGetValue(weightName, out var info) || info.Shape.Length < 2)
-                return null;
-            return ((long)info.Shape[0], (long)info.Shape[1]);
+            if (adapter == null)
+            {
+                _stepLora = null;
+                return;
+            }
+            TextLoraBinding? binding = null;
+            lock (_loraGate)
+            {
+                if (adapter is TextLoraAdapter lora)
+                    _loraBindings.TryGetValue(lora, out binding);
+            }
+            if (binding == null || !binding.IsMaterialized)
+                throw new InvalidOperationException($"LoRA adapter {adapter.Id} is not bound to this model.");
+            _stepLora = binding;
         }
 
-        private void DisposeLoras()
+        /// <inheritdoc/>
+        public IRequestAdapter? StepAdapter => _stepLora?.Adapter;
+
+        /// <inheritdoc/>
+        public IReadOnlyCollection<IRequestAdapter> BoundAdapters
         {
-            if (_activeLora is { Transient: true } transient)
-                transient.Dispose();
-            _activeLora = null;
-            foreach (var prepared in _preparedLoras.Values)
-                prepared.Dispose();
-            _preparedLoras.Clear();
+            get
+            {
+                lock (_loraGate)
+                    return _loraBindings.Keys.ToArray();
+            }
+        }
+
+        /// <inheritdoc/>
+        public void ReleaseAdapter(IRequestAdapter adapter)
+        {
+            if (adapter is not TextLoraAdapter lora)
+                return;
+            if (ReferenceEquals(_stepLora?.Adapter, lora))
+                throw new InvalidOperationException($"LoRA adapter {lora.Id} is selected for the running step.");
+            TextLoraBinding? binding;
+            lock (_loraGate)
+            {
+                if (!_loraBindings.Remove(lora, out binding))
+                    return;
+            }
+            binding.Dispose();
+        }
+
+        /// <summary>Release every adapter binding (model dispose).</summary>
+        private void ReleaseAllAdapters()
+        {
+            // A model built without its constructor (some tests) has no gate and no bindings.
+            if (_loraGate == null)
+                return;
+            _stepLora = null;
+            TextLoraBinding[] bindings;
+            lock (_loraGate)
+            {
+                bindings = _loraBindings.Values.ToArray();
+                _loraBindings.Clear();
+            }
+            foreach (var binding in bindings)
+                binding.Dispose();
         }
 
         /// <summary>
         /// The <c>[out, in]</c> shape of a base-model linear weight, or false (with dims 0)
-        /// when the name is not present in either weight dictionary.
+        /// when the name is not present in either weight dictionary, or names a weight that is
+        /// not 2-D (norms and biases load 1-D).
         /// </summary>
         private bool TryGetWeightDims(string weightName, out long inDim, out long outDim)
         {
@@ -1713,7 +1798,7 @@ namespace TensorSharp.Models
                 outDim = qw.Ne1;
                 return true;
             }
-            if (_weights.TryGetValue(weightName, out var w) && w.DimensionCount == 2)
+            if (_weights.TryGetValue(weightName, out var w) && w.Sizes.Length == 2)
             {
                 inDim = w.Sizes[1];
                 outDim = w.Sizes[0];
@@ -1723,13 +1808,72 @@ namespace TensorSharp.Models
             return false;
         }
 
-        /// <summary>True while the engine has a LoRA adapter selected for the current step, so
-        /// fused fast paths that bypass the generic <see cref="LinearForward"/> can fall back
-        /// to the LoRA-aware path.</summary>
-        protected bool HasActiveLora => _activeLora != null;
+        /// <summary>
+        /// True only while the current engine step runs with a LoRA adapter selected
+        /// (<see cref="SelectStepAdapter"/>), never merely because adapters are loaded or bound.
+        /// Fused fast paths that bypass <see cref="LinearForward"/> check this one predicate and
+        /// fall back to the LoRA-aware path, so base requests keep every fast path.
+        /// </summary>
+        protected bool IsLoraActiveForStep => _stepLora != null;
 
         /// <summary>
-        /// Add the active adapter's <c>x @ AT @ BT</c> correction to <paramref name="result"/>
+        /// Whether the step's adapter carries a delta for <paramref name="weightName"/> (a weight
+        /// as loaded, after fusion). A fast path that runs one weight without the hook (a fused
+        /// matmul+add, say) declines exactly then, so the weights an adapter leaves alone keep it;
+        /// callers check <see cref="IsLoraActiveForStep"/> first, so base traffic pays one null
+        /// check. Virtual only so a test can break such a gate and watch the audit catch it.
+        /// </summary>
+        internal virtual bool HasLoraDelta(string weightName)
+            => _stepLora != null && _stepLora.TryGetFactors(weightName, out _);
+
+        /// <summary>
+        /// Start auditing one forward that runs with an adapter selected, so a path that
+        /// bypassed the hook (and left some planned weight without its delta) fails the forward
+        /// instead of returning partly adapted output. Returns true when this call opened the
+        /// audit: false without an adapter (the whole cost for base traffic) and for a forward
+        /// nested in an audited one. The caller pairs a true with
+        /// <see cref="CloseLoraForwardAudit"/> in a <c>finally</c>, after
+        /// <see cref="VerifyLoraForwardAudit"/> on success. <c>Forward</c> and
+        /// <c>ForwardRefill</c> audit themselves; a family that applies text LoRA audits its
+        /// other entry points (<c>ForwardBatch</c>) the same way.
+        /// </summary>
+        protected bool OpenLoraForwardAudit()
+        {
+            if (_stepLora == null || _loraAuditOpen)
+                return false;
+            _loraAuditOpen = true;
+            _loraForwardSerial++;
+            return true;
+        }
+
+        /// <summary>Throw <see cref="TextLoraNotAppliedException"/> when the audited forward did
+        /// not apply the adapter to every planned weight (<c>output.weight</c> only when it
+        /// <paramref name="producedLogits"/>).</summary>
+        protected void VerifyLoraForwardAudit(bool producedLogits)
+        {
+            var binding = _stepLora;
+            string? missed = binding?.FindUnapplied(_loraForwardSerial, producedLogits);
+            if (missed != null)
+                throw new TextLoraNotAppliedException(
+                    $"LoRA adapter '{binding!.Adapter.Name}' was not applied to {missed} in this forward: a path that " +
+                    "bypasses the LoRA hook ran. The request fails rather than return partly adapted output.");
+        }
+
+        /// <summary><see cref="VerifyLoraForwardAudit(bool)"/> for a batched forward: it produced
+        /// logits when any sequence got them.</summary>
+        protected void VerifyLoraForwardAudit(IReadOnlyList<float[]> logits)
+        {
+            bool produced = false;
+            for (int i = 0; logits != null && i < logits.Count && !produced; i++)
+                produced = logits[i] != null;
+            VerifyLoraForwardAudit(produced);
+        }
+
+        /// <summary>End the audit <see cref="OpenLoraForwardAudit"/> opened.</summary>
+        protected void CloseLoraForwardAudit() => _loraAuditOpen = false;
+
+        /// <summary>
+        /// Add the selected adapter's <c>x @ AT @ BT</c> correction to <paramref name="result"/>
         /// (the base projection <c>x @ W^T</c> plus, when applicable, a sidecar scale).
         /// </summary>
         private void ApplyLoraDelta(Tensor result, Tensor input, (Tensor AT, Tensor BT) lora)
@@ -1744,6 +1888,23 @@ namespace TensorSharp.Models
             Ops.Addmm(result, 1f, result, 1f, h, lora.BT);
             h.Dispose();
             InvalidateTensorDeviceCache(result);
+        }
+
+        /// <summary>
+        /// The LoRA hook, keyed by weight name: when the step's adapter adapts
+        /// <paramref name="weightName"/>, add its delta for <paramref name="input"/> to
+        /// <paramref name="result"/> (the base projection, sidecar scale already applied) and
+        /// stamp the weight for the forward audit. <see cref="LinearForward"/> calls it; a family
+        /// with its own linear entry point (one that writes into a preallocated result) calls it
+        /// the same way. One null check without a selected adapter.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        protected bool TryApplyLoraDelta(Tensor result, Tensor input, string weightName)
+        {
+            if (_stepLora == null || !_stepLora.TryApplyFactors(weightName, _loraForwardSerial, out var lora))
+                return false;
+            ApplyLoraDelta(result, input, lora);
+            return true;
         }
 
         protected Tensor LinearForward(Tensor input, string weightName)
@@ -1783,17 +1944,12 @@ namespace TensorSharp.Models
                 return null;
             }
 
-            // Apply the active LoRA delta on top of the base projection. The fused FFN
-            // paths skip LinearForward entirely, so they are gated off when a LoRA is
-            // active (TryFusedDenseSwiGLUFFNInto below and any future fused kernels).
-            // Recording the weight lets the engine refuse a request whose forward skipped
-            // one of the adapter's targets on some other path.
-            if (_activeLora != null && _activeLora.Tensors.TryGetValue(weightName, out var lora))
-            {
-                ApplyLoraDelta(result, input, lora);
-                lock (_loraApplied)
-                    _loraApplied.Add(weightName);
-            }
+            // Apply the step's LoRA delta on top of the base projection (and stamp it for the
+            // forward audit). The fused FFN paths skip LinearForward entirely, so they are gated
+            // off while an adapter is selected (IsLoraActiveForStep: TryFusedDenseSwiGLUFFNInto,
+            // TryFusedDenseFFNProject); a fused path over one weight declines when that weight
+            // carries a delta (HasLoraDelta: Nemotron's matmul+add decode residuals).
+            TryApplyLoraDelta(result, input, weightName);
 
             _linearTicks += Stopwatch.GetTimestamp() - t0;
             return result;
@@ -2097,7 +2253,7 @@ namespace TensorSharp.Models
         {
             // The fused FFN bypasses LinearForward, so it cannot apply a LoRA delta on
             // gate_up/down. Fall back to the generic (LoRA-aware) FFN path when active.
-            if (HasActiveLora)
+            if (IsLoraActiveForStep)
                 return false;
             if (!IsGgmlBackend || residual == null || residual.DimensionCount != 2)
                 return false;
@@ -2144,6 +2300,9 @@ namespace TensorSharp.Models
         protected Tensor TryFusedDenseFFNProject(
             Tensor input, string normWeightName, string gateUpWeightName, string downWeightName, int actType)
         {
+            // Bypasses LinearForward like TryFusedDenseSwiGLUFFNInto, so the same LoRA gate.
+            if (IsLoraActiveForStep)
+                return null;
             if (!IsGgmlBackend || input == null || input.DimensionCount != 2)
                 return null;
             if (!_quantWeights.TryGetValue(gateUpWeightName, out var gateUpQW) || gateUpQW == null)
@@ -2556,13 +2715,22 @@ namespace TensorSharp.Models
             ThrowIfBackendFailed();
             if (_distributedDriver) DistributedControlGroup.BroadcastControl(TpControlForward, tokens);
             float[] logits;
-            try { logits = ForwardCore(tokens); }
+            bool loraAudit = OpenLoraForwardAudit();
+            try
+            {
+                logits = ForwardCore(tokens);
+                if (loraAudit) VerifyLoraForwardAudit(logits != null);
+            }
             catch (Exception symptom)
             {
                 Exception failure = BackendHasFailed() ? BackendFailure(symptom) : symptom;
                 AbortDistributedExecution(failure);
                 if (!ReferenceEquals(failure, symptom)) throw failure;
                 throw;
+            }
+            finally
+            {
+                if (loraAudit) CloseLoraForwardAudit();
             }
             ThrowIfBackendFailed();
             return DumpLogitsIfRequested(logits);
@@ -2677,13 +2845,22 @@ namespace TensorSharp.Models
             ThrowIfBackendFailed();
             if (_distributedDriver) DistributedControlGroup.BroadcastControl(TpControlForwardRefill, tokens);
             float[] logits;
-            try { logits = ForwardRefillCore(tokens); }
+            bool loraAudit = OpenLoraForwardAudit();
+            try
+            {
+                logits = ForwardRefillCore(tokens);
+                if (loraAudit) VerifyLoraForwardAudit(logits != null);
+            }
             catch (Exception symptom)
             {
                 Exception failure = BackendHasFailed() ? BackendFailure(symptom) : symptom;
                 AbortDistributedExecution(failure);
                 if (!ReferenceEquals(failure, symptom)) throw failure;
                 throw;
+            }
+            finally
+            {
+                if (loraAudit) CloseLoraForwardAudit();
             }
             ThrowIfBackendFailed();
             return logits;
@@ -2916,6 +3093,11 @@ namespace TensorSharp.Models
         /// </summary>
         public void YieldGpuComputeLock()
         {
+            // Never inside an adapter step: another GPU user would see the step's adapter.
+            // Engine steps do not yield (the worker holds the lock re-entrantly anyway); this
+            // keeps that true for any path a step might reach.
+            if (_stepLora != null)
+                return;
             try { Monitor.Exit(GpuComputeLock); }
             catch (SynchronizationLockException) { return; } // not held — nothing to yield
             try
@@ -3153,10 +3335,11 @@ namespace TensorSharp.Models
             // workers leave their loops cleanly.
             SignalDistributedWorkersShutdown();
 
-            DisposeLoras();
-
             if (MultimodalInjector is IDisposable multimodalInjector)
                 multimodalInjector.Dispose();
+
+            // LoRA factor tensors come from this model's allocator, so they go before it does.
+            ReleaseAllAdapters();
 
             foreach (var w in _weights.Values)
                 w.Dispose();
@@ -3341,9 +3524,26 @@ namespace TensorSharp.Models
             if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
                 throw new NotSupportedException($"Distributed tensor parallelism requires a multi-device GPU backend; {backend} cannot honor --tp-node-id/--tp-peers.");
             if (architecture.DistributedTensorParallelBackends is { } supported && !supported.Contains(backend))
-                throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement distributed tensor parallelism on {backend}. " +
-                    $"Use one of its distributed backends: {string.Join(", ", supported)}.");
+                throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement distributed tensor parallelism on " +
+                    $"--backend {BackendOptionName(backend)}. Use one of its distributed backends: {DescribeBackendOptions(supported)}.");
         }
+
+        /// <summary>The <c>--backend</c> spelling of <paramref name="backend"/>, which is what an
+        /// operator has to type to act on a refusal (the enum name GgmlCuda is not accepted).</summary>
+        private static string BackendOptionName(BackendType backend) => backend switch
+        {
+            BackendType.Cpu => "cpu",
+            BackendType.Cuda => "cuda",
+            BackendType.Mlx => "mlx",
+            BackendType.GgmlCpu => "ggml_cpu",
+            BackendType.GgmlMetal => "ggml_metal",
+            BackendType.GgmlCuda => "ggml_cuda",
+            BackendType.GgmlVulkan => "ggml_vulkan",
+            _ => backend.ToString(),
+        };
+
+        private static string DescribeBackendOptions(IEnumerable<BackendType> backends)
+            => string.Join(", ", backends.Select(b => "--backend " + BackendOptionName(b)));
 
         /// <summary>Reject unavailable stage executors before allocating GPUs or connecting peers.</summary>
         public static void ValidateDistributedLayerSplit(string ggufPath, BackendType backend)
@@ -3356,8 +3556,12 @@ namespace TensorSharp.Models
         {
             ArgumentNullException.ThrowIfNull(architecture);
             if (!architecture.SupportsDistributedLayerSplit || !architecture.DistributedLayerSplitBackends.Contains(backend))
-                throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement distributed --layer-split on {backend}. " +
-                    "Select a supported whole-layer stage executor or remove --tp-node-id/--tp-peers.");
+                throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement distributed --layer-split on " +
+                    $"--backend {BackendOptionName(backend)}. " +
+                    (architecture.SupportsDistributedLayerSplit && architecture.DistributedLayerSplitBackends.Count > 0
+                        ? $"Its distributed stage executor runs on {DescribeBackendOptions(architecture.DistributedLayerSplitBackends)}; " +
+                          "select it or remove --tp-node-id/--tp-peers."
+                        : "Select a supported whole-layer stage executor or remove --tp-node-id/--tp-peers."));
         }
 
         /// <summary>

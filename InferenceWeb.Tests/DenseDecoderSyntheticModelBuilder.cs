@@ -41,9 +41,14 @@ public sealed class DenseDecoderSyntheticModelBuilder
     public bool TiedOutput { get; init; }
     /// <summary>Store one layer's matrices as F16 while all other weights remain F32.</summary>
     public int? HalfPrecisionLayer { get; init; }
-    /// <summary>Rewrites a tensor's generated values (name, GGUF dims, values) before it is
-    /// written, e.g. to merge a LoRA delta into a weight. Null leaves every tensor as generated.</summary>
-    public Func<string, ulong[], float[], float[]> TransformTensor { get; init; }
+
+    /// <summary>
+    /// Rewrite tensors before they are written (a LoRA test's merged-weights twin): called
+    /// with each GGUF tensor name and its values as the file would store them (an F16 layer's
+    /// already rounded to half), it returns the values to write, or null to keep them. A
+    /// rewritten tensor is stored as F32, so the twin holds exactly what it was given.
+    /// </summary>
+    public Func<string, float[], float[]> Transform { get; init; }
 
     private static readonly string[] MistralControlTokens = { "[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]" };
 
@@ -51,10 +56,28 @@ public sealed class DenseDecoderSyntheticModelBuilder
 
     public string Write(string path)
     {
+        var tensors = BuildTensors();
+        var forcedF32 = new HashSet<string>(StringComparer.Ordinal);
+        if (Transform != null)
+        {
+            for (int i = 0; i < tensors.Count; i++)
+            {
+                var (name, dims, data) = tensors[i];
+                float[] stored = IsHalf(name, dims) ? Array.ConvertAll(data, v => (float)(Half)v) : data;
+                float[] rewritten = Transform(name, stored);
+                if (rewritten == null) continue;
+                tensors[i] = (name, dims, rewritten);
+                forcedF32.Add(name);
+            }
+        }
         using var fs = File.Create(path);
-        WriteGguf(fs, BuildMetadata(), BuildTensors());
+        WriteGguf(fs, BuildMetadata(), tensors, forcedF32);
         return path;
     }
+
+    private bool IsHalf(string name, ulong[] dims) =>
+        HalfPrecisionLayer.HasValue && dims.Length == 2 &&
+        name.StartsWith($"blk.{HalfPrecisionLayer.Value}.", StringComparison.Ordinal);
 
     private List<(string Name, ulong[] Dims, float[] Data)> BuildTensors()
     {
@@ -87,9 +110,6 @@ public sealed class DenseDecoderSyntheticModelBuilder
             t.Add(Gen(p + "ffn_up.weight", 0.08f, Hidden, FfnLength));
             t.Add(Gen(p + "ffn_down.weight", 0.08f, FfnLength, Hidden));
         }
-        if (TransformTensor != null)
-            for (int i = 0; i < t.Count; i++)
-                t[i] = (t[i].Item1, t[i].Item2, TransformTensor(t[i].Item1, t[i].Item2, t[i].Item3));
         return t;
     }
 
@@ -203,7 +223,7 @@ public sealed class DenseDecoderSyntheticModelBuilder
     private const int Alignment = 32;
 
     private void WriteGguf(Stream fs, List<(string Key, Action<BinaryWriter> Write)> kv,
-        List<(string Name, ulong[] Dims, float[] Data)> tensors)
+        List<(string Name, ulong[] Dims, float[] Data)> tensors, HashSet<string> forcedF32)
     {
         using var head = new MemoryStream();
         using (var w = new BinaryWriter(head, Encoding.UTF8, leaveOpen: true))
@@ -223,8 +243,7 @@ public sealed class DenseDecoderSyntheticModelBuilder
                 WriteStr(w, name);
                 w.Write((uint)dims.Length);
                 foreach (ulong d in dims) w.Write(d);
-                bool half = HalfPrecisionLayer.HasValue && dims.Length == 2 &&
-                    name.StartsWith($"blk.{HalfPrecisionLayer.Value}.", StringComparison.Ordinal);
+                bool half = IsHalf(name, dims) && !forcedF32.Contains(name);
                 w.Write(half ? 1u : 0u); // F16 or F32
                 w.Write(offset);
                 ulong bytes = (ulong)data.Length * (ulong)(half ? sizeof(ushort) : sizeof(float));
@@ -238,8 +257,7 @@ public sealed class DenseDecoderSyntheticModelBuilder
         fs.Write(new byte[pad], 0, pad);
         foreach (var (name, dims, data) in tensors)
         {
-            bool half = HalfPrecisionLayer.HasValue && dims.Length == 2 &&
-                name.StartsWith($"blk.{HalfPrecisionLayer.Value}.", StringComparison.Ordinal);
+            bool half = IsHalf(name, dims) && !forcedF32.Contains(name);
             byte[] raw = new byte[data.Length * (half ? sizeof(ushort) : sizeof(float))];
             if (half)
                 for (int i = 0; i < data.Length; i++)

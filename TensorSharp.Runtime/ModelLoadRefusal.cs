@@ -145,7 +145,9 @@ namespace TensorSharp.Runtime
 
         /// <summary>
         /// Wrappers that only carry another exception: reflection-invoked factories, a
-        /// single-exception aggregate from a task, a static constructor.
+        /// single-exception aggregate from a task, a static constructor, and an aggregate
+        /// whose every exception is a refusal (a loader that uploads to each device in
+        /// parallel, every device declining the same weights), reported as its first.
         /// </summary>
         private static Exception? Unwrap(Exception? exception)
         {
@@ -157,6 +159,7 @@ namespace TensorSharp.Runtime
                     TargetInvocationException tie => tie.InnerException,
                     TypeInitializationException tie => tie.InnerException,
                     AggregateException { InnerExceptions.Count: 1 } ae => ae.InnerExceptions[0],
+                    AggregateException { InnerExceptions.Count: > 1 } ae when AllRefusals(ae) => ae.InnerExceptions[0],
                     _ => null,
                 };
                 if (inner == null)
@@ -164,6 +167,16 @@ namespace TensorSharp.Runtime
                 ex = inner;
             }
             return ex;
+        }
+
+        private static bool AllRefusals(AggregateException aggregate)
+        {
+            foreach (Exception inner in aggregate.InnerExceptions)
+            {
+                if (!IsRefusal(inner))
+                    return false;
+            }
+            return true;
         }
     }
 }

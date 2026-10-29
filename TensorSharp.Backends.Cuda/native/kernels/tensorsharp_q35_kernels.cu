@@ -479,6 +479,19 @@ extern "C" __global__ void __launch_bounds__(512) ts_q35_add_rmsnorm_nvfp4_f32(
 #define TS_Q35_FP4_MMA 1
 #endif
 
+/// 1 when the image the driver loaded carries the tensor-core bodies: the FP4 MMA above and the
+/// mma / ldmatrix paths guarded by __CUDA_ARCH__ >= 800 (implied). Any other target - the plain
+/// compute_12x PTX, or sm_8x / sm_9x code JIT-compiled for a CC 12 device - writes 0, and there
+/// every GEMM would __trap(). A symbol lookup cannot tell: a fatbin holds both images.
+extern "C" __global__ void ts_q35_caps(int* out)
+{
+#ifdef TS_Q35_FP4_MMA
+    out[0] = 1;
+#else
+    out[0] = 0;
+#endif
+}
+
 #define TS_Q35_BM 128
 #define TS_Q35_BK 256
 #define TS_Q35_CROW (TS_Q35_BK / 2 + 16)

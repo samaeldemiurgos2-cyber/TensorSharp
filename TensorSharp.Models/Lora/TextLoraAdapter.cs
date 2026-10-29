@@ -10,6 +10,8 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models.Lora
 {
@@ -46,18 +48,39 @@ namespace TensorSharp.Models.Lora
 
     /// <summary>
     /// A loaded LoRA adapter: a name, the low rank and alpha, and one
-    /// <see cref="LoraDelta"/> per target projection keyed by base-model weight name
-    /// (e.g. <c>"blk.0.attn_qkv.weight"</c>). Immutable after load, so it is safe to
+    /// <see cref="LoraDelta"/> per target projection keyed by the base GGUF's tensor name
+    /// (e.g. <c>"blk.0.attn_q.weight"</c>). Immutable after load, so it is safe to
     /// share between the registry, the model and concurrent inference readers.
+    ///
+    /// <para>
+    /// A request carries the instance it resolved (<see cref="SequenceState.Adapter"/>),
+    /// and the engine compares adapters by reference: reloading a name loads a new
+    /// instance with a new <see cref="Generation"/> and retires the old one, which keeps
+    /// serving the requests that already hold it.
+    /// </para>
     /// </summary>
-    public sealed class TextLoraAdapter : TensorSharp.Runtime.ILoraAdapterHandle
+    public sealed class TextLoraAdapter : IRequestAdapter
     {
+        private static long s_generation;
+        private volatile bool _retired;
+
         public string Name { get; }
 
-        /// <summary>Low rank inferred from the <c>lora_A</c> tensors (or the PEFT config).</summary>
+        /// <summary>Process-wide load counter: tells two loads of one name apart in logs.</summary>
+        public long Generation { get; }
+
+        /// <inheritdoc/>
+        public string Id => $"{Name}#{Generation}";
+
+        /// <inheritdoc/>
+        public bool IsRetired => _retired;
+
+        /// <summary>Low rank from the PEFT config, or the largest rank of the <c>lora_A</c>
+        /// tensors (modules may differ; each <see cref="LoraDelta.Rank"/> is its own).</summary>
         public int Rank { get; }
 
-        /// <summary>The PEFT <c>lora_alpha</c>, or <see cref="Rank"/> when unspecified.</summary>
+        /// <summary>The PEFT <c>lora_alpha</c>, or <see cref="Rank"/> when unspecified or 0;
+        /// always a finite number >= 0.</summary>
         public float Alpha { get; }
 
         /// <summary>Per-target deltas keyed by base-model weight name.</summary>
@@ -66,21 +89,38 @@ namespace TensorSharp.Models.Lora
         /// <summary>One human-readable line summarising the source files.</summary>
         public string Summary { get; }
 
+        /// <summary>
+        /// The <c>general.architecture</c> a GGUF adapter was converted for, or null when the
+        /// file does not say (safetensors). A model of another architecture refuses it.
+        /// </summary>
+        public string? Architecture { get; }
+
         public TextLoraAdapter(
             string name,
             int rank,
             float alpha,
             IReadOnlyDictionary<string, LoraDelta> deltas,
-            string summary)
+            string summary,
+            string? architecture = null)
         {
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("A LoRA adapter name is required.", nameof(name));
+            // Listed as a JSON number (GET /v1/loras, GET /v1/models), which has no NaN or
+            // infinity. The loader refuses such an alpha with the reason; this keeps any other
+            // source from registering one that would fail every listing.
+            if (!float.IsFinite(alpha) || alpha < 0f)
+                throw new ArgumentOutOfRangeException(nameof(alpha), alpha, "A LoRA alpha must be a finite number >= 0.");
             Name = name;
             Rank = rank;
             Alpha = alpha;
             Deltas = deltas ?? throw new ArgumentNullException(nameof(deltas));
             Summary = summary ?? string.Empty;
+            Architecture = string.IsNullOrWhiteSpace(architecture) ? null : architecture;
+            Generation = Interlocked.Increment(ref s_generation);
         }
+
+        /// <summary>Mark the adapter unloaded or replaced (see <see cref="IRequestAdapter.IsRetired"/>).</summary>
+        internal void Retire() => _retired = true;
     }
 
     /// <summary>Public metadata for <c>GET /v1/models</c>, sized to stay cheap to list.</summary>

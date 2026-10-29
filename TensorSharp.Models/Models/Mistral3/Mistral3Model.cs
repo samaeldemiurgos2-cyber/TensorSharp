@@ -148,53 +148,33 @@ namespace TensorSharp.Models
             PrecomputeConstants();
         }
 
-        private unsafe void FuseQKVWeights()
+        private void FuseQKVWeights()
         {
             int fused = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                string qName = $"blk.{l}.attn_q.weight";
-                string kName = $"blk.{l}.attn_k.weight";
-                string vName = $"blk.{l}.attn_v.weight";
-                string qkvName = $"blk.{l}.attn_qkv.weight";
-
-                if (_quantWeights.TryGetValue(qName, out var qw) &&
-                    _quantWeights.TryGetValue(kName, out var kw) &&
-                    _quantWeights.TryGetValue(vName, out var vw) &&
-                    qw.GgmlType == kw.GgmlType && kw.GgmlType == vw.GgmlType &&
-                    qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
-                {
-                    if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, qw, kw, vw))
-                        continue;
-
-                    _quantWeights[qkvName] = fusedWeight;
-                    _quantWeights.Remove(qName); qw.Dispose();
-                    _quantWeights.Remove(kName); kw.Dispose();
-                    _quantWeights.Remove(vName); vw.Dispose();
+                if (TryFuseQkvWeights(l))
                     fused++;
-                }
-                else if (_weights.TryGetValue(qName, out var qf) &&
-                         _weights.TryGetValue(kName, out var kf) &&
-                         _weights.TryGetValue(vName, out var vf))
-                {
-                    int qDim = (int)qf.Sizes[0], kDim = (int)kf.Sizes[0], vDim = (int)vf.Sizes[0];
-                    int inDim = (int)qf.Sizes[1];
-                    var fusedTensor = new Tensor(AllocatorForWeight(qkvName), DType.Float32, qDim + kDim + vDim, inDim);
-                    using (var s0 = fusedTensor.Narrow(0, 0, qDim)) Ops.Copy(s0, qf);
-                    using (var s1 = fusedTensor.Narrow(0, qDim, kDim)) Ops.Copy(s1, kf);
-                    using (var s2 = fusedTensor.Narrow(0, qDim + kDim, vDim)) Ops.Copy(s2, vf);
-                    _weights[qkvName] = fusedTensor;
-                    _weights.Remove(qName); qf.Dispose();
-                    _weights.Remove(kName); kf.Dispose();
-                    _weights.Remove(vName); vf.Dispose();
-                    fused++;
-                }
             }
             if (fused > 0)
                 Console.WriteLine($"  Fused projections: {fused} QKV");
         }
 
         private bool[] _layerQkvFused;
+
+        // Text LoRA: on a single device every projection of a decoder layer and the LM head
+        // run through LinearForward, attn_q/k/v and ffn_gate/up as their fused weights. The one
+        // fused graph that skips it (TryFusedDenseSwiGLUFFNInto) declines while an adapter is
+        // selected. Gate and up never run as two weights here, so they count only fused.
+        private static readonly HashSet<string> s_textLoraProjections = new(StringComparer.Ordinal)
+            { "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_output", "ffn_gate_up", "ffn_down" };
+
+        protected override bool SupportsTextLora => true;
+
+        protected override string? TextLoraWeightRefusal(string weightName)
+            => weightName == "output.weight" || IsDecoderLayerProjection(weightName, s_textLoraProjections)
+                ? null
+                : "is not one of the projections Mistral 3 applies a LoRA delta to";
 
         private void PrecomputeConstants()
         {
@@ -428,6 +408,7 @@ namespace TensorSharp.Models
         // Vision support
         public void LoadVisionEncoder(string mmProjPath)
         {
+            RefuseVisionOffFirstStage();
             _visionEncoder = new Mistral3VisionEncoder(mmProjPath, _allocator);
             _visionEncoder.SetHostModel(this);
         }
@@ -438,7 +419,20 @@ namespace TensorSharp.Models
 
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
         {
+            RefuseVisionOffFirstStage();
             _pendingVisionEmbeddingsList.Add((embeddings, insertPosition));
+        }
+
+        /// <summary>Image rows are embedded and injected where this node embeds
+        /// tokens. In a multi-node pipeline that runs the last stage on node 0 (the
+        /// default), the first stage is another node, so images are refused rather
+        /// than dropped.</summary>
+        private void RefuseVisionOffFirstStage()
+        {
+            if (LayerSplitGroup?.NodeCount > 1 && LayerPlacement != null && !LayerPlacement.IsFirst)
+                throw new NotSupportedException(
+                    "Multi-node layer split runs node 0 as the last stage, so it cannot inject image embeddings. " +
+                    $"Set {LayerSplitPlan.DriverStageVariable}=first on every node to serve images.");
         }
 
         public Mistral3VisionEncoder VisionEncoder => _visionEncoder;

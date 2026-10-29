@@ -103,6 +103,7 @@ namespace TensorSharp.Models
             {
                 ParseBaseConfig();
                 ParseQwen4ExpConfig();
+                ConfigureQwenDistributed(ggufPath);
                 ValidateQwen4ExpTensorParallelMetadata();
                 ParseTokenizer();
                 if (!string.IsNullOrWhiteSpace(draftGgufPath))
@@ -132,14 +133,13 @@ namespace TensorSharp.Models
                 int maxContextLength = ResolveConfiguredContextLength();
                 int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
                 InitCaches(initialCacheLength, maxContextLength);
+                _q4eDistributed?.ValidateConfiguration($"qwen-cache|{_kvCacheDtype}|{initialCacheLength}|{maxContextLength}");
                 PlanExpertPlacement();
                 FinalizeMtpHead();
             }
-            catch
+            catch (Exception failure)
             {
-                // A constructor that throws has no caller to release its GGUF
-                // mapping, partial shards, device buffers or TP worker group.
-                Dispose();
+                CleanupQwenFailedConstruction(failure);
                 throw;
             }
         }
@@ -169,6 +169,12 @@ namespace TensorSharp.Models
         {
             int n = Config.NumLayers;
             _layerDevice = new int[n];
+            if (_q4eStage != null)
+            {
+                for (int layer = _q4eStage.FirstLayer; layer < _q4eStage.EndLayer; layer++)
+                    _layerDevice[layer] = _q4eStage.LocalRank(layer);
+                return;
+            }
             if (LayerSplitDegree <= 1)
                 return;
 
@@ -352,7 +358,7 @@ namespace TensorSharp.Models
             // frees the host copy right after uploading, so a head bound on the wrong
             // rank reads freed memory and the process dies in kernel warmup.
             if (IsHeadSpanWeight(weightName))
-                return _layerDevice[_layerDevice.Length - 1];
+                return _layerDevice[(_q4eStage?.EndLayer ?? _layerDevice.Length) - 1];
             return 0;
         }
 
@@ -364,8 +370,8 @@ namespace TensorSharp.Models
                 return true;
             // Tied head: with no output.weight the head matmuls against token_embd.
             return string.Equals(weightName, "token_embd.weight", StringComparison.Ordinal)
-                && !_quantWeights.ContainsKey("output.weight")
-                && !_weights.ContainsKey("output.weight");
+                && !_gguf.Tensors.ContainsKey("output.weight")
+                && (_q4eStage == null || _q4eStage.IsLast);
         }
 
         /// <summary>
@@ -376,7 +382,7 @@ namespace TensorSharp.Models
         /// </summary>
         protected override bool ShouldRetainCudaHostQuantWeight(string weightName)
         {
-            if (LayerSplitDegree > 1 && weightName != null
+            if ((LayerSplitDegree > 1 || _q4eStage != null) && weightName != null
                 && !weightName.StartsWith("blk.", StringComparison.Ordinal))
                 return true;
             return base.ShouldRetainCudaHostQuantWeight(weightName);
@@ -555,14 +561,18 @@ namespace TensorSharp.Models
                 }
             }
 
-            Need("token_embd.weight");
-            Need("output_hc_norm.weight");
-            Need("output_hc_down.weight");
-            Need("output_hc_up.weight");
-            if (_pleHeads > 0) Need("per_layer_token_embd.weight");
+            if (_q4eStage == null || _q4eStage.IsFirst) Need("token_embd.weight");
+            if (_q4eStage == null || _q4eStage.IsLast)
+            {
+                Need("output_hc_norm.weight");
+                Need("output_hc_down.weight");
+                Need("output_hc_up.weight");
+            }
+            if (_pleHeads > 0 && OwnsQwenPle) Need("per_layer_token_embd.weight");
 
             for (int il = 0; il < Config.NumLayers; il++)
             {
+                if (!OwnsQwenLayer(il)) continue;
                 Need($"blk.{il}.hc_attn_norm.weight");
                 Need($"blk.{il}.hc_attn_down.weight");
                 Need($"blk.{il}.hc_attn_up.weight");
@@ -620,7 +630,7 @@ namespace TensorSharp.Models
                 bool hasFused = _stackedExpertWeights.ContainsKey($"blk.{il}.ffn_gate_up_exps.weight");
                 if (!hasSplit && !hasFused)
                     missing.Add($"blk.{il}.ffn_gate_exps.weight (or ffn_gate_up_exps.weight)");
-                else if (!hasSplit && il == 0)
+                else if (!hasSplit)
                     _fusedGateUpExperts = true;
                 Need($"blk.{il}.ffn_gate_inp_shexp.weight");
                 Need($"blk.{il}.ffn_gate_shexp.weight");

@@ -198,6 +198,14 @@ namespace TensorSharp.Cuda
                 throw new NotSupportedException($"[glm-cuda] at most 16 experts per token, got {m.NExpertUsed}");
             if (m.NEmbd % 4 != 0 || HC * m.NEmbd % 256 != 0)
                 throw new NotSupportedException($"[glm-cuda] hidden width {m.NEmbd}");
+            // Before any device is touched: refused inside the per-device upload, two devices
+            // refusing at once reached the host as an AggregateException and aborted the CLI.
+            for (int il = 0; il < m.NLayer; il++)
+            {
+                var L = m.Layers[il];
+                if (L.Moe)
+                    CudaMoe.RequireExpertWeights("glm-cuda", il, L.GateExps, L.UpExps, L.DownExps);
+            }
             _perf = EnvInt("TS_GLM_PERF", 0);
             _stages = new CudaStageTimer("glm-cuda", _perf, StageNames);
 
@@ -216,6 +224,12 @@ namespace TensorSharp.Cuda
                 dev.DK = Dsv4Kernels.Create();
                 dev.GK = GlmKernels.Create();
                 _devs[d] = dev;
+            }
+            for (int il = 0; il < m.NLayer; il++)
+            {
+                var L = m.Layers[il];
+                if (L.Moe)
+                    CudaMoe.RequireExpertDecoders("glm-cuda", _devs[0].DK.DecodesQ5_1Experts, il, L.GateExps, L.UpExps, L.DownExps);
             }
             // ---- placement: contiguous runs of layers, each device filled to the same share of
             // what it has free after its fixed scratch ----
@@ -452,10 +466,6 @@ namespace TensorSharp.Cuda
                 dst.DownShexp = dev.Weights.Place(src.DownShexp);
                 dst.GateInp = UploadF32(dev, src.GateInp);
                 dst.ExpProbsBias = UploadF32(dev, src.ExpProbsBias);
-                if (dst.GateExps.Type != dst.UpExps.Type)
-                    throw new NotSupportedException($"[glm-cuda] layer {il}: expert gate/up quant types differ");
-                CudaMoe.RequireExpertType("glm-cuda", dst.GateExps.Type);
-                CudaMoe.RequireExpertType("glm-cuda", dst.DownExps.Type);
             }
             else
             {

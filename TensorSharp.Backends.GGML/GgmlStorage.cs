@@ -65,9 +65,9 @@ namespace TensorSharp.GGML
         /// <summary>
         /// Drain any pending GGML async compute targeting this storage's host
         /// memory before the caller reads/writes it. Cheap when no work is pending
-        /// (single atomic check on the C++ side); when there is pending work it
+        /// (two atomic loads on the C++ side); when there is pending work it
         /// performs one ggml_backend_synchronize to wait for the Metal command
-        /// queue to drain.
+        /// queue to drain, or waits for the one another thread is already running.
         ///
         /// This is what makes the lazy-sync optimisation (see
         /// <see cref="GgmlBasicOps.SetAsyncCompute"/>) safe: the per-op GPU

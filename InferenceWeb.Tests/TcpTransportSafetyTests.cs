@@ -149,11 +149,7 @@ public sealed class TcpTransportSafetyTests
         using var raw = new TcpClient();
         await ConnectRaw(raw, endpoints[1]);
         using var stream = raw.GetStream();
-        byte[] handshake = new byte[16];
-        BinaryPrimitives.WriteInt32LittleEndian(handshake, 0x54535032);
-        BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(4), 3);
-        BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(8), 0);
-        BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(12), 2);
+        byte[] handshake = TcpCommunicator.CreateHandshake(0, 2, TcpTransportOptions.FromEnvironment());
         await stream.WriteAsync(handshake);
         await stream.ReadExactlyAsync(handshake);
         using var node = await connecting.WaitAsync(TimeSpan.FromSeconds(5));
@@ -199,7 +195,7 @@ public sealed class TcpTransportSafetyTests
             }
             using var ready = await forwarding.AcceptTcpClientAsync().WaitAsync(TimeSpan.FromSeconds(5));
             var stream = ready.GetStream();
-            byte[] handshake = new byte[16];
+            byte[] handshake = new byte[TcpCommunicator.HandshakeBytes];
             await stream.ReadExactlyAsync(handshake);
             BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(8), 1);
             await stream.WriteAsync(handshake);
@@ -318,10 +314,7 @@ public sealed class TcpTransportSafetyTests
         {
             await ConnectRaw(raw, endpoints[1]);
             var stream = raw.GetStream();
-            byte[] handshake = new byte[16];
-            BinaryPrimitives.WriteInt32LittleEndian(handshake, 0x54535032);
-            BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(4), 3);
-            BinaryPrimitives.WriteInt32LittleEndian(handshake.AsSpan(12), 2);
+            byte[] handshake = TcpCommunicator.CreateHandshake(0, 2, TcpTransportOptions.FromEnvironment());
             await stream.WriteAsync(handshake);
             await stream.ReadExactlyAsync(handshake);
             return (await connecting.WaitAsync(TimeSpan.FromSeconds(5)), raw);

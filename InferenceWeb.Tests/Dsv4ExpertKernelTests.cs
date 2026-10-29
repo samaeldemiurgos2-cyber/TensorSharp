@@ -31,6 +31,7 @@ public sealed class Dsv4ExpertKernelTests
     [InlineData((int)GgmlTensorType.IQ3_S)]
     [InlineData((int)GgmlTensorType.IQ4_NL)]
     [InlineData((int)GgmlTensorType.IQ4_XS)]
+    [InlineData((int)GgmlTensorType.Q5_1)]
     public void TheTensorCoreExpertProjection_MatchesTheDequantizedWeights(int ggmlType)
     {
         long rowBytes = NativeDequant.RowSize(ggmlType, InDim);
@@ -112,6 +113,7 @@ public sealed class Dsv4ExpertKernelTests
     [InlineData((int)GgmlTensorType.IQ3_S)]
     [InlineData((int)GgmlTensorType.IQ4_NL)]
     [InlineData((int)GgmlTensorType.IQ4_XS)]
+    [InlineData((int)GgmlTensorType.Q5_1)]
     public void TheDecodeExpertProjection_ServesEveryTokenOfAStep(int ggmlType)
     {
         const int nt = 3;
@@ -168,7 +170,7 @@ public sealed class Dsv4ExpertKernelTests
 
     /// <summary>q8_1 as the quantize kernel writes it: per 32 values, d = amax / 127 stored as F16,
     /// round to nearest even.</summary>
-    private static float[,] QuantizeDequantizeQ8_1(float[,] input)
+    internal static float[,] QuantizeDequantizeQ8_1(float[,] input)
     {
         int rows = input.GetLength(0), cols = input.GetLength(1);
         var result = new float[rows, cols];
@@ -224,7 +226,7 @@ public sealed class Dsv4ExpertKernelTests
 
     /// <summary>A tensor whose bytes are on the device: CudaStorage mirrors host writes lazily,
     /// and these kernels take raw device pointers.</summary>
-    private static Tensor Up(CudaAllocator allocator, Array values)
+    internal static Tensor Up(CudaAllocator allocator, Array values)
     {
         Tensor t = Tensor.FromArray(allocator, values);
         t.Storage.EnsureDeviceCurrent();
@@ -232,13 +234,13 @@ public sealed class Dsv4ExpertKernelTests
     }
 
     /// <summary>Read back what a kernel wrote through a raw pointer.</summary>
-    private static float[] Down(Tensor t, int count)
+    internal static float[] Down(Tensor t, int count)
     {
         ((CudaStorage)t.Storage).MarkDeviceModified();
         return t.GetElementsAsFloat(count);
     }
 
-    private static float[] Row(float[,] m, int r)
+    internal static float[] Row(float[,] m, int r)
     {
         var row = new float[m.GetLength(1)];
         for (int k = 0; k < row.Length; k++)
@@ -248,7 +250,7 @@ public sealed class Dsv4ExpertKernelTests
 
     /// <summary>Deterministic bytes for <paramref name="rows"/> quantized rows: every bit pattern is a
     /// valid encoding except the F16 block scales, which are set to small finite values.</summary>
-    private static byte[] QuantRows(int ggmlType, int rows, long rowBytes, int seed)
+    internal static byte[] QuantRows(int ggmlType, int rows, long rowBytes, int seed)
     {
         var bytes = new byte[rows * rowBytes];
         uint x = (uint)(0x9E3779B9 * seed);
@@ -268,6 +270,7 @@ public sealed class Dsv4ExpertKernelTests
             (int)GgmlTensorType.IQ3_S => (110, new[] { 0 }),
             (int)GgmlTensorType.IQ4_NL => (18, new[] { 0 }),
             (int)GgmlTensorType.IQ4_XS => (136, new[] { 0 }),
+            (int)GgmlTensorType.Q5_1 => (24, new[] { 0 }),
             _ => throw new ArgumentOutOfRangeException(nameof(ggmlType)),
         };
         for (int b = 0; b * blockBytes < bytes.Length; b++)
@@ -277,6 +280,16 @@ public sealed class Dsv4ExpertKernelTests
                 ushort bits = BitConverter.HalfToUInt16Bits((System.Half)(0.01f + 0.003f * ((b + h) % 7)));
                 bytes[b * blockBytes + halves[h]] = (byte)bits;
                 bytes[b * blockBytes + halves[h] + 1] = (byte)(bits >> 8);
+            }
+            if (ggmlType == (int)GgmlTensorType.Q5_1)
+            {
+                // The block's offset m: below zero as quantize_row_q5_1 leaves it for centred weights
+                // (codes 0..31 around -16 d), and above it in every seventh block.
+                float d = (float)BitConverter.UInt16BitsToHalf((ushort)(bytes[b * blockBytes] | bytes[b * blockBytes + 1] << 8));
+                float m = b % 7 == 0 ? 3f * d : -(12f + b % 5) * d;
+                ushort mBits = BitConverter.HalfToUInt16Bits((System.Half)m);
+                bytes[b * blockBytes + 2] = (byte)mBits;
+                bytes[b * blockBytes + 3] = (byte)(mBits >> 8);
             }
         }
         return bytes;

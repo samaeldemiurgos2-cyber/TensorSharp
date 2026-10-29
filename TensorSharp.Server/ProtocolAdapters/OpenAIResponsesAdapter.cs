@@ -250,14 +250,11 @@ public sealed class OpenAIResponsesAdapter
                     skillPlan.Prompt.Catalog.Count, skillPlan.ToolsOffered);
         }
 
-        inferenceMessages = await knowledge.PrepareAsync(ctx, inferenceMessages, skillPlan?.ToolsOffered == true,
-            completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxOutputTokens, effectiveTools, enableThinking)).ConfigureAwait(false);
-        if (inferenceMessages == null) return;
-
-        // LoRA selection: an explicit `lora` field names an adapter, or "none"/empty for the
-        // base model. The adapter rides on this request's sampling config down to its
-        // sequence; the engine applies it to that sequence's forward passes only.
-        if (body.TryGetProperty("lora", out var loraProp))
+        // LoRA: resolved once, before any output, and carried by this request alone (see
+        // OpenAIChatAdapter; null is the base model, as when omitted). A request that cannot
+        // run with its adapter gets a 400.
+        TextLoraAdapter? lora = null;
+        if (body.TryGetProperty("lora", out var loraProp) && loraProp.ValueKind != JsonValueKind.Null)
         {
             if (loraProp.ValueKind != JsonValueKind.String)
             {
@@ -267,28 +264,34 @@ public sealed class OpenAIResponsesAdapter
                 return;
             }
 
-            string? loraName = loraProp.GetString();
-            if (!_svc.TryResolveLora(loraName, out var loraAdapter, out string? loraError))
+            if (!_svc.TryResolveLoraRequest(loraProp.GetString(), out lora, out LoraRequestError? loraError))
             {
                 logger.LogWarning(LogEventIds.HttpRequestRejected,
-                    "/v1/responses rejected: {LoraError} (id={ResponseId})", loraError, requestId);
-                await WriteErrorAsync(ctx, 400, loraError!).ConfigureAwait(false);
+                    "/v1/responses rejected: {LoraError} (id={ResponseId})", loraError!.Message, requestId);
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsJsonAsync(new { error = loraError.ToOpenAIError() }).ConfigureAwait(false);
                 return;
             }
-            samplingConfig.LoraAdapter = loraAdapter;
+            if (lora != null)
+                logger.LogInformation(LogEventIds.ChatStarted,
+                    "/v1/responses lora: id={ResponseId} adapter={Adapter}", requestId, lora.Id);
         }
+
+        inferenceMessages = await knowledge.PrepareAsync(ctx, inferenceMessages, skillPlan?.ToolsOffered == true,
+            completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxOutputTokens, effectiveTools, enableThinking)).ConfigureAwait(false);
+        if (inferenceMessages == null) return;
 
         if (stream)
         {
             await StreamResponseAsync(ctx, requestId, modelName!, instructions, maxOutputTokens,
                 inferenceMessages, samplingConfig, effectiveTools, enableThinking, responseFormat, store,
-                skillPlan, logger, knowledge).ConfigureAwait(false);
+                skillPlan, logger, knowledge, lora).ConfigureAwait(false);
         }
         else
         {
             await CompleteSyncAsync(ctx, requestId, modelName!, instructions, maxOutputTokens,
                 inferenceMessages, samplingConfig, effectiveTools, enableThinking, responseFormat, store,
-                skillPlan, logger, knowledge).ConfigureAwait(false);
+                skillPlan, logger, knowledge, lora).ConfigureAwait(false);
         }
     }
 
@@ -350,7 +353,8 @@ public sealed class OpenAIResponsesAdapter
         bool store,
         SkillRequestPlan? skillPlan,
         ILogger skillLogger,
-        KnowledgeProtocolRequest knowledge)
+        KnowledgeProtocolRequest knowledge,
+        TextLoraAdapter? lora)
     {
         if (!HostedModelGuard.TryEnsureHostedModelLoaded(_svc, modelName,
                 _options.StartupModelPath, _options.StartupMmProjPath, _options.DefaultBackend, out string loadError))
@@ -364,7 +368,7 @@ public sealed class OpenAIResponsesAdapter
         string? pipelineFinishReason = null;
 
         await foreach (var update
-            in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxOutputTokens, ctx.RequestAborted, samplingConfig, tools, enableThinking, skillPlan, skillLogger).ConfigureAwait(false))
+            in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxOutputTokens, ctx.RequestAborted, samplingConfig, tools, enableThinking, skillPlan, skillLogger, lora).ConfigureAwait(false))
         {
             knowledge.Observe(update);
             if (!update.Done)
@@ -446,7 +450,8 @@ public sealed class OpenAIResponsesAdapter
         bool store,
         SkillRequestPlan? skillPlan,
         ILogger skillLogger,
-        KnowledgeProtocolRequest knowledge)
+        KnowledgeProtocolRequest knowledge,
+        TextLoraAdapter? lora)
     {
         SseWriter.ApplyHeaders(ctx.Response);
 
@@ -511,7 +516,7 @@ public sealed class OpenAIResponsesAdapter
         }
 
         await foreach (var update
-            in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxOutputTokens, ctx.RequestAborted, samplingConfig, tools, enableThinking, skillPlan, skillLogger).ConfigureAwait(false))
+            in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxOutputTokens, ctx.RequestAborted, samplingConfig, tools, enableThinking, skillPlan, skillLogger, lora).ConfigureAwait(false))
         {
             knowledge.Observe(update);
             if (!update.Done)

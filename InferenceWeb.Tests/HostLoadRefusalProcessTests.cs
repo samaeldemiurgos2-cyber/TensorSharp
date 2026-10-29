@@ -97,6 +97,28 @@ public class HostLoadRefusalProcessTests : IDisposable
         Assert.DoesNotContain("Unhandled exception", run.Stdout + run.Stderr, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void BothHosts_NemotronMmprojMissingVisionTensors_IsRefusedAtLoad()
+    {
+        // A vision tower the encoder cannot run used to load, log "Nemotron multimodal warmup
+        // skipped" and fail every image request; it is now a load refusal naming the tensor.
+        string model = new NemotronSyntheticModelBuilder().Write(Path.Combine(_dir, "nemotron-tiny.gguf"));
+        string partial = new NemotronSyntheticMmprojBuilder { Omit = new[] { "mm.model.mlp.0.weight" } }
+            .Write(Path.Combine(_dir, "partial-projector.gguf"));
+        const string reason = "Missing 1 required tensor(s): mm.model.mlp.0.weight";
+
+        AssertRefused(RunCliWith(model, new[] { "--mmproj", partial }), reason);
+        AssertRefused(RunServerWith(model, new[] { "--mmproj", partial }), reason);
+
+        // Found beside the model for an --image request (the *mmproj*Nemotron*.gguf
+        // companion hint): this path had no refusal handler and left the CLI through an
+        // unhandled exception. The image is checked after the projector, so it need not exist.
+        File.Move(partial, Path.Combine(_dir, "mmproj-Nemotron-tiny.gguf"));
+        HostRun auto = RunCliWith(model, new[] { "--image", Path.Combine(_dir, "photo.png") });
+        AssertRefused(auto, reason);
+        Assert.DoesNotContain("Unhandled exception", auto.Stdout + auto.Stderr, StringComparison.Ordinal);
+    }
+
     public static IEnumerable<object[]> InvalidParallelismLines() => new[]
     {
         new object[] { new[] { "--layer-split" }, "--layer-split" },
@@ -104,8 +126,9 @@ public class HostLoadRefusalProcessTests : IDisposable
         new object[] { new[] { "--tp=two" }, "--tp" },
         new object[] { new[] { "--tp=2", "--layer-split=2" }, "cannot both" },
         new object[] { new[] { "--tp-node-id=0" }, "--tp-peers" },
-        new object[] { new[] { "--layer-split=2", "--tp-node-id=0",
-            "--tp-peers=127.0.0.1:9500,127.0.0.1:9501" }, "one node only" },
+        // Distributed layer split is valid; a node ID outside the peer list is not.
+        new object[] { new[] { "--layer-split=2", "--tp-node-id=2",
+            "--tp-peers=127.0.0.1:9500,127.0.0.1:9501" }, "must be less than the number of peers" },
     };
 
     [Theory]
@@ -181,6 +204,23 @@ public class HostLoadRefusalProcessTests : IDisposable
             Assert.DoesNotContain("waiting for rank", run.Stdout);
             Assert.DoesNotContain("Unhandled exception", run.Stderr);
         }
+    }
+
+    /// <summary>
+    /// An expert layout the direct-CUDA engine's kernels do not decode, under a layer split: each
+    /// device refused it inside the parallel upload, and the AggregateException of two refusals
+    /// aborted the CLI (Qwen3.8-Flash-Next UD-Q4_K_XL's Q5_1 down experts on two A40s, before the
+    /// engine took Q5_1). Now one refusal line naming the tensor, before any upload.
+    /// </summary>
+    [CudaFact]
+    public void Cli_DirectCudaExpertLayoutItCannotDecode_IsOneRefusalLine()
+    {
+        string model = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-q4_0-down.gguf"),
+            q4kxlExperts: true, expertDownType: SyntheticGguf.GgmlType.Q4_0);
+        HostRun run = RunCliWith(model, new[] { "--backend", "cuda", "--layer-split", "2" });
+
+        AssertRefused(run, "blk.0.ffn_down_exps.weight is Q4_0");
+        Assert.DoesNotContain("Unhandled exception", run.Stdout + run.Stderr, StringComparison.Ordinal);
     }
 
     [Theory]

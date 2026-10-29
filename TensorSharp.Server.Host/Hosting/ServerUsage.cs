@@ -373,15 +373,18 @@ namespace TensorSharp.Server.Host.Hosting
                     "its recipe is locked. Default: none (a PDD bundle's pdd_config.json is found next to its weights).",
                     "--lora-config config/lora/qwen-image-2.1-viggle-turbo.json"),
             }),
-            ("Text-LoRA adapters (chat models)", new[]
+            ("Text-model LoRA adapters (/v1/loras; the per-request \"lora\" field)", new[]
             {
-                new OptionHelp("--text-lora-dir <dir>",
-                    "The only directory POST /v1/loras may load text-LoRA adapters from; a request's \"path\" and \"config\" " +
-                    "are relative to it, and anything resolving outside it (.., an absolute path, a link) is refused. A loaded " +
-                    "adapter is selected per request with the \"lora\" field of /v1/chat/completions and /v1/responses; " +
-                    "requests under different adapters never share a forward pass, and a LoRA request reuses no cached " +
-                    "prefix. Also TS_TEXT_LORA_DIR. Default: none - runtime adapter loading is refused.",
-                    "--text-lora-dir /srv/loras"),
+                new OptionHelp("--loras-dir <dir>",
+                    "Directory of text-model LoRA adapters: llama.cpp GGUF adapters (.gguf, from convert_lora_to_gguf.py) " +
+                    "or .safetensors files whose tensors are named '<tensor>.lora_a' / '<tensor>.lora_b' after the base " +
+                    "GGUF's tensors. Every adapter at its top level is loaded at startup, after the model, under " +
+                    "its file name without the extension; one that does not load is logged and skipped. POST /v1/loras " +
+                    "may load more, but only files inside this directory, named relative to it, and at most 32 adapters " +
+                    "are held at once. Without it POST /v1/loras answers 403. A request selects an adapter with \"lora\"; " +
+                    "only nemotron_h, mistral3 and hunyuan-dense on a single device apply them. Keep the directory " +
+                    "writable only by the operator. Env: TS_LORAS_DIR. Default: none.",
+                    "--loras-dir /srv/loras"),
             }),
             ("Video-generation defaults and companion models", new[]
             {

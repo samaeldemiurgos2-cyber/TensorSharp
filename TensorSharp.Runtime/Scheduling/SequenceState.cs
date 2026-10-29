@@ -34,30 +34,28 @@ namespace TensorSharp.Runtime.Scheduling
             IReadOnlyList<int>? cacheBreakpoints = null,
             int sharedPrefixTokens = 0,
             string? cacheScope = null,
-            IReadOnlyList<int>? publicCheckpointBoundaries = null)
+            IReadOnlyList<int>? publicCheckpointBoundaries = null,
+            IRequestAdapter? adapter = null)
         {
             if (promptTokens == null) throw new ArgumentNullException(nameof(promptTokens));
             if (promptTokens.Count == 0) throw new ArgumentException("Prompt must be non-empty.", nameof(promptTokens));
             if (maxNewTokens <= 0) throw new ArgumentOutOfRangeException(nameof(maxNewTokens));
 
-            // K/V computed under a LoRA adapter is not the base model's, and the base
-            // model's is not the adapter's. Every reuse path (radix pages, retained holders,
-            // checkpoints, the live cache) is keyed by tokens and conversation scope only, so
-            // a LoRA sequence takes the explicit no-cache policy: an empty breakpoint list
-            // (no prefix is matched, captured, retained or continued, and the live cache it
-            // leaves behind is not continued by the next request) and no public prefix.
-            LoraAdapter = samplingConfig?.LoraAdapter;
-            if (LoraAdapter != null)
+            Sn = Interlocked.Increment(ref _counter);
+            RequestId = requestId ?? $"seq-{Sn:X}";
+            BlockTable = new BlockTable(blockSize);
+            PromptTokens = new List<int>(promptTokens);
+            Adapter = adapter;
+            // State computed under an adapter is not the base model's, and the radix keys
+            // are tokens only: an adapter sequence neither reads nor publishes anything
+            // another request can see. The explicit empty-breakpoint policy is the existing
+            // "no cross-request cache" contract every reuse path already honours.
+            if (adapter != null)
             {
                 cacheBreakpoints = Array.Empty<int>();
                 sharedPrefixTokens = 0;
                 publicCheckpointBoundaries = null;
             }
-
-            Sn = Interlocked.Increment(ref _counter);
-            RequestId = requestId ?? $"seq-{Sn:X}";
-            BlockTable = new BlockTable(blockSize);
-            PromptTokens = new List<int>(promptTokens);
             // Snapshot rather than alias, exactly as PromptTokens does above. The
             // caller builds this as a mutable List and edits it in place while
             // truncating the prompt; keeping the reference would let a later edit
@@ -126,6 +124,15 @@ namespace TensorSharp.Runtime.Scheduling
                 if (boundary == length) return true;
             return false;
         }
+
+        /// <summary>
+        /// The request adapter (a text LoRA) this sequence runs with, or null for the base
+        /// model. Fixed for the sequence's life. The scheduler never runs sequences of two
+        /// adapters in one step, and a sequence with an adapter is cache-isolated: its
+        /// <see cref="CacheBreakpoints"/> is the explicit empty list, so it neither reuses
+        /// nor publishes prefix-cache state, live-cache continuations or checkpoints.
+        /// </summary>
+        public IRequestAdapter? Adapter { get; }
 
         /// <summary>Set once the executor has taken (or found) a checkpoint for this
         /// sequence's shared prefix, so the prefill stops aligning to it.</summary>
@@ -221,20 +228,6 @@ namespace TensorSharp.Runtime.Scheduling
         /// want continuation reuse pass a stable conversation scope.
         /// </summary>
         public string? CacheScope { get; }
-
-        /// <summary>The text-LoRA adapter this sequence runs under
-        /// (<see cref="SamplingConfig.LoraAdapter"/>), or null for the base model. The
-        /// scheduler only puts sequences with the same adapter in one step, and the engine
-        /// activates it around that step's forward.</summary>
-        public ILoraAdapterHandle? LoraAdapter { get; }
-
-        /// <summary>Adapter targets applied by the forwards this sequence took part in, until
-        /// its first token proves every target was applied (<see cref="LoraTargetsVerified"/>).</summary>
-        internal HashSet<string>? LoraTargetsApplied { get; set; }
-
-        /// <summary>Set once the engine has checked, at this sequence's first sampled token,
-        /// that its prompt ran with every target of <see cref="LoraAdapter"/> applied.</summary>
-        internal bool LoraTargetsVerified { get; set; }
 
         public SequenceStatus Status { get; internal set; }
         public DateTime SubmittedAt { get; }

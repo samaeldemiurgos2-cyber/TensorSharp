@@ -509,6 +509,10 @@ and the final applied-source receipt
 (`docs/validation/muse-spark/final-applied-source/receipt.json`) (local
 validation evidence, not committed).
 Full-model inference and timing were not rerun on the repaired library.
+Paged-attention sessions have since moved to a process-wide registry
+(`ThreadCacheRegistry` in `ggml_ops_internal.h`): a model unload and
+`TSGgml_Shutdown` free every thread's sessions, and a thread that exits hands
+its sessions over instead of freeing them during its exit.
 
 ## Launching the sharded model
 

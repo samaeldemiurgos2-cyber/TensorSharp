@@ -99,10 +99,8 @@ namespace TensorSharp.Cli
             string selectedBackend = SelectedBackend(args);
             AppDomain.CurrentDomain.ProcessExit += (_, _) => ShutdownGgmlIfUsed(selectedBackend);
 
-            try
+            RunToExit(() => MainCore(args), () =>
             {
-                MainCore(args);
-                _log.LogInformation(LogEventIds.CliCompleted, "tensorsharp-cli completed exitCode={ExitCode}", Environment.ExitCode);
                 ShutdownGgmlIfUsed(selectedBackend);
 
                 // ggml-vulkan on Linux: the NVIDIA driver's worker threads
@@ -119,6 +117,26 @@ namespace TensorSharp.Cli
                     Console.Error.Flush();
                     LibcExit(Environment.ExitCode);
                 }
+            });
+        }
+
+        /// <summary>
+        /// Run <paramref name="mainCore"/>, then leave through <paramref name="leave"/> (the
+        /// ordered GGML shutdown, and <c>_exit</c> past the C++ static destructors on Linux
+        /// ggml-vulkan) on every exit the CLI handles: a normal return, including the refusals
+        /// that only set the exit code, and the operator's mistakes reported as one
+        /// "Configuration error:" line with exit code 1. Only a normal return used to leave
+        /// that way, so a prompt refused for MAX_CONTEXT after a Vulkan run went through the
+        /// destructors, and its exit code 1 could become a segfault. An unexpected failure is
+        /// rethrown with its stack trace. The code workspace is released before leaving:
+        /// <c>_exit</c> skips any finally block still pending.
+        /// </summary>
+        internal static void RunToExit(Action mainCore, Action leave)
+        {
+            try
+            {
+                mainCore();
+                _log.LogInformation(LogEventIds.CliCompleted, "tensorsharp-cli completed exitCode={ExitCode}", Environment.ExitCode);
             }
             catch (ArgumentException ex)
             {
@@ -127,6 +145,17 @@ namespace TensorSharp.Cli
                 // buries the one line they need. The full exception still goes
                 // to the log for the rare deep ArgumentException.
                 _log.LogError(LogEventIds.CliFailed, ex, "cli.invalid-arguments {Error}", ex.Message);
+                Console.Error.WriteLine("Configuration error: " + ex.Message);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+            }
+            catch (ContextLengthExceededException ex)
+            {
+                // A prompt that does not fit MAX_CONTEXT is the operator's to fix - a
+                // shorter input or a larger window - exactly like a bad flag. It used to
+                // end the run as an unhandled exception (a stack trace and SIGABRT, 134)
+                // when, for example, a skill file read in one round grew the next round's
+                // prompt past the window.
+                _log.LogError(LogEventIds.CliFailed, ex, "cli.context-exceeded {Error}", ex.Message);
                 Console.Error.WriteLine("Configuration error: " + ex.Message);
                 Environment.ExitCode = HostExitCodes.ConfigurationError;
             }
@@ -147,11 +176,12 @@ namespace TensorSharp.Cli
                 // which outlives this.
                 ReleaseCodeWorkspace();
             }
+            leave();
         }
 
         /// <summary>
         /// This process's code-execution workspace, held statically so
-        /// <see cref="Main"/> can release it on every exit path.
+        /// <see cref="RunToExit"/> can release it on every exit path.
         /// </summary>
         private static SessionWorkspaceManager _codeWorkspaces;
         private static SessionWorkspace _codeWorkspace;
@@ -1072,11 +1102,7 @@ namespace TensorSharp.Cli
                 }
                 catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string projectorRefusal))
                 {
-                    _log.LogError(LogEventIds.ModelLoadFailed,
-                        "Projector load refused: {MmProj}: {Reason}", mmProjPath, projectorRefusal);
-                    _log.LogDebug(LogEventIds.ModelLoadFailed, ex, "Projector load refused: {MmProj}", mmProjPath);
-                    Console.Error.WriteLine(ModelLoadRefusal.FormatErrorLine(projectorRefusal));
-                    Environment.ExitCode = HostExitCodes.ModelLoadRefused;
+                    ReportProjectorRefusal(ex, mmProjPath, projectorRefusal);
                     return;
                 }
             }
@@ -1095,7 +1121,18 @@ namespace TensorSharp.Cli
                 {
                     _log.LogInformation(LogEventIds.HostConfiguration,
                         "Auto-loading multimodal encoder: {MmProj}", autoMmproj);
-                    model.MultimodalInjector.LoadProjectors(autoMmproj);
+                    // Refused like a named --mmproj: encoders validate their tensors at load
+                    // (a partial Nemotron mmproj throws InvalidDataException), which used to
+                    // leave this path through an unhandled exception.
+                    try
+                    {
+                        model.MultimodalInjector.LoadProjectors(autoMmproj);
+                    }
+                    catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string projectorRefusal))
+                    {
+                        ReportProjectorRefusal(ex, autoMmproj, projectorRefusal);
+                        return;
+                    }
                 }
             }
 
@@ -1468,7 +1505,10 @@ namespace TensorSharp.Cli
                         if (codeRunner != null)
                             tools = AppendCodeTool(tools, codeRunner, codeWorkspace);
 
-                        skillToolContext = new SkillToolContext(new List<Skill>(skillPlan.Reachable))
+                        // The server's per-read ceiling for this window: a quarter of it, so
+                        // one skills_read cannot take the whole context of a small model.
+                        skillToolContext = new SkillToolContext(new List<Skill>(skillPlan.Reachable),
+                            TensorSharp.Server.Skills.SkillRequestPlan.ReadCapFor(model.MaxContextLength))
                         {
                             Marketplace = marketplace,
                             ScriptRunner = skillScriptsAllowed
@@ -2013,6 +2053,19 @@ namespace TensorSharp.Cli
             => string.Equals(mmProjArg, NoProjector, StringComparison.OrdinalIgnoreCase);
 
         /// <summary>
+        /// Report a refused projector load the way a refused model load is reported: the
+        /// reason on one stderr line and <see cref="HostExitCodes.ModelLoadRefused"/>.
+        /// </summary>
+        private static void ReportProjectorRefusal(Exception ex, string projectorPath, string reason)
+        {
+            _log.LogError(LogEventIds.ModelLoadFailed,
+                "Projector load refused: {MmProj}: {Reason}", projectorPath, reason);
+            _log.LogDebug(LogEventIds.ModelLoadFailed, ex, "Projector load refused: {MmProj}", projectorPath);
+            Console.Error.WriteLine(ModelLoadRefusal.FormatErrorLine(reason));
+            Environment.ExitCode = HostExitCodes.ModelLoadRefused;
+        }
+
+        /// <summary>
         /// Whether to look for the model's companion projector when no <c>--mmproj</c> was
         /// named: never after <c>--mmproj none</c>, and otherwise when an input needs an
         /// encoder the model declares. A video's frames go to the VISION encoder (and its
@@ -2444,7 +2497,8 @@ namespace TensorSharp.Cli
             var priorTurns = new List<ChatMessage>();
             string result = string.Empty;
 
-            for (int round = 1; round <= Math.Max(1, maxRounds); round++)
+            int rounds = Math.Max(1, maxRounds);
+            for (int round = 1; round <= rounds; round++)
             {
                 ParsedOutput parsed = null;
                 List<int> rawTokens = null;
@@ -2480,14 +2534,14 @@ namespace TensorSharp.Cli
                     RawPromptTrailingWhitespace = rawTrailingWhitespace,
                 });
 
+                var roundResults = new List<(string Content, string Tool)>();
                 foreach (var call in unknownCalls)
                 {
                     _log.LogWarning(LogEventIds.SkillToolInvoked,
                         "cli.skills.tool round={Round} tool={Tool} skill={SkillId} path={Path} ok={Ok} bytes={Bytes}",
                         round, call.Name ?? "-", "-", "-", false, 0);
                     Console.Error.WriteLine($"[tool call] {call.Name} (no such tool)");
-                    priorTurns.Add(BuildSkillResultMessage(
-                        toolResultsRendered,
+                    roundResults.Add((
                         SkillTools.DescribeUnknownTool(
                             call.Name,
                             tools,
@@ -2505,22 +2559,145 @@ namespace TensorSharp.Cli
                     Console.Error.WriteLine(
                         $"[skill] {call.Name} {toolResult.SkillId ?? "?"} {toolResult.ResourcePath ?? string.Empty}"
                         + (toolResult.Ok ? string.Empty : " (failed)"));
-                    priorTurns.Add(BuildSkillResultMessage(toolResultsRendered, toolResult.Content, call.Name));
+                    roundResults.Add((toolResult.Content, call.Name));
                 }
 
+                // The last round's results are followed by the note that ends the loop, and
+                // are fitted with it: added after the fit, it could push the final prompt
+                // past the window.
+                AddSkillResultsWithinContext(model, rawText, imagePaths, audioPaths, isVideo, systemPrompt,
+                    priorTurns, roundResults, tools, enableThinking, maxTokens, toolResultsRendered, round,
+                    SkillRoundTrailingNote(round, rounds, toolResultsRendered));
             }
 
             _log.LogWarning(LogEventIds.SkillLoopCapped,
                 "cli.skills.loop.capped rounds={Rounds}", maxRounds);
-            priorTurns.Add(BuildSkillResultMessage(toolResultsRendered,
-                "Error: the limit on skill lookups for this turn has been reached. Answer now using what you "
-                + "have already read, and say which part you could not check.", null));
             return RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
                 isVideo: isVideo, samplingConfig: samplingConfig,
                 enableThinking: enableThinking, tools: tools,
                 preserveAllInput: preserveAllInput,
                 specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
                 systemPrompt: systemPrompt, priorTurns: priorTurns, inference: inference);
+        }
+
+        /// <summary>The note that ends the skills loop, placed after the last round's results
+        /// so it is fitted with them; null on every earlier round.</summary>
+        internal static ChatMessage SkillRoundTrailingNote(int round, int rounds, bool toolResultsRendered) =>
+            round == rounds
+                ? BuildSkillResultMessage(toolResultsRendered,
+                    "Error: the limit on skill lookups for this turn has been reached. Answer now using what you "
+                    + "have already read, and say which part you could not check.", null)
+                : null;
+
+        /// <summary>
+        /// Append one round's tool results to <paramref name="priorTurns"/>, shortened where
+        /// the next round's prompt would otherwise leave less than the reply's share of the
+        /// context window (<see cref="TensorSharp.Server.Skills.ToolResultContextBudget"/>).
+        /// A 20 KB SKILL.md read by a model with MAX_CONTEXT=4096 made the next prompt 6,418
+        /// tokens and aborted the run; each result now keeps what fits and says what was cut.
+        /// The limit is <see cref="SkillRoundPromptLimit"/>. <paramref name="trailing"/>, when
+        /// set, follows the results and is counted with them.
+        /// </summary>
+        internal static void AddSkillResultsWithinContext(
+            ModelBase model, string rawText, List<string> imagePaths, List<string> audioPaths, bool isVideo,
+            string systemPrompt, List<ChatMessage> priorTurns, List<(string Content, string Tool)> results,
+            List<ToolFunction> tools, bool enableThinking, int maxTokens, bool toolResultsRendered, int round,
+            ChatMessage trailing = null)
+        {
+            int firstResult = priorTurns.Count;
+            void Place(IReadOnlyList<string> contents)
+            {
+                priorTurns.RemoveRange(firstResult, priorTurns.Count - firstResult);
+                for (int i = 0; i < results.Count; i++)
+                    priorTurns.Add(BuildSkillResultMessage(toolResultsRendered, contents[i], results[i].Tool));
+                if (trailing != null)
+                    priorTurns.Add(trailing);
+            }
+
+            var contents = results.Select(r => r.Content ?? string.Empty).ToList();
+            int context = model.MaxContextLength;
+            if (context <= 1 || results.Count == 0)
+            {
+                Place(contents);
+                return;
+            }
+
+            var renderer = new KVCachePromptRenderer(PromptRenderer);
+            List<int> Render(List<ChatMessage> messages) => renderer.RenderToTokens(
+                model.Tokenizer, model.Config.ChatTemplate, messages,
+                model.Config.Architecture, addGenerationPrompt: true,
+                tools: tools, enableThinking: enableThinking);
+            List<ChatMessage> NextRound() =>
+                BuildInferenceMessages(systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns);
+
+            int promptLimit = SkillRoundPromptLimit(model, maxTokens, NextRound(), Render);
+            IReadOnlyList<string> fitted = TensorSharp.Server.Skills.ToolResultContextBudget.Fit(
+                contents, promptLimit, context,
+                candidate =>
+                {
+                    Place(candidate);
+                    return Render(NextRound()).Count;
+                },
+                out bool truncated);
+            Place(fitted);
+            if (truncated)
+            {
+                _log.LogWarning(LogEventIds.PromptTruncated,
+                    "cli.skills.results.truncated round={Round} results={Results} bytes={Bytes} keptBytes={KeptBytes} promptLimit={PromptLimit} contextLimit={ContextLimit}",
+                    round, results.Count, contents.Sum(c => c.Length), fitted.Sum(c => c.Length), promptLimit, context);
+                Console.Error.WriteLine(
+                    $"[skill] result shortened to fit the {context}-token context window (MAX_CONTEXT)");
+            }
+        }
+
+        /// <summary>
+        /// The longest prompt a skills round's <paramref name="render"/> may produce: the context
+        /// window less the reply's share (the server's <c>HistoryCompactionReserve</c>: the
+        /// requested reply, at most a quarter of the window) and less the rows the prefill adds
+        /// for the media <paramref name="messages"/> carry. The template writes one placeholder
+        /// per picture, clip or video frame and the multimodal injector grows each to its
+        /// encoder's rows - hundreds for one Qwen-VL photo - so a limit on the rendered prompt
+        /// alone let a round with an image fit its results to the window and still be refused.
+        /// Measured once per round with a throwaway preparation: the rows do not depend on the
+        /// results, and the encodes come from the cache the round's own prefill filled.
+        /// </summary>
+        internal static int SkillRoundPromptLimit(ModelBase model, int maxTokens, List<ChatMessage> messages,
+            Func<List<ChatMessage>, List<int>> render)
+        {
+            int context = model.MaxContextLength;
+            int limit = context - TensorSharp.Server.ChatGenerationPipeline.HistoryCompactionReserve(
+                Math.Max(1, maxTokens), context);
+            if (!messages.Any(m => m?.ImagePaths is { Count: > 0 } || m?.AudioPaths is { Count: > 0 }))
+                return limit;
+
+            List<int> rendered = render(messages);
+            string requestId = $"cli-measure-{Guid.NewGuid():N}";
+            try
+            {
+                int expanded = model.MultimodalInjector.ProcessPromptTokens(
+                    messages, new List<int>(rendered), requestId).Count;
+                // At least 1: Fit reads zero or less as no limit at all, and media that fill the
+                // window on their own still leave the results nothing but their shortest form.
+                return Math.Max(1, limit - Math.Max(0, expanded - rendered.Count));
+            }
+            finally
+            {
+                model.MultimodalInjector.ClearPreparedPromptState(requestId);
+            }
+        }
+
+        /// <summary>The messages one single-shot round renders: the system turn, the user's
+        /// request, and the assistant/tool exchanges earlier rounds produced.</summary>
+        static List<ChatMessage> BuildInferenceMessages(string systemPrompt, string rawText,
+            List<string> imagePaths, List<string> audioPaths, bool isVideo, List<ChatMessage> priorTurns)
+        {
+            var messages = new List<ChatMessage>();
+            if (!string.IsNullOrWhiteSpace(systemPrompt))
+                messages.Add(new ChatMessage { Role = "system", Content = systemPrompt });
+            messages.Add(new ChatMessage { Role = "user", Content = rawText, ImagePaths = imagePaths, AudioPaths = audioPaths, IsVideo = isVideo });
+            if (priorTurns != null)
+                messages.AddRange(priorTurns);
+            return messages;
         }
 
         /// <summary>
@@ -2561,12 +2738,7 @@ namespace TensorSharp.Cli
             Action<ParsedOutput> onParsed = null, CliInferenceSession inference = null,
             Action<List<int>, string> onGenerated = null)
         {
-            var messages = new List<ChatMessage>();
-            if (!string.IsNullOrWhiteSpace(systemPrompt))
-                messages.Add(new ChatMessage { Role = "system", Content = systemPrompt });
-            messages.Add(new ChatMessage { Role = "user", Content = rawText, ImagePaths = imagePaths, AudioPaths = audioPaths, IsVideo = isVideo });
-            if (priorTurns != null)
-                messages.AddRange(priorTurns);
+            var messages = BuildInferenceMessages(systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns);
 
             var inputTokens = new KVCachePromptRenderer(PromptRenderer).RenderToTokens(
                 model.Tokenizer, model.Config.ChatTemplate, messages, model.Config.Architecture,
@@ -2592,7 +2764,7 @@ namespace TensorSharp.Cli
                 inputTokens = model.MultimodalInjector.ProcessPromptTokens(messages, inputTokens, requestId);
                 if (preserveAllInput && model.MaxContextLength > 0
                     && (long)inputTokens.Count + maxTokens > model.MaxContextLength)
-                    throw new InvalidOperationException(
+                    throw new ContextLengthExceededException(inputTokens.Count, model.MaxContextLength,
                         $"The complete PDF requires {inputTokens.Count} prompt tokens plus a " +
                         $"{maxTokens}-token generation reserve, but the loaded model supports " +
                         $"{model.MaxContextLength} context tokens. No document content was truncated. " +

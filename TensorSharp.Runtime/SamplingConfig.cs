@@ -150,16 +150,6 @@ namespace TensorSharp.Runtime
         public string? ReasoningEffort { get; set; }
 
         /// <summary>
-        /// The text-LoRA adapter this request runs under, or null for the base model. Like
-        /// <see cref="ReasoningEffort"/> it rides here because the sampling config is the one
-        /// per-request object every generation entry point carries to the sequence. The
-        /// engine reads it from <see cref="Scheduling.SequenceState.LoraAdapter"/>: sequences
-        /// under different adapters never share a forward, and a LoRA sequence neither
-        /// reuses nor publishes any cached prefix. The handle is immutable, so clones share it.
-        /// </summary>
-        public ILoraAdapterHandle? LoraAdapter { get; set; }
-
-        /// <summary>
         /// Returns true if this config is effectively greedy decoding.
         /// </summary>
         public bool IsGreedy => Temperature <= 0f && TopK <= 0 && TopP >= 1.0f && MinP <= 0f;
@@ -278,7 +268,6 @@ namespace TensorSharp.Runtime
                 ThinkingBudget = ThinkingBudget,
                 MessageThinkingBudget = MessageThinkingBudget,
                 ReasoningEffort = ReasoningEffort,
-                LoraAdapter = LoraAdapter,
             };
         }
     }

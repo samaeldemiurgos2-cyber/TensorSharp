@@ -269,6 +269,11 @@ namespace TensorSharp.Server
         /// -- the one the message's own "(Attached as file ...)" note gives -- not by the
         /// user's display name, which two photos can share.</summary>
         public IReadOnlyDictionary<string, string> StagedAttachmentNames { get; set; }
+
+        /// <summary>The LoRA adapter the request resolved (<c>ModelService.TryResolveLora</c>),
+        /// or null for the base model. Every generation of the turn, including skill-loop
+        /// rounds and sub-agents, runs with it; it never affects another request.</summary>
+        public TextLoraAdapter Adapter { get; set; }
     }
 
     internal sealed class ChatGenerationPipeline : IDisposable
@@ -353,6 +358,11 @@ namespace TensorSharp.Server
             // directly for a live denoising preview.
             if (model is DiffusionGemmaModel)
             {
+                // Denoising runs outside the engine, where no adapter is ever selected: a
+                // LoRA request would silently get the base model's answer.
+                if (turnContext?.Adapter != null)
+                    throw new NotSupportedException(
+                        "The loaded model generates by block diffusion, which does not apply LoRA adapters.");
                 await foreach (var u in DiffusionChatStreamAsync(session, history, maxTokens, cancellationToken, enableThinking, samplingConfig)
                     .ConfigureAwait(false))
                 {
@@ -668,7 +678,8 @@ namespace TensorSharp.Server
                 cacheBreakpoints: explicitBreakpoints,
                 sharedPrefixTokens: sharedPrefixTokens,
                 cacheScope: cacheScope,
-                publicCheckpointBoundaries: publicCheckpointBoundaries);
+                publicCheckpointBoundaries: publicCheckpointBoundaries,
+                adapter: turnContext.Adapter);
 
             bool announceSuffix = AnnouncesGenerationSuffix(arch, model.Config.ChatTemplate, recordedSuffix, cfg);
             if (announceSuffix)

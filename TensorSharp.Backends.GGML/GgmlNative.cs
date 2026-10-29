@@ -6988,8 +6988,9 @@ internal enum GgmlIndexReductionOp
 
         /// <summary>
         /// Drain any GPU work that was deferred under async compute. Cheap when no
-        /// work is pending (single atomic exchange on the C++ side); when work is
-        /// pending it does one ggml_backend_synchronize on the Metal command queue.
+        /// work is pending (two atomic loads and no write on the C++ side); when work
+        /// is pending it does one ggml_backend_synchronize on the Metal command queue,
+        /// or waits for the one another thread is already running.
         /// </summary>
         public static void HostReadBarrier()
         {

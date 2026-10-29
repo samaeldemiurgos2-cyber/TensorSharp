@@ -35,6 +35,7 @@ public class ServerOptionsBuilderTests : IDisposable
         // The companion pass runs the LoRA preflight over an inherited TS_LORAS when the
         // command line names no plug-in, so a developer shell's TS_LORAS must not reach it.
         _env.Set(TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable, null);
+        _env.Set(TextLoraHostOptions.EnvironmentVariable, null);
         // Build needs a writable base directory because it creates an
         // "uploads" folder under it. Use a temp dir per test instance to keep
         // the workspace clean.
@@ -374,6 +375,7 @@ public class ServerOptionsBuilderTests : IDisposable
             "--skill", "--list-skills",
             "--code-exec", "--code-exec-allow-install", "--code-exec-install-domains",
             "--code-exec-timeout", "--code-exec-shell", "--code-exec-max-output",
+            "--loras-dir",
             "--config",
             "--help",
         };
@@ -417,6 +419,7 @@ public class ServerOptionsBuilderTests : IDisposable
             SkillHostOptions.DisableFlag, SkillHostOptions.NoDiscoveryFlag,
             SkillHostOptions.AllowScriptsFlag, SkillHostOptions.MaxRoundsFlag,
             SkillHostOptions.SandboxFlag, SkillHostOptions.AllowNetworkFlag,
+            TextLoraHostOptions.DirectoryFlag,
         };
         accepted.AddRange(SpeculativeCliFlags.SwitchFlags);
         accepted.AddRange(SpeculativeCliFlags.ValueFlags);
@@ -432,6 +435,109 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.True(missing.Count == 0,
             "The server accepts these flags but --help never mentions them:\n  "
             + string.Join("\n  ", missing));
+    }
+
+    // ---- text-LoRA directory (--loras-dir / TS_LORAS_DIR) ----
+
+    [Theory]
+    [InlineData("--loras-dir", false)]
+    [InlineData("--loras-dir", true)]
+    [InlineData("--LORAS-DIR", false)]
+    public void Build_LorasDir_ResolvesToTheCanonicalDirectory(string flag, bool joined)
+    {
+        string dir = Path.Combine(_baseDir, "loras");
+        Directory.CreateDirectory(dir);
+        string given = dir + Path.DirectorySeparatorChar;
+        string[] args = joined ? new[] { flag + "=" + given } : new[] { flag, given };
+
+        Assert.Equal(dir, ServerOptionsBuilder.Build(args, _baseDir).LoraDirectory);
+    }
+
+    [Fact]
+    public void Build_LorasDir_LastOccurrenceWins()
+    {
+        string first = Directory.CreateDirectory(Path.Combine(_baseDir, "first")).FullName;
+        string second = Directory.CreateDirectory(Path.Combine(_baseDir, "second")).FullName;
+
+        var options = ServerOptionsBuilder.Build(new[] { "--loras-dir", first, "--loras-dir", second }, _baseDir);
+
+        Assert.Equal(second, options.LoraDirectory);
+    }
+
+    [Fact]
+    public void Build_LorasDir_UnsetIsNull_AndAnEmptyVariableMeansUnset()
+    {
+        Assert.Null(ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir).LoraDirectory);
+        _env.Set(TextLoraHostOptions.EnvironmentVariable, "");
+        Assert.Null(ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir).LoraDirectory);
+    }
+
+    [Fact]
+    public void Build_LorasDir_ThatIsNotAnExistingDirectory_IsAStartupErrorNamingTheFlag()
+    {
+        string file = Path.Combine(_baseDir, "adapter.safetensors");
+        File.WriteAllBytes(file, new byte[] { 1 });
+        foreach (string value in new[] { Path.Combine(_baseDir, "missing"), file, "" })
+        {
+            var ex = Assert.Throws<ArgumentException>(() => ServerOptionsBuilder.Build(new[] { "--loras-dir", value }, _baseDir));
+            Assert.StartsWith("Invalid value for --loras-dir:", ex.Message);
+            Assert.Contains("is not an existing directory", ex.Message);
+        }
+    }
+
+    [Fact]
+    public void Build_LorasDirEnv_IsUsedWhenTheFlagIsAbsent_AndTheFlagWins()
+    {
+        string fromEnv = Directory.CreateDirectory(Path.Combine(_baseDir, "env")).FullName;
+        string fromFlag = Directory.CreateDirectory(Path.Combine(_baseDir, "flag")).FullName;
+        _env.Set(TextLoraHostOptions.EnvironmentVariable, fromEnv);
+
+        Assert.Equal(fromEnv, ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir).LoraDirectory);
+        Assert.Equal(fromFlag, ServerOptionsBuilder.Build(new[] { "--loras-dir", fromFlag }, _baseDir).LoraDirectory);
+
+        // The flag wins outright: a stale variable is not even checked.
+        _env.Set(TextLoraHostOptions.EnvironmentVariable, Path.Combine(_baseDir, "gone"));
+        Assert.Equal(fromFlag, ServerOptionsBuilder.Build(new[] { "--loras-dir", fromFlag }, _baseDir).LoraDirectory);
+        var ex = Assert.Throws<ArgumentException>(() => ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir));
+        Assert.StartsWith("Invalid value for TS_LORAS_DIR:", ex.Message);
+    }
+
+    [Fact]
+    public void Build_LorasDir_DoesNotApplyToAnEmbeddingServer()
+    {
+        string dir = Directory.CreateDirectory(Path.Combine(_baseDir, "loras")).FullName;
+        string model = Path.Combine(_baseDir, "encoder.gguf");
+
+        var ex = Assert.Throws<ArgumentException>(() => ServerOptionsBuilder.Build(
+            new[] { "--model", model, "--embeddings", "--backend", "cpu", "--no-skills", "--loras-dir", dir }, _baseDir));
+        Assert.Contains("--loras-dir does not apply to --embeddings", ex.Message);
+
+        // A deployment-wide variable is ignored there rather than refusing to start.
+        _env.Set(TextLoraHostOptions.EnvironmentVariable, dir);
+        Assert.Null(ServerOptionsBuilder.Build(
+            new[] { "--model", model, "--embeddings", "--backend", "cpu", "--no-skills" }, _baseDir).LoraDirectory);
+    }
+
+    [Theory]
+    [InlineData("--lora-dir")]
+    [InlineData("--loras-dirs")]
+    [InlineData("--lorasdir")]
+    public void Build_LorasDirTypo_SuggestsTheFlag(string typo)
+    {
+        var ex = Assert.Throws<ArgumentException>(() => ServerOptionsBuilder.Build(new[] { typo, _baseDir }, _baseDir));
+        Assert.Contains("Did you mean '--loras-dir'", ex.Message);
+    }
+
+    [Fact]
+    public void LorasDir_IsNotOneOfTheImagePluginLoraFlags()
+    {
+        // --lora / --lora-scale / --lora-config are the Qwen-Image-2.1 / MiniMax-H3 plug-in
+        // flags, pinned by LoraCliFlagsTests and refused for text models; the directory flag
+        // must neither join that table nor be mistaken for one of its spellings.
+        Assert.DoesNotContain(TextLoraHostOptions.DirectoryFlag, TensorSharp.Runtime.LoraCliFlags.Flags);
+        Assert.False(TensorSharp.Runtime.LoraCliFlags.IsLoraFlag(TextLoraHostOptions.DirectoryFlag));
+        Assert.False(TensorSharp.Runtime.LoraCliFlags.IsLoraFlag(TextLoraHostOptions.DirectoryFlag + "=/srv/loras"));
+        Assert.Empty(TensorSharp.Runtime.LoraCliFlags.Parse(new[] { TextLoraHostOptions.DirectoryFlag, _baseDir }));
     }
 
     // ---- video companion flags ----

@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
 using TensorSharp.Runtime.Paged;
 
 namespace TensorSharp.Runtime.Scheduling.PrefixCache;
@@ -22,6 +23,53 @@ internal sealed partial class PrefixCacheCoordinator
         public int UsedTokens(KvBlock block) => block.Used;
         public int RefCount(KvBlock block) => block.RefCount;
         public long SnapshotByteLength(KvBlock block) => pool.Storage.SlabLength(block.Id);
+    }
+
+    /// <summary>
+    /// Whether this family's only reuse across requests - its pages - is written by a lone
+    /// forward alone. A recurrent page is a restore point only where a per-sequence Forward
+    /// ended (<see cref="PrefixCacheCapabilities.PagesNeedStateAtEnd"/>), and a step that runs
+    /// two prompts takes the batched route, whose model-paged rows carry no recurrent state
+    /// (Nemotron-H): requests that arrive together and share a prompt prefix then each forward
+    /// all of it, and no page of it is ever kept. The scheduler holds such requests back for the
+    /// step in which one of them forwards the prefix alone and publishes it (its lone page
+    /// producer). A family with public checkpoints, or whose batched route writes pages, never
+    /// needs the hold.
+    /// </summary>
+    internal bool PagesNeedLoneForward
+        => SharedPrefixOnlyInStatePages
+           && !ExecutionOptions.FromEnvironment().BatchedPathDisabled
+           && _model is IBatchedPagedModel { BatchedForwardAvailable: true, SupportsLinearKVMigration: true };
+
+    /// <summary>
+    /// Whether this family keeps a prefix across requests only as pages that resume where a
+    /// forward ended (<see cref="PrefixCacheCapabilities.PagesNeedStateAtEnd"/>): no public
+    /// checkpoint holds its shared prefix, so only a page whose forward ended there can.
+    /// </summary>
+    private bool SharedPrefixOnlyInStatePages
+        => _tree.Caps.Pages is PageSupport.A1HostSlab or PageSupport.Both
+           && _tree.Caps.PagesNeedStateAtEnd
+           && _scheduler.PrefixCacheConfigured
+           && !PublicCheckpointsSupported
+           && _model.SupportsKVStateSnapshot && _model.SupportsCrossSequenceKvReuse;
+
+    /// <summary>
+    /// Where a prefill round of <paramref name="sequence"/> must end for its page at the shared
+    /// prefix to be a restore point: <see cref="SequenceState.SharedPrefixTokens"/>, block-aligned,
+    /// on a family that keeps the prefix only as such pages (<see cref="SharedPrefixOnlyInStatePages"/>).
+    /// 0 for none: a family with public checkpoints aligns to them instead
+    /// (<c>ContinuousBatchScheduler.AlignSharedPrefixBoundary</c>), and a boundary past the request's
+    /// cache breakpoints, the page window or a media span the pages cannot cross publishes no page.
+    /// </summary>
+    internal int SharedPrefixPageBoundary(SequenceState sequence)
+    {
+        int boundary = sequence.SharedPrefixTokens - sequence.SharedPrefixTokens % _pool.BlockSize;
+        if (boundary <= 0 || !SharedPrefixOnlyInStatePages
+            || (sequence.CacheBreakpoints != null && boundary > sequence.CacheBreakpointLimit)
+            || !_tree.Rules.PageInWindow(boundary))
+            return 0;
+        return PromptMediaSpans.ClampReusablePrefix(boundary, sequence.MediaSpans, sequence.MediaSpans,
+            _tree.Caps.ReuseAcrossMediaSpan) == boundary ? boundary : 0;
     }
 
     internal void CapturePages(SequenceState seq)
@@ -69,7 +117,13 @@ internal sealed partial class PrefixCacheCoordinator
         {
             while (pages.Count > 0 && (pages[^1].PageIndex + 1) * blockSize > node.Depth)
                 pages.RemoveAt(pages.Count - 1);
+            long upgraded = _tree.Counters.PagesUpgraded;
             _tree.AttachPages(node, CollectionsMarshal.AsSpan(pages));
+            if (_tree.Counters.PagesUpgraded > upgraded)
+                _logger.LogInformation(
+                    "Prefix cache: {RequestId}'s restore point replaced {Count} cached page(s) of the same tokens " +
+                    "that held no recurrent state; requests sharing that prefix resume from it now.",
+                    seq.RequestId, _tree.Counters.PagesUpgraded - upgraded);
         }
         finally
         {

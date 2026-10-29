@@ -19,7 +19,9 @@ spec.loader.exec_module(logits)
 
 
 def compare(reference_path, candidate_path, *, max_absolute_error, max_rmse,
-            min_cosine, max_relative_l2, require_same_argmax=False):
+            min_cosine, max_relative_l2, require_same_argmax=False, max_normalized_error=None):
+    if max_normalized_error is not None and (not math.isfinite(max_normalized_error) or max_normalized_error < 0):
+        raise ValueError("Normalized error gate must be finite and nonnegative")
     reference = json.loads(reference_path.read_text())
     candidate = json.loads(candidate_path.read_text())
     failures, rows = [], []
@@ -56,6 +58,18 @@ def compare(reference_path, candidate_path, *, max_absolute_error, max_rmse,
             cand, cand_hash = vector(candidate_path, right)
             row = logits.compare(ref, cand, max_absolute_error, max_rmse, min_cosine,
                                  require_same_argmax, max_relative_l2)
+            # Match Glm5NextCudaEngineTests.RelativeError: normalize the maximum
+            # absolute error by the reference's largest magnitude, with a unit
+            # floor. This is distinct from the relative-L2 gate above.
+            scale = max(1.0, max(abs(value) for value in ref))
+            row["normalization_scale"] = scale
+            row["normalized_max_error"] = row["max_absolute_error"] / scale
+            row["thresholds"]["max_normalized_error"] = max_normalized_error
+            if max_normalized_error is not None:
+                if row["normalized_max_error"] > max_normalized_error:
+                    row["failures"].append(
+                        f"Normalized maximum error {row['normalized_max_error']} exceeds {max_normalized_error}")
+                row["status"] = "failed" if row["failures"] else "passed"
             row.update(index=index, operation=left["operation"], reference_sha256=ref_hash,
                        candidate_sha256=cand_hash)
             rows.append(row)
@@ -79,16 +93,20 @@ def main():
     parser.add_argument("--max-rmse", type=float, required=True)
     parser.add_argument("--max-relative-l2", type=float, required=True)
     parser.add_argument("--min-cosine", type=float, required=True)
+    parser.add_argument("--max-normalized-error", type=float,
+                        help="Optional max absolute error / max(1, max absolute reference logit), per vector")
     parser.add_argument("--require-same-argmax", action="store_true")
     args = parser.parse_args()
     if any(not math.isfinite(value) or value < 0 for value in
-           (args.max_absolute_error, args.max_rmse, args.max_relative_l2)):
+           (args.max_absolute_error, args.max_rmse, args.max_relative_l2, args.max_normalized_error)
+           if value is not None):
         parser.error("Error gates must be finite and nonnegative")
     if not math.isfinite(args.min_cosine) or not -1 <= args.min_cosine <= 1:
         parser.error("Cosine gate must be finite and between -1 and 1")
     report = compare(args.reference, args.candidate, max_absolute_error=args.max_absolute_error,
                      max_rmse=args.max_rmse, min_cosine=args.min_cosine,
-                     max_relative_l2=args.max_relative_l2, require_same_argmax=args.require_same_argmax)
+                     max_relative_l2=args.max_relative_l2, require_same_argmax=args.require_same_argmax,
+                     max_normalized_error=args.max_normalized_error)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({key: value for key, value in report.items() if key != "vectors"}, indent=2))

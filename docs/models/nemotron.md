@@ -11,7 +11,7 @@
 | Image processor | [`NemotronImageProcessor`](../../TensorSharp.Models/Models/Nemotron/NemotronImageProcessor.cs) |
 | Audio frontend | [`NemotronAudioPreprocessor`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioPreprocessor.cs) (Parakeet-style log-mel) |
 | Audio encoder | [`NemotronAudioEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioEncoder.cs) (Parakeet/FastConformer + sound projector; needs a companion GGUF that no public repository ships, see §4.7) |
-| Example models | Nemotron-H-8B-Reasoning-128K, Nemotron-H-47B-Reasoning-128K, Nemotron 3 Nano Omni |
+| Example models | Nemotron-H-8B-Reasoning-128K, Nemotron-H-47B-Reasoning-128K, Nemotron 3 Nano Omni, Nemotron 3.5 Bolt 74B-A9B and Super VL 120B-A12B (see [below](#nemotron-35-super-vl-and-bolt)) |
 | Modalities | Text, image (Omni-class with `mmproj` loaded). Audio only when an audio companion GGUF carrying the Parakeet tower is loaded (§4.7); otherwise audio is **refused** (HTTP 400 / CLI error with `NemotronModel.AudioInputUnsupportedMessage`): the public Omni GGUFs ship no audio tower, only the RADIO vision tower in the `mmproj` (see §4.6). |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes: Reasoning-128K `<TOOLCALL>[...]</TOOLCALL>` (JSON or Python-style calls), Nemotron 3 Nano / Omni `<tool_call>` with an XML `<function=...>` body (§12); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
@@ -27,6 +27,8 @@ Verified GGUF pointers:
 | Nemotron-H-8B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) | `nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf` (4.983 GB) or `nvidia_Nemotron-H-8B-Reasoning-128K-Q8_0.gguf` (8.620 GB) | — (text only) |
 | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) | `nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf` (28.188 GB) | — (text only) |
 | Nemotron 3 Nano Omni 30B-A3B | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) | `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf` (23.927 GB) | `mmproj-BF16.gguf` (1.590 GB; same repo) — **required for image input** |
+| Nemotron 3.5 Bolt 74B-A9B | [nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF) | `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` (22.018 GB) | `mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf` (1.734 GB; same repo) |
+| Nemotron 3.5 Super VL 120B-A12B | [ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF](https://huggingface.co/ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF) | `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4.gguf` (76.919 GB) or `-Q4_0.gguf` (71.934 GB) | `mmproj-NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Q8_0.gguf` (0.967 GB) or `-BF16.gguf` (1.734 GB; same repo) |
 
 The Omni `mmproj` enables **image input only**: it carries the 32-block RADIO
 vision tower (`v.blk.*`, `v.patch_embd`, `v.position_embd`) and the
@@ -66,6 +68,78 @@ Server (Web UI + OpenAI/Ollama-compatible APIs on `http://localhost:5000`):
 ```bash
 dotnet run --project TensorSharp.Server.Host -c Release -- --model models/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf \
   --mmproj models/mmproj-BF16.gguf --backend ggml_cuda --max-tokens 4096
+```
+
+### Nemotron 3.5 Super VL and Bolt
+
+Both are `nemotron_h_moe` checkpoints of 88 layers: 40 Mamba2, 8 attention (32 query heads over 2 KV
+heads, head_dim 128) and 40 latent MoE layers (hidden 4096, MoE latent 1024, shared expert). Both come
+with a RADIO vision mmproj. The [design note](../design/nemotron-super-vl-bolt-support.md) records how
+support was added and what was validated.
+
+| | Bolt 74B-A9B | Super VL 120B-A12B |
+|---|---|---|
+| Routed experts | Per layer ("Puzzle" config): 240-496 experts, top-9, n_ff 1536-2560 | 512 experts, top-22, n_ff 2688 |
+| Language GGUF | `...-Bolt-74B-A9B-24GB.gguf`, **22.018 GB**: IQ2_XXS experts, NVFP4 Mamba2 projections with `.scale` sidecars | `...-NVFP4.gguf`, **76.919 GB** (NVFP4 experts with per-expert scales); `...-Q4_0.gguf`, **71.934 GB** (no sidecars) |
+| mmproj | 1.734 GB; q/k/v stored **split** (fused at load) | Q8_0 0.967 GB or BF16 1.734 GB; fused q/k/v, plus a `v.post_ln` this encoder does not apply |
+
+**Memory.** The language GGUF has to fit on the device, with room for the KV cache and workspace:
+- **Super VL NVFP4** needs about 71.6 GiB (76.919 GB) of weights on one device. It ran on a 128 GB
+  DGX Spark (GB10) and does not fit a 48 GB GPU, which is why the PR #282 review ran it on
+  `ggml_cpu`. One 96 GB GPU should hold it, but that was not validated.
+- **Bolt-24GB** ran on `ggml_cuda` and `cuda` on the DGX Spark. In the PR #282 review it ran on a
+  48 GB A40 with ECC enabled (about 45.0 GiB usable).
+- **The vision tower** adds about 3.2 GiB of F32 weights at load, plus about 3.1 GiB of F32 transposed
+  copies made on the first encode (the server's multimodal warmup, or the first image). These are
+  estimates from the tensor shapes, not measured. On
+  the GGML backends they use the language model's allocator. The direct `cuda` backend runs the tower on
+  the CPU allocator, in host RAM.
+
+**`--tp`.** Only `--tp 2` can apply, because the attention layers have 2 KV heads.
+- **Super VL** is accepted under `--tp 2` with either file. The NVFP4 file used to be refused because
+  TP did not apply its `.scale` sidecars; the Q4_0 file has none and never was. TP now applies the
+  NVFP4 scales: per-tensor `.scale`, the per-expert down scale folded into the routing weights, and
+  the per-expert up scale before ReLU^2.
+  - Its MoE runs as a per-expert row split, not expert parallelism, which is not used for latent MoE.
+  - The split refuses an expert width that does not divide into whole quant blocks per rank. 2688 is
+    fine at `--tp 2` for NVFP4 (64-value blocks) and Q4_0.
+  - This path is covered by synthetic tests only (`NemotronExpertScaleTests`). Besides the CPU tests,
+    a gated `ggml_cuda` `--tp 2` test (`GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin`) runs
+    the TP batched expert decode, with the up scales applied before ReLU^2 through
+    `TSGgml_MoEExpertsForwardF32`, and the expert-parallel down-scale path (non-latent layers only).
+    It needs `TS_TEST_GGML_BACKEND=cuda` and either two GPUs or
+    `GGML_CUDA_DEVICES=2`, which emulates two devices on one GPU; the local validation used the
+    emulated mode. No real Super VL `--tp 2` generation has completed on GPUs.
+  - The split is uneven: besides its half of the routed experts, rank 0 holds all of the Mamba2,
+    latent, shared-expert, router and LM-head weights. The NVFP4 file does not fit two A40s with ECC
+    enabled (48 GB, 46,068 MiB or about 45.0 GiB usable each): rank 0 ran out of memory while
+    preloading its weights. Estimated from the tensor shapes, rank 0's weights alone come to about
+    41.8 GiB, leaving about 3 GiB for the KV cache, workspace and everything else the load allocates;
+    rank 1's come to about 29.8 GiB. With ECC off, 48 GB cards (an A40, RTX A6000 or RTX 6000 Ada)
+    report about 49,140 MiB (about 48.0 GiB usable), which would leave rank 0 about 6 GiB. None has
+    been measured, so whether the file fits there is unknown.
+    The Q4_0 file's `--tp 2` fit has not been measured.
+- **Bolt** is refused under `--tp`: "Nemotron per-block MoE configuration (Nemotron Puzzle/Bolt) is not
+  yet supported under tensor parallelism."
+
+**`--n-cpu-moe` / `--cpu-moe` save no VRAM for either model.** Nemotron's single-device MoE path does
+not implement the offload, and nothing warns about it. The CLI and server still log "MoE CPU offload
+active".
+- On `ggml_cuda`, the selected layers' experts skip the load-time upload but are uploaded when the MoE
+  kernel first uses them.
+- On `cuda`, every quantized weight is uploaded at load.
+- Under `--tp`, only expert-parallel MoE on `ggml_cuda` keeps experts on the host, and expert
+  parallelism is never used for a latent MoE.
+
+So Super VL NVFP4 needs one large device. Under `--tp 2`, its rank 0 needs a GPU with more usable
+memory than an A40 with ECC enabled (about 45.0 GiB), and no such setup has been validated. The Q4_0
+file's `--tp 2` fit has not been measured. Offload does not help.
+
+```bash
+hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --local-dir models
+hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --local-dir models
+dotnet run --project TensorSharp.Cli -c Release -- --model models/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf \
+  --mmproj models/mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --image photo.png --backend ggml_cuda
 ```
 
 ## 1. Origin and intent
@@ -260,7 +334,20 @@ The dense FFN uses a single `ffn_up` matmul followed by ReLU² and
 ### 4.4 FFN layer (MoE)
 
 - **Routing**: `sigmoid(logits) + exp_probs_b` (per-expert additive bias) →
-  TopK → optional renormalization → optional global scale.
+  TopK → optional renormalization (division by the sum) → optional global scale.
+  One router (`RouteMoEToken`) serves every path: the single-device per-token
+  loop, the batched-by-expert prefill and the `--tp` router. They pick the same
+  experts in the same order with bit-identical weights. The order matters
+  because the MoE kernels sum the routes in that order. Before, `--tp` sorted
+  its top-k by probability, and later normalised by `1/sum`. Each of those
+  changes moved the `--tp` greedy text. `NemotronTensorParallelRoutingTests`
+  checks this on the cpu backend's TP seam.
+- **Host decode attention under `--tp`**: the per-rank attention runs in C#
+  (`AttentionDecodePureCS`). Its softmax flushes terms below `exp(-50)` to
+  zero. Without the flush, a sharply peaked row leaves its tail in the
+  subnormal range, and every multiply on a subnormal takes a microcode assist.
+  That cost up to 20x on an i7-11800H, so decode speed under `--tp` depended
+  on the generated text.
 - **Latent bottleneck** (optional): `ffn_latent_in` projects hidden to a
   smaller `latentDim`, the experts run in latent space, then
   `ffn_latent_out` projects back to hidden.
@@ -284,11 +371,26 @@ Mirrors NVIDIA's RADIO / CLIP-style ViT used by the v2_vl projector:
 - **Class embedding** (optional) prepended to the sequence.
 - **32 encoder blocks** (default for Nemotron Omni): LayerNorm → fused-QKV
   self-attention → residual → LayerNorm → up linear → GELU → down linear →
-  residual.
+  residual. Bolt's mmproj stores Q, K and V (weights and biases) as separate
+  `attn_q` / `attn_k` / `attn_v` tensors. The loader concatenates them into
+  `attn_qkv` in Q, K, V row order, so split and fused files run the same
+  weights. A block stored in both layouts, or a split triple with a part
+  missing, is refused.
 - After the encoder, the class tokens are stripped and a pixel-shuffle by
   `scaleFactor` reduces the spatial resolution.
 - A projector (RMSNorm → Linear → ReLU² → Linear) emits embeddings in the
   LM hidden dim.
+- **Checked at load.** Every tensor the forward reads must exist and match the
+  `clip.vision.*` metadata. The projector's output width must equal the
+  language model's hidden size (a Nano Omni mmproj projects to 2688, Bolt and
+  Super VL to 4096). Otherwise the load fails with `InvalidDataException`,
+  which names the file, the tensors and the expected layout. A server started
+  with `--mmproj`, or the CLI, refuses to start (exit code 2). Before this
+  check, such a file loaded and then failed every image request.
+- **Not used:** the video tower's `v.patch_embd.weight.1` (skipped at load,
+  with one log line), and Super VL's `v.post_ln`, which llama.cpp applies after
+  the blocks (a follow-up). Super VL image embeddings therefore differ from
+  llama.cpp's.
 
 `NemotronImageProcessor` (mirrors `nemotronh.ImageProcessor`):
 
@@ -416,8 +518,8 @@ quality, GPU execution and latency are not qualified.
 | `nemotron_h.attention.head_count` | uint32[] | Per-layer Q head count |
 | `nemotron_h.feed_forward_length` | uint32[] | Per-layer FFN size (0 ⇒ no FFN) |
 | `nemotron_h.attention.scale` | float32 | Attention scale factor (0 ⇒ auto) |
-| `nemotron_h.expert_count` | uint32 | MoE expert count (0 ⇒ dense) |
-| `nemotron_h.expert_used_count` | uint32 | TopK experts per token |
+| `nemotron_h.expert_count` | uint32 | MoE expert count (0 ⇒ dense); each layer's count is taken from its stacked expert tensor, which on Bolt varies from 240 to 496 (this scalar is the largest) |
+| `nemotron_h.expert_used_count` | uint32 or uint32[] | TopK experts per token; Bolt stores a per-layer array (0 on non-FFN layers), and each FFN layer uses its own value |
 | `nemotron_h.expert_weights_norm` | bool | Renormalize selected expert weights to sum=1 |
 | `nemotron_h.expert_weights_scale` | float32 | Global scale factor applied to expert weights |
 
@@ -492,9 +594,7 @@ Constructor:
 
 `Forward(int[] tokens)` runs the per-op managed loop. For each layer it
 dispatches to `Mamba2Block` / `AttentionBlock` / `FFNBlock` based on
-`_layerTypes[l]`. Optional CPU offload (`CPU_MATMUL_THRESHOLD`, off by
-default on Apple Silicon) routes small matmuls to the managed CPU path even
-when a GPU backend is selected.
+`_layerTypes[l]`.
 
 ## 8. Prefill optimization
 
@@ -517,6 +617,35 @@ when a GPU backend is selected.
   the 8B (12.5 GB at 8k on the 47B) and every long request failed with
   HTTP 500. The same code serves `nemotron_h_moe` (Nemotron 3.5, Nemotron 3
   Nano Omni).
+- **Attention prefill on the direct `cuda` backend** changed in PR #282. The
+  single-sequence prefill path calls `CudaFusedOps.TryGqaPrefillAttention`
+  when the context is at most 8,192 tokens and the K/V cache is a contiguous
+  F32 or F16 tensor. (The batched/paged forward does not use it.) The kernel
+  reads the live `[kvHeads, cacheLen, headDim]` cache in place and broadcasts
+  each KV head to its query group. It no longer expands K/V to every query
+  head (16x for Nemotron 3.x) or materializes a `[heads, rows, context]`
+  score tensor.
+  - **Kernel choice.** Nemotron 3.x attention (32 query heads over 2 KV
+    heads, head_dim 128, full attention) uses the group-16 flash kernel
+    `ts_gqa_prefill_flash_g16d128_{f16,f32}`. A build that compiles the
+    kernels locally with nvcc has it, and so does the committed compute_61
+    baseline PTX used when nvcc is absent (refreshed with CUDA 12.8). The
+    generic GQA prefill kernel runs only when the loaded module lacks it, such
+    as a stale or custom PTX. `benchmarks/FlashAttnBench` prints the kernel it
+    ran.
+  - **Fallback.** Longer contexts and other cache layouts keep the
+    materialized sub-chunk path above.
+  - **Numerics.** Both kernels sum the softmax in a different order from the
+    materialized path, so greedy output can change at near-tie tokens compared
+    with builds before PR #282.
+  - **The review's measurements (2x A40, CUDA 12.8; not re-measured here).**
+    The group-16 kernel's max error against the CPU reference was 1.21e-4, and
+    it was 1.7-3.6x faster at 2K-8K tokens. The gain did not show end to end in
+    Nemotron 3.5 Lightning's ~6K-token prefill. On Nemotron-H 8B, 2 of 7 greedy
+    answers were reworded and both were still correct.
+
+  `NemotronModel.MaterializedPrefillAttentionForTest` forces the old path in
+  tests.
 - **Mamba2 prefill** processes tokens **sequentially** (loop over `seqLen`)
   through the SSM scan; chunked parallel scanning is on the optimization
   list.
@@ -550,15 +679,6 @@ are processed in one GGML graph dispatch:
   `_numExpertsUsed`.
 - Pre-allocated reusable result tensors (`_expertUpResult`,
   `_expertDownResult`, `_latentAccumTensor`, `_latentOutResult`).
-
-### CPU offload for tiny ops
-
-Small ops on the decode hot path (RMSNorm, residual add, expert / router
-matmuls) can be executed on CPU via the CPU SIMD kernels even when the
-backend is GPU. This avoids the per-dispatch GPU overhead (~1 ms+ per call
-on Metal). Large matmuls (SSM in/out, attention QKV/output, LM head)
-remain on GPU. The threshold is `CPU_MATMUL_THRESHOLD` (0 by default on
-Apple Silicon unified memory; raise it for discrete GPU systems).
 
 ### SIMD ReLU² and bias add
 
@@ -776,6 +896,22 @@ DSpark request diverge). The Mamba-2 snapshot/rollback is exact. Running
 attention and MoE row by row makes the verify exact, but 4 rows then cost
 116 ms against a 28 ms decode step (plus 70 ms per DSpark block), so an exact
 verify cannot beat plain decoding. Details: [speculative decoding](../speculative_decoding.md#nemotron-h-refuses-speculation).
+
+### Text LoRA adapters
+
+Nemotron-H takes text LoRA adapters (`--lora`, `/v1/loras`, a request's `lora`)
+on one device with `cpu`, `ggml_cpu`, `ggml_cuda` or `cuda`; under `--tp` they are
+refused. Every projection outside the routed experts is adapted: Mamba2 `ssm_in`
+and `ssm_out`, `attn_q/k/v` (fused into `attn_qkv` at load) and `attn_output`, the
+dense `ffn_up` and `ffn_down`, the shared experts, the latent `ffn_latent_down` /
+`ffn_latent_up`, the router and the LM head. An adapter on a routed expert
+(`*_exps`) is refused with a 400 that names it. While a step runs with an adapter,
+the decode fast paths (the `FusedMatMulQuantAdd` residual adds and the MoE decode
+residual) decline for the weights it adapts, and the projection that feeds the native
+Mamba2 decode applies the delta itself; requests without an adapter keep every fast
+path. Validated on synthetic models against a merged-weights twin (cpu, ggml_cpu,
+ggml_cuda), not yet on a real checkpoint or on `cuda`. Details: [design
+doc](../design/logprobs-lora-moe-runtime-features.md) §2.2.
 
 ## 12. Output parser and chat template
 
