@@ -419,13 +419,19 @@ struct ForwardGraph {
     }
 };
 
+// The graph and prefix caches are deliberately leaked: a static destructor
+// freeing their buffers at process exit aborts on ggml_cuda (cudaFree inside the
+// DLL's process detach). TSGgml_QwenImage21ResetForwardCache and
+// TSGgml_QwenImage21ReleasePrefixCaches, which a model unload and TSGgml_Shutdown
+// call, are the release path.
 std::recursive_mutex graph_mutex;
-std::array<std::array<std::unique_ptr<ForwardGraph>, 2>, TSG_MAX_DEVICES> graph_cache;
+std::array<std::array<std::unique_ptr<ForwardGraph>, 2>, TSG_MAX_DEVICES>& graph_cache =
+    *new std::array<std::array<std::unique_ptr<ForwardGraph>, 2>, TSG_MAX_DEVICES>();
 uint64_t graph_use = 0;
 // Requests normally hold one cache per CFG branch; the bound only protects a
 // caller that never releases its keys.
 constexpr size_t kMaxPrefixCaches = 4;
-std::vector<std::unique_ptr<PrefixCache>> prefix_caches;
+std::vector<std::unique_ptr<PrefixCache>>& prefix_caches = *new std::vector<std::unique_ptr<PrefixCache>>();
 uint64_t prefix_cache_ids = 0, prefix_cache_use = 0;
 
 void validate(const TSGQi21Desc* d) {

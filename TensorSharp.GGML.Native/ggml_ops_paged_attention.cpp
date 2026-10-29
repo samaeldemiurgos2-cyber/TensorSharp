@@ -171,6 +171,7 @@ namespace
         {
             if (buffer != nullptr)
             {
+                test_note_cache_release();
                 ggml_backend_buffer_free(buffer);
                 buffer = nullptr;
             }
@@ -196,8 +197,18 @@ namespace
     };
 
     constexpr std::size_t kPagedAttnCacheSize = 16;
-    thread_local std::array<PagedAttnSession, kPagedAttnCacheSize> g_paged_attn_cache;
-    thread_local std::uint64_t g_paged_attn_lru_counter = 0;
+
+    // One thread's sessions, owned by a process-wide registry rather than by a
+    // thread_local (see ThreadCacheRegistry in ggml_ops_internal.h). Continuous
+    // batching calls this from server and ThreadPool threads; one that exited
+    // holding a session freed its CUDA buffer inside the DLL's thread detach,
+    // and ggml aborted the process.
+    struct PagedAttnThreadCache
+    {
+        std::array<PagedAttnSession, kPagedAttnCacheSize> sessions;
+        std::uint64_t lru = 0;
+    };
+    using PagedAttnCaches = ThreadCacheRegistry<PagedAttnThreadCache>;
 
     // Thread-local mask scratch so we don't allocate a fresh vector per call.
     thread_local std::vector<ggml_fp16_t> g_paged_attn_mask_scratch;
@@ -212,10 +223,11 @@ namespace
     }
 
     PagedAttnSession* find_paged_attn_session(
+        PagedAttnThreadCache& cache,
         int num_q, int padded_kv_len_bucket, int num_heads, int num_kv_heads,
         int head_dim, std::uint32_t scale_bits, bool has_sinks)
     {
-        for (auto& sess : g_paged_attn_cache)
+        for (auto& sess : cache.sessions)
         {
             // Equal packed shapes on different layer-placement ranks must
             // never reuse device buffers allocated by another backend.
@@ -228,24 +240,27 @@ namespace
                 sess.scale_bits == scale_bits &&
                 sess.has_sinks == has_sinks)
             {
-                sess.lru = ++g_paged_attn_lru_counter;
+                sess.lru = ++cache.lru;
                 return &sess;
             }
         }
         return nullptr;
     }
 
-    PagedAttnSession& acquire_paged_attn_session_slot()
+    PagedAttnSession& acquire_paged_attn_session_slot(PagedAttnThreadCache& cache)
     {
         // Prefer an invalid slot.
-        for (auto& sess : g_paged_attn_cache)
-            if (!sess.valid) { sess.lru = ++g_paged_attn_lru_counter; return sess; }
-        // Otherwise evict the LRU entry.
-        PagedAttnSession* victim = &g_paged_attn_cache[0];
-        for (auto& sess : g_paged_attn_cache)
+        for (auto& sess : cache.sessions)
+            if (!sess.valid) { sess.lru = ++cache.lru; return sess; }
+        // Otherwise evict the LRU entry. On Metal async the victim's last call can
+        // still have its result download queued (finalize_compute_with_download),
+        // and that blit reads the buffer destroy() frees: drain it first.
+        PagedAttnSession* victim = &cache.sessions[0];
+        for (auto& sess : cache.sessions)
             if (sess.lru < victim->lru) victim = &sess;
+        host_read_barrier();
         victim->destroy();
-        victim->lru = ++g_paged_attn_lru_counter;
+        victim->lru = ++cache.lru;
         return *victim;
     }
 
@@ -362,12 +377,17 @@ namespace
         const bool has_sinks = (sinks_data != nullptr);
         const std::uint32_t scale_bits = float_bits(scale);
 
+        PagedAttnCaches& caches = PagedAttnCaches::instance();
+        caches.free_retired();
+        PagedAttnCaches::Slot& owned = caches.this_thread();
+        std::lock_guard<std::mutex> cache_lock(owned.mutex);
+        PagedAttnThreadCache& cache = owned.cache;
         PagedAttnSession* sess = find_paged_attn_session(
-            num_q, padded_kv_len_bucket, num_heads, num_kv_heads, head_dim,
+            cache, num_q, padded_kv_len_bucket, num_heads, num_kv_heads, head_dim,
             scale_bits, has_sinks);
         if (sess == nullptr)
         {
-            PagedAttnSession& slot = acquire_paged_attn_session_slot();
+            PagedAttnSession& slot = acquire_paged_attn_session_slot(cache);
             if (!build_paged_attn_session(slot, num_q, padded_kv_len_bucket,
                                           num_heads, num_kv_heads, head_dim,
                                           scale, has_sinks))
@@ -1282,24 +1302,30 @@ TSG_EXPORT int TSGgml_PagedAttentionForwardDevice(
 }
 
 #if defined(TSG_GGML_TEST_DIAGNOSTICS)
-// Calling-thread diagnostic only: no allocation, backend lookup or mutation.
-// Used to prove that backend teardown retired this thread's retained sessions.
+// Diagnostic only: counts the retained sessions of every thread, live or exited,
+// with no backend lookup or mutation. Used to prove that backend teardown
+// released them.
 TSG_EXPORT int TSGgml_PagedAttentionSessionCount()
 {
     int count = 0;
-    for (const auto& session : g_paged_attn_cache)
-        if (session.valid && session.buffer != nullptr) ++count;
+    PagedAttnCaches::instance().for_each([&](const PagedAttnThreadCache& cache) {
+        for (const auto& session : cache.sessions)
+            if (session.valid && session.buffer != nullptr) ++count;
+    });
     return count;
 }
 #endif
 
 namespace tsg
 {
-    // Match the existing prefill-session lifecycle. The caller has stopped
-    // compute before backend teardown; free buffers while their backend lives.
-    // This releases the calling thread's TLS cache, not other worker threads.
+    // Frees every thread's cached paged-attention sessions, live and retired.
+    // Called from TSGgml_ClearHostBufferCache and TSGgml_Shutdown so their backend
+    // buffers are released while the backend and the driver are alive. A thread
+    // inside a call finishes it first; its next call builds the session again.
     void free_paged_attn_sessions()
     {
-        for (auto& session : g_paged_attn_cache) session.destroy();
+        PagedAttnCaches::instance().release_all([](PagedAttnThreadCache& cache) {
+            for (auto& session : cache.sessions) session.destroy();
+        });
     }
 }

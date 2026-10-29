@@ -294,6 +294,7 @@
     <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2DecodeClear" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2DecodeF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2DecodeReadState" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2PrefillClear" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2PrefillF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NormF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NormGradF32" SymbolType="Function" />
@@ -303,6 +304,7 @@
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForwardWithSinks" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionSessionCount" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PrefaultHostSpans" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_PrefillAttentionSessionCount" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PreloadQuantizedWeight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen21VisionEncoderF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatched" SymbolType="Function" />
@@ -413,6 +415,8 @@
     <ReferenceNativeSymbol Include="TSGgml_TensorParallelInitLoopback" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_TensorParallelMatmul" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_TensorParallelSetGlobalGeometry" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_TestReuseAllocate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_TestUndrainedCacheReleases" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_TranscodeBonsaiToQ2_0" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_UnaryF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_UnregisterPinnedHostBuffer" SymbolType="Function" />

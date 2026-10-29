@@ -2340,7 +2340,7 @@ namespace
 
         void destroy()
         {
-            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (buffer != nullptr) { test_note_cache_release(); ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             ctx_mem.reset();
             q_in = k_in = v_in = mask = result = nullptr;
@@ -2357,16 +2357,27 @@ namespace
     };
 
     constexpr std::size_t kPrefillAttnCacheSize = 16;
-    thread_local std::array<PrefillAttnSession, kPrefillAttnCacheSize> g_prefill_attn_cache;
-    thread_local std::uint64_t g_prefill_attn_lru = 0;
+
+    // One thread's sessions, owned by a process-wide registry rather than by a
+    // thread_local (see ThreadCacheRegistry in ggml_ops_internal.h): freeing them
+    // in a thread_local destructor aborted the process at the exit of any thread
+    // that had run a cached prefill, including the thread that exits the process.
+    struct PrefillAttnThreadCache
+    {
+        std::array<PrefillAttnSession, kPrefillAttnCacheSize> sessions;
+        std::uint64_t lru = 0;
+    };
+    using PrefillAttnCaches = ThreadCacheRegistry<PrefillAttnThreadCache>;
+
     thread_local std::vector<ggml_fp16_t> g_prefill_mask_scratch;
     thread_local std::vector<unsigned char> g_prefill_zero_scratch;
 
     PrefillAttnSession* find_prefill_session(
+        PrefillAttnThreadCache& cache,
         int num_q, int kv_bucket, int num_heads, int num_kv_heads, int head_dim,
         std::uint32_t scale_bits, bool kv_f16)
     {
-        for (auto& s : g_prefill_attn_cache)
+        for (auto& s : cache.sessions)
         {
             // A shape match alone is insufficient during whole-layer GPU
             // placement: this graph's tensors live on its original backend.
@@ -2374,22 +2385,25 @@ namespace
                 s.num_heads == num_heads && s.num_kv_heads == num_kv_heads &&
                 s.head_dim == head_dim && s.scale_bits == scale_bits && s.kv_f16 == kv_f16)
             {
-                s.lru = ++g_prefill_attn_lru;
+                s.lru = ++cache.lru;
                 return &s;
             }
         }
         return nullptr;
     }
 
-    PrefillAttnSession& acquire_prefill_session_slot()
+    PrefillAttnSession& acquire_prefill_session_slot(PrefillAttnThreadCache& cache)
     {
-        for (auto& s : g_prefill_attn_cache)
-            if (!s.valid) { s.lru = ++g_prefill_attn_lru; return s; }
-        PrefillAttnSession* victim = &g_prefill_attn_cache[0];
-        for (auto& s : g_prefill_attn_cache)
+        for (auto& s : cache.sessions)
+            if (!s.valid) { s.lru = ++cache.lru; return s; }
+        PrefillAttnSession* victim = &cache.sessions[0];
+        for (auto& s : cache.sessions)
             if (s.lru < victim->lru) victim = &s;
+        // On Metal async the victim's last call can still have its result
+        // download queued, and that blit reads the buffer destroy() frees.
+        host_read_barrier();
         victim->destroy();
-        victim->lru = ++g_prefill_attn_lru;
+        victim->lru = ++cache.lru;
         return *victim;
     }
 
@@ -2492,11 +2506,16 @@ namespace
         const int kv_bucket = prefill_kv_bucket(kv_len);
         const std::uint32_t scale_bits = prefill_float_bits(scale);
 
+        PrefillAttnCaches& caches = PrefillAttnCaches::instance();
+        caches.free_retired();
+        PrefillAttnCaches::Slot& owned = caches.this_thread();
+        std::lock_guard<std::mutex> cache_lock(owned.mutex);
+        PrefillAttnThreadCache& cache = owned.cache;
         PrefillAttnSession* sess = find_prefill_session(
-            seq_len, kv_bucket, num_heads, num_kv_heads, head_dim, scale_bits, kv_f16);
+            cache, seq_len, kv_bucket, num_heads, num_kv_heads, head_dim, scale_bits, kv_f16);
         if (sess == nullptr)
         {
-            PrefillAttnSession& slot = acquire_prefill_session_slot();
+            PrefillAttnSession& slot = acquire_prefill_session_slot(cache);
             if (!build_prefill_session(slot, seq_len, kv_bucket, num_heads, num_kv_heads,
                                        head_dim, scale, kv_f16))
                 return 0;
@@ -2717,17 +2736,33 @@ namespace
 
 namespace tsg
 {
-    // Frees the calling thread's cached prefill-attention sessions. Called
-    // from TSGgml_Shutdown so the sessions' backend (CUDA) buffers are
-    // released while the driver is still alive; otherwise the thread_local
-    // destructors run during CRT teardown, after CUDA driver shutdown, and
-    // ggml aborts with "CUDA error: driver shutting down" on process exit.
+    // Frees every thread's cached prefill-attention sessions, live and retired.
+    // Called from TSGgml_ClearHostBufferCache and TSGgml_Shutdown so the sessions'
+    // backend (CUDA) buffers are released while the backend and the driver are
+    // alive. A thread inside a call finishes it first; its next call builds the
+    // session again.
     void free_prefill_attn_sessions()
     {
-        for (auto& s : g_prefill_attn_cache)
-            s.destroy();
+        PrefillAttnCaches::instance().release_all([](PrefillAttnThreadCache& cache) {
+            for (auto& s : cache.sessions)
+                s.destroy();
+        });
     }
 }
+
+#if defined(TSG_GGML_TEST_DIAGNOSTICS)
+// Diagnostic only: counts the retained prefill-attention sessions of every
+// thread, live or exited, with no backend lookup or mutation.
+TSG_EXPORT int TSGgml_PrefillAttentionSessionCount()
+{
+    int count = 0;
+    PrefillAttnCaches::instance().for_each([&](const PrefillAttnThreadCache& cache) {
+        for (const auto& s : cache.sessions)
+            if (s.valid && s.buffer != nullptr) ++count;
+    });
+    return count;
+}
+#endif
 
 // ============================================================================
 // Fused prefill attention: Q*K^T → causal mask → softmax → *V as one GGML

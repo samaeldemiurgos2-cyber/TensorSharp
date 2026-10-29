@@ -241,9 +241,13 @@ namespace
             context = PooledContextHandle();
         }
     };
-    FfnTpPending g_ffn_tp[tsg::TSG_MAX_DEVICES];
-    // Same parking for the generic row-parallel matmul + residual add.
-    FfnTpPending g_mmadd_tp[tsg::TSG_MAX_DEVICES];
+    // Deliberately leaked, like g_mg_tp in ggml_ops_muse_glimmer.cpp: a static
+    // destructor freeing a parked buffer at process exit aborts on ggml_cuda.
+    // TSGgml_ReleaseFusedFfnTpGraphs is the release path.
+    FfnTpPending* const g_ffn_tp = new FfnTpPending[tsg::TSG_MAX_DEVICES];
+    // Same parking for the generic row-parallel matmul + residual add, released
+    // by TSGgml_ReleaseFusedMatmulAddTpGraphs.
+    FfnTpPending* const g_mmadd_tp = new FfnTpPending[tsg::TSG_MAX_DEVICES];
 }
 
 // ============================================================================
@@ -4496,13 +4500,17 @@ TSG_EXPORT int TSGgml_MoEExpertsForwardF32(
         if (!zc)
             upload_binding(inp_bind, input.data, inp_bind.raw_bytes);
 
-        // Upload weight data
+        // Upload weight data. The pointers are the experts' cache keys, which for
+        // a preloaded expert are opaque GCHandles: an expert under 4 KiB (never
+        // looked up above) used to be uploaded from the handle itself, so the
+        // graph multiplied by whatever bytes followed it or faulted reading them
+        // (a Nemotron --tp decode, whose per-rank expert shards are that small).
         for (int e = 0; e < num_experts; e++)
         {
             if (!up_w[e].cached || up_w[e].needs_upload)
-                ggml_backend_tensor_set(up_w[e].t, up_data_ptrs[e], 0, up_w[e].bytes);
+                ggml_backend_tensor_set(up_w[e].t, resolve_upload_source(up_data_ptrs[e]), 0, up_w[e].bytes);
             if (!dn_w[e].cached || dn_w[e].needs_upload)
-                ggml_backend_tensor_set(dn_w[e].t, down_data_ptrs[e], 0, dn_w[e].bytes);
+                ggml_backend_tensor_set(dn_w[e].t, resolve_upload_source(down_data_ptrs[e]), 0, dn_w[e].bytes);
         }
 
         ggml_status status = tsg::compute_graph(g_backend, graph);
@@ -4683,11 +4691,11 @@ TSG_EXPORT int TSGgml_MoEExpertsSwiGLUForwardF32(
         for (int e = 0; e < num_experts; e++)
         {
             if (!gate_w[e].cached || gate_w[e].needs_upload)
-                ggml_backend_tensor_set(gate_w[e].t, gate_data_ptrs[e], 0, gate_w[e].bytes);
+                ggml_backend_tensor_set(gate_w[e].t, resolve_upload_source(gate_data_ptrs[e]), 0, gate_w[e].bytes);
             if (!up_w[e].cached || up_w[e].needs_upload)
-                ggml_backend_tensor_set(up_w[e].t, up_data_ptrs[e], 0, up_w[e].bytes);
+                ggml_backend_tensor_set(up_w[e].t, resolve_upload_source(up_data_ptrs[e]), 0, up_w[e].bytes);
             if (!dn_w[e].cached || dn_w[e].needs_upload)
-                ggml_backend_tensor_set(dn_w[e].t, down_data_ptrs[e], 0, dn_w[e].bytes);
+                ggml_backend_tensor_set(dn_w[e].t, resolve_upload_source(down_data_ptrs[e]), 0, dn_w[e].bytes);
         }
 
         ggml_status status = tsg::compute_graph(g_backend, graph);
@@ -4915,21 +4923,21 @@ TSG_EXPORT int TSGgml_MoEExpertsSwiGLUResidualF32(
         for (int e = 0; e < num_experts; e++)
         {
             if (!gate_w[e].cached || gate_w[e].needs_upload)
-                ggml_backend_tensor_set(gate_w[e].t, gate_data_ptrs[e], 0, gate_w[e].bytes);
+                ggml_backend_tensor_set(gate_w[e].t, resolve_upload_source(gate_data_ptrs[e]), 0, gate_w[e].bytes);
             if (!up_w[e].cached || up_w[e].needs_upload)
-                ggml_backend_tensor_set(up_w[e].t, up_data_ptrs[e], 0, up_w[e].bytes);
+                ggml_backend_tensor_set(up_w[e].t, resolve_upload_source(up_data_ptrs[e]), 0, up_w[e].bytes);
             if (!dn_w[e].cached || dn_w[e].needs_upload)
-                ggml_backend_tensor_set(dn_w[e].t, down_data_ptrs[e], 0, dn_w[e].bytes);
+                ggml_backend_tensor_set(dn_w[e].t, resolve_upload_source(down_data_ptrs[e]), 0, dn_w[e].bytes);
         }
 
         if (has_shared)
         {
             if (!sh_g.cached || sh_g.needs_upload)
-                ggml_backend_tensor_set(sh_g.t, shared_gate_data, 0, sh_g.bytes);
+                ggml_backend_tensor_set(sh_g.t, resolve_upload_source(shared_gate_data), 0, sh_g.bytes);
             if (!sh_u.cached || sh_u.needs_upload)
-                ggml_backend_tensor_set(sh_u.t, shared_up_data, 0, sh_u.bytes);
+                ggml_backend_tensor_set(sh_u.t, resolve_upload_source(shared_up_data), 0, sh_u.bytes);
             if (!sh_d.cached || sh_d.needs_upload)
-                ggml_backend_tensor_set(sh_d.t, shared_down_data, 0, sh_d.bytes);
+                ggml_backend_tensor_set(sh_d.t, resolve_upload_source(shared_down_data), 0, sh_d.bytes);
         }
 
         ggml_status status = tsg::compute_graph(g_backend, graph);

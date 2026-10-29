@@ -40,7 +40,10 @@ namespace
             context = PooledContextHandle();
         }
     };
-    G4VerifyTpPending g_g4v_tp[tsg::TSG_MAX_DEVICES];
+    // Deliberately leaked, like g_mg_tp in ggml_ops_muse_glimmer.cpp: a static
+    // destructor freeing a parked buffer at process exit aborts on ggml_cuda.
+    // TSGgml_Gemma4ReleaseVerifyTpGraphs is the release path.
+    G4VerifyTpPending* const g_g4v_tp = new G4VerifyTpPending[tsg::TSG_MAX_DEVICES];
 }
 
 // Release every rank's parked tensor-parallel verify graph. The C# side calls

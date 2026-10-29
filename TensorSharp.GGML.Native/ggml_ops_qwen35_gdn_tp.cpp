@@ -128,9 +128,10 @@ namespace
     {
         static std::once_flag flag;
         std::call_once(flag, []() {
+            // Only what TSGgml_Qwen35GdnDropTpGraphs left; see release_cache_at_exit.
             std::atexit([]() {
                 std::lock_guard<std::mutex> lk(g_gdn_tp_mutex);
-                g_gdn_tp_cache.clear();
+                release_cache_at_exit(g_gdn_tp_cache);
             });
         });
     }
