@@ -78,6 +78,19 @@ namespace TensorSharp.Models
             {
                 if (_layerTypes[l] != LayerType.FFN)
                     continue;
+                // MoEFFNPrefill applies ReLU^2 inside the kernel and takes no per-expert
+                // scale, so an NVFP4 up scale could not be applied before the squaring.
+                // Such a model stays on the per-expert split, whose batched decode and
+                // per-expert loop both apply it. A down scale alone is fine here: the
+                // router folds it into the route weights. (InitExpertScales runs before
+                // sharding, so the scales are known by now.)
+                if (HasExpertUpScale(l))
+                {
+                    Console.WriteLine(
+                        $"  Nemotron MoE: expert parallelism declined - layer {l}'s experts carry NVFP4 up-projection " +
+                        "scales the expert-parallel kernel cannot apply before ReLU^2; using the per-expert split.");
+                    return false;
+                }
                 if (!_stackedExpertWeights.TryGetValue($"blk.{l}.ffn_up_exps.weight", out var up) || up == null)
                     return false;
                 if (!_stackedExpertWeights.TryGetValue($"blk.{l}.ffn_down_exps.weight", out var down) || down == null)
@@ -283,18 +296,16 @@ namespace TensorSharp.Models
 
             // MoEFFNPrefill applies ReLU^2 inside the kernel and takes no per-expert
             // scale array, so an NVFP4 up scale cannot be applied before the squaring -
-            // deferring it overflows to +Inf and then NaN (see InitExpertScales). The
-            // per-expert fallback that could apply it is unavailable here, because
-            // building EP shards removes the per-expert weights. Refuse loudly rather
-            // than route garbage.
+            // deferring it overflows to +Inf and then NaN (see InitExpertScales).
+            // CanUseNemotronExpertParallelMoE declines such models at load and
+            // EnsureNemotronTpAppliesExpertScales refuses them, so reaching this is a
+            // bug - fail the step rather than route garbage.
             if (HasExpertUpScale(layer))
             {
-                throw new NotSupportedException(
-                    $"Nemotron expert-parallel MoE cannot serve layer {layer}: its experts carry NVFP4 " +
-                    "scale2 sidecars whose up-projection scale must be applied before the ReLU^2 activation, " +
-                    "and MoEFFNPrefill has no per-expert pre-activation scale hook. Run without expert-parallel " +
-                    "MoE (the per-expert tensor-parallel path applies the scale correctly), or use a GGUF whose " +
-                    "expert scales are folded into the quantized blocks.");
+                throw new InvalidOperationException(
+                    $"Nemotron expert-parallel MoE reached layer {layer}, whose experts carry NVFP4 up-projection " +
+                    "scales it cannot apply before ReLU^2; the load-time checks should have kept this model on " +
+                    "the per-expert split.");
             }
 
             var upShards = _tpStackedUp[layer];
@@ -305,7 +316,7 @@ namespace TensorSharp.Models
             int tp = TpDegree;
             int rankOffset = TpRankOffset;
             int hiddenSize = Config.HiddenSize;
-            int nUsed = _numExpertsUsed;
+            int nUsed = _numExpertsUsedPerLayer[layer];
             int perRank = _tpExpertsPerRank;
             int intermediate = (int)upShards[0].PerExpertNe1;
 

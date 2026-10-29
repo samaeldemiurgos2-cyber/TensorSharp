@@ -92,6 +92,47 @@ namespace TensorSharp.Models
             TensorComputePrimitives.Zero(data, n);
 
         /// <summary>
+        /// Softmax terms whose exponent argument (score minus the row max) is below this
+        /// are flushed to exactly zero. exp(-50) is 1.9e-22: next to the max term's 1, no
+        /// F32 sum over fewer than 2^40 positions can register it, so the attention output
+        /// does not change. Left in, the tail of a sharply peaked row lands in the SUBNORMAL
+        /// range (exp of anything under -87.3), and every multiply that touches a subnormal
+        /// operand - the normalisation and the w*V accumulation, per cached position per
+        /// head - takes a microcode assist on x86. Measured on an i7-11800H over 16 heads x
+        /// 640 positions x headDim 128 (one tensor-parallel rank's decode attention for
+        /// Nemotron 3.5): 0.18 ms with a normal tail, 2.1 ms with half of each row
+        /// subnormal, 3.9 ms at 90%; with the flush, 0.14 ms at every one of those. That
+        /// made host decode attention (every --tp attention layer on the GGML backends,
+        /// and the cpu backend) up to 20x slower for content whose attention is sharply
+        /// peaked, so one build's decode speed moved with the text it happened to generate.
+        /// </summary>
+        internal const float DecodeSoftmaxFlushBelow = -50f;
+
+        // exp(x) per lane, with lanes below `floor` (and the -inf tail padding) clamped
+        // before the exp, so it never computes a subnormal either, and zeroed after it.
+        // NaN lanes compare false and still propagate.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector512<float> FlushedExp(Vector512<float> x, Vector512<float> floor)
+        {
+            Vector512<float> below = Vector512.LessThan(x, floor);
+            return Vector512.AndNot(Vector512.Exp(Vector512.ConditionalSelect(below, floor, x)), below);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> FlushedExp(Vector256<float> x, Vector256<float> floor)
+        {
+            Vector256<float> below = Vector256.LessThan(x, floor);
+            return Vector256.AndNot(Vector256.Exp(Vector256.ConditionalSelect(below, floor, x)), below);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector128<float> FlushedExp(Vector128<float> x, Vector128<float> floor)
+        {
+            Vector128<float> below = Vector128.LessThan(x, floor);
+            return Vector128.AndNot(Vector128.Exp(Vector128.ConditionalSelect(below, floor, x)), below);
+        }
+
+        /// <summary>
         /// Vectorized exp(row[i] - max): writes e back into <paramref name="row"/> and
         /// returns the sum. Same shape as the exp phase of
         /// <see cref="CpuKernels.SoftmaxRow"/> (Vector512/256/128.Exp with
@@ -99,18 +140,20 @@ namespace TensorSharp.Models
         /// k-split path can keep chunk-partial sums and the grouped paths keep their
         /// running-max reuse plus <see cref="TensorComputePrimitives.Scale"/> step.
         /// Up to a few ULP from scalar MathF.Exp (BCL vector-exp approximation).
+        /// Terms below <see cref="DecodeSoftmaxFlushBelow"/> come out exactly zero.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        private static unsafe float VecExpRow(float* row, float max, int n)
+        internal static unsafe float VecExpRow(float* row, float max, int n)
         {
             float sum = 0f;
             int i = 0;
             if (CpuKernels.Use512)
             {
-                Vector512<float> vm = Vector512.Create(max), acc = Vector512<float>.Zero;
+                Vector512<float> vm = Vector512.Create(max), floor = Vector512.Create(DecodeSoftmaxFlushBelow);
+                Vector512<float> acc = Vector512<float>.Zero;
                 for (; i + 16 <= n; i += 16)
                 {
-                    Vector512<float> ex = Vector512.Exp(Vector512.Load(row + i) - vm);
+                    Vector512<float> ex = FlushedExp(Vector512.Load(row + i) - vm, floor);
                     Vector512.Store(ex, row + i);
                     acc += ex;
                 }
@@ -119,7 +162,7 @@ namespace TensorSharp.Models
                     float* t = stackalloc float[16];
                     int rem = n - i;
                     for (int j = 0; j < 16; j++) t[j] = j < rem ? row[i + j] : float.NegativeInfinity;
-                    Vector512<float> ex = Vector512.Exp(Vector512.Load(t) - vm);
+                    Vector512<float> ex = FlushedExp(Vector512.Load(t) - vm, floor);
                     Vector512.Store(ex, t);
                     acc += ex;
                     for (int j = 0; j < rem; j++) row[i + j] = t[j];
@@ -129,10 +172,11 @@ namespace TensorSharp.Models
             }
             else if (Vector256.IsHardwareAccelerated)
             {
-                Vector256<float> vm = Vector256.Create(max), acc = Vector256<float>.Zero;
+                Vector256<float> vm = Vector256.Create(max), floor = Vector256.Create(DecodeSoftmaxFlushBelow);
+                Vector256<float> acc = Vector256<float>.Zero;
                 for (; i + 8 <= n; i += 8)
                 {
-                    Vector256<float> ex = Vector256.Exp(Vector256.Load(row + i) - vm);
+                    Vector256<float> ex = FlushedExp(Vector256.Load(row + i) - vm, floor);
                     Vector256.Store(ex, row + i);
                     acc += ex;
                 }
@@ -141,7 +185,7 @@ namespace TensorSharp.Models
                     float* t = stackalloc float[8];
                     int rem = n - i;
                     for (int j = 0; j < 8; j++) t[j] = j < rem ? row[i + j] : float.NegativeInfinity;
-                    Vector256<float> ex = Vector256.Exp(Vector256.Load(t) - vm);
+                    Vector256<float> ex = FlushedExp(Vector256.Load(t) - vm, floor);
                     Vector256.Store(ex, t);
                     acc += ex;
                     for (int j = 0; j < rem; j++) row[i + j] = t[j];
@@ -151,10 +195,11 @@ namespace TensorSharp.Models
             }
             else if (Vector128.IsHardwareAccelerated)
             {
-                Vector128<float> vm = Vector128.Create(max), acc = Vector128<float>.Zero;
+                Vector128<float> vm = Vector128.Create(max), floor = Vector128.Create(DecodeSoftmaxFlushBelow);
+                Vector128<float> acc = Vector128<float>.Zero;
                 for (; i + 4 <= n; i += 4)
                 {
-                    Vector128<float> ex = Vector128.Exp(Vector128.Load(row + i) - vm);
+                    Vector128<float> ex = FlushedExp(Vector128.Load(row + i) - vm, floor);
                     Vector128.Store(ex, row + i);
                     acc += ex;
                 }
@@ -163,7 +208,7 @@ namespace TensorSharp.Models
                     float* t = stackalloc float[4];
                     int rem = n - i;
                     for (int j = 0; j < 4; j++) t[j] = j < rem ? row[i + j] : float.NegativeInfinity;
-                    Vector128<float> ex = Vector128.Exp(Vector128.Load(t) - vm);
+                    Vector128<float> ex = FlushedExp(Vector128.Load(t) - vm, floor);
                     Vector128.Store(ex, t);
                     acc += ex;
                     for (int j = 0; j < rem; j++) row[i + j] = t[j];
@@ -173,7 +218,8 @@ namespace TensorSharp.Models
             }
             for (; i < n; i++)
             {
-                float e = MathF.Exp(row[i] - max);
+                float d = row[i] - max;
+                float e = d < DecodeSoftmaxFlushBelow ? 0f : MathF.Exp(d);
                 row[i] = e;
                 sum += e;
             }
@@ -632,7 +678,11 @@ namespace TensorSharp.Models
                     if (chunkSum <= 0) continue;
                     float* chunkAcc = p + 2;
 
-                    float scale = MathF.Exp(chunkMax - globalMax);
+                    // A chunk this far below the global max adds nothing an F32 sum can
+                    // hold, and its scale would be subnormal (see VecExpRow).
+                    float logScale = chunkMax - globalMax;
+                    if (logScale < DecodeSoftmaxFlushBelow) continue;
+                    float scale = MathF.Exp(logScale);
                     globalSum += chunkSum * scale;
                     VecScaleAdd(rOut, chunkAcc, scale, headDim);
                 }
