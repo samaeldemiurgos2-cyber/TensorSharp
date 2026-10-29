@@ -33,7 +33,9 @@ public sealed class Mistral3LayerSplitPrecisionTests : IDisposable
             KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, explicitF32);
             using var model = new InspectableMistral(_path, new MetadataGroup(node));
             Assert.Equal(expected, model.CacheDtype);
-            Assert.Equal(node == 0, model.QuantizedCount == 0);
+            // The first pipeline stage owns the leading F32 layers.
+            Assert.Equal(LayerSplitPlan.StageOf(node, 2, LayerSplitPlan.DriverRunsLastStageFromEnvironment()) == 0,
+                model.QuantizedCount == 0);
         }
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, explicitF32);
         using var reference = new InspectableMistral(_path);

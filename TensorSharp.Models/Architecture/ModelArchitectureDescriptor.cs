@@ -109,8 +109,9 @@ namespace TensorSharp.Models.Architecture
         public Func<int, BackendType, bool> SupportsNativeTensorParallel { get; init; }
 
         /// <summary>Whether the tensor-parallel executor consumes cross-node
-        /// collectives. Only applies to TensorParallel architectures; native
-        /// executors that own local ranks must set this to false.</summary>
+        /// collectives. Only applies to TensorParallel architectures. Native
+        /// executors must connect their rank reductions to the supplied group;
+        /// owning several local ranks alone does not provide distributed support.</summary>
         public bool SupportsDistributedTensorParallel { get; init; } = true;
 
         /// <summary>Optional backend restriction for cross-node collectives.

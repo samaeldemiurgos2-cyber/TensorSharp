@@ -284,6 +284,7 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     }
     switch (w->type) {
 #define TSG_STRIP_TYPE(TYPE) case TYPE: dispatch_quant_strip<TYPE>(state->device, state->stream, width, a); break;
+        TSG_STRIP_TYPE(GGML_TYPE_Q5_1)
         TSG_STRIP_TYPE(GGML_TYPE_Q2_K)
         TSG_STRIP_TYPE(GGML_TYPE_Q3_K)
         TSG_STRIP_TYPE(GGML_TYPE_Q4_K)

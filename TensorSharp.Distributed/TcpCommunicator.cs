@@ -5,13 +5,61 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Numerics;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace TensorSharp.Distributed
 {
+    /// <summary>All-reduce exchange pattern. Both produce the same rank-ordered sum.</summary>
+    public enum TcpAllReduceAlgorithm
+    {
+        /// <summary>Workers send to rank 0, which sums and returns the result: one round trip.</summary>
+        Star = 0,
+        /// <summary>Every node sends to every peer and sums locally: one one-way latency.</summary>
+        Symmetric = 1,
+    }
+
+    /// <summary>Wire settings every node must share; they are checked in the handshake.</summary>
+    public sealed record TcpTransportOptions
+    {
+        public TcpAllReduceAlgorithm AllReduce { get; init; } = TcpAllReduceAlgorithm.Symmetric;
+
+        /// <summary>Symmetric payloads up to this size are sent inline before receiving.
+        /// Larger ones are written on a separate thread so two large concurrent
+        /// writes cannot fill both directions' buffers and deadlock.</summary>
+        public int SymmetricInlineBytes { get; init; } = 32 * 1024;
+
+        public static TcpTransportOptions FromEnvironment()
+        {
+            var options = new TcpTransportOptions();
+            string algorithm = Environment.GetEnvironmentVariable("TENSORSHARP_TP_ALLREDUCE");
+            if (!string.IsNullOrWhiteSpace(algorithm))
+            {
+                options = options with
+                {
+                    AllReduce = algorithm.Trim().ToLowerInvariant() switch
+                    {
+                        "star" => TcpAllReduceAlgorithm.Star,
+                        "symmetric" => TcpAllReduceAlgorithm.Symmetric,
+                        _ => throw new ArgumentException("TENSORSHARP_TP_ALLREDUCE must be 'symmetric' or 'star'."),
+                    },
+                };
+            }
+            string inline = Environment.GetEnvironmentVariable("TENSORSHARP_TP_SYMMETRIC_INLINE_BYTES");
+            if (!string.IsNullOrWhiteSpace(inline))
+            {
+                if (!int.TryParse(inline, out int bytes) || bytes < 0)
+                    throw new ArgumentException("TENSORSHARP_TP_SYMMETRIC_INLINE_BYTES must be a non-negative integer.");
+                options = options with { SymmetricInlineBytes = bytes };
+            }
+            return options;
+        }
+    }
+
     /// <summary>
     /// Persistent TCP mesh shared by tensor parallelism and layer pipelines.
     /// Frames contain an int32 little-endian length (including the type byte),
@@ -22,17 +70,27 @@ namespace TensorSharp.Distributed
     public sealed class TcpCommunicator : IDisposable
     {
         private const byte MsgAllReduceContribute = 1, MsgAllReduceResult = 2,
-            MsgBarrierAck = 3, MsgControl = 4, MsgHeartbeat = 5, MsgTensor = 6, MsgBroadcast = 7;
-        private const int ProtocolMagic = 0x54535032, ProtocolVersion = 2;
-        private const int SmallFrameBytes = 4096, MaxControlBytes = 16 * 1024 * 1024;
+            MsgBarrierAck = 3, MsgControl = 4, MsgHeartbeat = 5, MsgTensor = 6, MsgBroadcast = 7,
+            MsgAllReduceExchange = 8;
+        private const int ProtocolMagic = 0x54535032;
+        /// <summary>Version 3 adds the all-reduce settings to the handshake.</summary>
+        public const int ProtocolVersion = 3;
+        /// <summary>Base handshake (magic, version, rank, world size) plus the all-reduce settings.</summary>
+        public const int HandshakeBytes = 24;
+        // Frames up to this size are copied behind their header and written once,
+        // so a decode collective is one segment (and one SSH packet on a tunnel).
+        private const int CoalesceBytes = 64 * 1024, MaxControlBytes = 16 * 1024 * 1024;
         private readonly int _rank, _worldSize, _ioTimeoutMs, _operationTimeoutMs;
+        private readonly TcpTransportOptions _options;
         private readonly TcpListener _listener;
         private readonly TcpClient[] _peers;
         private readonly NetworkStream[] _streams;
         private readonly object[] _sendLocks;
+        private readonly byte[][] _frames;
         private readonly object _operationLock = new();
         private Timer _heartbeatTimer;
         private float[] _reduceBuffer = Array.Empty<float>();
+        private float[][] _peerBuffers;
         private Exception _fault;
         private int _closed, _disposed;
 
@@ -59,8 +117,27 @@ namespace TensorSharp.Distributed
         /// or the I/O timeout when unset. Idle controls and load barriers are exempt.</param>
         public TcpCommunicator(int rank, IPEndPoint[] endpoints,
             TimeSpan? connectTimeout, TimeSpan? ioTimeout, TimeSpan? operationTimeout)
+            : this(rank, endpoints, connectTimeout, ioTimeout, operationTimeout, null)
+        {
+        }
+
+        /// <param name="options">Wire settings; defaults to <see cref="TcpTransportOptions.FromEnvironment"/>.
+        /// Every node must use the same settings, which the handshake verifies.</param>
+        public TcpCommunicator(int rank, IPEndPoint[] endpoints,
+            TimeSpan? connectTimeout, TimeSpan? ioTimeout, TimeSpan? operationTimeout,
+            TcpTransportOptions options)
         {
             ArgumentNullException.ThrowIfNull(endpoints);
+            _options = options ?? TcpTransportOptions.FromEnvironment();
+            if (_options.SymmetricInlineBytes < 0)
+                throw new ArgumentOutOfRangeException(nameof(options), "SymmetricInlineBytes must not be negative.");
+            // Both nodes write up to two inline frames per direction before reading.
+            // A socket buffer override smaller than that would block both writers.
+            string socketBuffer = Environment.GetEnvironmentVariable("TENSORSHARP_TP_SOCKET_BUFFER_BYTES");
+            if (_options.AllReduce == TcpAllReduceAlgorithm.Symmetric && int.TryParse(socketBuffer, out int socketBytes)
+                && 2L * (_options.SymmetricInlineBytes + 5) > socketBytes)
+                throw new ArgumentException($"TENSORSHARP_TP_SOCKET_BUFFER_BYTES ({socketBytes}) must hold two inline frames; " +
+                    $"lower TENSORSHARP_TP_SYMMETRIC_INLINE_BYTES to at most {Math.Max(0, socketBytes / 2 - 5)}.");
             if (endpoints.Length < 2)
                 throw new ArgumentException("TCP communicator requires at least 2 nodes.", nameof(endpoints));
             if ((uint)rank >= (uint)endpoints.Length) throw new ArgumentOutOfRangeException(nameof(rank));
@@ -78,6 +155,8 @@ namespace TensorSharp.Distributed
             _peers = new TcpClient[_worldSize];
             _streams = new NetworkStream[_worldSize];
             _sendLocks = new object[_worldSize];
+            _frames = new byte[_worldSize][];
+            _peerBuffers = new float[_worldSize][];
             for (int r = 0; r < _worldSize; r++) _sendLocks[r] = new object();
             _listener = new TcpListener(endpoints[rank]);
             try
@@ -99,12 +178,15 @@ namespace TensorSharp.Distributed
                     {
                         var stream = Configure(client);
                         SetHandshakeTimeout(stream, expires);
-                        int remoteRank = ReadHandshake(stream);
+                        int remoteRank = ReadHandshake(stream, out bool sameSettings);
                         if (remoteRank < 0 || remoteRank >= rank || _peers[remoteRank] != null)
                             throw new InvalidOperationException($"Invalid or duplicate inbound rank {remoteRank} at rank {rank}.");
+                        // Reply before refusing different settings: the dialer then sees the
+                        // mismatch itself instead of retrying a closed connection until its deadline.
+                        WriteHandshake(stream);
+                        if (!sameSettings) throw TransportSettingsMismatch();
                         _peers[remoteRank] = client;
                         _streams[remoteRank] = stream;
-                        WriteHandshake(stream);
                         stream.ReadTimeout = stream.WriteTimeout = _ioTimeoutMs;
                     }
                     catch { client.Dispose(); throw; }
@@ -118,11 +200,13 @@ namespace TensorSharp.Distributed
             }
             catch { Dispose(); throw; }
             _heartbeatTimer = new Timer(SendHeartbeats, null, 15_000, 15_000);
-            Console.WriteLine($"[TcpCommunicator] Rank {rank}/{_worldSize} connected to all peers (protocol {ProtocolVersion}).");
+            Console.WriteLine($"[TcpCommunicator] Rank {rank}/{_worldSize} connected to all peers (protocol {ProtocolVersion}, " +
+                $"all-reduce {_options.AllReduce.ToString().ToLowerInvariant()}, inline {_options.SymmetricInlineBytes} B).");
         }
 
         public int Rank => _rank;
         public int WorldSize => _worldSize;
+        public TcpTransportOptions Options => _options;
 
         /// <summary>Verify that every node agrees on a mode, placement or model
         /// identity before doing dependent work. This is a consistency check,
@@ -196,11 +280,25 @@ namespace TensorSharp.Distributed
                 var client = new TcpClient(endpoint.AddressFamily);
                 try
                 {
-                    client.ConnectAsync(endpoint.Address, endpoint.Port, cancellation).AsTask().GetAwaiter().GetResult();
+                    if (OperatingSystem.IsWindows())
+                        client.ConnectAsync(endpoint.Address, endpoint.Port, cancellation).AsTask().GetAwaiter().GetResult();
+                    else
+                    {
+                        // An async connect permanently switches a Unix socket to .NET's
+                        // emulated non-blocking mode, which routes every later blocking
+                        // read through the epoll thread. Rank 0 receives every star
+                        // contribution and every stage's logits, so keep its sockets
+                        // on direct blocking reads. SO_SNDTIMEO bounds connect() here.
+                        int remaining = (int)Math.Ceiling((expires - DateTime.UtcNow).TotalMilliseconds);
+                        if (remaining < 1) cancellation.ThrowIfCancellationRequested();
+                        client.Client.SendTimeout = Math.Max(1, remaining);
+                        client.Connect(endpoint.Address, endpoint.Port);
+                    }
                     var stream = Configure(client);
                     SetHandshakeTimeout(stream, expires);
                     WriteHandshake(stream);
-                    int receivedRank = ReadHandshake(stream);
+                    int receivedRank = ReadHandshake(stream, out bool sameSettings);
+                    if (!sameSettings) throw TransportSettingsMismatch();
                     if (receivedRank != remoteRank)
                         throw new InvalidOperationException($"Expected rank {remoteRank} at {endpoint}, received rank {receivedRank}.");
                     stream.ReadTimeout = stream.WriteTimeout = _ioTimeoutMs;
@@ -229,31 +327,48 @@ namespace TensorSharp.Distributed
             }
         }
 
-        private void WriteHandshake(NetworkStream stream)
+        /// <summary>Handshake bytes a node with these settings sends: magic, version,
+        /// rank, world size, all-reduce algorithm and symmetric inline limit.</summary>
+        public static byte[] CreateHandshake(int rank, int worldSize, TcpTransportOptions options)
         {
-            Span<byte> data = stackalloc byte[16];
+            ArgumentNullException.ThrowIfNull(options);
+            var data = new byte[HandshakeBytes];
             BinaryPrimitives.WriteInt32LittleEndian(data, ProtocolMagic);
-            BinaryPrimitives.WriteInt32LittleEndian(data[4..], ProtocolVersion);
-            BinaryPrimitives.WriteInt32LittleEndian(data[8..], _rank);
-            BinaryPrimitives.WriteInt32LittleEndian(data[12..], _worldSize);
-            stream.Write(data);
+            BinaryPrimitives.WriteInt32LittleEndian(data.AsSpan(4), ProtocolVersion);
+            BinaryPrimitives.WriteInt32LittleEndian(data.AsSpan(8), rank);
+            BinaryPrimitives.WriteInt32LittleEndian(data.AsSpan(12), worldSize);
+            BinaryPrimitives.WriteInt32LittleEndian(data.AsSpan(16), (int)options.AllReduce);
+            BinaryPrimitives.WriteInt32LittleEndian(data.AsSpan(20), options.SymmetricInlineBytes);
+            return data;
         }
 
-        private int ReadHandshake(NetworkStream stream)
+        private void WriteHandshake(NetworkStream stream) => stream.Write(CreateHandshake(_rank, _worldSize, _options));
+
+        private static InvalidOperationException TransportSettingsMismatch() => new(
+            "Distributed transport settings differ between peers. Use the same " +
+            "TENSORSHARP_TP_ALLREDUCE and TENSORSHARP_TP_SYMMETRIC_INLINE_BYTES on every node.");
+
+        private int ReadHandshake(NetworkStream stream, out bool sameSettings)
         {
-            Span<byte> data = stackalloc byte[16];
+            Span<byte> data = stackalloc byte[HandshakeBytes];
             ReadExact(stream, data[..4]);
             if (BinaryPrimitives.ReadInt32LittleEndian(data) != ProtocolMagic)
                 throw new InvalidOperationException("Incompatible TCP protocol. Run the same TensorSharp build on every node.");
-            ReadExact(stream, data[4..]);
+            // Check the version before reading the settings: an older peer sends no
+            // settings, and waiting for them would stall until the handshake deadline.
+            ReadExact(stream, data[4..16]);
             if (BinaryPrimitives.ReadInt32LittleEndian(data[4..]) != ProtocolVersion ||
                 BinaryPrimitives.ReadInt32LittleEndian(data[12..]) != _worldSize)
-                throw new InvalidOperationException("TCP protocol version or node count differs between peers.");
+                throw new InvalidOperationException("TCP protocol version or node count differs between peers. Run the same TensorSharp build on every node.");
+            ReadExact(stream, data[16..]);
+            sameSettings = BinaryPrimitives.ReadInt32LittleEndian(data[16..]) == (int)_options.AllReduce &&
+                BinaryPrimitives.ReadInt32LittleEndian(data[20..]) == _options.SymmetricInlineBytes;
             return BinaryPrimitives.ReadInt32LittleEndian(data[8..]);
         }
 
-        /// <summary>Lossless rank-ordered sum. Only root needs a reusable receive buffer.
-        /// Direct synchronous I/O avoids a thread wakeup for every decode collective.</summary>
+        /// <summary>Lossless rank-ordered sum ((v0 + v1) + v2) + ..., bit-identical on
+        /// every node and for both algorithms. Direct synchronous I/O avoids a thread
+        /// wakeup for every decode collective.</summary>
         public void AllReduce(float[] buffer, int length)
         {
             ArgumentNullException.ThrowIfNull(buffer);
@@ -264,32 +379,115 @@ namespace TensorSharp.Distributed
                 ThrowIfUnavailable();
                 try
                 {
-                    var values = buffer.AsSpan(0, length);
-                    var bytes = MemoryMarshal.AsBytes(values);
-                    if (_rank == 0)
-                    {
-                        if (_reduceBuffer.Length < length) _reduceBuffer = new float[length];
-                        var incoming = _reduceBuffer.AsSpan(0, length);
-                        for (int r = 1; r < _worldSize; r++)
-                        {
-                            ReceiveInto(r, MsgAllReduceContribute, MemoryMarshal.AsBytes(incoming));
-                            int i = 0;
-                            if (Vector.IsHardwareAccelerated)
-                                for (; i <= length - Vector<float>.Count; i += Vector<float>.Count)
-                                    (new Vector<float>(values.Slice(i)) + new Vector<float>(incoming.Slice(i))).CopyTo(values.Slice(i));
-                            for (; i < length; i++) values[i] += incoming[i];
-                        }
-                        for (int r = 1; r < _worldSize; r++) SendMessage(r, MsgAllReduceResult, bytes);
-                    }
-                    else
-                    {
-                        SendMessage(0, MsgAllReduceContribute, bytes);
-                        ReceiveInto(0, MsgAllReduceResult, bytes);
-                    }
+                    if (_options.AllReduce == TcpAllReduceAlgorithm.Symmetric) AllReduceSymmetric(buffer, length);
+                    else AllReduceStar(buffer, length);
                     // TCP orders the first and every subsequent operation; no extra barrier.
                 }
                 catch (Exception ex) { Fail(ex); throw; }
             }
+        }
+
+        private void AllReduceStar(float[] buffer, int length)
+        {
+            var values = buffer.AsSpan(0, length);
+            var bytes = MemoryMarshal.AsBytes(values);
+            if (_rank == 0)
+            {
+                if (_reduceBuffer.Length < length) _reduceBuffer = new float[length];
+                var incoming = _reduceBuffer.AsSpan(0, length);
+                for (int r = 1; r < _worldSize; r++)
+                {
+                    ReceiveInto(r, MsgAllReduceContribute, MemoryMarshal.AsBytes(incoming));
+                    AddInto(values, incoming);
+                }
+                for (int r = 1; r < _worldSize; r++) SendMessage(r, MsgAllReduceResult, bytes);
+            }
+            else
+            {
+                SendMessage(0, MsgAllReduceContribute, bytes);
+                ReceiveInto(0, MsgAllReduceResult, bytes);
+            }
+        }
+
+        /// <summary>
+        /// Every node sends its contribution to every peer, receives theirs, then
+        /// sums in rank order. A node waits for one one-way latency instead of the
+        /// star's round trip through rank 0. Small payloads are sent inline: two
+        /// frames per direction fit in the socket buffers, so both nodes writing
+        /// first cannot deadlock. Larger payloads use one writer per peer while
+        /// this thread receives; a writer only waits for its own destination to read.
+        /// </summary>
+        private void AllReduceSymmetric(float[] buffer, int length)
+        {
+            for (int r = 0; r < _worldSize; r++)
+                if (r != _rank && (_peerBuffers[r] == null || _peerBuffers[r].Length < length))
+                    _peerBuffers[r] = new float[length];
+            int bytes = length * sizeof(float);
+            Task[] writers = null;
+            if (bytes <= _options.SymmetricInlineBytes)
+            {
+                var own = MemoryMarshal.AsBytes(buffer.AsSpan(0, length));
+                for (int r = 0; r < _worldSize; r++)
+                    if (r != _rank) SendMessage(r, MsgAllReduceExchange, own);
+            }
+            else
+            {
+                // Writers only read the buffer; it is not summed into until they finish.
+                writers = new Task[_worldSize - 1];
+                for (int r = 0, w = 0; r < _worldSize; r++)
+                {
+                    if (r == _rank) continue;
+                    int peer = r;
+                    writers[w++] = Task.Factory.StartNew(
+                        () => SendMessage(peer, MsgAllReduceExchange, MemoryMarshal.AsBytes(buffer.AsSpan(0, length))),
+                        CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                }
+            }
+
+            Exception receiveError = null;
+            try
+            {
+                for (int r = 0; r < _worldSize; r++)
+                    if (r != _rank)
+                        ReceiveInto(r, MsgAllReduceExchange, MemoryMarshal.AsBytes(_peerBuffers[r].AsSpan(0, length)));
+            }
+            catch (Exception ex)
+            {
+                // Close the mesh first so a writer blocked on a stalled peer fails now
+                // instead of waiting for its socket write timeout.
+                receiveError = ex;
+                Fail(ex);
+            }
+            if (writers != null)
+            {
+                try { Task.WaitAll(writers); }
+                catch (AggregateException ex) when (receiveError == null) { ExceptionDispatchInfo.Throw(ex.InnerException ?? ex); }
+                catch (AggregateException) { /* The receive failure is the primary error. */ }
+            }
+            if (receiveError != null) ExceptionDispatchInfo.Throw(receiveError);
+
+            // Reproduce the star's order exactly. IEEE addition is commutative, so
+            // own + partial equals partial + own; only the grouping must match.
+            // (A lane holding two NaNs may keep either payload; every other value matches.)
+            var values = buffer.AsSpan(0, length);
+            if (_rank == 0)
+            {
+                for (int r = 1; r < _worldSize; r++) AddInto(values, _peerBuffers[r].AsSpan(0, length));
+                return;
+            }
+            var lower = _peerBuffers[0].AsSpan(0, length);
+            for (int r = 1; r < _rank; r++) AddInto(lower, _peerBuffers[r].AsSpan(0, length));
+            AddInto(values, lower);
+            for (int r = _rank + 1; r < _worldSize; r++) AddInto(values, _peerBuffers[r].AsSpan(0, length));
+        }
+
+        private static void AddInto(Span<float> destination, ReadOnlySpan<float> source)
+        {
+            int i = 0;
+            if (Vector.IsHardwareAccelerated)
+                for (; i <= destination.Length - Vector<float>.Count; i += Vector<float>.Count)
+                    (new Vector<float>(destination.Slice(i)) + new Vector<float>(source.Slice(i))).CopyTo(destination.Slice(i));
+            for (; i < destination.Length; i++) destination[i] += source[i];
         }
 
         /// <summary>Send a stage activation directly from its F32 source buffer.</summary>
@@ -327,7 +525,7 @@ namespace TensorSharp.Distributed
                 try
                 {
                     int size = 8 + count * 4;
-                    Span<byte> data = size <= SmallFrameBytes ? stackalloc byte[size] : new byte[size];
+                    Span<byte> data = size <= 4096 ? stackalloc byte[size] : new byte[size];
                     BinaryPrimitives.WriteInt32LittleEndian(data, op);
                     BinaryPrimitives.WriteInt32LittleEndian(data[4..], count);
                     if (count > 0) MemoryMarshal.AsBytes(payload.AsSpan()).CopyTo(data[8..]);
@@ -425,19 +623,27 @@ namespace TensorSharp.Distributed
             if (payload.Length == int.MaxValue) throw new ArgumentOutOfRangeException(nameof(payload));
             lock (_sendLocks[destination])
             {
-                // Coalesce small decode/control messages into one syscall/TCP segment.
-                Span<byte> frame = stackalloc byte[SmallFrameBytes];
-                BinaryPrimitives.WriteInt32LittleEndian(frame, payload.Length + 1);
-                frame[4] = type;
                 var stream = _streams[destination];
-                if (payload.Length <= SmallFrameBytes - 5)
+                if (payload.Length <= CoalesceBytes)
                 {
-                    payload.CopyTo(frame[5..]);
-                    stream.Write(frame[..(5 + payload.Length)]);
+                    // One write per decode/control frame: a separate header write is
+                    // an extra segment, and an extra packet through an SSH tunnel.
+                    // The buffer is per destination and guarded by its send lock.
+                    int length = 5 + payload.Length;
+                    byte[] frame = _frames[destination];
+                    if (frame == null || frame.Length < length)
+                        _frames[destination] = frame = new byte[Math.Min(CoalesceBytes + 5, Math.Max(length, 2 * (frame?.Length ?? 2048)))];
+                    BinaryPrimitives.WriteInt32LittleEndian(frame, payload.Length + 1);
+                    frame[4] = type;
+                    payload.CopyTo(frame.AsSpan(5));
+                    stream.Write(frame, 0, length);
                 }
                 else
                 {
-                    stream.Write(frame[..5]);
+                    Span<byte> header = stackalloc byte[5];
+                    BinaryPrimitives.WriteInt32LittleEndian(header, payload.Length + 1);
+                    header[4] = type;
+                    stream.Write(header);
                     stream.Write(payload);
                 }
             }
@@ -493,7 +699,10 @@ namespace TensorSharp.Distributed
                         if (remainingTicks <= 0) throw OperationTimeout();
                         int remainingMs = (int)Math.Min(int.MaxValue,
                             Math.Ceiling(remainingTicks * 1000d / Stopwatch.Frequency));
-                        int timeout = Math.Min(_ioTimeoutMs, Math.Max(1, remainingMs));
+                        // Shorten the socket timeout only when the deadline is at least a
+                        // second sooner. Otherwise every read paid two setsockopt calls
+                        // whenever the operation and I/O timeouts were equal (the default).
+                        int timeout = remainingMs + 1000L < _ioTimeoutMs ? Math.Max(1, remainingMs) : _ioTimeoutMs;
                         if (timeout != currentTimeout)
                         {
                             stream.ReadTimeout = timeout;

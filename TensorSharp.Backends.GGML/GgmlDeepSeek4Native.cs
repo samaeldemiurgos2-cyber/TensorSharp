@@ -61,6 +61,10 @@ namespace TensorSharp.GGML
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4SetPipelineDriver(IntPtr handle, int driver);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_Dsv4UBatch(IntPtr handle);
 
         [LibraryImport(DllName)]
@@ -202,6 +206,14 @@ namespace TensorSharp.GGML
                 Marshal.GetFunctionPointerForDelegate(transfer), IntPtr.Zero);
             GC.KeepAlive(transfer);
             return handle;
+        }
+
+        /// <summary>Set the pipeline stage whose host samples; its logits are not
+        /// sent when it is the last stage. Every node must pass the same stage.</summary>
+        public static void SetPipelineDriver(IntPtr handle, int driverStage)
+        {
+            if (TSGgml_Dsv4SetPipelineDriver(handle, driverStage) != 1)
+                throw new InvalidOperationException("The native DeepSeek executor rejected the pipeline driver stage.");
         }
 
         /// <summary>Tokens the DSpark drafter proposes per block, or 0 when no

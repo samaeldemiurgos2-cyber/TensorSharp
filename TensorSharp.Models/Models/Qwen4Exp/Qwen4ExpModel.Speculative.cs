@@ -23,9 +23,9 @@ namespace TensorSharp.Models
         public bool SpecPlainStepUsesForward => true;
         // SpecForward delegates to Forward's image injection and captures each
         // chunk's MRoPE positions before Forward consumes them for MTP catch-up.
-        public bool SpecSupportsMultimodalPrefill => true;
-        public bool SpecTrunkFollowsBoundCache => true;
-        public bool SpeculationProfitable => !_specStateFailed && IsGgmlBackend
+        public bool SpecSupportsMultimodalPrefill => !HasDistributedQwen;
+        public bool SpecTrunkFollowsBoundCache => !HasDistributedQwen;
+        public bool SpeculationProfitable => !HasDistributedQwen && !_specStateFailed && IsGgmlBackend
             && !_tokenGraphUnsupported && !_fusedGateUpExperts
             && !_fusedFfnUnsupported && !_fusedGdnUnsupported && !_fusedAttnUnsupported
             && !_gdnVerify;
@@ -97,6 +97,7 @@ namespace TensorSharp.Models
 
         public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            RefuseUnmirroredQwenOperation("speculative execution and rollback");
             ArgumentNullException.ThrowIfNull(tokens);
             ArgumentNullException.ThrowIfNull(logitsOut);
             if (tokens.Length == 0 || logitsOut.Length < checked(Config.VocabSize * (allLogitsRows ? tokens.Length : 1))
@@ -140,6 +141,7 @@ namespace TensorSharp.Models
 
         public void SpecEnsureCapacity(int requiredSeqLen)
         {
+            RefuseUnmirroredQwenOperation("speculative execution and rollback");
             if (requiredSeqLen < _cacheSeqLen || requiredSeqLen > MaxContextLength)
                 throw new ArgumentOutOfRangeException(nameof(requiredSeqLen));
             EnsureCacheCapacity(requiredSeqLen);
@@ -148,6 +150,7 @@ namespace TensorSharp.Models
 
         public unsafe void SpecSnapshotRecurrentState()
         {
+            RefuseUnmirroredQwenOperation("speculative execution and rollback");
             FlushArenaCache(_kCache);
             _specMetadata = null; // a partial capture must never restore an older window
             _specRecurrentRestored = false;
@@ -204,6 +207,7 @@ namespace TensorSharp.Models
 
         public void SpecRestoreRecurrentState()
         {
+            RefuseUnmirroredQwenOperation("speculative execution and rollback");
             FlushArenaCache(_kCache);
             ValidateSpecMetadata(_specMetadata);
             // Reserve before native ownership changes; metadata publication after
@@ -222,6 +226,7 @@ namespace TensorSharp.Models
 
         public void SpecRewindCache(int length)
         {
+            RefuseUnmirroredQwenOperation("speculative execution and rollback");
             ValidateSpecMetadata(_specMetadata);
             if (!_specRecurrentRestored || length != _specMetadata.Position || length > _cacheSeqLen)
                 throw new InvalidOperationException("qwen4exp: recurrent rewind must return to the captured position, then replay accepted tokens.");

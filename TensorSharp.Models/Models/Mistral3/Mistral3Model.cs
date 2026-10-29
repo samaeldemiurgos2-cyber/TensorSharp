@@ -428,6 +428,7 @@ namespace TensorSharp.Models
         // Vision support
         public void LoadVisionEncoder(string mmProjPath)
         {
+            RefuseVisionOffFirstStage();
             _visionEncoder = new Mistral3VisionEncoder(mmProjPath, _allocator);
             _visionEncoder.SetHostModel(this);
         }
@@ -438,7 +439,20 @@ namespace TensorSharp.Models
 
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
         {
+            RefuseVisionOffFirstStage();
             _pendingVisionEmbeddingsList.Add((embeddings, insertPosition));
+        }
+
+        /// <summary>Image rows are embedded and injected where this node embeds
+        /// tokens. In a multi-node pipeline that runs the last stage on node 0 (the
+        /// default), the first stage is another node, so images are refused rather
+        /// than dropped.</summary>
+        private void RefuseVisionOffFirstStage()
+        {
+            if (LayerSplitGroup?.NodeCount > 1 && LayerPlacement != null && !LayerPlacement.IsFirst)
+                throw new NotSupportedException(
+                    "Multi-node layer split runs node 0 as the last stage, so it cannot inject image embeddings. " +
+                    $"Set {LayerSplitPlan.DriverStageVariable}=first on every node to serve images.");
         }
 
         public Mistral3VisionEncoder VisionEncoder => _visionEncoder;

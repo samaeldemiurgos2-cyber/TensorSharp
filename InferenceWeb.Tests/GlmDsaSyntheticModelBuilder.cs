@@ -22,6 +22,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace InferenceWeb.Tests;
@@ -84,7 +85,8 @@ internal static class GlmDsaSyntheticModelBuilder
     public static string WriteGlm5NextTpFixture(
         string path, int numHeads, bool quantizeAttentionOutput, int numLayers = 1,
         bool mixedAttention = false, bool routedExperts = false, bool quantizeExperts = false,
-        int contextLength = 256, int indexerTopK = 4)
+        int contextLength = 256, int indexerTopK = 4, int expertFfn = 64,
+        string architecture = "glm5next", bool tiedOutput = false)
     {
         const int hidden = 64;
         const int ffn = 64;
@@ -105,6 +107,10 @@ internal static class GlmDsaSyntheticModelBuilder
             throw new ArgumentException("Mixed attention requires at least one KDA and one MLA layer.");
         if (quantizeExperts && !routedExperts)
             throw new ArgumentException("Quantized experts require routedExperts.");
+        if (expertFfn <= 0 || (quantizeExperts && expertFfn % Q8Block != 0))
+            throw new ArgumentOutOfRangeException(nameof(expertFfn));
+        if (architecture is not ("glm5next" or "glm5-next"))
+            throw new ArgumentException("Expected a GLM-5.3-Flash architecture alias.", nameof(architecture));
         if (quantizeAttentionOutput && dInner % Q8Block != 0)
             throw new ArgumentException("The Q8_0 fixture's KDA width must contain whole quantization blocks.",
                 nameof(numHeads));
@@ -158,7 +164,6 @@ internal static class GlmDsaSyntheticModelBuilder
         // Optional verification fixture: preserve the existing all-KDA/dense
         // defaults byte-for-byte while exercising the production mixed layout.
         var kvHeads = new uint[numLayers];
-        const int expertFfn = 64; // TP2 leaves a whole Q8_0 block per rank.
         for (int l = 0; l < numLayers; l++)
         {
             string p = $"blk.{l}.";
@@ -209,8 +214,9 @@ internal static class GlmDsaSyntheticModelBuilder
         if (quantizeExperts)
             foreach (var tensor in tensors)
                 if (tensor.Name.EndsWith("_exps.weight", StringComparison.Ordinal)) tensor.Type = GgmlType.Q8_0;
+        if (tiedOutput) tensors.RemoveAll(t => t.Name == "output.weight");
 
-        const string a = "glm5next";
+        string a = architecture;
         var kv = new List<KvEntry>
         {
             new KvStr  { Key = "general.architecture", V = a },
@@ -256,6 +262,11 @@ internal static class GlmDsaSyntheticModelBuilder
         };
 
         var tokens = new List<string>(vocab);
+        if (routedExperts)
+        {
+            kv.Add(new KvU32 { Key = $"{a}.expert_shared_count", V = 1 });
+            kv.Add(new KvU32 { Key = $"{a}.expert_shared_feed_forward_length", V = (uint)expertFfn });
+        }
         foreach (int b in ByteToUnicode(vocab)) tokens.Add(char.ConvertFromUtf32(b));
         var types = new int[vocab];
         Array.Fill(types, 1);
@@ -291,12 +302,28 @@ internal static class GlmDsaSyntheticModelBuilder
     /// <param name="indexerTopK">Cells the indexer keeps per query once it selects; the default is
     /// past any prompt the tests use (dense attention), a small value makes the pooled selection
     /// run from the first ubatch.</param>
-    public static string WriteGlm5NextCudaFixture(string path, int contextLength = 512, int indexerTopK = 2048)
+    public static string WriteGlm5NextCudaFixture(string path, int contextLength = 512, int indexerTopK = 2048,
+        string distributedQuantizationProfile = null, int distributedLayers = 4, bool distributedDenseOnly = false,
+        bool distributedKdaOnly = false, int distributedExpertFfn = 2048)
     {
+        if (distributedQuantizationProfile is not (null or "all" or "attention" or "experts" or "q8-control" or "iq3-iq4" or "mixed" or "mixed-checkpoint"))
+            throw new ArgumentException("Unknown distributed quantization profile.", nameof(distributedQuantizationProfile));
+        if (distributedLayers < 1)
+            throw new ArgumentOutOfRangeException(nameof(distributedLayers));
+        if (distributedExpertFfn < 256 || distributedExpertFfn % 256 != 0)
+            throw new ArgumentOutOfRangeException(nameof(distributedExpertFfn), "Expert rows must contain whole K/IQ blocks.");
         const string a = "glm5next";
-        const int hidden = 256, heads = 2, headDim = 128, lowRank = 64, conv = 4, hc = 4, vocab = 256;
+        const int hidden = 256, headDim = 128, lowRank = 64, conv = 4, hc = 4, vocab = 256;
         const int qLora = 64, kvLora = 512, headK = 128, headV = 128;
-        const int idxHeads = 16, idxDim = 128, experts = 8, used = 2, expertFfn = 256, ffn = 256, layers = 4;
+        const int idxHeads = 16, idxDim = 128, experts = 8, used = 2, ffn = 256;
+        // Opt-in only: preserve the existing CUDA fixture's bytes and geometry.
+        // Eight 128-wide heads and 2048 expert channels leave whole 256-value
+        // quantization blocks on every global rank in a four-rank run.
+        int heads = distributedQuantizationProfile == null ? 2 : 8;
+        int expertFfn = distributedQuantizationProfile == null ? 256 : distributedExpertFfn;
+        int layers = distributedQuantizationProfile == null ? 4 : distributedLayers;
+        bool mixedRoles = distributedQuantizationProfile is "mixed" or "mixed-checkpoint";
+        int SourceLayer(int layer) => layer == 0 ? 0 : new[] { 11, 12, 44 }[(layer - 1) % 3];
         int dInner = heads * headDim;
         var tensors = new List<TensorSpec>
         {
@@ -319,7 +346,7 @@ internal static class GlmDsaSyntheticModelBuilder
                 Gen(p + "hc_ffn_scale.weight", 0.2f, 3),
                 Gen(p + "hc_ffn_base.weight", 0.2f, (2 + hc) * hc),
             });
-            if (l % 2 == 0)
+            if (distributedKdaOnly || (mixedRoles ? SourceLayer(l) % 4 != 3 : l % 2 == 0))
             {
                 tensors.AddRange(new[]
                 {
@@ -362,7 +389,7 @@ internal static class GlmDsaSyntheticModelBuilder
                     Gen(p + "indexer_compressor_ape.weight", 0.2f, idxDim, 4),
                 });
             }
-            if (l == 0)
+            if (l == 0 || distributedDenseOnly)
             {
                 tensors.AddRange(new[]
                 {
@@ -394,17 +421,59 @@ internal static class GlmDsaSyntheticModelBuilder
                 && !t.Name.EndsWith("indexer_compressor_ape.weight", StringComparison.Ordinal))
                 t.Type = GgmlType.Q8_0;
 
+        // Match the real IQ3_XXS checkpoint's projection formats, independently
+        // selectable so a topology difference can be attributed to attention
+        // versus routed expert arithmetic. These are actual upstream-quantized
+        // deterministic F32 rows, with a uniform importance matrix for IQ2_S.
+        foreach (var t in tensors)
+        {
+            if (distributedQuantizationProfile is "all" or "attention" or "iq3-iq4" or "mixed" or "mixed-checkpoint")
+                if (t.Name.EndsWith("attn_output.weight", StringComparison.Ordinal) ||
+                    t.Name.EndsWith("attn_q.weight", StringComparison.Ordinal) ||
+                    t.Name.EndsWith("attn_k.weight", StringComparison.Ordinal) ||
+                    t.Name.EndsWith("attn_v.weight", StringComparison.Ordinal))
+                    t.Type = GgmlType.Q6_K;
+            if (distributedQuantizationProfile is "all" or "experts" or "iq3-iq4" or "mixed" or "mixed-checkpoint")
+            {
+                // The exceptional production tensors are IQ3_S gate/up on
+                // layer 11, and IQ4_XS down on layers 11, 12 and 44. Map those
+                // actual layer roles into three small routed fixture layers.
+                int sourceLayer = t.Name.StartsWith("blk.", StringComparison.Ordinal)
+                    ? SourceLayer(int.Parse(t.Name.Split('.')[1])) : -1;
+                bool iq3Gate = distributedQuantizationProfile == "iq3-iq4" ||
+                    (mixedRoles && sourceLayer == 11);
+                bool iq4Down = distributedQuantizationProfile == "iq3-iq4" || mixedRoles;
+                if (t.Name.EndsWith("ffn_gate_exps.weight", StringComparison.Ordinal) ||
+                    t.Name.EndsWith("ffn_up_exps.weight", StringComparison.Ordinal)) t.Type = iq3Gate ? GgmlType.IQ3_S : GgmlType.IQ2_S;
+                if (t.Name.EndsWith("ffn_down_exps.weight", StringComparison.Ordinal)) t.Type = iq4Down ? GgmlType.IQ4_XS : GgmlType.IQ3_S;
+                if (distributedQuantizationProfile == "mixed-checkpoint")
+                {
+                    // Header-verified exception: production block 11 uses Q8
+                    // attention output/shared projections. Blocks 0/12/44 use
+                    // Q6 attention outputs; 12/44 shared and block0 dense FFNs
+                    // are Q6 too. Keep the older mixed profile reproducible.
+                    if (t.Name.EndsWith("attn_output.weight", StringComparison.Ordinal))
+                        t.Type = sourceLayer == 11 ? GgmlType.Q8_0 : GgmlType.Q6_K;
+                    if (t.Name.EndsWith("_shexp.weight", StringComparison.Ordinal))
+                        t.Type = sourceLayer == 11 ? GgmlType.Q8_0 : GgmlType.Q6_K;
+                    if (sourceLayer == 0 && (t.Name.EndsWith("ffn_gate.weight", StringComparison.Ordinal) ||
+                        t.Name.EndsWith("ffn_up.weight", StringComparison.Ordinal) ||
+                        t.Name.EndsWith("ffn_down.weight", StringComparison.Ordinal))) t.Type = GgmlType.Q6_K;
+                }
+            }
+        }
+
         var clamp = new float[layers];
         Array.Fill(clamp, 10.0f);
         var kv = new List<KvEntry>
         {
             new KvStr  { Key = "general.architecture", V = a },
             new KvStr  { Key = "general.name", V = "tiny-glm5next-cuda" },
-            new KvU32  { Key = $"{a}.block_count", V = layers },
+            new KvU32  { Key = $"{a}.block_count", V = (uint)layers },
             new KvU32  { Key = $"{a}.context_length", V = (uint)contextLength },
             new KvU32  { Key = $"{a}.embedding_length", V = hidden },
             new KvU32  { Key = $"{a}.feed_forward_length", V = ffn },
-            new KvU32  { Key = $"{a}.attention.head_count", V = heads },
+            new KvU32  { Key = $"{a}.attention.head_count", V = (uint)heads },
             new KvU32Arr { Key = $"{a}.attention.head_count_kv", V = kvHeads },
             new KvF32  { Key = $"{a}.rope.freq_base", V = 10000.0f },
             new KvF32  { Key = $"{a}.attention.layer_norm_rms_epsilon", V = 1e-5f },
@@ -416,11 +485,11 @@ internal static class GlmDsaSyntheticModelBuilder
             new KvU32  { Key = $"{a}.attention.key_length_mla", V = headK },
             new KvU32  { Key = $"{a}.attention.value_length_mla", V = headV },
             new KvU32  { Key = $"{a}.rope.dimension_count", V = 0 },
-            new KvU32  { Key = $"{a}.leading_dense_block_count", V = 1 },
+            new KvU32  { Key = $"{a}.leading_dense_block_count", V = distributedDenseOnly ? (uint)layers : 1 },
             new KvU32  { Key = $"{a}.expert_count", V = experts },
             new KvU32  { Key = $"{a}.expert_used_count", V = used },
-            new KvU32  { Key = $"{a}.expert_feed_forward_length", V = expertFfn },
-            new KvU32  { Key = $"{a}.expert_shared_feed_forward_length", V = expertFfn },
+            new KvU32  { Key = $"{a}.expert_feed_forward_length", V = (uint)expertFfn },
+            new KvU32  { Key = $"{a}.expert_shared_feed_forward_length", V = (uint)expertFfn },
             new KvU32  { Key = $"{a}.expert_shared_count", V = 1 },
             new KvU32  { Key = $"{a}.expert_group_count", V = 1 },
             new KvU32  { Key = $"{a}.expert_group_used_count", V = 1 },
@@ -462,7 +531,31 @@ internal static class GlmDsaSyntheticModelBuilder
         return path;
     }
 
-    private enum GgmlType { F32 = 0, Q8_0 = 8 }
+    private enum GgmlType { F32 = 0, Q8_0 = 8, Q6_K = 14, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23 }
+
+    [DllImport("GgmlOps", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void ggml_quantize_init(int type);
+
+    [DllImport("GgmlOps", CallingConvention = CallingConvention.Cdecl)]
+    private static extern UIntPtr ggml_quantize_chunk(int type, float[] source, byte[] destination,
+        long start, long rows, long rowWidth, float[] importance);
+
+    private static byte[] QuantizeNative(float[] data, int rowWidth, GgmlType type)
+    {
+        if (rowWidth % 256 != 0 || data.Length % rowWidth != 0)
+            throw new ArgumentException("K/IQ fixture rows must contain whole 256-value blocks.");
+        int blockBytes = type switch { GgmlType.Q6_K => 210, GgmlType.IQ3_S => 110, GgmlType.IQ2_S => 82, GgmlType.IQ4_XS => 136,
+            _ => throw new ArgumentOutOfRangeException(nameof(type)) };
+        byte[] result = new byte[checked(data.Length / 256 * blockBytes)];
+        float[] importance = new float[rowWidth];
+        Array.Fill(importance, 1.0f);
+        ggml_quantize_init((int)type);
+        ulong written = ggml_quantize_chunk((int)type, data, result, 0, data.Length / rowWidth,
+            rowWidth, importance).ToUInt64();
+        if (written != (ulong)result.Length)
+            throw new InvalidOperationException($"Native {type} quantizer wrote {written}, expected {result.Length} bytes.");
+        return result;
+    }
 
     private const int Q8Block = 32;
     private const int Q8BlockBytes = 2 + Q8Block;   // f16 scale + 32 int8
@@ -546,6 +639,8 @@ internal static class GlmDsaSyntheticModelBuilder
         {
             if (Type == GgmlType.Q8_0)
                 return QuantizeQ8_0(Data, (int)Dims[0]);
+            if (Type is GgmlType.Q6_K or GgmlType.IQ3_S or GgmlType.IQ2_S or GgmlType.IQ4_XS)
+                return QuantizeNative(Data, (int)Dims[0], Type);
             byte[] raw = new byte[Data.Length * sizeof(float)];
             Buffer.BlockCopy(Data, 0, raw, 0, raw.Length);
             return raw;
@@ -789,9 +884,15 @@ internal static class GlmDsaSyntheticModelBuilder
                 foreach (ulong d in t.Dims) w.Write(d);
                 w.Write((uint)t.Type);
                 w.Write(offset);
-                ulong bytes = t.Type == GgmlType.Q8_0
-                    ? (ulong)t.Data.Length / Q8Block * Q8BlockBytes
-                    : (ulong)t.Data.Length * sizeof(float);
+                ulong bytes = t.Type switch
+                {
+                    GgmlType.Q8_0 => (ulong)t.Data.Length / Q8Block * Q8BlockBytes,
+                    GgmlType.Q6_K => (ulong)t.Data.Length / 256 * 210,
+                    GgmlType.IQ3_S => (ulong)t.Data.Length / 256 * 110,
+                    GgmlType.IQ2_S => (ulong)t.Data.Length / 256 * 82,
+                    GgmlType.IQ4_XS => (ulong)t.Data.Length / 256 * 136,
+                    _ => (ulong)t.Data.Length * sizeof(float)
+                };
                 offset += (bytes + Alignment - 1) / Alignment * Alignment;
             }
         }

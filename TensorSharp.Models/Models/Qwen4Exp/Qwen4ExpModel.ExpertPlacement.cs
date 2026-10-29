@@ -97,7 +97,7 @@ namespace TensorSharp.Models
             // preloaded above, but the span still has to bind float weights and
             // caches. Plan against current free memory rather than total VRAM.
             // A layer split needs a per-device plan and is left to explicit flags.
-            if (_backend == BackendType.GgmlCuda && !IsTensorParallel && LayerSplitDegree <= 1)
+            if (_backend == BackendType.GgmlCuda && !IsTensorParallel && LayerSplitDegree <= 1 && _q4eStage == null)
             {
                 if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
                     return;

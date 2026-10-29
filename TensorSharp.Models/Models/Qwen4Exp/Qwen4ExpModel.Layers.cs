@@ -366,7 +366,7 @@ namespace TensorSharp.Models
             _gdnStateT ??= new Tensor[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                if (!_isRecurrent[l]) continue;
+                if (!OwnsQwenLayer(l) || !_isRecurrent[l]) continue;
                 if (_gdnStateT[l] != null) continue;
                 _gdnStateT[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
                 Ops.Fill(_gdnStateT[l], 0f);

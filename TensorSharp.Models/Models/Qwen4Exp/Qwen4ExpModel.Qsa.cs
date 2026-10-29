@@ -80,7 +80,7 @@ namespace TensorSharp.Models
             var args = GC.AllocateArray<Qwen4ExpQsaArgs>(Config.NumLayers, pinned: true);
             for (int l = 0; l < Config.NumLayers; ++l)
             {
-                if (!UsesQsa(l)) continue;
+                if (!OwnsQwenLayer(l) || !UsesQsa(l)) continue;
                 ref var a = ref args[l];
                 string prefix = $"blk.{l}.indexer.";
                 if (!TryResolveQuant(prefix + "k_proj.weight", out a.KProj, out a.KType, out a.KBytes)

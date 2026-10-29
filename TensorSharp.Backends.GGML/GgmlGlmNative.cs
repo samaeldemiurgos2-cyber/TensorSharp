@@ -20,6 +20,47 @@ namespace TensorSharp.GGML
         private const string DllName = "GgmlOps";
         private const CallingConvention Conv = CallingConvention.Cdecl;
 
+        [UnmanagedFunctionPointer(Conv)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public delegate bool CrossNodeAllReduce(IntPtr user, IntPtr data, int count);
+
+        [UnmanagedFunctionPointer(Conv)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public delegate bool LayerTransfer(IntPtr user, int peer, int send, IntPtr data, int bytes);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern IntPtr TSGgml_GlmLoadModelDistributed(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int localRanks, int globalRanks, int rankOffset,
+            int nCtx, int nUbatch, int nThreads, [MarshalAs(UnmanagedType.LPUTF8Str)] string backend,
+            CrossNodeAllReduce reduce, IntPtr user);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern IntPtr TSGgml_GlmLoadModelLayerPipeline(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int localDevices, int node, int nodes,
+            int nCtx, int nUbatch, int nThreads, int nCpuMoe,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string backend, LayerTransfer transfer, IntPtr user);
+
+        public static IntPtr LoadModelDistributed(string path, int localRanks, int globalRanks, int rankOffset,
+            int nCtx, int nUbatch, int nThreads, string backend, CrossNodeAllReduce reduce)
+            => TSGgml_GlmLoadModelDistributed(path, localRanks, globalRanks, rankOffset,
+                nCtx, nUbatch, nThreads, backend, reduce, IntPtr.Zero);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmSetPipelineDriver(IntPtr handle, int driver);
+
+        /// <summary>Set the pipeline stage whose host samples; its logits are not
+        /// sent when it is the last stage. Every node must pass the same stage.</summary>
+        public static void SetPipelineDriver(IntPtr handle, int driverStage)
+        {
+            if (TSGgml_GlmSetPipelineDriver(handle, driverStage) != 1)
+                throw new InvalidOperationException("The native GLM executor rejected the pipeline driver stage.");
+        }
+
+        public static IntPtr LoadModelLayerPipeline(string path, int localDevices, int node, int nodes,
+            int nCtx, int nUbatch, int nThreads, int nCpuMoe, string backend, LayerTransfer transfer)
+            => TSGgml_GlmLoadModelLayerPipeline(path, localDevices, node, nodes, nCtx, nUbatch, nThreads,
+                nCpuMoe, backend, transfer, IntPtr.Zero);
+
         /// <summary>No routed-expert CPU offload (the default).</summary>
         public const int CpuMoeNone = 0;
         /// <summary>Offload only as many leading layers as the VRAM actually needs.</summary>

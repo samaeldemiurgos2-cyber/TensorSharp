@@ -47,7 +47,10 @@ namespace TensorSharp.Models
             SupportsLayerSplit = true,
             // The direct-CUDA engine places whole layers too.
             LayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda },
-            SupportsDistributedTensorParallel = false,
+            SupportsDistributedTensorParallel = true,
+            DistributedTensorParallelBackends = new[] { BackendType.GgmlCuda },
+            SupportsDistributedLayerSplit = true,
+            DistributedLayerSplitBackends = new[] { BackendType.GgmlCuda },
 
         };
     }

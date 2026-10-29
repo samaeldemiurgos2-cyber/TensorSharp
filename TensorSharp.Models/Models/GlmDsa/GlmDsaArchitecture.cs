@@ -19,7 +19,7 @@ namespace TensorSharp.Models
             // pooled DSA indexer, Sinkhorn hyper-connections, 288-expert MoE. Same class.
             Id = "glm-dsa",
             DisplayName = "GLM-5.x (DeepSeek Sparse Attention) and GLM-5.3-Flash",
-            Aliases = new[] { "glm-dsa", "glm_dsa", "glm5next" },
+            Aliases = new[] { "glm-dsa", "glm_dsa" },
             Factory = Create,
             SupportsLayerSplit = true,
             // GLM-5.3-Flash also places whole layers on --backend cuda (the direct-CUDA engine).
@@ -32,6 +32,31 @@ namespace TensorSharp.Models
                 Environment.GetEnvironmentVariable("TS_GLM_TP_OVERSUBSCRIBE") == "1",
             ProjectorFileHints = new[] { "*mmproj*.gguf" },
         };
+
+        // The hybrid Flash graph keeps each layer's recurrent and attention
+        // state local and has rank-local TP segments. glm-dsa's reused indexer
+        // state needs its own adapter before it can advertise these capabilities.
+        public static ModelArchitectureDescriptor FlashDescriptor { get; } = new()
+        {
+            Id = "glm5next",
+            DisplayName = "GLM-5.3-Flash",
+            Aliases = new[] { "glm5next", "glm5-next" },
+            Factory = CreateFlash,
+            SupportsLayerSplit = true,
+            LayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda },
+            SupportsDistributedLayerSplit = true,
+            DistributedLayerSplitBackends = new[] { BackendType.GgmlCuda },
+            SupportsDistributedTensorParallel = true,
+            DistributedTensorParallelBackends = new[] { BackendType.GgmlCuda },
+            SupportsNativeTensorParallel = (_, backend) => backend == BackendType.GgmlCpu &&
+                Environment.GetEnvironmentVariable("TS_GLM_NATIVE") != "0" &&
+                Environment.GetEnvironmentVariable("TS_GLM_TP_OVERSUBSCRIBE") == "1",
+            ProjectorFileHints = new[] { "*mmproj*.gguf" },
+        };
+
+        private static ModelBase CreateFlash(ModelCreateContext context)
+            => new GlmDsaModel(context.GgufPath, context.Backend, context.TpDegree, context.TpGroup,
+                context.LayerSplitDegree, GlmDsaModel.DirectCudaApplies(context.Backend, context.Probe));
 
         private static ModelBase Create(ModelCreateContext context)
         {

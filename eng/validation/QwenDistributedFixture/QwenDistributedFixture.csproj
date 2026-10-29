@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../TensorSharp.Models/TensorSharp.Models.csproj" />
+    <ProjectReference Include="../../../TensorSharp.Distributed/TensorSharp.Distributed.csproj" />
+    <Compile Include="../../../InferenceWeb.Tests/SyntheticGguf.cs" Link="SyntheticGguf.cs" />
+    <Compile Include="../../../InferenceWeb.Tests/Qwen4ExpSyntheticModelBuilder.cs" Link="Qwen4ExpSyntheticModelBuilder.cs" />
+  </ItemGroup>
+</Project>

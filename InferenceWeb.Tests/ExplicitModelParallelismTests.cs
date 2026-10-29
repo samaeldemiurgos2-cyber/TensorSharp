@@ -137,7 +137,6 @@ public sealed class ExplicitModelParallelismTests : IDisposable
 
     [Theory]
     [InlineData("glm-dsa")]
-    [InlineData("glm5next")]
     [InlineData("deepseek4")]
     [InlineData("qwen-image")]
     [InlineData("diffusion-gemma")]

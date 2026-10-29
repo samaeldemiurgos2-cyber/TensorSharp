@@ -65,7 +65,7 @@ namespace TensorSharp.Models
         /// <summary>Concurrent requests are served by the native executor's
         /// sequence slots. Only the native executor has slots; the managed
         /// per-op path stays on the serial per-sequence route.</summary>
-        public bool SupportsPerSequenceFusedForward => _exec != null;
+        public bool SupportsPerSequenceFusedForward => _exec != null && !IsDistributedGlm;
 
         public bool HasFusedSequenceCache(string requestId)
         {
@@ -83,6 +83,7 @@ namespace TensorSharp.Models
         /// position 0).</summary>
         public bool BindSequenceCache(string requestId)
         {
+            RefuseUnmirroredGlmOperation("per-request cache slots");
             if (string.IsNullOrEmpty(requestId))
                 throw new ArgumentException("RequestId required", nameof(requestId));
             lock (_nativeSync)
@@ -119,6 +120,7 @@ namespace TensorSharp.Models
         /// allocate a fresh primary for later N==1 use.</summary>
         public void AdoptPrimaryCacheToFused(string requestId)
         {
+            RefuseUnmirroredGlmOperation("sequence-slot adoption");
             if (string.IsNullOrEmpty(requestId)) return;
             lock (_nativeSync)
             {
@@ -176,6 +178,7 @@ namespace TensorSharp.Models
         {
             lock (_nativeSync)
             {
+                if (IsDistributedGlm) return false;
                 if (_exec == null || _slotByRequest == null) return false;
                 int n = requestIds.Count;
                 if (n < 2) return false;

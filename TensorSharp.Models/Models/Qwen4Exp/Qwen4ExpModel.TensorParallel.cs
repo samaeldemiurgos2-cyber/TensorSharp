@@ -27,12 +27,12 @@ namespace TensorSharp.Models
         private void ValidateQwen4ExpTensorParallelMetadata()
         {
             if (!IsTensorParallel) return;
-            if (!IsGgmlBackend || GlobalTpDegree != TpDegree || LayerSplitDegree > 1
-                || !GgmlBasicOps.TensorParallelFusedAvailable(TpDegree))
-                throw new NotSupportedException("Qwen4Exp tensor parallelism needs a local GGML device group with fused collectives.");
-            if (_expertFf <= 0 || _sharedFf <= 0 || _expertFf % TpDegree != 0 || _sharedFf % TpDegree != 0
-                || Config.HiddenSize % TpDegree != 0)
-                throw new NotSupportedException($"Qwen4Exp FFN/output widths {_expertFf}/{_sharedFf}/{Config.HiddenSize} must be divisible by TP degree {TpDegree}.");
+            if (!IsGgmlBackend || LayerSplitDegree > 1
+                || !(HasDistributedQwen ? GgmlBasicOps.TensorParallelFusedAvailableDistributed(TpDegree) : GgmlBasicOps.TensorParallelFusedAvailable(TpDegree)))
+                throw new NotSupportedException("Qwen4Exp tensor parallelism needs a GGML device group with fused collectives.");
+            if (_expertFf <= 0 || _sharedFf <= 0 || _expertFf % GlobalTpDegree != 0 || _sharedFf % GlobalTpDegree != 0
+                || Config.HiddenSize % GlobalTpDegree != 0)
+                throw new NotSupportedException($"Qwen4Exp FFN/output widths {_expertFf}/{_sharedFf}/{Config.HiddenSize} must be divisible by global TP degree {GlobalTpDegree}.");
             for (int l = 0; l < Config.NumLayers; ++l)
                 foreach (string suffix in new[] { "gate_exps", "up_exps", "down_exps", "gate_shexp", "up_shexp", "down_shexp" })
                 {
@@ -40,14 +40,14 @@ namespace TensorSharp.Models
                     if (!_gguf.Tensors.TryGetValue(name, out var info) || info.Shape.Length < 2)
                         throw new NotSupportedException($"Qwen4Exp TP needs separate gate/up tensors: missing {name}.");
                     long block = GgufFile.GetBlockSize(info.Type);
-                    if (block <= 0 || info.Shape[0] % (ulong)block != 0 || info.Shape[1] % (ulong)TpDegree != 0)
-                        throw new NotSupportedException($"Qwen4Exp TP: {name} cannot be split into {TpDegree} whole-block shards (block {block}).");
+                    if (block <= 0 || info.Shape[0] % (ulong)block != 0 || info.Shape[1] % (ulong)GlobalTpDegree != 0)
+                        throw new NotSupportedException($"Qwen4Exp TP: {name} cannot be split into {GlobalTpDegree} whole-block shards (block {block}).");
                     try
                     {
-                        GgmlBasicOps.RequireQwen4ExpTensorParallelWeight((int)info.Type,
+                        GgmlBasicOps.RequireQwen4ExpTensorParallelWeightGlobal((int)info.Type,
                             checked((int)info.Shape[0]), checked((int)info.Shape[1]),
                             info.Shape.Length > 2 ? checked((int)info.Shape[2]) : 1,
-                            TpDegree, !suffix.StartsWith("down", StringComparison.Ordinal));
+                            GlobalTpDegree, !suffix.StartsWith("down", StringComparison.Ordinal), TpRankOffset);
                     }
                     catch (NotSupportedException e)
                     { throw new NotSupportedException($"Qwen4Exp TP cannot preserve {name} ({info.Type}): {e.Message}", e); }
@@ -57,11 +57,11 @@ namespace TensorSharp.Models
         private void PrepareQwen4ExpTensorParallel()
         {
             if (!IsTensorParallel) return;
-            if (!IsGgmlBackend || GlobalTpDegree != TpDegree || LayerSplitDegree > 1
-                || !GgmlBasicOps.TensorParallelFusedAvailable(TpDegree))
-                throw new NotSupportedException("Qwen4Exp tensor parallelism needs a local GGML device group with fused collectives.");
-            if (_fusedGateUpExperts || _expertFf % TpDegree != 0 || _sharedFf % TpDegree != 0
-                || Config.HiddenSize % TpDegree != 0)
+            if (!IsGgmlBackend || LayerSplitDegree > 1
+                || !(HasDistributedQwen ? GgmlBasicOps.TensorParallelFusedAvailableDistributed(TpDegree) : GgmlBasicOps.TensorParallelFusedAvailable(TpDegree)))
+                throw new NotSupportedException("Qwen4Exp tensor parallelism needs a GGML device group with fused collectives.");
+            if (_fusedGateUpExperts || _expertFf % GlobalTpDegree != 0 || _sharedFf % GlobalTpDegree != 0
+                || Config.HiddenSize % GlobalTpDegree != 0)
                 throw new NotSupportedException("Qwen4Exp TP requires separate gate/up expert tensors and FFN widths divisible by the TP degree.");
 
             // All projections slice complete output rows, preserving each dot's
@@ -73,7 +73,7 @@ namespace TensorSharp.Models
                     string name = $"blk.{l}.ffn_{suffix}_exps.weight";
                     if (!_stackedExpertWeights.TryGetValue(name, out var weight))
                         throw new NotSupportedException($"Qwen4Exp TP needs stacked expert tensor {name}.");
-                    ValidateTensorParallelExpertShape(weight, TpDegree, false);
+                    ValidateTensorParallelExpertShape(weight, GlobalTpDegree, false);
                 }
             }
 
@@ -90,7 +90,7 @@ namespace TensorSharp.Models
             {
                 Parallel.ForEach(work, item =>
                     _q4eTpExperts[item.Name][item.Rank] = SliceTensorParallelExpert(
-                        _stackedExpertWeights[item.Name], item.Rank, TpDegree, false,
+                        _stackedExpertWeights[item.Name], TpRankOffset + item.Rank, GlobalTpDegree, false,
                         item.Name.Contains(".ffn_down_") ? 1 : Qwen4ExpMmqRowAlignment(
                             _stackedExpertWeights[item.Name].GgmlType, _expertFf)));
                 foreach (var shards in _q4eTpExperts.Values)
@@ -101,8 +101,8 @@ namespace TensorSharp.Models
                     Array.Empty<string>());
             }
             catch { DisposeQwen4ExpTensorParallel(); throw; }
-            Console.WriteLine($"  Qwen4Exp TP: expert channels {_expertFf}->{_expertFf / TpDegree}, shared channels {_sharedFf}->{_sharedFf / TpDegree}; "
-                + $"down output rows {Config.HiddenSize}->{Config.HiddenSize / TpDegree}; "
+            Console.WriteLine($"  Qwen4Exp TP: expert channels {_expertFf}->{_expertFf / GlobalTpDegree}, shared channels {_sharedFf}->{_sharedFf / GlobalTpDegree}; "
+                + $"down output rows {Config.HiddenSize}->{Config.HiddenSize / GlobalTpDegree}; "
                 + $"{_q4eTpExpertBytes / 1024 / 1024} MiB tensor-sliced in {timer.ElapsedMilliseconds} ms across {TpDegree} ranks.");
         }
 
@@ -111,7 +111,7 @@ namespace TensorSharp.Models
         // outputs in the native graph. Neighboring ranks may share edge rows.
         internal static int Qwen4ExpMmqRowAlignment(int type, long rows)
             => rows % 128 == 0 && (GgmlTensorType)type is
-                GgmlTensorType.Q8_0 or GgmlTensorType.Q2_K or GgmlTensorType.Q3_K or
+                GgmlTensorType.Q5_1 or GgmlTensorType.Q8_0 or GgmlTensorType.Q2_K or GgmlTensorType.Q3_K or
                 GgmlTensorType.Q4_K or GgmlTensorType.Q5_K or GgmlTensorType.Q6_K or
                 GgmlTensorType.IQ2_XXS or GgmlTensorType.IQ2_XS or GgmlTensorType.IQ3_XXS or
                 GgmlTensorType.IQ1_S or GgmlTensorType.IQ4_NL or GgmlTensorType.IQ3_S or
@@ -142,7 +142,7 @@ namespace TensorSharp.Models
                     var shards = new QuantizedWeight[TpDegree];
                     for (int rank = 0; rank < TpDegree; ++rank)
                     {
-                        var range = Qwen4ExpOutputRowRange(source.Ne1, rank, TpDegree, alignment);
+                        var range = Qwen4ExpOutputRowRange(source.Ne1, TpRankOffset + rank, GlobalTpDegree, alignment);
                         shards[rank] = QuantizedWeight.CreateExternalView(
                             new IntPtr(checked(source.Data.ToInt64() + range.First * rowBytes)),
                             range.Count * rowBytes, source.GgmlType, source.Ne0, range.Count, source);
@@ -275,16 +275,21 @@ namespace TensorSharp.Models
                 }
                 for (int r = 0; r < TpDegree; ++r)
                     fixed (Qwen4ExpFfnArgs* rankFfn = _q4eTpFfnArgs[r])
-                        _q4eTpPlans[r] = GgmlBasicOps.Qwen4ExpTokenSpanTp((IntPtr)rankFfn, gdn, attn, kinds, layerBegin, layerEnd,
+                        _q4eTpPlans[r] = GgmlBasicOps.Qwen4ExpTokenSpanTpGlobal((IntPtr)rankFfn, gdn, attn, kinds, layerBegin, layerEnd,
                             resData, maskData, nEmbd, hc, hcLowRank, nTokens,
                             headKDim, headVDim, nKHeads, nVHeads, dConv,
                             headDim, nHead, nHeadKv, kvCapacity, nKv, position,
                             nRot, ropeBase, ropeFreqScale, attnScale,
-                            nExpert, nExpertUsed, nFf / TpDegree, nFfSh / TpDegree, eps, cacheSlot,
+                            nExpert, nExpertUsed, nFf / GlobalTpDegree, nFfSh / GlobalTpDegree, eps, cacheSlot,
                             r == 0 ? head : IntPtr.Zero, r == 0 ? logitsOut : IntPtr.Zero,
                             ple, pleLayer, pleEmb, mropePos, mropeSections, ropePosition,
-                            r, r == 0 ? hiddenOut : IntPtr.Zero, logitsRows, qsa, qsaPositions, qsaPositionCount);
-                GgmlBasicOps.TensorParallelExecutePlans(_q4eTpPlans);
+                            r, r == 0 ? hiddenOut : IntPtr.Zero, logitsRows, qsa, qsaPositions, qsaPositionCount, GlobalTpDegree, TpRankOffset);
+                if (HasDistributedQwen)
+                {
+                    try { GgmlBasicOps.TensorParallelExecutePlansDistributed(_q4eTpPlans, _q4eCrossNode); }
+                    catch (Exception failure) { _q4eDistributed.Abort(failure); throw; }
+                }
+                else GgmlBasicOps.TensorParallelExecutePlans(_q4eTpPlans);
                 if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_Q4E_NODE_DUMP")))
                     GgmlBasicOps.Qwen4ExpTestDumpTpPlans(_q4eTpPlans, layerBegin, layerEnd,
                         nTokens, position, logitsRows, nKv);
