@@ -369,6 +369,13 @@ namespace TensorSharp.Cuda
                 scale);
         }
 
+        /// <summary>
+        /// The kernel the last successful GQA prefill attention call on this thread
+        /// launched (flash2-group4, flash-group4, flash-g16d128, generic or
+        /// generic-sinks), or null before any. For benches and diagnostics.
+        /// </summary>
+        public static string LastGqaPrefillRoute => CudaKernelOps.LastGqaPrefillRoute;
+
         public static bool TryGqaPrefillAttentionWithSinks(
             Tensor result,
             Tensor query,

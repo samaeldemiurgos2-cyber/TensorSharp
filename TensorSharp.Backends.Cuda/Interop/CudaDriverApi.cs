@@ -109,6 +109,14 @@ namespace TensorSharp.Cuda.Interop
         public const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
 
         [LibraryImport(LibName)]
+        public static partial int cuFuncGetAttribute(out int value, int attribute, IntPtr function);
+
+        // CUfunction_attribute: the virtual architecture (major * 10 + minor) the code the
+        // driver loaded for a function was compiled from, i.e. its __CUDA_ARCH__ / 10: 86 for
+        // sm_86 SASS, 61 for compute_61 PTX the driver JIT-compiled for a newer GPU.
+        public const int CU_FUNC_ATTRIBUTE_PTX_VERSION = 5;
+
+        [LibraryImport(LibName)]
         public static partial int cuLaunchKernel(
             IntPtr function,
             uint gridDimX,

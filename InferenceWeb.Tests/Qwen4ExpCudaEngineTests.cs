@@ -36,9 +36,12 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
     }
 
-    private string Fixture(int indexerTopK = 16, bool q2kxlExperts = false) => Qwen4ExpSyntheticModelBuilder.Write(
-        Path.Combine(_dir, $"qwen4exp-{indexerTopK}{(q2kxlExperts ? "-q2kxl" : "")}.gguf"), indexerTopK,
-        q2kxlExperts: q2kxlExperts);
+    private string Fixture(int indexerTopK = 16, bool q2kxlExperts = false, bool q4kxlExperts = false,
+        SyntheticGguf.GgmlType? expertDownType = null, float expertDownGain = 0.25f) => Qwen4ExpSyntheticModelBuilder.Write(
+        Path.Combine(_dir, $"qwen4exp-{indexerTopK}{(q2kxlExperts ? "-q2kxl" : "")}{(q4kxlExperts ? "-q4kxl" : "")}" +
+            $"{(expertDownType is { } down ? "-down" + down : "")}-g{expertDownGain}.gguf"), indexerTopK,
+        q2kxlExperts: q2kxlExperts, q4kxlExperts: q4kxlExperts, expertDownType: expertDownType,
+        expertDownGain: expertDownGain);
 
     private static readonly int[] Prompt = Enumerable.Range(0, 40).Select(i => (i * 37 + 11) % 250).ToArray();
     private static readonly int[] Steps = { 17, 203, 99, 4, 150, 61 };
@@ -130,6 +133,50 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             _output.WriteLine($"{(i == 0 ? "prefill" : $"decode {i}")}: relative error {err:E3}, argmax {ArgMax(cuda[i])} vs {ArgMax(native[i])}");
         }
         Assert.True(worst <= 2e-2, $"the direct-CUDA engine strayed {worst:E3} from the native token span");
+    }
+
+    /// <summary>The UD-Q4_K_XL expert mix - Q4_K gate/up over Q5_1 down, the layout 43 of the shipped
+    /// file's 48 down projections take - on the direct engine's per-token kernels (the decode steps)
+    /// and tensor-core kernels (the 40-token prompt), against ggml-cuda's own Q5_1 kernels in the
+    /// native span. Before the engine learned Q5_1 it refused the file at load ("unsupported expert
+    /// quant type 7"), and with <c>--layer-split 2</c> that refusal aborted the CLI.</summary>
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TheDirectCudaEngine_AnswersAsTheNativeSpan_Q4KXLExperts()
+    {
+        // The routed down projection at full gain (the fixture's default writes a quarter-size update):
+        // at a quarter, even a decoder that drops every fifth bit stayed under the bound (1.8e-2,
+        // against 6.6e-3 here); at full gain it strays 6.3e-2, while this decoder still answers within
+        // the 6.6e-3 it does at a quarter.
+        string path = Fixture(indexerTopK: 2048, q4kxlExperts: true, expertDownGain: 1f);
+        float[][] native, cuda;
+        using (ModelBase model = ModelBase.Create(path, BackendType.GgmlCuda))
+            native = Run(model);
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda))
+        {
+            Assert.IsType<Qwen4ExpCudaModel>(model);
+            cuda = Run(model);
+        }
+        double worst = 0;
+        for (int i = 0; i < native.Length; i++)
+        {
+            double err = RelativeError(cuda[i], native[i]);
+            worst = Math.Max(worst, err);
+            _output.WriteLine($"{(i == 0 ? "prefill" : $"decode {i}")}: relative error {err:E3}, argmax {ArgMax(cuda[i])} vs {ArgMax(native[i])}");
+        }
+        Assert.True(worst <= 2e-2, $"the direct-CUDA engine strayed {worst:E3} from the native token span");
+    }
+
+    /// <summary>An expert layout no direct-CUDA kernel decodes (Q4_0 down) is refused at load as one
+    /// <see cref="NotSupportedException"/> naming the tensor, which the hosts report as a load refusal,
+    /// and not from inside the per-device upload.</summary>
+    [CudaFact]
+    public void AnUndecodableExpertLayout_IsRefusedAtLoadByTensorName()
+    {
+        string path = Fixture(q4kxlExperts: true, expertDownType: SyntheticGguf.GgmlType.Q4_0);
+        var ex = Assert.Throws<NotSupportedException>(() => ModelBase.Create(path, BackendType.Cuda));
+        Assert.StartsWith("[q4e-cuda] blk.0.ffn_down_exps.weight is Q4_0 (ggml type 2)", ex.Message);
+        Assert.True(ModelLoadRefusal.TryDescribe(ex, out string reason));
+        Assert.Contains("--backend ggml_cuda", reason);
     }
 
     /// <summary>Two devices answer as one: the streams cross the boundary through pinned memory, and

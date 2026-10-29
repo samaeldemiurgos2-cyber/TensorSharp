@@ -1319,6 +1319,7 @@ namespace TensorSharp.Cuda
                 // f32 math, so it serves both cache dtypes.
                 if (kernels.Flash2Supports(headDim))
                 {
+                    LastGqaPrefillRoute = "flash2-group4";
                     kernels.LaunchGqaPrefillFlash2Group4(
                         queryPtr, keyPtr, valuePtr, IntPtr.Zero, resultPtr,
                         numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize,
@@ -1326,6 +1327,7 @@ namespace TensorSharp.Cuda
                     resultStorage.MarkDeviceModified();
                     return true;
                 }
+                LastGqaPrefillRoute = "flash-group4";
                 kernels.LaunchGqaPrefillFlashGroup4(
                     queryPtr,
                     keyPtr,
@@ -1358,6 +1360,7 @@ namespace TensorSharp.Cuda
                 (long)maskStart + seqLen <= kvLen &&
                 kernels.FlashG16D128Supports(headDim, numQHeads, numKVHeads))
             {
+                LastGqaPrefillRoute = "flash-g16d128";
                 kernels.LaunchGqaPrefillFlashG16D128(
                     queryPtr, keyPtr, valuePtr, IntPtr.Zero, resultPtr,
                     numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize,
@@ -1367,6 +1370,7 @@ namespace TensorSharp.Cuda
             }
             if (keyIsHalf)
             {
+                LastGqaPrefillRoute = "generic";
                 kernels.LaunchGqaPrefillAttentionF16(
                     queryPtr,
                     keyPtr,
@@ -1385,6 +1389,7 @@ namespace TensorSharp.Cuda
             }
             else
             {
+                LastGqaPrefillRoute = "generic";
                 kernels.LaunchGqaPrefillAttentionF32(
                     queryPtr,
                     keyPtr,
@@ -1404,6 +1409,16 @@ namespace TensorSharp.Cuda
             resultStorage.MarkDeviceModified();
             return true;
         }
+
+        /// <summary>
+        /// The kernel the last successful <see cref="TryGqaPrefillAttention"/> /
+        /// <see cref="TryGqaPrefillAttentionWithSinks"/> on this thread launched:
+        /// flash2-group4, flash-group4, flash-g16d128, generic or generic-sinks. A
+        /// diagnostic for benches and tests, which otherwise cannot see that, say, a
+        /// PTX without the group-16 kernel served Nemotron's shape generically.
+        /// </summary>
+        [ThreadStatic]
+        internal static string LastGqaPrefillRoute;
 
         public static bool TryGqaPrefillAttentionWithSinks(
             Tensor result,
@@ -1494,6 +1509,7 @@ namespace TensorSharp.Cuda
                 // flash2 = flash1 with a larger K chunk (fewer sync rounds).
                 if (kernels.Flash2Supports(headDim))
                 {
+                    LastGqaPrefillRoute = "flash2-group4";
                     kernels.LaunchGqaPrefillFlash2Group4(
                         queryPtr, keyPtr, valuePtr, sinksPtr, resultPtr,
                         numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize,
@@ -1501,6 +1517,7 @@ namespace TensorSharp.Cuda
                     resultStorage.MarkDeviceModified();
                     return true;
                 }
+                LastGqaPrefillRoute = "flash-group4";
                 kernels.LaunchGqaPrefillFlashGroup4(
                     queryPtr,
                     keyPtr,
@@ -1532,6 +1549,7 @@ namespace TensorSharp.Cuda
                 (long)maskStart + seqLen <= kvLen &&
                 kernels.FlashG16D128Supports(headDim, numQHeads, numKVHeads))
             {
+                LastGqaPrefillRoute = "flash-g16d128";
                 kernels.LaunchGqaPrefillFlashG16D128(
                     queryPtr, keyPtr, valuePtr, sinksPtr, resultPtr,
                     numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize,
@@ -1550,6 +1568,7 @@ namespace TensorSharp.Cuda
 
             if (keyIsHalf)
             {
+                LastGqaPrefillRoute = "generic-sinks";
                 kernels.LaunchGqaPrefillAttentionSinksF16(
                     queryPtr,
                     keyPtr,
@@ -1570,6 +1589,7 @@ namespace TensorSharp.Cuda
             }
             else
             {
+                LastGqaPrefillRoute = "generic-sinks";
                 kernels.LaunchGqaPrefillAttentionSinksF32(
                     queryPtr,
                     keyPtr,

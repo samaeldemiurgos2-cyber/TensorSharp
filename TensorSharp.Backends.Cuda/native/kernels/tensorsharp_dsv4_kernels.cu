@@ -313,6 +313,65 @@ __device__ __forceinline__ float ts_dsv4_dot_q8_0_block(
     return __half2float(d16) * __half2float(q8->d) * (float)sumi;
 }
 
+#define TS_DSV4_Q5_1_BLOCK_BYTES 24   // half d, half m, uint32 qh, qs[16], 32 values
+
+// One Q5_1 block's 32 five-bit codes as 8 packed ints: ints 0-3 are values 0-15 (the low nibbles
+// of qs), ints 4-7 values 16-31 (the high nibbles), and value j's fifth bit is bit j of qh, placed
+// as ggml-cuda's vec_dot_q5_1_q8_1 places it. A block decodes to d * code + m (ggml's
+// dequantize_row_q5_1). The 24-byte blocks keep qh and qs 4-byte aligned.
+__device__ __forceinline__ void ts_dsv4_q5_1_ints(const uint8_t* __restrict__ blk, int* __restrict__ w8)
+{
+    const int qh = ts_dsv4_get_int_b4(blk + 4, 0);
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        const int ql = ts_dsv4_get_int_b4(blk + 8, k);
+        const int h0 = qh >> (4 * k);        // fifth bits of values 4k .. 4k+3
+        const int h1 = qh >> (4 * k + 16);   // and of values 16+4k .. 16+4k+3
+        int lo = ql & 0x0F0F0F0F;
+        lo |= (h0 << 4) & 0x00000010;
+        lo |= (h0 << 11) & 0x00001000;
+        lo |= (h0 << 18) & 0x00100000;
+        lo |= (h0 << 25) & 0x10000000;
+        int hi = (ql >> 4) & 0x0F0F0F0F;
+        hi |= (h1 << 4) & 0x00000010;
+        hi |= (h1 << 11) & 0x00001000;
+        hi |= (h1 << 18) & 0x00100000;
+        hi |= (h1 << 25) & 0x10000000;
+        w8[k] = lo;
+        w8[k + 4] = hi;
+    }
+}
+
+// One Q5_1 block against one q8_1 block: d5 * d8 * sum(code * q) + m5 * d8 * sum(q). ggml-cuda
+// takes the second term from the q8_1 block's F16 sum; this file's other formats with an offset
+// (Q2_K, Q4_K, Q5_K) sum the int8 activations with dp4a, so every expert route (this one, the
+// register-staged kernels over the split q8_1 layout, which carries no sum) computes it the same way.
+__device__ __forceinline__ float ts_dsv4_dot_q5_1_block(
+    const uint8_t* __restrict__ blk, const ts_dsv4_block_q8_1* __restrict__ q8)
+{
+    int w8[8];
+    ts_dsv4_q5_1_ints(blk, w8);
+    const int* a = (const int*)q8->qs;
+    int dot = 0, asum = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+    {
+        dot = ts_dsv4_dp4a(w8[k], a[k], dot);
+        asum = ts_dsv4_dp4a(0x01010101, a[k], asum);
+    }
+    const float d = __half2float(*(const half*)blk);
+    const float m = __half2float(*(const half*)(blk + 2));
+    return __half2float(q8->d) * (d * (float)dot + m * (float)asum);
+}
+
+// Present only in a module whose expert decoders read Q5_1. A module built from older source (a
+// committed PTX baseline not yet regenerated, which machines without nvcc load) sends Q5_1 rows down
+// the Q8_0 branch: wrong output and no error. Dsv4Kernels looks this name up, and the engines refuse
+// Q5_1 experts on a module that lacks it. Never launched.
+extern "C" __global__ void ts_dsv4_caps_q5_1_experts() {}
+
+#define TS_DSV4_WTYPE_Q5_1 7
 #define TS_DSV4_WTYPE_Q8_0 8
 #define TS_DSV4_WTYPE_Q6_K 14
 #define TS_DSV4_WTYPE_IQ3S 21
@@ -749,6 +808,13 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
         const int nGroups = inDim / 32;
         for (int g = lane; g < nGroups; g += 32)
             sum += ts_dsv4_dot_sub_q8_1(wRow, wtype, g, act + g);
+    }
+    else if (wtype == TS_DSV4_WTYPE_Q5_1)
+    {
+        // Unsloth's UD-Q4_K_XL keeps most of Qwen3.8-Flash-Next's expert down projections in Q5_1.
+        const int nBlk = inDim / 32;
+        for (int b = lane; b < nBlk; b += 32)
+            sum += ts_dsv4_dot_q5_1_block(wRow + (size_t)b * TS_DSV4_Q5_1_BLOCK_BYTES, act + b);
     }
     else // TS_DSV4_WTYPE_Q8_0
     {
@@ -2459,8 +2525,8 @@ extern "C" __global__ void ts_dsv4_moe_scatter_i32(
 // Scales fold the weight's block scale (and, for IQ3_S, the sub-block
 // (1 + 2*ls) factor); the activation's own q8_1 scale is applied at use.
 // Codebook values fit int8 for every supported type (IQ3_S grid |v| <= 15 after
-// sign application, MXFP4 table |v| <= 12, Q6_K raw-32 is -32..31, Q8_0 is
-// already int8). Q6_K's two half-group scales are kept separately.
+// sign application, MXFP4 table |v| <= 12, Q6_K raw-32 is -32..31, Q5_1's codes
+// are 0..31, Q8_0 is already int8). Q6_K's two half-group scales are kept separately.
 //
 // Activations come from the DENSE split q8_1 layout (ts_quantize_q8_1_split_rows_f32):
 // a contiguous int8 row plus a separate per-block float scale. The interleaved
@@ -2656,7 +2722,7 @@ __device__ __forceinline__ void ts_dsv4_decode_sub(
 
 // The grouped expert kernels' decoder (register-staged and tensor-core prefill): every layout
 // ts_dsv4_decode_sub reads, plus IQ2_XS and IQ3_XXS, Qwen3.8-Flash-Next UD-Q2_K_XL's gate/up
-// experts. Kept out of ts_dsv4_decode_sub itself because the per-token decode kernels inline that
+// experts, and Q5_1, its UD-Q4_K_XL's down experts. Kept out of ts_dsv4_decode_sub itself because the per-token decode kernels inline that
 // one for their Q6_K / IQ4 rows: with the two branches there, Qwen3.8-Flash-Next's decode on two
 // A40s fell from 56.9 to 55.0-55.6 tok/s (its down projection is IQ4_NL).
 __device__ __forceinline__ void ts_dsv4_decode_sub_grouped(
@@ -2718,6 +2784,18 @@ __device__ __forceinline__ void ts_dsv4_decode_sub_grouped(
         *scLo = sc;
         *scHi = sc;
     }
+    else if (wtype == TS_DSV4_WTYPE_Q5_1)
+    {
+        // d * code + m: the grouped kernels subtract the min times the activation sum, so the
+        // block's offset m goes in negated.
+        const uint8_t* blk = wRow + (size_t)sub * TS_DSV4_Q5_1_BLOCK_BYTES;
+        ts_dsv4_q5_1_ints(blk, w8);
+        *scLo = __half2float(*(const half*)blk);
+        *scHi = *scLo;
+        *mnLo = -__half2float(*(const half*)(blk + 2));
+        *mnHi = *mnLo;
+        return;
+    }
     else
     {
         ts_dsv4_decode_sub(wRow, wtype, sub, w8, scLo, scHi, mnLo, mnHi);
@@ -2745,9 +2823,10 @@ __device__ __forceinline__ void ts_dsv4_expert_row_tokens(
     int w[NR][NK][8];
     float scLo[NR][NK], scHi[NR][NK], mnLo[NR][NK], mnHi[NR][NK];
     bool live[NR];
-    // Only Q2_K, Q4_K and Q5_K subtract mins, which needs each half's activation sum; one
-    // branch per warp.
-    const bool hasMin = wtype == TS_DSV4_WTYPE_Q2_K || wtype == TS_DSV4_WTYPE_Q4_K || wtype == TS_DSV4_WTYPE_Q5_K;
+    // Only Q2_K, Q4_K, Q5_K and Q5_1 subtract mins (Q5_1 a negated offset), which needs each
+    // half's activation sum; one branch per warp.
+    const bool hasMin = wtype == TS_DSV4_WTYPE_Q2_K || wtype == TS_DSV4_WTYPE_Q4_K || wtype == TS_DSV4_WTYPE_Q5_K
+        || wtype == TS_DSV4_WTYPE_Q5_1;
     // A width that is not a multiple of 1024 (V4.1's experts are 2304 wide) leaves the last
     // sub-blocks of the row to the first lanes only.
     const int nSub = inDim / 32;
