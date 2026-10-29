@@ -159,7 +159,21 @@ namespace tsg
     // Async dispatch state. The default is eager-sync;
     // C# enables async at backend init time via TSGgml_SetAsyncCompute(1).
     std::atomic<bool> g_async_compute_enabled{false};
-    std::atomic<bool> g_pending_gpu_work{false};
+    HostReadGate g_pending_gpu_work;
+
+    // host_read_barrier's slow path. g_backend is the calling thread's active
+    // rank's backend; it is null only after a teardown, which resets the gate.
+    bool host_read_barrier_drain()
+    {
+        return g_pending_gpu_work.drain([] {
+            if (g_backend != nullptr)
+                sync_backend(g_backend);
+        });
+    }
+
+#if defined(TSG_GGML_TEST_DIAGNOSTICS)
+    std::atomic<int> g_test_undrained_cache_releases{0};
+#endif
 
     static bool is_truthy_env(const char* value)
     {
@@ -1824,7 +1838,16 @@ namespace tsg
                 return false;
         }
         // ggml_gallocr_alloc_graph reuses the existing buffer when the new graph
-        // fits and grows (reallocates) it only when a larger graph appears.
+        // fits and grows (reallocates) it only when a larger graph appears. The
+        // growth frees the old buffer first (ggml_gallocr_reserve_n_impl), and on
+        // Metal async an earlier op's queued download can still be reading it
+        // (finalize_compute_with_download from a tensor this allocator placed), so
+        // drain before handing the allocator a graph.
+        host_read_barrier();
+#if defined(TSG_GGML_TEST_DIAGNOSTICS)
+        if (ggml_gallocr_get_buffer_size(slot.gallocr, 0) != 0)
+            test_note_cache_release();
+#endif
         bool ok = ggml_gallocr_alloc_graph(slot.gallocr, graph);
         if (!ok)
         {
@@ -1982,7 +2005,13 @@ namespace tsg
                 if (alloc_size > max_size) alloc_size = max_size; // never exceed a single buffer
                 if (alloc_size < required_bytes) alloc_size = required_bytes;
                 if (g_reuse_compute_buf != nullptr)
+                {
+                    // On Metal async an earlier op's queued download can still be
+                    // reading a result it left in this buffer.
+                    host_read_barrier();
+                    test_note_cache_release();
                     ggml_backend_buffer_free(g_reuse_compute_buf);
+                }
                 g_reuse_compute_buf = ggml_backend_buft_alloc_buffer(buft, alloc_size);
                 if (g_reuse_compute_buf == nullptr)
                 {
@@ -2282,27 +2311,53 @@ namespace tsg
     // it back before any upload. Registration is the only thing that makes an
     // upload from a key safe, and it makes the miss path merely slow (a
     // re-upload) instead of fatal.
+    //
+    // For a weight under 4 KiB the miss path is the ONLY path: the binders
+    // consult the device caches only from 4096 bytes up (their
+    // `raw_bytes >= 4096` gates), so such a weight is uploaded from its key on
+    // every call. The managed side releases the host bytes as soon as the
+    // preload returns (freed, or the GGUF unmapped), and resolving the key to
+    // them read released memory: an access violation in addmm_quant on a
+    // Q8_0 [64 x 32] projection (2176 bytes). Those keys resolve to a private
+    // copy made here instead; they are small by definition.
+    constexpr std::size_t k_uncached_weight_bytes = 4096;
+
     std::mutex g_cache_key_mutex;
     std::unordered_map<const void*, const void*> g_cache_key_host_data;
+    std::unordered_map<const void*, std::unique_ptr<std::uint8_t[]>> g_cache_key_copies;
 
-    void register_cache_key(const void* cache_key, const void* host_data)
+    void register_cache_key(const void* cache_key, const void* host_data, std::size_t bytes)
     {
         if (cache_key == nullptr || host_data == nullptr || cache_key == host_data)
             return;
+        std::unique_ptr<std::uint8_t[]> copy;
+        if (bytes < k_uncached_weight_bytes)
+        {
+            copy.reset(new std::uint8_t[bytes]);
+            std::memcpy(copy.get(), host_data, bytes);
+            host_data = copy.get();
+        }
         std::lock_guard<std::mutex> lock(g_cache_key_mutex);
         g_cache_key_host_data[cache_key] = host_data;
+        if (copy)
+            g_cache_key_copies[cache_key] = std::move(copy);
+        else
+            g_cache_key_copies.erase(cache_key);
     }
 
     void forget_cache_keys()
     {
         std::lock_guard<std::mutex> lock(g_cache_key_mutex);
         g_cache_key_host_data.clear();
+        g_cache_key_copies.clear();
     }
 
     // Number of uploads that had to be redirected — i.e. preloaded weights whose
     // device copy was not found. Each one is a silent re-upload of a whole
     // weight, so a non-zero count is a performance signal as well as the thing
-    // that used to be a crash. Reported under TS_GGML_LOG_VRAM=1.
+    // that used to be a crash. Reported under TS_GGML_LOG_VRAM=1. A weight under
+    // 4 KiB is not counted: it has no device copy to find, and its upload from
+    // the private copy is the designed path.
     std::atomic<std::int64_t> g_cache_key_redirects{0};
 
     const void* resolve_upload_source(const void* data)
@@ -2315,6 +2370,8 @@ namespace tsg
             auto it = g_cache_key_host_data.find(data);
             if (it == g_cache_key_host_data.end())
                 return data;
+            if (g_cache_key_copies.find(data) != g_cache_key_copies.end())
+                return it->second;
             data = it->second;
         }
 
@@ -3203,11 +3260,14 @@ extern "C" void TSGgml_DFlashResetCaches();
 extern "C" void TSGgml_QwenImage21ResetForwardCache();
 extern "C" void TSGgml_QwenImage21ReleasePrefixCaches();
 extern "C" void TSGgml_WanResetForwardCache();
+extern "C" void TSGgml_NemotronMamba2PrefillClear();
+extern "C" void TSGgml_NemotronMamba2DecodeClear(std::uint64_t model_key);
 
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
 {
     // Everything below frees buffers a deferred command buffer may still be reading
-    // (see TSGgml_ReleaseReuseComputeBuffers). One atomic when nothing is pending.
+    // (see TSGgml_ReleaseReuseComputeBuffers). Two atomic loads and no write when
+    // nothing is pending.
     host_read_barrier();
     // ModelBase.Dispose uses this global cache sweep before unmapping weights.
     // Retire compact expert buffers here as well, while CUDA is still alive.
@@ -3240,6 +3300,14 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     TSGgml_Gemma4ResetMoEBatchedDecodeCache();
     TSGgml_Gemma4MoEResetDecodeCache();
     TSGgml_GptOssResetDecodeCache();
+    // Per-shape graphs that hold no state between calls, so another live model
+    // simply rebuilds its own. Nothing else released them before thread or
+    // process teardown, where freeing a CUDA buffer aborts on Windows (see
+    // ThreadCacheRegistry in ggml_ops_internal.h). The Mamba2 decode graphs
+    // carry a live model's recurrent state; each model clears its own on Dispose.
+    TSGgml_NemotronMamba2PrefillClear();
+    tsg::free_prefill_attn_sessions();
+    tsg::free_paged_attn_sessions();
     // A process-global host-weight eviction must retire every verify graph/TP
     // plan, but another live Qwen35 model may still own the only current copy of
     // its recurrent state. Preserve those owner-private state buffers so its next
@@ -3388,6 +3456,8 @@ TSG_EXPORT void TSGgml_Shutdown()
     TSGgml_MuseGlimmerResetDecodeCache();
     TSGgml_DFlashResetCaches();
     TSGgml_WanResetForwardCache();
+    TSGgml_NemotronMamba2PrefillClear();
+    TSGgml_NemotronMamba2DecodeClear(0);
 #if defined(TSG_GGML_USE_METAL)
     // MPS owns a separate command queue, staging buffers and compiled graphs.
     // Its release function waits for its mutex-protected synchronous invocation
@@ -3399,9 +3469,11 @@ TSG_EXPORT void TSGgml_Shutdown()
     // them before backend teardown, including callers that skip model disposal.
     tsg_cudnn_conv2d_release();
 #endif
-    // Release the calling thread's cached prefill-attention sessions while the
-    // CUDA driver is still alive; leaving them to thread_local destructors
-    // aborts the process on exit ("CUDA error: driver shutting down").
+    // Release every thread's cached prefill-attention and paged-attention
+    // sessions, including those of threads that have exited, while their
+    // backends and the CUDA driver are alive. They are owned by a process-wide
+    // registry (ThreadCacheRegistry in ggml_ops_internal.h), so nothing frees them
+    // at thread or process exit; a thread still inside a call finishes it first.
     free_prefill_attn_sessions();
     free_paged_attn_sessions();
     // MoE CPU offload keeps a persistent ggml CPU backend (and its worker thread
@@ -3427,7 +3499,8 @@ TSG_EXPORT void TSGgml_Shutdown()
         ggml_threadpool_free(pool);
     tsg::g_cpu_pools.clear();
     tsg::g_device_count.store(1, std::memory_order_release);
-    g_pending_gpu_work.store(false, std::memory_order_release);
+    // Every backend was synchronized before it was freed above.
+    g_pending_gpu_work.reset();
 }
 
 // Throw the GPU backend away and build it again, in this process.
@@ -3506,8 +3579,8 @@ TSG_EXPORT void TSGgml_ReleaseReuseComputeBuffers()
 {
     // Drain first. Under async compute the last graph's command buffer is still
     // reading the very scratch this frees, and Metal commits that read whenever
-    // it gets round to it - long after the free returned. The barrier is a
-    // single atomic when nothing was deferred.
+    // it gets round to it - long after the free returned. The barrier is two
+    // atomic loads and no write when nothing was deferred.
     host_read_barrier();
     TSGgml_QwenImage21ResetForwardCache();
     free_reuse_compute_buffer();
@@ -4339,12 +4412,7 @@ TSG_EXPORT void TSGgml_SetAsyncCompute(int enabled)
     // When async is being turned off, drain any pending GPU work so subsequent
     // host reads don't see stale data.
     if (previous && !desired)
-    {
-        if (g_pending_gpu_work.exchange(false, std::memory_order_acq_rel) && g_backend != nullptr)
-        {
-            tsg::sync_backend(g_backend);
-        }
-    }
+        host_read_barrier();
 }
 
 TSG_EXPORT int TSGgml_GetAsyncCompute()
@@ -4352,13 +4420,55 @@ TSG_EXPORT int TSGgml_GetAsyncCompute()
     return g_async_compute_enabled.load(std::memory_order_acquire) ? 1 : 0;
 }
 
-// Drain pending GPU work iff any was deferred. Returns 1 when it actually
-// blocked on the backend, 0 when there was nothing to do. Safe to call from
-// any thread; cheap when there's no pending work (single atomic exchange).
+// Drain pending GPU work iff any was deferred, waiting out a drain another
+// thread is running. Returns 1 when this call synchronized the backend, 0 when
+// there was nothing to do or another thread's drain covered it. Safe to call
+// from any thread; cheap when there's no pending work (two atomic loads).
 TSG_EXPORT int TSGgml_HostReadBarrier()
 {
     return host_read_barrier() ? 1 : 0;
 }
+
+#if defined(TSG_GGML_TEST_DIAGNOSTICS)
+// Diagnostic only: cached buffers released while marked GPU work was still
+// pending (see test_note_cache_release). Never reset; tests compare counts.
+TSG_EXPORT int TSGgml_TestUndrainedCacheReleases()
+{
+    return g_test_undrained_cache_releases.load(std::memory_order_relaxed);
+}
+
+// Diagnostic only: places a two-node graph of `elements` floats per tensor with
+// one of the shared allocators every op draws on, the retained compute buffer
+// (gallocr == 0) or the retained gallocr (gallocr != 0). A graph larger than any
+// before it makes the allocator free its old buffer and allocate a bigger one.
+// Returns the allocator's buffer size afterwards, or 0 when it failed.
+TSG_EXPORT std::int64_t TSGgml_TestReuseAllocate(std::int64_t elements, int gallocr)
+{
+    clear_last_error();
+    if (elements <= 0 || !ensure_backend())
+        return 0;
+    PooledContextHandle context;
+    if (!context.init(1024 * 1024))
+        return 0;
+    ggml_tensor* input = ggml_new_tensor_1d(context.value, GGML_TYPE_F32, elements);
+    ggml_set_input(input);
+    ggml_tensor* output = ggml_scale(context.value, input, 2.0f);
+    ggml_set_output(output);
+    ggml_cgraph* graph = ggml_new_graph(context.value);
+    ggml_build_forward_expand(graph, output);
+    if (gallocr != 0)
+    {
+        if (!alloc_graph_reuse_gallocr(graph))
+            return 0;
+        std::lock_guard<std::mutex> lock(g_reuse_gallocr_mutex);
+        return static_cast<std::int64_t>(ggml_gallocr_get_buffer_size(g_reuse_gallocr, 0));
+    }
+    if (!alloc_ctx_tensors_reuse(context.value, graph))
+        return 0;
+    std::lock_guard<std::mutex> lock(g_reuse_compute_mutex);
+    return static_cast<std::int64_t>(g_reuse_compute_size);
+}
+#endif
 
 TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
     void* cache_key, void* host_data, int ggml_type,
@@ -4378,7 +4488,7 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
         // Register before any early return: from here on the managed side may
         // hand this key to an op, and every path that could upload from it must
         // be able to resolve it back to the real weight bytes.
-        register_cache_key(cache_key, host_data);
+        register_cache_key(cache_key, host_data, static_cast<std::size_t>(raw_bytes));
 
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         if (dev == nullptr)

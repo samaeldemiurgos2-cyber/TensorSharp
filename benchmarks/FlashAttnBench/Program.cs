@@ -1,7 +1,11 @@
-// Standalone microbench for the direct-CUDA flash prefill attention kernel
-// (ts_gqa_prefill_flash_group4_*). Times CudaFusedOps.TryGqaPrefillAttention at
-// the real Qwen3.5 / Gemma4 prefill shapes and verifies against a CPU reference,
-// so the kernel can be tuned without a full model load. nsys-profilable (plain exe).
+// Standalone microbench for the direct-CUDA flash prefill attention kernels
+// (ts_gqa_prefill_flash_group4_*, ts_gqa_prefill_flash_g16d128_*). Times
+// CudaFusedOps.TryGqaPrefillAttentionWithSinks at the real Qwen3.5 / Gemma4 /
+// Nemotron prefill shapes and verifies against a CPU reference, so the kernels
+// can be tuned without a full model load. The route column is the kernel that
+// actually ran (CudaFusedOps.LastGqaPrefillRoute): a PTX built without a flash
+// kernel serves its shape generically, and the timing must say so.
+// nsys-profilable (plain exe).
 //
 // Env knobs:
 //   TS_FLASH_LENS   comma list of seqLen==kvLen prefill sizes (default 2048,3200)
@@ -87,12 +91,14 @@ static void RunOne(string name, int numQHeads, int numKVHeads, int headDim, int 
     CudaFusedOps.TryCopyHeadFirstToCache(vCache, vActive, 0, kvLen, cacheSize, circular: false);
 
     using var actual = new Tensor(allocator, DType.Float32, seqLen, numQHeads * headDim);
+    var routes = new HashSet<string>();
 
     // WithSinks(sinks=null) is the entry the models actually use (Qwen full-attn
     // and Gemma both reach flash through it) and routes d256/d512 at any window.
     bool ok = CudaFusedOps.TryGqaPrefillAttentionWithSinks(
         actual, qTensor, kCache, vCache, sinks: null,
         numQHeads, numKVHeads, headDim, seqLen, kvLen, cacheSize, maskStart, windowSize, scale);
+    if (ok) routes.Add(CudaFusedOps.LastGqaPrefillRoute ?? "unknown");
     if (!ok)
     {
         Console.WriteLine($"{name,-24} {len,6} {"n/a",10} {"declined",12}");
@@ -118,10 +124,11 @@ static void RunOne(string name, int numQHeads, int numKVHeads, int headDim, int 
         allocator.Synchronize();
         sw.Stop();
         times.Add(sw.Elapsed.TotalMilliseconds);
+        routes.Add(CudaFusedOps.LastGqaPrefillRoute ?? "unknown");
     }
     times.Sort();
     double med = times[times.Count / 2];
-    Console.WriteLine($"{name,-24} {len,6} {med,10:F3} {maxErr,12:E2} {"flash",8}");
+    Console.WriteLine($"{name,-24} {len,6} {med,10:F3} {maxErr,12:E2} {string.Join("+", routes),8}");
 }
 
 static float VerifySampled(

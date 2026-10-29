@@ -1,5 +1,6 @@
 // https://github.com/zhongkaifu/TensorSharp
 using System.Net;
+using System.Net.Sockets;
 using TensorSharp.Distributed;
 
 namespace InferenceWeb.Tests;
@@ -11,28 +12,39 @@ namespace InferenceWeb.Tests;
 /// </summary>
 public class TcpCommunicatorTests
 {
-    private static int _nextPort = 19500;
-    private static int GetFreePort() => Interlocked.Increment(ref _nextPort);
+    // Ephemeral ports, and every rank on a task: these used fixed ports from 19501 and
+    // raw threads, so a port already held on the host (an SSH tunnel on 19501) threw
+    // "Address already in use" on a thread nothing observed and killed the test host.
+    private static IPEndPoint[] Endpoints(int count)
+    {
+        var listeners = Enumerable.Range(0, count).Select(_ => new TcpListener(IPAddress.Loopback, 0)).ToArray();
+        try
+        {
+            foreach (var listener in listeners) listener.Start();
+            return listeners.Select(listener => (IPEndPoint)listener.LocalEndpoint).ToArray();
+        }
+        finally { foreach (var listener in listeners) listener.Stop(); }
+    }
+
+    private static TcpCommunicator[] Connect(int count)
+    {
+        var endpoints = Endpoints(count);
+        var tasks = Enumerable.Range(0, count).Select(rank => Task.Run(() => new TcpCommunicator(rank, endpoints))).ToArray();
+        Assert.True(Task.WaitAll(tasks, TimeSpan.FromSeconds(20)), "connect timed out");
+        return tasks.Select(t => t.Result).ToArray();
+    }
 
     private static (TcpCommunicator, TcpCommunicator) CreatePair()
     {
-        int port0 = GetFreePort();
-        int port1 = GetFreePort();
-        var endpoints = new[]
-        {
-            new IPEndPoint(IPAddress.Loopback, port0),
-            new IPEndPoint(IPAddress.Loopback, port1),
-        };
+        var nodes = Connect(2);
+        return (nodes[0], nodes[1]);
+    }
 
-        TcpCommunicator c0 = null, c1 = null;
-        var t0 = new Thread(() => c0 = new TcpCommunicator(0, endpoints));
-        var t1 = new Thread(() => c1 = new TcpCommunicator(1, endpoints));
-        t0.Start(); t1.Start();
-        t0.Join(10_000); t1.Join(10_000);
-
-        Assert.NotNull(c0);
-        Assert.NotNull(c1);
-        return (c0, c1);
+    /// <summary>Runs one action per rank concurrently; a failure on any rank fails the test.</summary>
+    private static void RunRanks(int timeoutMs, params Action[] ranks)
+    {
+        var tasks = ranks.Select(rank => Task.Run(rank)).ToArray();
+        Assert.True(Task.WaitAll(tasks, timeoutMs), "collective timed out");
     }
 
     [Fact]
@@ -44,10 +56,7 @@ public class TcpCommunicatorTests
             var buf0 = new float[] { 1f, 2f, 3f, 4f };
             var buf1 = new float[] { 10f, 20f, 30f, 40f };
 
-            var t0 = new Thread(() => c0.AllReduce(buf0, buf0.Length));
-            var t1 = new Thread(() => c1.AllReduce(buf1, buf1.Length));
-            t0.Start(); t1.Start();
-            t0.Join(10_000); t1.Join(10_000);
+            RunRanks(10_000, () => c0.AllReduce(buf0, buf0.Length), () => c1.AllReduce(buf1, buf1.Length));
 
             Assert.Equal(new float[] { 11f, 22f, 33f, 44f }, buf0);
             Assert.Equal(new float[] { 11f, 22f, 33f, 44f }, buf1);
@@ -73,10 +82,7 @@ public class TcpCommunicatorTests
                 buf1[i] = i * 0.002f;
             }
 
-            var t0 = new Thread(() => c0.AllReduce(buf0, buf0.Length));
-            var t1 = new Thread(() => c1.AllReduce(buf1, buf1.Length));
-            t0.Start(); t1.Start();
-            t0.Join(30_000); t1.Join(30_000);
+            RunRanks(30_000, () => c0.AllReduce(buf0, buf0.Length), () => c1.AllReduce(buf1, buf1.Length));
 
             // AllReduce computes i*0.001f + i*0.002f, which is NOT bit-identical
             // to i*0.003f: each product rounds independently and the sum rounds
@@ -110,13 +116,7 @@ public class TcpCommunicatorTests
         var (c0, c1) = CreatePair();
         try
         {
-            var t0 = new Thread(() => c0.Barrier());
-            var t1 = new Thread(() => c1.Barrier());
-            t0.Start(); t1.Start();
-            bool ok0 = t0.Join(10_000);
-            bool ok1 = t1.Join(10_000);
-            Assert.True(ok0, "Barrier timed out on rank 0");
-            Assert.True(ok1, "Barrier timed out on rank 1");
+            RunRanks(10_000, c0.Barrier, c1.Barrier);
         }
         finally
         {
@@ -133,10 +133,7 @@ public class TcpCommunicatorTests
             var buf0 = new float[] { 42f, 43f, 44f };
             var buf1 = new float[] { 0f, 0f, 0f };
 
-            var t0 = new Thread(() => c0.Broadcast(buf0, rootRank: 0));
-            var t1 = new Thread(() => c1.Broadcast(buf1, rootRank: 0));
-            t0.Start(); t1.Start();
-            t0.Join(10_000); t1.Join(10_000);
+            RunRanks(10_000, () => c0.Broadcast(buf0, rootRank: 0), () => c1.Broadcast(buf1, rootRank: 0));
 
             Assert.Equal(new float[] { 42f, 43f, 44f }, buf0);
             Assert.Equal(new float[] { 42f, 43f, 44f }, buf1);
@@ -150,22 +147,8 @@ public class TcpCommunicatorTests
     [Fact]
     public void AllReduce_ThreeNodes_SumsCorrectly()
     {
-        int port0 = GetFreePort();
-        int port1 = GetFreePort();
-        int port2 = GetFreePort();
-        var endpoints = new[]
-        {
-            new IPEndPoint(IPAddress.Loopback, port0),
-            new IPEndPoint(IPAddress.Loopback, port1),
-            new IPEndPoint(IPAddress.Loopback, port2),
-        };
-
-        TcpCommunicator c0 = null, c1 = null, c2 = null;
-        var t0 = new Thread(() => c0 = new TcpCommunicator(0, endpoints));
-        var t1 = new Thread(() => c1 = new TcpCommunicator(1, endpoints));
-        var t2 = new Thread(() => c2 = new TcpCommunicator(2, endpoints));
-        t0.Start(); t1.Start(); t2.Start();
-        t0.Join(10_000); t1.Join(10_000); t2.Join(10_000);
+        var nodes = Connect(3);
+        TcpCommunicator c0 = nodes[0], c1 = nodes[1], c2 = nodes[2];
 
         try
         {
@@ -173,11 +156,10 @@ public class TcpCommunicatorTests
             var buf1 = new float[] { 10f, 20f };
             var buf2 = new float[] { 100f, 200f };
 
-            var ta0 = new Thread(() => c0.AllReduce(buf0, buf0.Length));
-            var ta1 = new Thread(() => c1.AllReduce(buf1, buf1.Length));
-            var ta2 = new Thread(() => c2.AllReduce(buf2, buf2.Length));
-            ta0.Start(); ta1.Start(); ta2.Start();
-            ta0.Join(10_000); ta1.Join(10_000); ta2.Join(10_000);
+            RunRanks(10_000,
+                () => c0.AllReduce(buf0, buf0.Length),
+                () => c1.AllReduce(buf1, buf1.Length),
+                () => c2.AllReduce(buf2, buf2.Length));
 
             Assert.Equal(new float[] { 111f, 222f }, buf0);
             Assert.Equal(new float[] { 111f, 222f }, buf1);
@@ -201,10 +183,7 @@ public class TcpCommunicatorTests
                 var buf0 = new float[] { v, v * 2 };
                 var buf1 = new float[] { v * 10, v * 20 };
 
-                var t0 = new Thread(() => c0.AllReduce(buf0, buf0.Length));
-                var t1 = new Thread(() => c1.AllReduce(buf1, buf1.Length));
-                t0.Start(); t1.Start();
-                t0.Join(10_000); t1.Join(10_000);
+                RunRanks(10_000, () => c0.AllReduce(buf0, buf0.Length), () => c1.AllReduce(buf1, buf1.Length));
 
                 Assert.Equal(v * 11, buf0[0], 3);
                 Assert.Equal(v * 22, buf0[1], 3);

@@ -414,6 +414,11 @@ else
     builder.Services.AddSingleton<IResponsesStore, InMemoryResponsesStore>();
 }
 builder.Services.AddSingleton<OpenAIResponsesAdapter>();
+// The text-LoRA directory confines POST /v1/loras (and the startup load below) to the
+// adapter files the operator put there. Not registered without --loras-dir / TS_LORAS_DIR,
+// and then POST /v1/loras answers 403.
+if (hostingOptions.LoraDirectory != null)
+    builder.Services.AddSingleton(new LoraAdapterDirectory(hostingOptions.LoraDirectory));
 
 WebRootSetup.Resolve(builder.Environment, baseDirectory);
 
@@ -678,6 +683,15 @@ catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string? loadRefu
         GgmlShutdown.ShutdownIfLoaded();
     });
     return;
+}
+
+// Text-LoRA adapters at the top of --loras-dir, loaded after the startup model so each is
+// checked against it and its factors are materialized once. One that does not load is
+// logged and skipped; it never stops the server.
+if (!hostingOptions.EmbeddingsEnabled)
+{
+    app.Services.GetService<LoraAdapterDirectory>()?.Preload(
+        app.Services.GetRequiredService<ModelService>(), startupLogger);
 }
 
 // --width / --height are also the Qwen-Image-2.1 default image size, which needs both

@@ -112,6 +112,9 @@ def main():
     writer.add_tokenizer_pre("joyai-llm")
     writer.add_token_list(tokens)
     writer.add_token_types([1] * len(tokens))
+    # A byte-level (gpt2) vocabulary needs a merges array to load; gguf-py
+    # refuses an empty one. Fixture inputs are token ids, so it is never used.
+    writer.add_token_merges(["a b"])
     writer.add_bos_token_id(0)
     writer.add_eos_token_id(1)
     writer.add_add_bos_token(False)

@@ -35,6 +35,9 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly ILogger _logger;
         private readonly bool _stopRepetition;
         private readonly int _nativeSlotContextLimit;
+        // The model's context window (MAX_CONTEXT), or 0 when it advertises none. A request
+        // must leave its prompt one token of room and stops generating where it ends.
+        private readonly int _contextLimit;
         private readonly BlockPool _pool;
         private readonly ContinuousBatchScheduler _scheduler;
         private readonly BatchExecutor _executor;
@@ -74,6 +77,7 @@ namespace TensorSharp.Runtime.Scheduling
             }
             _stopRepetition = cfg.StopRepetition;   // cfg is null-checked above
             _nativeSlotContextLimit = UsesNativeDeepSeek41Slots(model) ? Math.Max(0, model.MaxContextLength) : 0;
+            _contextLimit = Math.Max(0, model.MaxContextLength);
 
             long blockBytes = ComputeBlockByteSize(model, cfg.BlockSize);
             int numBlocks = ResolveEffectiveNumBlocks(model, cfg, _logger);
@@ -269,6 +273,31 @@ namespace TensorSharp.Runtime.Scheduling
             });
         }
 
+        /// <summary>
+        /// Release the model's copy of every retired request adapter (see
+        /// <see cref="IRequestAdapter.IsRetired"/>) that no request in flight still runs with;
+        /// the rest go as their last request finishes. Queued like a trim and applied on the
+        /// engine thread between steps, because a step may be reading the adapter's factors
+        /// right now. Safe to call at any time. Returns false once the engine has shut down,
+        /// when nothing it ran is left to finish.
+        /// </summary>
+        public bool ReleaseRetiredAdapters()
+            => _commands.Writer.TryWrite(new EngineCommand { Kind = EngineCommandKind.ReleaseAdapters });
+
+        /// <summary>How many submitted, unfinished requests run with an adapter that
+        /// <paramref name="match"/> accepts. Safe from any thread.</summary>
+        public int CountInFlightRequests(Func<IRequestAdapter, bool> match)
+        {
+            ArgumentNullException.ThrowIfNull(match);
+            int count = 0;
+            foreach (var entry in _handles)
+            {
+                if (entry.Value.Sequence.Adapter is { } adapter && match(adapter))
+                    count++;
+            }
+            return count;
+        }
+
         public void Dispose()
         {
             lock (_submissionGate)
@@ -329,6 +358,14 @@ namespace TensorSharp.Runtime.Scheduling
                         ApplyCommand(cmd);
                 }
 
+                // A retired adapter's factors go once its last request has left (finished,
+                // failed or aborted); base-only traffic never sets the flag.
+                if (_adapterSweepPending)
+                {
+                    lock (_model.GpuComputeLock)
+                        SweepRetiredAdapters();
+                }
+
                 // If there's nothing in flight, block on command channel.
                 if (_scheduler.RunningCount == 0 && _scheduler.WaitingCount == 0)
                 {
@@ -373,6 +410,11 @@ namespace TensorSharp.Runtime.Scheduling
                         FailStepSequences(ex, output, "scheduler");
                         continue;
                     }
+
+                    // A request that resolved an adapter before it was unloaded binds it
+                    // again for its own steps; sweep it once that request is done.
+                    if (output.Adapter is { IsRetired: true })
+                        _adapterSweepPending = true;
 
                     if (output.IsEmpty)
                     {
@@ -637,19 +679,24 @@ namespace TensorSharp.Runtime.Scheduling
                 case EngineCommandKind.Submit:
                     try
                     {
+                        // Every model: the prompt must leave room for one generated token.
+                        // The pool check in Submit below cannot catch this - the pool is
+                        // sized for the whole context or more - so a 6k-token prompt under
+                        // MAX_CONTEXT=4096 used to be admitted and fail inside the model's
+                        // prefill ("Requested sequence length ... exceeds configured max
+                        // context"), after spending a forward on it.
+                        int promptTokens = cmd.Sequence.PromptTokens.Count;
+                        if (_contextLimit > 0 && promptTokens >= _contextLimit)
+                            throw RefuseForContext(cmd.Sequence,
+                                new ContextLengthExceededException(promptTokens, _contextLimit));
                         // A larger metadata pool accounts for independent native
                         // slots; it must not enlarge any individual slot's context.
-                        long requested = (long)cmd.Sequence.PromptTokens.Count + cmd.Sequence.MaxNewTokens;
+                        long requested = (long)promptTokens + cmd.Sequence.MaxNewTokens;
                         if (_nativeSlotContextLimit > 0 && requested > _nativeSlotContextLimit)
-                        {
-                            var error = new InvalidOperationException(
+                            throw RefuseForContext(cmd.Sequence, new ContextLengthExceededException(
+                                promptTokens, _nativeSlotContextLimit,
                                 $"DeepSeek V4.1 request requires {requested} tokens, but each native sequence slot " +
-                                $"has a context limit of {_nativeSlotContextLimit}. Shorten the prompt or output allowance.");
-                            cmd.Sequence.Status = SequenceStatus.FinishedError;
-                            cmd.Sequence.FinishReason = "error";
-                            cmd.Sequence.Error = error;
-                            throw error;
-                        }
+                                $"has a context limit of {_nativeSlotContextLimit}. Shorten the prompt or output allowance."));
                         _scheduler.Submit(cmd.Sequence);
                     }
                     catch (Exception ex)
@@ -669,6 +716,10 @@ namespace TensorSharp.Runtime.Scheduling
                     {
                         _logger.LogWarning(ex, "Trimming idle memory failed");
                     }
+                    break;
+
+                case EngineCommandKind.ReleaseAdapters:
+                    SweepRetiredAdapters();
                     break;
 
                 case EngineCommandKind.Speculation:
@@ -698,6 +749,60 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                     break;
             }
+        }
+
+        /// <summary>Mark a sequence refused at submission (nothing was scheduled for it) and
+        /// return the error for the submit path to deliver to its handle.</summary>
+        private static ContextLengthExceededException RefuseForContext(
+            SequenceState seq, ContextLengthExceededException error)
+        {
+            seq.Status = SequenceStatus.FinishedError;
+            seq.FinishReason = "error";
+            seq.Error = error;
+            return error;
+        }
+
+        // Set when an adapter was retired (ReleaseRetiredAdapters) or a retired one ran a
+        // step, and cleared once no retired adapter is still bound. Engine thread only.
+        private bool _adapterSweepPending;
+
+        /// <summary>Release the model's state for every retired adapter that no request in
+        /// flight runs with. Engine thread, under the GPU compute lock, between steps.</summary>
+        private void SweepRetiredAdapters()
+        {
+            _adapterSweepPending = false;
+            if (_model is not IAdapterAwareModel aware)
+                return;
+            foreach (var adapter in aware.BoundAdapters)
+            {
+                if (!adapter.IsRetired)
+                    continue;
+                if (_scheduler.ReferencesAdapter(adapter) || HandlesReference(adapter))
+                {
+                    _adapterSweepPending = true;
+                    continue;
+                }
+                try
+                {
+                    aware.ReleaseAdapter(adapter);
+                    _logger.LogInformation("Released LoRA adapter {Adapter}: unloaded, and no request runs with it.", adapter.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Releasing LoRA adapter {Adapter} failed", adapter.Id);
+                }
+            }
+        }
+
+        // Submissions still queued as commands are in _handles before the scheduler sees them.
+        private bool HandlesReference(IRequestAdapter adapter)
+        {
+            foreach (var entry in _handles)
+            {
+                if (ReferenceEquals(entry.Value.Sequence.Adapter, adapter))
+                    return true;
+            }
+            return false;
         }
 
         private void ApplyResults(List<SequenceStepResult> results, SchedulerOutput output)
@@ -763,9 +868,23 @@ namespace TensorSharp.Runtime.Scheduling
 
                         handle?.PublishToken(token);
 
-                        // Stop on max-new-tokens.
-                        if (emittedCount >= seq.MaxNewTokens)
+                        // Stop on max-new-tokens, or where the context window ends. Every
+                        // path forwards a decode token in the step that samples it, so the
+                        // token after this one would be written at position prompt+emitted:
+                        // past the window once that reaches it, which the model refuses
+                        // ("Requested sequence length N+1 exceeds configured max context N")
+                        // and which used to fail the request mid-reply. Reported as the
+                        // length cap it is, the same "max_tokens" a host clamping the reply
+                        // to the room its prompt leaves (ClampGenerationReserve) would see.
+                        bool contextFull = _contextLimit > 0
+                            && (long)seq.PromptTokens.Count + emittedCount >= _contextLimit;
+                        if (emittedCount >= seq.MaxNewTokens || contextFull)
                         {
+                            if (emittedCount < seq.MaxNewTokens)
+                                _logger.LogInformation(
+                                    "Request {RequestId} reached the model's {Context}-token context window after " +
+                                    "{Emitted} of {Requested} requested tokens; finishing it as a length stop",
+                                    seq.RequestId, _contextLimit, emittedCount, seq.MaxNewTokens);
                             TruncateUnpublishedTail(seq, emittedCount);
                             LogSpeculationStatsIfAny(seq);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedLengthCapped, "max_tokens", output);
@@ -970,6 +1089,7 @@ namespace TensorSharp.Runtime.Scheduling
             Abort,
             Trim,
             Speculation,
+            ReleaseAdapters,
         }
     }
 }

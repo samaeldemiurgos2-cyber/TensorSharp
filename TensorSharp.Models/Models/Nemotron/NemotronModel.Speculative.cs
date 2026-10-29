@@ -200,7 +200,24 @@ namespace TensorSharp.Models
         /// set, LM-head logits for every row instead of only the last.
         /// Advances the KV caches and _cacheSeqLen exactly like ForwardCore().
         /// </summary>
-        public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+        public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+        {
+            // Speculation is off for text-LoRA steps (and refused on this trunk), but an entry
+            // point that could run under an adapter audits itself like Forward and ForwardBatch:
+            // every planned weight applied, the LM head included (this forward always emits logits).
+            bool loraAudit = OpenLoraForwardAudit();
+            try
+            {
+                SpecForwardCore(tokens, hAllOut, logitsOut, allLogitsRows);
+                if (loraAudit) VerifyLoraForwardAudit(producedLogits: true);
+            }
+            finally
+            {
+                if (loraAudit) CloseLoraForwardAudit();
+            }
+        }
+
+        private unsafe void SpecForwardCore(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             // Latch that the speculative trunk is in use. The Mamba2 native decode
             // kernel keeps conv/SSM state device-side, which a verify batch cannot see

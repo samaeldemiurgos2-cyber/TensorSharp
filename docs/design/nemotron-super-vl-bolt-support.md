@@ -1,9 +1,9 @@
 # Nemotron 3.5 Super VL / Bolt support - Design & gap analysis
 
-**Status:** All gaps addressed. G1/G2/G6 implemented; G3/G4 verified already covered; G5 already supported by existing vision code.
-**Date:** 2026-10-19 / 2026-10-20
+**Status:** G1, G2, G3 and G6 implemented. G2 and G3 work only after fixes made when the DGX Spark run found them broken (section 5). G4 was covered as claimed. G5 (vision) was **not** covered for Bolt, whose mmproj splits q/k/v; that was fixed after the PR #282 review. Super VL's `v.post_ln` is still not applied (a follow-up, see G5). Tensor parallelism now applies the NVFP4 scales and Nemotron opts in, but only synthetic tests cover it, on CPU and in a gated `ggml_cuda` `--tp 2` test; no real Super VL `--tp 2` generation has completed on GPUs (section 6).
+**Date:** 2026-10-19 / 2026-10-20; corrected 2026-10-28 after the PR #282 review
 **Target models:**
-- `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` (ggml-org GGUF, ~79GB)
+- `NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` (ggml-org GGUF, about 71.6 GiB / 76.919 GB)
 - `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF` (unsloth)
 
 ## 1. What the model actually is (from the downloaded GGUF header)
@@ -171,8 +171,10 @@ treatment in `69201abb`.
 Lesson for the next shape review: "the managed routing data structures support N" is not the same as
 "every native kernel on the path supports N". Check the kernel's own argument validation.
 
-The outstanding verification is still CPU-offload memory for 512 NVFP4 experts per MoE layer
-(~2.8 GB/layer) -- `--n-cpu-moe` has not been validated.
+CPU offload does not cover these experts. 512 NVFP4 experts are about 1.6 GB per MoE layer
+(512 x 2 x 1024 x 2688 values at 36 bytes per 64), and Nemotron's single-device MoE path does not
+implement `--n-cpu-moe` (section 6). Under `--tp`, only expert parallelism honours the flag, and that
+path is never taken for a latent MoE.
 
 ### G4 -- BF16 non-expert weights -- **verified already covered (confirmed on Spark)**
 
@@ -188,19 +190,97 @@ attractive suspect. It is not the cause. `addmm_quant_f32_impl` passes the type 
 `ModelBase.DFlash.cs` claiming the AddmmQuant family "silently returns a zeroed output" for F16/BF16
 is drafter-specific and stale, not a general constraint.
 
-Do **not** "fix" this by dequantizing BF16 to F32 at load. That grew Super VL from ~73 GB to ~85 GB of
-weights and OOM-killed it on a 121 GB Spark during prefill warmup. Run models at the quantization they
-ship in -- these GGUFs are sized deliberately for the platform. If a dtype genuinely is unsupported,
-fix it in TensorSharp-owned native code rather than inflating the footprint.
+Do **not** "fix" this by dequantizing BF16 to F32 at load: doing so OOM-killed Super VL during prefill
+warmup on a Spark. That Spark's unified pool is 124,546 MiB (121.6 GiB), the total in the
+`model load refused` message quoted in section 6; the original report gave it as 121 GB. The NVFP4 file
+holds about 71.6 GiB (76.919 GB) of weights, and F32 doubles every BF16 tensor in section 2:
+`ssm_in`/`ssm_out` on the 40 Mamba2 layers, `attn_q/k/v` and `attn_output` on the 8 attention layers
+(4096 x 4096 for q and output, 4096 x 256 for k and v) and `ffn_latent_down/up` on the 40 MoE layers.
+Estimated from those shapes, that adds about 9.3 GiB, for about 81-83 GiB of weights; the range is
+whether the token embedding and LM head (131072 x 4096 each, another 1 GiB apiece if stored as BF16)
+were expanded too. This is an estimate, not a measurement: the original Spark report gave ~73 before
+and ~85 after without recording whether the unit was GB or GiB, and neither figure matches the file
+size in either unit. Run models at the quantization they ship in -- these GGUFs are sized deliberately
+for the platform. If a dtype genuinely is unsupported, fix it in TensorSharp-owned native code rather
+than inflating the footprint.
 
-### G5 -- Vision -- **already supported**
+### G5 -- Vision -- **was NOT covered for Bolt; fixed**
 
-Super-VL / Bolt are `image-text-to-text` with a RADIO-family vision tower in the mmproj.
-`NemotronVisionEncoder` handles the exact `clip` mmproj + `nemotron_omni` projector format:
-it reads `clip.vision.*` config keys, loads `v.blk.*` ViT blocks (with bias and GELU) and
-`mm.model.mlp.*` projector tensors. `LoadVisionEncoder` is already wired. The
-RADIO ViT (32 blocks, 1280 embed, 16 heads, GELU, bias, scale_factor=2, MLP 1280->20480->4096)
-matches the existing code exactly. No additional work needed.
+Super-VL / Bolt are `image-text-to-text` with a RADIO-family vision tower in the mmproj. This section
+first said the encoder "handles the exact `clip` mmproj + `nemotron_omni` projector format" and
+"matches the existing code exactly", and the PR #282 description called this "verified against the
+actual mmproj header". **That was wrong for Bolt.**
+
+The published mmprojs use three layouts. These were read from their GGUF headers, with shapes in
+GGUF ne order:
+
+| mmproj | q/k/v | Extra tensors | Projector out |
+|---|---|---|---|
+| Bolt: `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF` `mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`; unsloth `mmproj-BF16.gguf` (519 tensors) | **split** `attn_q` / `attn_k` / `attn_v` weights [1280, 1280] (BF16) and biases [1280] | `v.patch_embd.weight.1` [16, 16, 6, 1280] (video only); no `v.post_ln` | 4096 (`nemotron_omni`) |
+| Super VL: ggml-org `mmproj-NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-{BF16,Q8_0}.gguf` (393 tensors) | fused `attn_qkv` [1280, 3840], bias [3840] | `v.patch_embd.weight.1` and `v.post_ln.{weight,bias}` [1280] | 4096 (`nemotron_omni`) |
+| Nano Omni: unsloth `mmproj-BF16.gguf` (390 tensors) | fused `attn_qkv` | none | 2688 (`nemotron_v2_vl`) |
+
+`SelfAttention` read only `v.blk.N.attn_qkv`, and `LinearForward` returned `null` for a weight that was not
+loaded. So on Bolt every image request threw `NullReferenceException` (HTTP 500), and startup printed
+`Nemotron multimodal warmup skipped: Object reference not set to an instance of an object`. Text
+requests were unaffected, which is how the model "loaded and worked".
+
+The projector was also misdescribed. It is RMSNorm, then 5120 -> 20480, ReLU^2, then 20480 -> 4096
+(2688 for Nano Omni). Its input is the 1280-wide tower output after the 2x2 pixel shuffle (1280 x 4 =
+5120), not 1280.
+
+**Fix (in tree):**
+- `NemotronVisionEncoder.LoadWeights` concatenates each block's split `attn_q` / `attn_k` / `attn_v`
+  weights and biases into `attn_qkv`. Output rows go in Q, K, V order, after the dequantize to F32 that
+  every vision weight already went through. A split file and a fused file therefore run identical
+  weights. A block stored in both layouts is refused, and so is a split triple with a part missing,
+  checked from the tensor names before any data is read.
+- `ValidateWeights` checks every tensor the forward reads against the `clip.vision.*` metadata. The
+  patch embedding, the norms, `attn_qkv`, `attn_out`, the FFN and `mm.model.mlp.{0,1,3}` are required.
+  Biases and the class and position embeddings are optional, but checked when present. Any problem
+  fails the load with `InvalidDataException` naming the file, the missing or mis-shaped tensors and the
+  expected layout, rather than failing the first image. `LinearForward` now throws with the weight's
+  name instead of returning `null`.
+- `NemotronModel.LoadVisionEncoder` refuses a projector whose output width is not the language model's
+  hidden size, e.g. a Nano Omni mmproj (2688) with Bolt (4096).
+- `v.patch_embd.weight.1` is skipped with one log line. Nemotron takes no video input.
+- A warmup failure now prints `Nemotron multimodal warmup FAILED (image requests will fail): ...`.
+
+How a refused mmproj surfaces:
+- **Server startup with `--mmproj`:** the server logs `Model load refused`, prints
+  `error: model load refused: ...` and exits with code 2.
+- **Web UI model switch:** HTTP 500 carrying the reason.
+- **CLI:** the same error line and exit code 2, whether the projector was named with `--mmproj` or found
+  beside the model for an `--image` request. The second path had no handler and ended in an unhandled
+  exception.
+- **Interactive `/mmproj`:** prints the reason and keeps the loaded model.
+
+The Qwen3.5, Gemma 4 and Mistral 3 mmproj loaders are untouched.
+
+Evidence:
+- `NemotronVisionEncoderTests`, on synthetic mmprojs whose split tensors are row slices of the fused ones:
+  - encoder output from a split file is bit-identical to the fused file's, for F32, BF16 and Q8_0 q/k/v
+    on the managed path, F32 and Q8_0 on ggml_cpu, and F32 and BF16 on ggml_cuda;
+  - language-model logits after an image prefill are identical;
+  - the refusals above.
+- `HostLoadRefusalProcessTests.BothHosts_NemotronMmprojMissingVisionTensors_IsRefusedAtLoad` covers the
+  real CLI and server processes.
+- No real Bolt image was run for this fix.
+
+**Follow-ups (not done):**
+- **`v.post_ln`.** Super VL's mmproj ships a post-encoder LayerNorm, which llama.cpp's `build_vit`
+  (`tools/mtmd/clip.cpp`) applies when the tensor is present. This encoder does not read it, so Super
+  VL image embeddings differ from llama.cpp's. It was left out because there is no end-to-end oracle:
+  Super VL's language model does not fit one 48 GB GPU. Bolt's and Nano Omni's mmprojs have no
+  `post_ln`.
+- **Dynamic resolution.** The `nemotron_omni` mmprojs declare `clip.vision.image_min_pixels` and
+  `clip.vision.image_max_pixels`, which llama.cpp uses for dynamic resolution. This encoder tiles
+  instead, with one tile by default.
+- **GELU.** llama.cpp uses the exact erf GELU for `nemotron_omni`, and this encoder uses the tanh
+  approximation.
+
+Lesson: "loads and prints the right config" is not evidence. Diff the file's tensor list against what the
+forward reads, for every published file of the family.
 
 ## 5. Summary
 
@@ -217,6 +297,7 @@ What was actually broken:
 | G2 per-expert scale2 | implemented | folded past ReLU^2, overflowed to Inf/NaN | `6be5296e`, `a0941ceb` |
 | G3 top-22 | "verified already covered" | GGML kernel rejects >16 experts | `57a20f89`, `69201abb` |
 | G4 BF16 | "no gap" | **correct as written** | none needed |
+| G5 vision | "already supported" | Bolt's split q/k/v: NullReferenceException on every image (found by the PR #282 review, not on the Spark); Super VL's `v.post_ln` ignored | split q/k/v fused at load + load-time validation; `post_ln` still open |
 
 G4 is the one claim that held up, and it is worth trusting: BF16 works natively through AddmmQuant.
 
@@ -227,7 +308,8 @@ Both models, `--temperature 0`, native quantization, no weight expansion:
 - **Bolt 74B** on `ggml_cuda` and on `cuda`: correct answers, `finishReason=eos`. Byte-identical
   output across the pre- and post-merge trees.
 - **Super VL 120B** on `ggml_cuda`: `"The capital of France is Paris."` and a correct multi-step
-  reasoning answer, both `finishReason=eos`. 72 GB of weights loads and runs in the 121 GB pool.
+  reasoning answer, both `finishReason=eos`. About 71.6 GiB (76.919 GB) of weights loads and runs in
+  the 121.6 GiB pool.
 
 Symptoms before the fixes, for anyone who hits something similar: Bolt was fluent for 3-4 tokens then
 collapsed into `>>(>>(` and file-extension soup; Super VL aborted warmup with "non-finite router
@@ -269,19 +351,65 @@ Two traps if you build on the host instead of in the container:
   `CopyGgmlNativeBinary` has no skip condition, so it still copies the fresh `.so`.
 
 The committed PTX baseline targets `compute_61`, and **nvcc 13 dropped `compute_61`** (it lists
-`compute_75`..`compute_121`), so the baseline cannot be refreshed on a Spark. Any newly added kernel
-must therefore be resolved with `GetOptionalFunction`, not `GetFunction`: the latter calls
-`ThrowOnError` and handles are resolved eagerly in the `CudaKernels` constructor, so a missing symbol
-would take the whole direct-CUDA backend down on no-nvcc builds. Gate the feature on the handle being
-non-zero and fall back.
+`compute_75`..`compute_121`), so the baseline cannot be refreshed on a Spark. Refresh it on a host with
+a CUDA 12.x nvcc (`-p:TensorSharpUpdateCommittedPtx=true -p:CudaArch=compute_61`):
+`CommittedPtx_HasAnEntryForEveryKernelInTheSource` fails until every kernel in the source is in it.
+Any newly added kernel must still be resolved with `GetOptionalFunction`, not `GetFunction`: the latter
+calls `ThrowOnError` and handles are resolved eagerly in the `CudaKernels` constructor, so a missing
+symbol in a stale or custom PTX would take the whole direct-CUDA backend down on no-nvcc builds. Gate
+the feature on the handle being non-zero and fall back.
 
 ### Still unverified
 
-- **Tensor parallelism.** `69201abb` is compile-verified only; a single GB10 cannot execute any TP
-  path. Expert-parallel MoE throws `NotSupportedException` for up-scaled experts rather than routing
-  garbage, because `MoEFFNPrefill` has no per-expert scale hook and building EP shards removes the
-  per-expert weights the fallback needs.
-- **Vision (G5)** -- unchanged, still unexercised end-to-end.
-- **CPU offload** with 512 NVFP4 experts per layer (`--n-cpu-moe`).
-- The new group-16/head_dim-128 flash prefill kernel is restricted to `windowSize == 0`; it implements
-  sliding windows but only full attention has been run.
+- **Tensor parallelism.** With the fix for PR #282 review item 4, every Nemotron TP path applies the
+  NVFP4 scales:
+  - The router folds the per-expert down scale into the route weights.
+  - The batched decode kernel and the per-expert loop apply the up scale before ReLU^2.
+  - The TP linears apply the per-tensor `.scale`.
+  - Nemotron opts in to `SupportsTensorParallelWeightScales`.
+
+  What this means for each model:
+  - **Super VL NVFP4:** `--tp 2` is no longer refused, but the file does not fit two A40s with ECC
+    enabled (below). `--tp 2` is the only degree, since the attention layers have 2 KV heads.
+  - **Super VL Q4_0:** has no sidecars and was never refused.
+  - **Bolt:** still refused under `--tp`, now by the per-block MoE check rather than the sidecar gate.
+
+  Expert parallelism is not used for these models. They are latent MoE, and their kernel has no
+  pre-activation scale hook for up-scaled experts. They run the per-expert row split, which refuses an
+  expert width that does not split on quant-block boundaries. `EnsureNemotronTpAppliesExpertScales` is
+  the permanent fail-closed guard.
+
+  This is covered by synthetic tests only (`NemotronExpertScaleTests`, TP against one device and
+  against folded twins). Besides the CPU tests, a gated `ggml_cuda` `--tp 2` test
+  (`GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin`) runs the TP batched expert decode, with the
+  up scales applied before ReLU^2 through `TSGgml_MoEExpertsForwardF32`, and the expert-parallel
+  down-scale path (non-latent layers only). It needs
+  `TS_TEST_GGML_BACKEND=cuda` and either two GPUs or
+  `GGML_CUDA_DEVICES=2`, which emulates two devices on one GPU; the local validation used the emulated
+  mode. No real Super VL `--tp 2` generation has completed on GPUs. On two A40s with ECC enabled
+  (48 GB, about 45.0 GiB usable each) the NVFP4 GGUF does not fit: rank 0, which besides its half of
+  the routed experts holds all of the Mamba2, latent, shared-expert, router and LM-head weights, runs
+  out of memory while preloading its weights. Estimated from the tensor shapes, rank 0's weights alone
+  come to about 41.8 GiB and rank 1's to about 29.8 GiB. With ECC off, 48 GB cards (an A40, RTX A6000
+  or RTX 6000 Ada) report about 49,140 MiB (about 48.0 GiB usable), which would leave rank 0 about
+  6 GiB; none has been measured. The Q4_0 GGUF's `--tp 2` fit has not been measured.
+- **Vision (G5):** split q/k/v and validation are covered by the synthetic tests above. No real Bolt
+  or Super VL image has been run since the fix. `v.post_ln` is still not applied.
+- **CPU offload (`--n-cpu-moe` / `--cpu-moe`):** not implemented by Nemotron's single-device MoE path.
+  The hosts still log "MoE CPU offload active", but no VRAM is saved:
+  - on `ggml_cuda`, the selected layers' experts skip the load-time upload and are uploaded when the MoE
+    kernel first uses them;
+  - on `cuda`, every quantized weight is uploaded at load.
+
+  Only expert-parallel MoE under `--tp` on `ggml_cuda` keeps experts on the host, and that path is never
+  taken for Super VL or Bolt.
+- **Group-16/head_dim-128 flash prefill kernel:** restricted to `windowSize == 0`. It implements sliding
+  windows, but only full attention has been run. Builds that compile the kernels locally with nvcc have
+  it, and so does the committed compute_61 baseline PTX used without nvcc: it was refreshed with CUDA
+  12.8, and `CommittedPtx_HasAnEntryForEveryKernelInTheSource` keeps it current. Its body has no
+  `__CUDA_ARCH__ >= 800` guard, so unlike the vision MMA and Q8_0 MMQ kernels it is not disabled when
+  the loaded code targets a lower arch.
+
+  Only a module without it (a stale or custom PTX) leaves Nemotron's direct-`cuda` prefill on the
+  generic GQA kernel. Either way the prefill no longer takes the materialized path, so greedy text can
+  change at near-ties (`docs/models/nemotron.md` section 8).

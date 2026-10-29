@@ -482,7 +482,15 @@ Qwen/MoE 回归通过 CUDA 327 项（跳过 17）和 CPU 319 项（跳过 22）�
 直接 `cuda` 引擎能运行 UD-Q2_K_XL 的 IQ2_XS 与 IQ3_XXS 专家：decode 用从 ggml 点积移植来的逐 token
 kernel，仍以捕获的 CUDA 图运行；prefill 则把这两种布局解码进它的 tensor-core 与寄存器暂存
 （register-staged）分组 kernel。在分组 kernel 接手之前，它对这个文件的 prefill 走最慢的回退路径，
-约 500 tok/s。该引擎没有主机专家接缝，所以 `--n-cpu-moe` 在它上面只打印警告，专家仍留在 GPU 上。
+约 500 tok/s。它也能运行 UD-Q4_K_XL：该文件 48 层路由 down 投影中有 43 层存为 Q5_1（另外 5 层为
+Q8_0），gate/up 为 Q4_K/Q5_K。decode 像 ggml 的 `vec_dot_q5_1_q8_1` 一样用 dp4a 把 Q5_1 与 q8_1 激活
+做点积（偏移项取自 int8 激活之和），prefill 则把它解码进同样的分组 kernel，全部以 ggml 的
+`dequantize_row_q5_1` 为准。此前引擎在加载时拒绝
+这个文件，而在 `--layer-split 2` 下两个设备各自的拒绝以未处理的 `AggregateException` 中止了 CLI；
+现在它不能解码的专家布局会在任何上传之前被拒绝，只输出一行点名该张量的 `error: model load refused:`。
+尚未在直接引擎上测量 UD-Q4_K_XL 的吞吐。没有 nvcc 的构建使用已提交的 PTX，它需要重新生成才包含 Q5_1
+解码器；在此之前引擎会拒绝 Q5_1 专家，而不是把它们当作 Q8_0 解码。
+该引擎没有主机专家接缝，所以 `--n-cpu-moe` 在它上面只打印警告，专家仍留在 GPU 上。
 直接 `cuda` 引擎使用 `--layer-split N` 分配多个 GPU，并拒绝 `--tp N`。
 `ggml_cuda` 已支持对 UD-Q2_K_XL 使用 `--tp 2`，保留原始量化权重；支持的格式及设备/布局要求见
 [多 GPU](#多-gpu)。

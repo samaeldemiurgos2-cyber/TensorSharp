@@ -111,7 +111,8 @@ namespace TensorSharp.Runtime
             Span<byte> lenBytes = stackalloc byte[8];
             fs.ReadExactly(lenBytes);
             ulong headerLen = BitConverter.ToUInt64(lenBytes);
-            if (headerLen == 0 || (long)headerLen > _fileLength - 8)
+            // Compared unsigned: a length with the top bit set is negative as a long.
+            if (headerLen == 0 || headerLen > (ulong)(_fileLength - 8))
                 throw new InvalidDataException($"safetensors header length {headerLen} is out of range for '{Path}' ({_fileLength} bytes).");
 
             byte[] headerBytes = new byte[headerLen];
@@ -145,7 +146,11 @@ namespace TensorSharp.Runtime
                     throw new InvalidDataException($"safetensors tensor '{prop.Name}' has data_offsets [{begin},{end}] outside the {dataBytes}-byte data section of '{Path}'.");
 
                 var info = new SafetensorTensorInfo { Name = prop.Name, Shape = shape, Dtype = dtype, Begin = begin, End = end };
-                long expected = info.NumElements * DtypeSize(dtype);
+                // Sized with overflow checks and no negative dimension: either lets a shape's byte
+                // count match the bytes it was given while ReadFloat32 sizes its array from the shape.
+                long expected = ByteLength(shape, dtype);
+                if (expected < 0)
+                    throw new InvalidDataException($"safetensors tensor '{prop.Name}' has shape {Stringify(shape)}, which is negative or too large for {dtype}.");
                 if (info.ByteCount != expected)
                     throw new InvalidDataException($"safetensors tensor '{prop.Name}' byte length {info.ByteCount} != {expected} expected for {dtype}{Stringify(shape)}.");
                 Tensors[prop.Name] = info;
@@ -288,6 +293,20 @@ namespace TensorSharp.Runtime
                 or SafetensorDtype.F8_E4M3 or SafetensorDtype.F8_E5M2 => 1,
             _ => throw new NotSupportedException($"unknown safetensors dtype {d}"),
         };
+
+        /// <summary>The bytes a <paramref name="shape"/> of <paramref name="dtype"/> takes, or -1 when
+        /// a dimension is negative or the count does not fit in an int64.</summary>
+        private static long ByteLength(long[] shape, SafetensorDtype dtype)
+        {
+            long bytes = DtypeSize(dtype);
+            foreach (long d in shape)
+            {
+                if (d < 0 || (d > 0 && bytes > long.MaxValue / d))
+                    return -1;
+                bytes *= d;
+            }
+            return bytes;
+        }
 
         private static string Stringify(long[] shape) => "[" + string.Join(",", shape) + "]";
 

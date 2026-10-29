@@ -82,6 +82,7 @@ OpenAI / Ollama 响应附加 `knowledge_sources`、`knowledge_citation_repairs`�
 | Agent Skills | 技能目录：首先是二进制文件旁的 `skills` 目录（通过 `POST /api/skills` 上传的技能安装在此处；最先扫描，因此同名时其中的技能优先），然后是 `--skills-dir`（默认为从工作目录向上直到 Git 根目录的每个已存在的 `.agents/skills`，由近及远），在 `/v1/skills` 与 `/api/skills` 列出，也可通过 `POST /api/skills` 以 `.zip` 安装。所有聊天端点都可用 `"skills": [...]` 按请求选中。对同时支持工具声明与输出解析的模型族（包括 Qwen 3.8 Flash Next，`qwen4exp`），模型自己的技能调用在服务端内部应答，因此客户端拿到完整回复；不支持完整工具闭环的模型族则以内联方式获得选中技能说明。`skills_run` 只有在服务启动时传入 `--skills-allow-exec` 才可用。 |
 | Agent 式代码执行 | `--code-exec` 会为支持工具调用的模型族加入进程内执行的 `shell`、`read_file`、`write_file` 与 `apply_patch`。Web UI 每个聊天会话保留一个工作区；每个 OpenAI/Ollama HTTP 请求在内部轮次间使用私有工作区，响应结束后由服务删除。联网与安装软件包是相互独立且默认关闭的权限。 |
 | 子智能体 | 在 `/v1/chat/completions`、`/v1/responses`、`/api/chat/ollama` 与 Web UI `/api/chat` 上，对能渲染工具声明且有工具解析器的模型族（Mistral 3、Hunyuan Dense 与 DiffusionGemma 除外）默认开启。模型可以调用 `spawn_agent`、`wait_agent`、`send_input`、`close_agent` 与 `list_agents`；子智能体由服务端在进程内用同一个已加载模型运行；`explorer` 与 `reviewer` 子智能体只读，`worker` 只有在服务启动时传入 `--agents-allow-worker-tools` 时才获得父级的可写工具。`--no-multi-agent` 为整个服务关闭委派，`"multi_agent": false` 为单个请求关闭。见[子智能体](#子智能体multi_agent)。 |
+| 文本 LoRA 适配器 | 只从 `--loras-dir` 加载（启动时加载顶层的每个适配器，运行时再通过 `POST /v1/loras` 加载；未配置该目录时返回 403），同时最多 32 个；在 `/v1/chat/completions` 与 `/v1/responses` 上用 `"lora"` 按请求选择（仅单设备上的 `nemotron_h`、`mistral3`、`hunyuan-dense`；其他情况返回 400）。见[文本模型 LoRA 适配器](#文本模型-lora-适配器lorav1loras)。 |
 | 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`，`/v1/chat/completions` 在解码时用 JSON 语法约束它们；`response_format`（`json_object` / `json_schema`）不能与 `tools` 同时使用；只有声明了推理结束位置的模型家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、GLM-5.3-Flash、Gemma 4、Nemotron-H、Muse-Glimmer、Muse Spark）允许与 `think` 同时使用 |
 
 > **网络安全：**服务监听 `0.0.0.0:5000`，没有 API Key 身份验证或内置 TLS。
@@ -1007,6 +1008,107 @@ curl http://127.0.0.1:5000/v1/systemone \
 那一个）达到 `TS_JEV_MAX_PENDING`（默认 32）时返回 529 并带 `Retry-After: 1`，请求逐个执行。
 图像字节按上传限额存储，因此也可能返回 413 或 507。概率语义、图像输入、`TS_JEV_MAX_CANVAS`
 分块与验证见 [Jev 指南](../docs/models/jev_zh-cn.md)。
+
+### 文本模型 LoRA 适配器（`lora`、`/v1/loras`）
+
+已加载的文本 LoRA 适配器在 `/v1/chat/completions` 或 `/v1/responses` 上用
+`"lora": "<名称>"` 按请求选择，只作用于该请求；省略、`null` 或 `"none"` 表示基础模型。
+只有单设备、`cpu`/`ggml_cpu`/`ggml_cuda`/`cuda` 后端上的 `nemotron_h`、`mistral3` 与
+`hunyuan-dense` 模型族会应用适配器（Nemotron 应用于路由专家之外的所有投影：Mamba2 的
+`ssm_in`/`ssm_out`、注意力 q/k/v/output、dense 的 `ffn_up`/`ffn_down`、共享专家、latent 的
+`ffn_latent_down`/`ffn_latent_up`、路由器和 LM head）。其他模型、后端或多 GPU 模式、未知名称，
+或含有已加载模型无法应用的模块（例如路由专家 `*_exps`）的适配器，都会在任何流式输出之前返回 400；
+适配器绝不会只应用一部分。
+
+适配器是运维者 LoRA 目录 `--loras-dir <dir>`（或 `TS_LORAS_DIR`）中的文件，有两种形式。两者都以
+基础 GGUF 的张量名加 `.lora_a` / `.lora_b` 后缀命名目标（例如 `blk.0.attn_q.weight.lora_a`
+`[rank, in]` 与 `blk.0.attn_q.weight.lora_b` `[out, rank]`）；TensorSharp 会把 `attn_q/k/v`
+与 `ffn_gate/up` 解析到加载时融合的投影上。
+
+- llama.cpp 的 GGUF 适配器（`.gguf`），即 `convert_lora_to_gguf.py` 的输出：
+  `general.type = adapter`、`adapter.type = lora`，alpha 来自 `adapter.lora.alpha`
+  （与 llama.cpp 一样必须是 FLOAT32 值，其他类型会被拒绝），
+  因子为 F32/F16/BF16/Q8_0。其 `general.architecture` 必须与已加载模型一致，或与基础 GGUF
+  自身的标签一致（与 llama.cpp 相同，因此 `llama` 适配器适用于 GGUF 标为 `llama` 的 Mistral 3 基础模型）。
+- `.safetensors` 文件，`r` 与 `lora_alpha`（以及 `use_rslora`）来自旁边的
+  `adapter_config.json`，或 safetensors 元数据中的 `rank` / `alpha` 键。
+
+两种形式中，alpha 为 0 或未给出都表示缩放为 1（无论是否启用 `use_rslora`），这与 llama.cpp 读取
+`adapter.lora.alpha` 的方式相同；此时适配器列出的 `alpha` 等于 `r`。
+
+训练得到的 PEFT 适配器（`adapter_model.safetensors`，张量名为 `base_model.model...lora_A.weight`）
+会被拒绝，并提示使用 llama.cpp 的转换器：`python convert_lora_to_gguf.py <peft_adapter_dir> --base <hf_base_model_dir>`
+生成要使用的 `.gguf`。DoRA、`fan_in_fan_out`、`alpha_pattern`、`rank_pattern`、`modules_to_save`、
+`trainable_token_indices`、训练过的偏置（`bias` 不是 `"none"`、`lora_bias`）、`layer_replication`、
+激活式 LoRA（`alora_invocation_tokens`、较早的 `invocation_string`，或 GGUF 中的 `adapter.alora.*`）、
+PEFT 的 LoRA 变体（`kasa_config`、`arrow_config` 或 `use_bdlora` 取 null 或 false 以外的任何值；
+`velora_config` 与 `monteclora_config` 可以加载，因为 PEFT 在推理时把两者都当作普通 LoRA 应用）、
+会改写基础权重的 `init_lora_weights`（`"pissa"`、`"pissa_niter_<N>"`、`"olora"`、`"corda"`、
+`"astra"`、`"loftq"`、`"lora_ga"`；除非 PEFT 保存时做了转换
+（`save_pretrained(..., path_initial_model_for_weight_conversion=...)`，LoftQ 不支持），
+这类适配器作用于改写后的权重之上）、不是 `true` 或 `false` 的
+`use_dora`、`use_rslora`、`fan_in_fan_out` 或 `lora_bias`（PEFT 会把 `1` 或 `"true"` 当作开启）、
+任何不是因子的张量、为负数或不是有限数值的 alpha（绝不会用秩代替），以及含有 NaN 或无穷大、或在乘上
+`alpha / r` 与 `scale` 后溢出的因子同样会被拒绝。
+
+目录顶层的每个适配器都会在启动时、模型加载之后，以去掉扩展名的文件名为名称加载。加载失败的文件会
+连同原因记入日志并被跳过。
+
+```bash
+dotnet TensorSharp.Server.Host.dll --model mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf \
+  --backend ggml_cuda --loras-dir /srv/loras
+
+# 运行时再从该目录加载一个。"path" 相对于 --loras-dir（绝对路径只有位于其中时才接受）；
+# "config" 与 "scale" 可选。
+curl -X POST http://localhost:5000/v1/loras \
+  -H "Content-Type: application/json" \
+  -d '{"name": "math-v2", "path": "math/math-v2.safetensors", "scale": 0.8}'
+# {"id":"math-v2","rank":16,"alpha":32,"modules":96,"summary":"lora math-v2: math-v2.safetensors (r=16, alpha=32, modules=96) config=adapter_config.json"}
+
+# 列出适配器；"in_flight" 是此刻正在使用该适配器的请求数，"applicable" 表示已加载模型能否应用它
+#（不能时 "reason" 说明原因）。GET /v1/models 在 "loras" 下列出同样的 "applicable" / "reason"。
+curl http://localhost:5000/v1/loras
+
+# 为单个请求使用它
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf", "lora": "math-v2", "messages": [{"role": "user", "content": "Integrate x^2."}]}'
+
+# 卸载；已经在用它运行的请求会用它跑完
+curl -X DELETE http://localhost:5000/v1/loras/math-v2
+```
+
+`POST /v1/loras` 加载一个适配器（名称已加载时为重新加载）：
+
+| 字段 | 规则 |
+|---|---|
+| `name` | 1–64 个字母、数字、`.`、`_` 或 `-`，以字母或数字开头；不能是任意大小写的 `none` |
+| `path` | `--loras-dir` 内已存在的 `.safetensors` 或 `.gguf` 适配器，相对于该目录 |
+| `config` | 可选，`--loras-dir` 内的 `.json` 文件；省略时使用权重旁的 `adapter_config.json`（`.gguf` 适配器自带 alpha，不读取配置） |
+| `scale` | 可选，有限数值，乘在 `alpha / r` 上 |
+
+所有错误都使用 OpenAI 格式
+`{"error": {"message", "type", "param", "code"}}`，`type` 为 `"invalid_request_error"`，5xx 则为
+`"server_error"`：
+
+| 状态码 | 场景 |
+|---|---|
+| 403（`code: "lora_loading_disabled"`） | 服务启动时没有 `--loras-dir` / `TS_LORAS_DIR`。旧版本在这里接受任意服务器路径。 |
+| 400（`param: "path"` 或 `"config"`） | 路径没有指向目录内类型正确的已存在文件。不存在、在目录外、含 `..`、是目录、或经链接离开目录，都返回同一条消息，因此不会泄露服务器上存在哪些文件。 |
+| 400（`param: "path"`） | 文件存在但无法加载：`LoRA adapter '<path>' could not be loaded: <reason>`。原因会指出张量、dtype、形状或 alpha，或说明文件被截断、无法读取，但绝不包含服务器路径；读取文件时未预料的失败只说明读取意外失败。完整异常只写入服务端日志。 |
+| 503 / 500（`code: "lora_load_failed"`） | 加载在服务端失败：读取文件或把适配器绑定到已加载模型时，为适配器因子分配的主机或设备内存耗尽返回 503；绑定时发生其他未预料的失败（例如加载期间模型被卸载）返回 500。消息只说明这一点，不含异常内容或服务器路径；完整异常只写入服务端日志。不会注册任何适配器。 |
+| 400（`code: "lora_not_applicable"`） | 适配器可以加载，但已加载模型无法应用其全部模块，包括模型中不存在的目标（无论其层号是多少）；消息相同，并附带 `unsupported_modules`（层号合并，例如 `blk.{0-27}.attn_output.weight`；层号大到无法合并的名称按原样列出）。不会注册任何适配器。 |
+| 400（`param: "name"` / `"scale"`） | 名称无效，或 scale 不是有限数值 |
+| 409（`code: "lora_limit_reached"`） | 已加载 32 个适配器。请先卸载一个；重新加载已加载的名称始终允许。 |
+| 404（`code: "lora_not_found"`） | `DELETE` 的名称未加载 |
+
+对话或 responses 请求若指定了无法使用的适配器，会得到相同格式、`param: "lora"` 的错误：未加载的名称为
+`code: "lora_not_found"`，否则为 `"lora_not_applicable"` 并附带 `unsupported_modules`。它在任何输出之前
+返回，`"stream": true` 也是如此。
+
+这些路由和服务其他部分一样没有身份验证。LoRA 目录应只允许运维者写入：检查会跟随链接，但无法发现
+在检查与读取之间被替换的链接，也无法发现硬链接。嵌入服务（`--embeddings`）拒绝 `--loras-dir`，
+并以其嵌入模式的 400 应答 `POST /v1/loras`。
 
 ### 工具型接口
 

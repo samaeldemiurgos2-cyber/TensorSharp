@@ -34,7 +34,8 @@ namespace TensorSharp.Runtime.Scheduling
             IReadOnlyList<int>? cacheBreakpoints = null,
             int sharedPrefixTokens = 0,
             string? cacheScope = null,
-            IReadOnlyList<int>? publicCheckpointBoundaries = null)
+            IReadOnlyList<int>? publicCheckpointBoundaries = null,
+            IRequestAdapter? adapter = null)
         {
             if (promptTokens == null) throw new ArgumentNullException(nameof(promptTokens));
             if (promptTokens.Count == 0) throw new ArgumentException("Prompt must be non-empty.", nameof(promptTokens));
@@ -44,6 +45,17 @@ namespace TensorSharp.Runtime.Scheduling
             RequestId = requestId ?? $"seq-{Sn:X}";
             BlockTable = new BlockTable(blockSize);
             PromptTokens = new List<int>(promptTokens);
+            Adapter = adapter;
+            // State computed under an adapter is not the base model's, and the radix keys
+            // are tokens only: an adapter sequence neither reads nor publishes anything
+            // another request can see. The explicit empty-breakpoint policy is the existing
+            // "no cross-request cache" contract every reuse path already honours.
+            if (adapter != null)
+            {
+                cacheBreakpoints = Array.Empty<int>();
+                sharedPrefixTokens = 0;
+                publicCheckpointBoundaries = null;
+            }
             // Snapshot rather than alias, exactly as PromptTokens does above. The
             // caller builds this as a mutable List and edits it in place while
             // truncating the prompt; keeping the reference would let a later edit
@@ -112,6 +124,15 @@ namespace TensorSharp.Runtime.Scheduling
                 if (boundary == length) return true;
             return false;
         }
+
+        /// <summary>
+        /// The request adapter (a text LoRA) this sequence runs with, or null for the base
+        /// model. Fixed for the sequence's life. The scheduler never runs sequences of two
+        /// adapters in one step, and a sequence with an adapter is cache-isolated: its
+        /// <see cref="CacheBreakpoints"/> is the explicit empty list, so it neither reuses
+        /// nor publishes prefix-cache state, live-cache continuations or checkpoints.
+        /// </summary>
+        public IRequestAdapter? Adapter { get; }
 
         /// <summary>Set once the executor has taken (or found) a checkpoint for this
         /// sequence's shared prefix, so the prefill stops aligning to it.</summary>

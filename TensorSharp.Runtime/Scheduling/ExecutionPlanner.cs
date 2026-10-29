@@ -66,7 +66,14 @@ namespace TensorSharp.Runtime.Scheduling
             // speculates on its linear trunk instead.
             if (config.Speculation.Enabled)
             {
-                if (!caps.SupportsSpeculativeTrunk)
+                if (features.AdapterActive)
+                {
+                    // Neither the drafters nor the verify trunks apply a request adapter,
+                    // so an adapter step decodes plainly (see BatchExecutor's arming gate).
+                    rejections.Add(new ExecutionPathRejection(
+                        ExecutionPathKind.SpeculativePerSequence, "a LoRA adapter is active for this step"));
+                }
+                else if (!caps.SupportsSpeculativeTrunk)
                 {
                     rejections.Add(new ExecutionPathRejection(
                         ExecutionPathKind.SpeculativePerSequence,

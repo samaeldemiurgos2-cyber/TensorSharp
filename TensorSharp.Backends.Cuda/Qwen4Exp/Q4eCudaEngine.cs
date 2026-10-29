@@ -229,6 +229,9 @@ namespace TensorSharp.Cuda
             for (int il = 0; il < m.NLayer; il++)
             {
                 var L = m.Layers[il];
+                // Before any device is touched: refused inside the per-device upload, two devices
+                // refusing at once reached the host as an AggregateException and aborted the CLI.
+                CudaMoe.RequireExpertWeights("q4e-cuda", il, L.GateExps, L.UpExps, L.DownExps);
                 if (L.Ple)
                 {
                     if (_pleLayer >= 0)
@@ -260,6 +263,11 @@ namespace TensorSharp.Cuda
                 dev.GK = GlmKernels.Create();
                 dev.QK = Q4eKernels.Create();
                 _devs[d] = dev;
+            }
+            for (int il = 0; il < m.NLayer; il++)
+            {
+                var L = m.Layers[il];
+                CudaMoe.RequireExpertDecoders("q4e-cuda", _devs[0].DK.DecodesQ5_1Experts, il, L.GateExps, L.UpExps, L.DownExps);
             }
 
             // ---- placement: contiguous runs of layers, each device filled to the same share of
@@ -509,11 +517,6 @@ namespace TensorSharp.Cuda
             dst.GateShexp = dev.Weights.Place(src.GateShexp);
             dst.UpShexp = dev.Weights.Place(src.UpShexp);
             dst.DownShexp = dev.Weights.Place(src.DownShexp);
-            CudaMoe.RequireExpertType("q4e-cuda", dst.GateExps.Type);
-            CudaMoe.RequireExpertType("q4e-cuda", dst.UpExps.Type);
-            CudaMoe.RequireExpertType("q4e-cuda", dst.DownExps.Type);
-            if (dst.GateExps.Type != dst.UpExps.Type)
-                throw new NotSupportedException($"[q4e-cuda] layer {il}: expert gate/up quant types differ");
         }
 
         // -------------------------------------------------------------------

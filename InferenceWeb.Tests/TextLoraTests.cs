@@ -7,6 +7,7 @@
 
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json.Nodes;
 using TensorSharp.Models.Lora;
@@ -189,6 +190,106 @@ namespace InferenceWeb.Tests
             {
                 registry.Dispose();
             }
+        }
+
+        [Theory]
+        [InlineData("I32")]
+        [InlineData("I8")]
+        [InlineData("BOOL")]
+        [InlineData("F8_E4M3")]
+        public void Load_RefusesFactorsThatAreNotFloats_NamingTheTensor(string dtype)
+        {
+            string path = LoraFixtures.WriteAdapter(Path.Combine(_dir, "int.safetensors"), "w", dtype: dtype);
+
+            var ex = Assert.Throws<InvalidDataException>(() => TextLoraLoader.Load("int", path));
+            Assert.Contains("'w.lora_a'", ex.Message);
+            Assert.Contains("F32, F16, BF16 or F64", ex.Message);
+        }
+
+        [Theory]
+        [InlineData("F16")]
+        [InlineData("BF16")]
+        [InlineData("F64")]
+        public void Load_AcceptsEveryFloatFactorDtype(string dtype)
+        {
+            string path = LoraFixtures.WriteAdapter(Path.Combine(_dir, "f.safetensors"), "w", dtype: dtype);
+            Assert.Single(TextLoraLoader.Load("f", path).Deltas);
+        }
+
+        [Fact]
+        public void Load_DiscoverSiblingConfigFalse_IgnoresAdapterConfigJson()
+        {
+            string path = LoraFixtures.WriteAdapter(Path.Combine(_dir, "adapter.safetensors"), "w");
+            File.WriteAllText(Path.Combine(_dir, "adapter_config.json"), "{ \"r\": 1, \"lora_alpha\": 8.0 }");
+
+            Assert.Equal(8f, TextLoraLoader.Load("x", path).Alpha);
+            Assert.Equal(1f, TextLoraLoader.Load("x", path, discoverSiblingConfig: false).Alpha);
+            Assert.Equal(8f, new TextLoraRegistry().Load("x", path, discoverSiblingConfig: true).Alpha);
+            Assert.Equal(1f, new TextLoraRegistry().Load("x", path, discoverSiblingConfig: false).Alpha);
+        }
+
+        /// <summary>
+        /// A .gguf is read as a GGUF adapter (see TextLoraAdapterFormatTests), never parsed as a
+        /// safetensors header: a file that is not a valid GGUF says so.
+        /// </summary>
+        [Fact]
+        public void Load_GgufThatIsNotAValidGguf_SaysSo()
+        {
+            string path = Path.Combine(_dir, "adapter.gguf");
+            File.WriteAllBytes(path, Encoding.ASCII.GetBytes("GGUF").Concat(new byte[60]).ToArray());
+
+            var ex = Assert.Throws<InvalidDataException>(() => TextLoraLoader.Load("g", path));
+            Assert.Contains("is not a valid GGUF file", ex.Message);
+            Assert.DoesNotContain(_dir, ex.Message);
+        }
+
+        /// <summary>
+        /// A header or config the JSON reader rejects is reported as a malformed file
+        /// (<see cref="InvalidDataException"/>), whatever the reader threw, and without the
+        /// file's text: callers map exception types to statuses, and the JSON reader's own
+        /// exceptions are indistinguishable from server faults.
+        /// </summary>
+        [Theory]
+        [InlineData("{\"w.lora_a\": oops", "is not valid JSON")]
+        [InlineData("{\"w.lora_a\":{\"shape\":[1,1],\"data_offsets\":[0,4]}}", "expected fields and types")]
+        [InlineData("{\"w.lora_a\":{\"dtype\":5,\"shape\":[1,1],\"data_offsets\":[0,4]}}", "expected fields and types")]
+        [InlineData("{\"w.lora_a\":{\"dtype\":\"F32\",\"shape\":[1.5,1],\"data_offsets\":[0,4]}}", "expected fields and types")]
+        public void Load_MalformedHeader_IsInvalidData(string header, string reason)
+        {
+            string path = LoraFixtures.WriteRaw(Path.Combine(_dir, "bad.safetensors"), header, new byte[8]);
+
+            var ex = Assert.Throws<InvalidDataException>(() => TextLoraLoader.Load("bad", path));
+            Assert.Contains(reason, ex.Message);
+            Assert.Contains("'bad.safetensors'", ex.Message);
+            Assert.DoesNotContain(_dir, ex.Message);
+            Assert.DoesNotContain("oops", ex.Message);
+        }
+
+        [Fact]
+        public void Load_MalformedConfig_IsInvalidData()
+        {
+            string path = LoraFixtures.WriteAdapter(Path.Combine(_dir, "a.safetensors"), "w");
+            string config = Path.Combine(_dir, "cfg.json");
+            File.WriteAllText(config, "{ \"r\": 1, oops");
+
+            var ex = Assert.Throws<InvalidDataException>(() => TextLoraLoader.Load("a", path, config));
+            Assert.Equal("LoRA config 'cfg.json' is not valid JSON.", ex.Message);
+        }
+
+        [Fact]
+        public void Registry_FailedReload_KeepsThePreviousAdapter()
+        {
+            var registry = new TextLoraRegistry();
+            string good = LoraFixtures.WriteAdapter(Path.Combine(_dir, "good.safetensors"), "w");
+            string bad = Path.Combine(_dir, "bad.safetensors");
+            File.WriteAllBytes(bad, new byte[] { 1, 2, 3, 4 });
+
+            var loaded = registry.Load("a", good);
+            Assert.ThrowsAny<IOException>(() => registry.Load("a", bad));
+
+            Assert.Same(loaded, registry.Get("a"));
+            Assert.False(loaded.IsRetired);
+            Assert.Equal(1, registry.Count);
         }
 
         // ---- helpers --------------------------------------------------------

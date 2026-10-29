@@ -265,7 +265,11 @@ namespace
     // buffers, deferred snapshot authority, and parked TP plans under that id is
     // what makes two live models safe to interleave. Owner 0 remains a compatibility
     // bucket for older direct callers of GgmlBasicOps.
-    std::unordered_map<std::uint64_t, std::unique_ptr<Q35VerifyOwnerState>> g_q35v_owners;
+    // Deliberately leaked: an owner's parked TP buffers must not be freed by a
+    // static destructor at process exit, which aborts on ggml_cuda.
+    // TSGgml_Qwen35ReleaseVerifyTpGraphs is the release path.
+    std::unordered_map<std::uint64_t, std::unique_ptr<Q35VerifyOwnerState>>& g_q35v_owners =
+        *new std::unordered_map<std::uint64_t, std::unique_ptr<Q35VerifyOwnerState>>();
 
     // ggml's backend globals and the fixed verify graph cache are process-global too.
     // Serialize complete verify/snapshot operations so an owner cannot be released

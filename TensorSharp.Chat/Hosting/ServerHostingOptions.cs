@@ -70,8 +70,10 @@ namespace TensorSharp.Server.Hosting
             int embeddingThreads = 0,
             int embeddingContextSize = 0,
             MultiAgentOptions? multiAgent = null,
-            TensorSharp.Models.Video.VideoCanvasPolicy videoCanvasPolicy = TensorSharp.Models.Video.VideoCanvasPolicy.ModelRecipe)
+            TensorSharp.Models.Video.VideoCanvasPolicy videoCanvasPolicy = TensorSharp.Models.Video.VideoCanvasPolicy.ModelRecipe,
+            string? loraDirectory = null)
         {
+            LoraDirectory = loraDirectory;
             VideoCanvasPolicy = videoCanvasPolicy;
             MultiAgent = multiAgent ?? new MultiAgentOptions();
             MultiAgent.Validate();
@@ -500,6 +502,14 @@ namespace TensorSharp.Server.Hosting
         /// than a behaviour, so it stays out of the flag surface.
         /// </summary>
         public string PrefixCacheDirectory { get; }
+
+        /// <summary>
+        /// Canonical absolute path of the text-model LoRA adapter directory
+        /// (<c>--loras-dir</c> / <c>TS_LORAS_DIR</c>), or null when none is configured.
+        /// <c>POST /v1/loras</c> loads adapter files only from inside it and is refused
+        /// (403) without it; the host also loads every adapter at its top level at startup.
+        /// </summary>
+        public string? LoraDirectory { get; }
 
         /// <summary>True when the file logger should be wired in.</summary>
         public bool FileLoggingEnabled { get; }

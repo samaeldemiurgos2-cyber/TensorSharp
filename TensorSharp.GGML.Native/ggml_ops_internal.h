@@ -42,6 +42,7 @@
 #include "ggml-quants.h"
 #include "ggml_ops_flash_attn_guard.h"
 #include "ggml_ops_bonsai.h"
+#include "ggml_ops_host_read_gate.h"
 
 #if defined(_WIN32)
 #define TSG_EXPORT extern "C" __declspec(dllexport)
@@ -433,7 +434,8 @@ namespace tsg
     // an explicit ggml_backend_synchronize call (see ggml-metal-context.m).
 
     extern std::atomic<bool> g_async_compute_enabled;
-    extern std::atomic<bool> g_pending_gpu_work;
+    // Process-wide, like the queue it stands for; see ggml_ops_host_read_gate.h.
+    extern HostReadGate g_pending_gpu_work;
 
     // True iff we're allowed to defer the sync after this op:
     //   - async mode is on,
@@ -451,7 +453,7 @@ namespace tsg
 
     inline void mark_pending_gpu_work()
     {
-        g_pending_gpu_work.store(true, std::memory_order_release);
+        g_pending_gpu_work.mark_pending();
     }
 
     // Bumped once per GGML_LOG_LEVEL_ERROR line ggml emits (see
@@ -562,17 +564,36 @@ namespace tsg
     }
 
     // Drains pending GPU work if any. Called from C# right before host code wants
-    // to read tensor data (via Storage.EnsureHostReadable). Returns true when a
-    // sync actually happened.
+    // to read tensor data (via Storage.EnsureHostReadable). On return, all work
+    // marked before the call has completed, even when another thread was already
+    // draining it (on Metal, while one thread at a time submits to the backend:
+    // see ggml_ops_host_read_gate.h). Returns true when this call ran the sync.
+    //
+    // The check stays inline (two atomic loads); the drain is out of line in
+    // ggml_ops_core.cpp so ~200 call sites do not each carry the lock.
+    bool host_read_barrier_drain();
+
     inline bool host_read_barrier()
     {
-        if (g_pending_gpu_work.exchange(false, std::memory_order_acq_rel))
-        {
-            sync_backend(g_backend);
-            return true;
-        }
-        return false;
+        if (g_pending_gpu_work.idle())
+            return false;
+        return host_read_barrier_drain();
     }
+
+    // Test builds count every cached buffer released (freed, or handed to an
+    // allocator that may free it) while marked work is still pending: such work
+    // can be a queued download still reading it, so each release follows a
+    // host_read_barrier. Read by TSGgml_TestUndrainedCacheReleases.
+#if defined(TSG_GGML_TEST_DIAGNOSTICS)
+    extern std::atomic<int> g_test_undrained_cache_releases;
+    inline void test_note_cache_release()
+    {
+        if (!g_pending_gpu_work.idle())
+            g_test_undrained_cache_releases.fetch_add(1, std::memory_order_relaxed);
+    }
+#else
+    inline void test_note_cache_release() {}
+#endif
 
     // --- RAII handles ---
 
@@ -1392,11 +1413,167 @@ namespace tsg
     private:
         bool active_;
     };
+
+    // Per-thread caches of objects that own backend buffers (the fused
+    // prefill-attention and the paged-attention sessions). Each thread uses its
+    // own cache, so concurrent callers (tensor-parallel rank workers, batching
+    // threads) never share a graph, but the caches are owned by this registry
+    // rather than by a thread_local: a thread_local destructor runs inside the
+    // DLL's thread detach on Windows, where cudaFree fails ("CUDA-capable
+    // device(s) is/are busy or unavailable") and ggml aborts the process. A
+    // thread's exit only retires its cache, and the cache is freed on an ordinary
+    // thread: by free_retired() at the next call that uses the same kind of
+    // cache, on any thread, or by release_all() from a model unload
+    // (TSGgml_ClearHostBufferCache) or TSGgml_Shutdown.
+    //
+    // A cached call costs an atomic load and an uncontended lock, with no
+    // allocation after the thread's first call.
+    template <typename Cache>
+    class ThreadCacheRegistry
+    {
+    public:
+        struct Slot
+        {
+            // Held by the owning thread for a whole call, and by a release.
+            std::mutex mutex;
+            Cache cache;
+        };
+
+        // One registry per cache type. Never destroyed: a static destructor
+        // freeing what is left at process exit would fail exactly like the
+        // thread_local one did.
+        static ThreadCacheRegistry& instance()
+        {
+            static ThreadCacheRegistry* registry = new ThreadCacheRegistry();
+            return *registry;
+        }
+
+        // The calling thread's slot, registered on the thread's first call.
+        Slot& this_thread()
+        {
+            thread_local Holder holder;
+            if (!holder.slot)
+            {
+                auto slot = std::make_shared<Slot>();
+                std::lock_guard<std::mutex> lock(mutex_);
+                live_.push_back(slot);
+                holder.slot = std::move(slot);
+            }
+            return *holder.slot;
+        }
+
+        // Frees the caches of threads that have exited; their last references
+        // are dropped here, outside the registry lock.
+        void free_retired()
+        {
+            if (!any_retired_.load(std::memory_order_acquire))
+                return;
+            std::vector<std::shared_ptr<Slot>> retired;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                retired.swap(retired_);
+                any_retired_.store(false, std::memory_order_relaxed);
+            }
+            host_read_barrier();
+        }
+
+        // Frees the retired caches and calls release(cache) on every live
+        // thread's cache under its lock, so a thread inside a call finishes it
+        // first; its next call builds what it needs again. The first barrier
+        // follows the swap, like free_retired's: a thread that retired just
+        // before it can still have GPU work queued on the caches freed at
+        // return. It runs again under each slot lock: on Metal async a call that
+        // finished while this waited can still have GPU work queued on the
+        // buffers it frees.
+        template <typename Release>
+        void release_all(Release&& release)
+        {
+            std::vector<std::shared_ptr<Slot>> live, retired;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                live = live_;
+                retired.swap(retired_);
+                any_retired_.store(false, std::memory_order_relaxed);
+            }
+            host_read_barrier();
+            for (auto& slot : live)
+            {
+                std::lock_guard<std::mutex> slot_lock(slot->mutex);
+                host_read_barrier();
+                release(slot->cache);
+            }
+        }
+
+        // Calls visit(cache) on every cache, live and retired (diagnostics).
+        template <typename Visit>
+        void for_each(Visit&& visit)
+        {
+            std::vector<std::shared_ptr<Slot>> all;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                all = live_;
+                all.insert(all.end(), retired_.begin(), retired_.end());
+            }
+            for (auto& slot : all)
+            {
+                std::lock_guard<std::mutex> slot_lock(slot->mutex);
+                visit(static_cast<const Cache&>(slot->cache));
+            }
+        }
+
+    private:
+        // The calling thread's reference. On thread exit it hands the slot to
+        // the retired list without touching the cache.
+        struct Holder
+        {
+            std::shared_ptr<Slot> slot;
+
+            ~Holder()
+            {
+                if (slot)
+                    instance().retire(std::move(slot));
+            }
+        };
+
+        void retire(std::shared_ptr<Slot> slot)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            live_.erase(std::remove(live_.begin(), live_.end(), slot), live_.end());
+            retired_.push_back(std::move(slot));
+            any_retired_.store(true, std::memory_order_release);
+        }
+
+        std::mutex mutex_;
+        std::vector<std::shared_ptr<Slot>> live_;
+        std::vector<std::shared_ptr<Slot>> retired_;
+        std::atomic<bool> any_retired_{false};
+    };
+
+    // What an atexit handler does with a cache of backend buffers that is still
+    // populated when the process exits. On Windows a DLL's atexit handlers run
+    // inside its process detach, where cudaFree fails, and elsewhere they can run
+    // after the CUDA runtime's own teardown ("driver shutting down"); either way
+    // ggml aborts a process that has finished its work. So the cache gives up its
+    // entries without freeing them, and the process exit reclaims the memory.
+    // Metal is the exception: its device's static deleter, which runs after these
+    // handlers, asserts that no buffer is left in its residency set, and freeing
+    // there is safe. A model unload or TSGgml_Shutdown is what frees these caches
+    // while the backend is alive.
+    template <typename Cache>
+    void release_cache_at_exit(Cache& cache)
+    {
+#if !defined(TSG_GGML_USE_METAL)
+        static_cast<void>(new Cache(std::move(cache)));
+#endif
+        cache.clear();
+    }
+
     // Free the cached reuse gallocr (called from TSGgml_Shutdown / backend reset).
     void free_reuse_gallocr();
-    // Free the calling thread's cached prefill-attention sessions (defined in
-    // ggml_ops_norm_attn.cpp; called from TSGgml_Shutdown so their CUDA
-    // buffers are released before driver teardown).
+    // Free every thread's cached prefill-attention and paged-attention sessions
+    // (defined in ggml_ops_norm_attn.cpp and ggml_ops_paged_attention.cpp; called
+    // from TSGgml_ClearHostBufferCache and TSGgml_Shutdown so their CUDA buffers
+    // are released before driver teardown).
     void free_prefill_attn_sessions();
     void free_paged_attn_sessions();
 

@@ -1014,6 +1014,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsLayerPartitionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME distributed-layer-byte-partition COMMAND GgmlOpsLayerPartitionTest)
     set_tests_properties(distributed-layer-byte-partition PROPERTIES TIMEOUT 60)
+
+    # host_read_barrier's drain gate with a sync the test blocks: a caller that
+    # arrives while another thread drains waits for that drain. Header-only.
+    add_executable(GgmlOpsHostReadGateTest tests/host_read_gate_test.cpp)
+    target_include_directories(GgmlOpsHostReadGateTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsHostReadGateTest PRIVATE Threads::Threads)
+    add_test(NAME host-read-barrier-drain-gate COMMAND GgmlOpsHostReadGateTest)
+    set_tests_properties(host-read-barrier-drain-gate PROPERTIES TIMEOUT 60)
     # Explicit per-width routed-expert layer timing behind the automatic ubatch
     # (see the source header). Never registered as a CTest.
     add_executable(GgmlOpsDsv4MoeWidthBench tests/dsv4_moe_width_bench.cpp)
@@ -1043,6 +1051,12 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         set_tests_properties(paged-attention-lifecycle-cuda paged-attention-lifecycle-cuda-multi
             PROPERTIES RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
     endif()
+    # Cached buffers a queued download may read are drained before release:
+    # session-cache eviction and reuse-allocator growth, on the CPU backend.
+    add_executable(GgmlOpsHostReadEvictionTest tests/host_read_eviction_test.cpp)
+    target_link_libraries(GgmlOpsHostReadEvictionTest PRIVATE GgmlOps)
+    add_test(NAME host-read-barrier-eviction-cpu COMMAND GgmlOpsHostReadEvictionTest)
+    set_tests_properties(host-read-barrier-eviction-cpu PROPERTIES RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
 
     # The standalone MoE kernel's uploaded biases must never share memory with an
     # activation a fused backend kernel writes while still reading them.

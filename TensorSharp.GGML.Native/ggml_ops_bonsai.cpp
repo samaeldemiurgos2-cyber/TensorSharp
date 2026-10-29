@@ -23,7 +23,11 @@ struct Transform {
     std::map<ggml_backend_t, std::unique_ptr<DeviceConstants>> devices;
 };
 std::mutex registry_mutex;
-std::unordered_map<const void *, std::shared_ptr<Transform>> registry;
+// Deliberately leaked: a static destructor freeing a transform's device constants
+// at process exit aborts on ggml_cuda. Unregistering a weight and
+// bonsai_clear_backend (TSGgml_Shutdown) are the release paths.
+std::unordered_map<const void *, std::shared_ptr<Transform>>& registry =
+    *new std::unordered_map<const void *, std::shared_ptr<Transform>>();
 std::atomic<bool> has_transforms{false};
 
 std::shared_ptr<Transform> lookup(const void * key) {

@@ -70,9 +70,19 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] gemvWarp;
         private readonly IntPtr gemvCombine;
 
+        /// <summary>
+        /// Whether ts_dsv4_moe_mma_f32 carries its tensor-core body: it is guarded by
+        /// __CUDA_ARCH__ &gt;= 800 and compiles to nothing below that, which is what the
+        /// committed compute_61 baseline holds. See CudaKernels.ArchGuardedKernelsUsable.
+        /// </summary>
+        public bool HasMoeMma { get; }
+
         private Dsv4Kernels(CudaModule module)
         {
             this.module = module;
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            CudaDriverApi.cuDeviceGetAttribute(out int ccMajor, 75 /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR */, device);
+            HasMoeMma = CudaKernels.ArchGuardedKernelsUsable(module.CompiledArchOf("ts_dsv4_moe_mma_f32"), ccMajor);
             embed = module.GetFunction("ts_dsv4_embed_f32");
             v41AttnPrep = module.GetFunction("ts_dsv41_attn_prep_f32");
             v41Compress = module.GetFunction("ts_dsv41_compress_f32");
@@ -129,7 +139,16 @@ namespace TensorSharp.Cuda
             dsparkGather = module.GetFunction("ts_dsv4_dspark_gather_f32");
             dsparkArgmax = module.GetFunction("ts_dsv4_dspark_argmax_f32");
             dsparkConf = module.GetFunction("ts_dsv4_dspark_conf_f32");
+            // A module built from source older than the Q5_1 expert decoder lacks the marker.
+            try { module.GetFunction("ts_dsv4_caps_q5_1_experts"); DecodesQ5_1Experts = true; }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { } // CUDA_ERROR_NOT_FOUND
         }
+
+        /// <summary>Whether this module's expert kernels decode Q5_1 rows. False on a module built
+        /// from older kernel source (the committed PTX baseline before its refresh), whose kernels
+        /// would read a Q5_1 row as Q8_0; <see cref="CudaMoe.RequireExpertDecoders"/> refuses those
+        /// experts there.</summary>
+        public bool DecodesQ5_1Experts { get; }
 
         public static Dsv4Kernels Create()
         {
@@ -142,6 +161,10 @@ namespace TensorSharp.Cuda
             }
             return new Dsv4Kernels(CudaModule.LoadFromFile(path));
         }
+
+        /// <summary>Kernels over an already loaded module (tests that load a specific image).
+        /// Requires the module's context to be current.</summary>
+        internal static Dsv4Kernels FromModule(CudaModule module) => new Dsv4Kernels(module);
 
         private static void Launch(IntPtr fn, uint gx, uint gy, uint gz, int block, uint sharedBytes, IntPtr stream, void** args)
         {

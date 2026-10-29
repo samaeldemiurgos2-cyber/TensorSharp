@@ -123,14 +123,17 @@ namespace
     // Metal device singleton's static destructor runs. atexit handlers fire in
     // LIFO order interleaved with C++ static destructors, so registering after
     // the Metal device has been initialized guarantees we tear down GPU
-    // resources first and avoid `[rsets->data count] == 0` assertions.
+    // resources first and avoid `[rsets->data count] == 0` assertions. On every
+    // other backend the handler leaks them instead (see release_cache_at_exit):
+    // nothing else releases this cache, so on ggml_cuda any Qwen3.5 chunked
+    // prefill left a CUDA buffer for the exit to free.
     void ensure_gdn_cache_cleanup_registered()
     {
         static std::once_flag flag;
         std::call_once(flag, []() {
             std::atexit([]() {
                 std::lock_guard<std::mutex> lk(g_gdn_chunked_cache_mutex);
-                g_gdn_chunked_cache.clear();
+                release_cache_at_exit(g_gdn_chunked_cache);
             });
         });
     }

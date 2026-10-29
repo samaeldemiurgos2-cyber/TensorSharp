@@ -1207,13 +1207,15 @@ namespace TensorSharp.Cli
                         break;
                     }
 
+                    int firstResult = _history.Count;
+                    var roundResults = new List<(string Content, string Tool)>();
                     foreach (var call in unknownCalls)
                     {
                         Console.WriteLine($"[tool call] {call.Name} (no such tool)");
-                        _history.Add(BuildSkillResultMessage(
-                            SkillTools.DescribeUnknownTool(
-                                call.Name, _tools, ReachableSkillIds(_skillToolContext)),
-                            call.Name));
+                        string unknown = SkillTools.DescribeUnknownTool(
+                            call.Name, _tools, ReachableSkillIds(_skillToolContext));
+                        roundResults.Add((unknown, call.Name));
+                        _history.Add(BuildSkillResultMessage(unknown, call.Name));
                     }
 
                     cancellationToken.ThrowIfCancellationRequested();
@@ -1230,25 +1232,31 @@ namespace TensorSharp.Cli
                             "interactive.skills.tool round={Round} tool={Tool} skill={SkillId} path={Path} ok={Ok} bytes={Bytes}",
                             round, call.Name, result.SkillId ?? "-", result.ResourcePath ?? "-",
                             result.Ok, result.Content?.Length ?? 0);
+                        roundResults.Add((result.Content, call.Name));
                         _history.Add(BuildSkillResultMessage(result.Content, call.Name));
                     }
 
-                    if (round == maxRounds)
+                    // Told IN THE CONVERSATION and then given one last generation, the
+                    // way the one-shot path has always done it (Program.cs, the
+                    // "limit on skill lookups" message). Printing a bracketed note to
+                    // the terminal and breaking left the user with the tool trace and
+                    // no answer at all — the model was mid-work, was never asked to
+                    // wrap up, and never got a turn in which it could. The note is
+                    // fitted with the round's results: added after the fit, it could
+                    // push the final prompt past the window.
+                    bool lastRound = round == maxRounds;
+                    FitSkillResultsToContext(firstResult, roundResults, round, lastRound
+                        ? BuildSkillResultMessage(
+                            "Error: the limit on tool calls for this turn has been reached. Answer now "
+                            + "using what you have already read, and say which part you could not check.",
+                            null)
+                        : null);
+
+                    if (lastRound)
                     {
                         _log.LogWarning(LogEventIds.SkillLoopCapped,
                             "interactive.skills.loop.capped rounds={Rounds}", maxRounds);
-
-                        // Told IN THE CONVERSATION and then given one last generation, the
-                        // way the one-shot path has always done it (Program.cs, the
-                        // "limit on skill lookups" message). Printing a bracketed note to
-                        // the terminal and breaking left the user with the tool trace and
-                        // no answer at all — the model was mid-work, was never asked to
-                        // wrap up, and never got a turn in which it could.
                         Console.WriteLine("[skill lookup limit reached for this turn — answering now]");
-                        _history.Add(BuildSkillResultMessage(
-                            "Error: the limit on tool calls for this turn has been reached. Answer now "
-                            + "using what you have already read, and say which part you could not check.",
-                            null));
                         Stream(BuildRenderHistoryForContinuation(), cancellationToken);
                         break;
                     }
@@ -1423,7 +1431,9 @@ namespace TensorSharp.Cli
                 if (_codeRunner != null)
                     _tools = Program.AppendCodeTool(_tools, _codeRunner, _codeWorkspace);
 
-                _skillToolContext = new SkillToolContext(new List<Skill>(plan.Reachable))
+                // The server's per-read ceiling for this window (SkillRequestPlan.ReadCapFor).
+                _skillToolContext = new SkillToolContext(new List<Skill>(plan.Reachable),
+                    TensorSharp.Server.Skills.SkillRequestPlan.ReadCapFor(_model.MaxContextLength))
                 {
                     Marketplace = marketplace,
                     ScriptRunner = _skillOptions.AllowScripts
@@ -1503,6 +1513,58 @@ namespace TensorSharp.Cli
                 rendered.Add(new ChatMessage { Role = "system", Content = leadingSystem });
             rendered.AddRange(_history);
             return rendered;
+        }
+
+        /// <summary>
+        /// Shorten the tool results this round appended at <paramref name="firstResult"/> so
+        /// the next round's prompt leaves the reply its share of the context window, as the
+        /// one-shot loop does (Program.AddSkillResultsWithinContext,
+        /// <see cref="TensorSharp.Server.Skills.ToolResultContextBudget"/>), media rows of
+        /// earlier turns included (<see cref="Program.SkillRoundPromptLimit"/>).
+        /// <paramref name="trailing"/>, when set, follows the results and is counted with them.
+        /// </summary>
+        private void FitSkillResultsToContext(int firstResult, List<(string Content, string Tool)> results, int round,
+            ChatMessage trailing = null)
+        {
+            void Place(IReadOnlyList<string> contents)
+            {
+                _history.RemoveRange(firstResult, _history.Count - firstResult);
+                for (int i = 0; i < results.Count; i++)
+                    _history.Add(BuildSkillResultMessage(contents[i], results[i].Tool));
+                if (trailing != null)
+                    _history.Add(trailing);
+            }
+
+            var contents = results.Select(r => r.Content ?? string.Empty).ToList();
+            int context = _model.MaxContextLength;
+            if (context <= 1 || results.Count == 0)
+            {
+                Place(contents);
+                return;
+            }
+
+            List<int> Render(List<ChatMessage> messages) => _renderer.RenderToTokens(
+                _model.Tokenizer, _model.Config.ChatTemplate, messages,
+                _model.Config.Architecture, addGenerationPrompt: true,
+                tools: _tools, enableThinking: _enableThinking);
+
+            int promptLimit = Program.SkillRoundPromptLimit(_model, _maxTokens, BuildRenderHistoryForContinuation(), Render);
+            IReadOnlyList<string> fitted = TensorSharp.Server.Skills.ToolResultContextBudget.Fit(
+                contents, promptLimit, context,
+                candidate =>
+                {
+                    Place(candidate);
+                    return Render(BuildRenderHistoryForContinuation()).Count;
+                },
+                out bool truncated);
+            Place(fitted);
+            if (truncated)
+            {
+                Console.WriteLine($"[skill] result shortened to fit the {context}-token context window (MAX_CONTEXT)");
+                _log.LogWarning(LogEventIds.PromptTruncated,
+                    "interactive.skills.results.truncated round={Round} results={Results} bytes={Bytes} keptBytes={KeptBytes} promptLimit={PromptLimit} contextLimit={ContextLimit}",
+                    round, results.Count, contents.Sum(c => c.Length), fitted.Sum(c => c.Length), promptLimit, context);
+            }
         }
 
         /// <summary>
@@ -1603,11 +1665,16 @@ namespace TensorSharp.Cli
             // allowance is closed (with the family's hand-over text) so the turn still answers.
             // Without it a model reasoning in circles printed no answer at all: DeepSeek V4.1 Q2_K
             // under --think --max-tokens 20000 planned for all 20,000 tokens of two turns running.
+            // The allowance is the reply the window still has room for, as on the server
+            // (ClampGenerationReserve) and as Inference.Generate clamps it: a budget sized for
+            // the unclamped --max-tokens never fired before the window ended the reply mid-thought.
+            int replyAllowance = TensorSharp.Server.ChatGenerationPipeline.ClampGenerationReserve(
+                _maxTokens, promptTokenCount, _model.MaxContextLength);
             bool budgetThinking = TensorSharp.Server.ChatGenerationPipeline.ReasonsWhetherAsked(arch, _enableThinking);
             SamplingConfig sampling = TensorSharp.Server.ChatGenerationPipeline.WithThinkingBudget(_samplingConfig, _model.Tokenizer, arch,
                 budgetThinking
-                    ? TensorSharp.Server.ChatGenerationPipeline.ThinkingBudgetFor(_maxTokens, enableThinking: true)
-                    : TensorSharp.Server.ChatGenerationPipeline.UnrequestedThinkingBudgetFor(_maxTokens),
+                    ? TensorSharp.Server.ChatGenerationPipeline.ThinkingBudgetFor(replyAllowance, enableThinking: true)
+                    : TensorSharp.Server.ChatGenerationPipeline.UnrequestedThinkingBudgetFor(replyAllowance),
                 out _, budgetThinking, inputTokens);
             var sampler = new TokenSampler(sampling);
             var generatedTokens = new List<int>();

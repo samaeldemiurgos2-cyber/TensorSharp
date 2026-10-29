@@ -68,6 +68,12 @@ namespace TensorSharp.Runtime.Scheduling
         public List<string> PreemptedRequestIds { get; }
         public List<string> FinishedRequestIds { get; }
 
+        /// <summary>The request adapter every scheduled sequence of this step runs with
+        /// (<see cref="SequenceState.Adapter"/>), or null for the base model. The scheduler
+        /// never mixes adapters in one step; the executor selects this one on the model for
+        /// the step and refuses a step whose sequences disagree with it.</summary>
+        public IRequestAdapter? Adapter { get; internal set; }
+
         /// <summary>Sum of <see cref="ScheduledSequenceWork.NumScheduledTokens"/>
         /// across all scheduled work. Used for token-budget telemetry.</summary>
         public int TotalScheduledTokens

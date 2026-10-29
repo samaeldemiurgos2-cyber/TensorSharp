@@ -132,9 +132,12 @@ namespace
     {
         static std::once_flag flag;
         std::call_once(flag, []() {
+            // Nothing else releases this cache, so a Qwen3.5 prefill that ran
+            // here on ggml_cuda left a CUDA buffer for the exit to free; see
+            // release_cache_at_exit.
             std::atexit([]() {
                 std::lock_guard<std::mutex> lk(g_q35_rec_prefill_mutex);
-                g_q35_rec_prefill_cache.clear();
+                release_cache_at_exit(g_q35_rec_prefill_cache);
             });
         });
     }

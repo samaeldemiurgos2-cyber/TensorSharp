@@ -93,6 +93,8 @@ public sealed class CudaPtxBuildSettingsTests
         string baseline = Path.Combine(directory, "baseline");
         foreach (string path in new[] { tools, kernels, intermediate, stamps, baseline }) Directory.CreateDirectory(path);
         string stub = Path.Combine(tools, OperatingSystem.IsWindows() ? "nvcc.cmd" : "nvcc");
+        // cmd.exe splits a batch file's arguments at '=' as well as at spaces, so the target's
+        // unquoted -arch=compute_61 arrives as two, -arch and compute_61; a quoted one stays whole.
         if (OperatingSystem.IsWindows())
             File.WriteAllText(stub, """
                 @echo off
@@ -102,7 +104,13 @@ public sealed class CudaPtxBuildSettingsTests
                 if "%~1"=="" goto done
                 set "argument=%~1"
                 if "!argument:~0,6!"=="-arch=" set "arch=!argument:~6!"
+                if "%~1"=="-arch" goto arch
                 if "%~1"=="-o" goto output
+                shift
+                goto next
+                :arch
+                shift
+                set "arch=%~1"
                 shift
                 goto next
                 :output
@@ -112,11 +120,15 @@ public sealed class CudaPtxBuildSettingsTests
                 goto next
                 :done
                 if not defined out exit /b 2
+                if not defined arch exit /b 3
                 > "%out%" echo .target !arch:compute_=sm_!
                 exit /b 0
-                """.Replace("\n", "\r\n", StringComparison.Ordinal) + "\r\n");
+                """.ReplaceLineEndings("\r\n") + "\r\n");
         else
         {
+            // A raw literal keeps this source file's line endings, and a tree checked out on Windows
+            // has CRLF: "#!/bin/sh\r" cannot exec, so dash keeps searching PATH and runs the real
+            // toolkit's nvcc. Like nvcc, the stub rejects a bare argument that is not the kernel.
             File.WriteAllText(stub, """
                 #!/bin/sh
                 if [ "$1" = "--version" ]; then exit 0; fi
@@ -124,12 +136,15 @@ public sealed class CudaPtxBuildSettingsTests
                     case "$1" in
                         -arch=*) arch=${1#-arch=} ;;
                         -o) shift; output=$1 ;;
+                        -*) ;;
+                        *.cu) input=$1 ;;
+                        *) echo "nvcc error : Don't know what to do with '$1'" >&2; exit 1 ;;
                     esac
                     shift
                 done
-                [ -n "$output" ] || exit 2
+                [ -n "$output" ] && [ -n "$input" ] || exit 2
                 printf '.target sm_%s\n' "${arch#compute_}" > "$output"
-                """ + "\n");
+                """.ReplaceLineEndings("\n") + "\n");
             File.SetUnixFileMode(stub, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
         File.WriteAllText(Path.Combine(kernels, "probe.cu"), "// The fake toolchain checks build policy, not CUDA arithmetic.\n");
@@ -141,13 +156,19 @@ public sealed class CudaPtxBuildSettingsTests
         File.SetLastWriteTimeUtc(stamp, DateTime.UtcNow.AddMinutes(5));
         try
         {
-            var result = await RunTarget("CompileCudaPtx", new()
+            // A stub that cannot run is skipped for the next nvcc on PATH, so prove it runs first.
+            using (var probe = Process.Start(stub, "--version")!)
+                Assert.True(probe.WaitForExit(10_000) && probe.ExitCode == 0, "The fake nvcc does not run by itself.");
+            var properties = new Dictionary<string, string>
             {
                 ["TensorSharpUpdateCommittedPtx"] = "true", ["CudaArch"] = "auto", ["CudaArchFallback"] = "compute_120",
                 ["CudaKernelDir"] = kernels, ["PtxOutputDir"] = intermediate, ["CudaPtxStampDir"] = stamps,
                 ["CudaCommittedPtxDir"] = baseline, ["OutDir"] = Path.Combine(directory, "output"),
-                ["_CompilerBinDir"] = "unused-stub-compiler",
-            }, new() { ["PATH"] = tools + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH") });
+            };
+            // The target sets this whole nvcc flag only on Windows; presetting it skips the vswhere lookup.
+            if (OperatingSystem.IsWindows()) properties["_CompilerBinDir"] = "--compiler-bindir=unused-stub-compiler";
+            var result = await RunTarget("CompileCudaPtx", properties,
+                new() { ["PATH"] = tools + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH") });
             Assert.True(result.ExitCode == 0, result.Output + result.Error);
             Assert.Equal(".target sm_61", File.ReadAllText(Path.Combine(baseline, "probe.ptx")).Trim());
             Assert.Equal(".target sm_61", File.ReadAllText(stale).Trim());

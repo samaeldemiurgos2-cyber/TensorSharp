@@ -261,101 +261,153 @@ namespace TensorSharp.Runtime.Scheduling
             GpuLockWaiters.YieldToWaiters(_model.GpuComputeLock, MaxYieldToPreparation);
             lock (_model.GpuComputeLock)
             {
-                if (RadixCache != null)
+                // A request adapter (text LoRA) is selected on the model for exactly this
+                // step and cleared before the lock is released, in the same lock region,
+                // so no other GPU user (a media encoder between steps, a warm-up) and no
+                // other step ever sees it. Base steps only verify that none is mixed in.
+                IAdapterAwareModel? adapterModel = SelectStepAdapter(output);
+                try
                 {
-                    RadixCache.Drain();
-                    if (RadixCache.DisplacePrimary())
+                    if (RadixCache != null)
                     {
-                        _liveCacheValid = false;
-                        _liveCacheSeq = null;
-                        _liveCacheLen = 0;
+                        RadixCache.Drain();
+                        if (RadixCache.DisplacePrimary())
+                        {
+                            _liveCacheValid = false;
+                            _liveCacheSeq = null;
+                            _liveCacheLen = 0;
+                            _currentOwner = null;
+                            _ownerTokensInModel = 0;
+                            _ownerForwardedTokens = 0;
+                        }
+                        foreach (var work in output.ScheduledWork)
+                            _fusedSeqById[work.Sequence.RequestId] = work.Sequence;
+                    }
+                    // The scheduler freed the previous owner's blocks during
+                    // FinishSequence / PreemptSequence, but our _currentOwner
+                    // reference outlives that. Without this reset, the next
+                    // step's TryPrepareSequencesForPagedIfNeeded would call into
+                    // TryMigrateLinearKVToPaged with NumBlocks==0 (it returns
+                    // false and the executor logs a misleading "linear→paged
+                    // migration failed" warning), and EnsureOwnership on the
+                    // new sequence would try to extract state out of the dead
+                    // owner. Treat anything that's not Running as "no owner";
+                    // the model's linear cache will be reset cleanly when the
+                    // new sequence claims ownership.
+                    if (_currentOwner != null && _currentOwner.Status != SequenceStatus.Running)
+                    {
                         _currentOwner = null;
                         _ownerTokensInModel = 0;
                         _ownerForwardedTokens = 0;
                     }
-                    foreach (var work in output.ScheduledWork)
-                        _fusedSeqById[work.Sequence.RequestId] = work.Sequence;
-                }
-                // The scheduler freed the previous owner's blocks during
-                // FinishSequence / PreemptSequence, but our _currentOwner
-                // reference outlives that. Without this reset, the next
-                // step's TryPrepareSequencesForPagedIfNeeded would call into
-                // TryMigrateLinearKVToPaged with NumBlocks==0 (it returns
-                // false and the executor logs a misleading "linear→paged
-                // migration failed" warning), and EnsureOwnership on the
-                // new sequence would try to extract state out of the dead
-                // owner. Treat anything that's not Running as "no owner";
-                // the model's linear cache will be reset cleanly when the
-                // new sequence claims ownership.
-                if (_currentOwner != null && _currentOwner.Status != SequenceStatus.Running)
-                {
-                    _currentOwner = null;
-                    _ownerTokensInModel = 0;
-                    _ownerForwardedTokens = 0;
-                }
 
-                // Centralised path selection: snapshot what the loaded
-                // model+backend can do (ExecutionCapabilities), what the
-                // operator overrode (ExecutionOptions, the TS_* switches) and
-                // what this step's requests need (ExecutionStepFeatures), then
-                // ask the planner for the candidate chain. All the "which
-                // path?" logic lives in ExecutionPlanner.PlanStep; this method
-                // only executes the plan. Options/capabilities are snapshotted
-                // per step because several are env-var backed and tests toggle
-                // them at runtime.
-                var options = ExecutionOptions.FromEnvironment();
-                var caps = ExecutionCapabilities.FromModel(_model);
-                var features = ComputeStepFeatures(output, caps);
-                var plan = ExecutionPlanner.PlanStep(caps, options, PlanConfig, features);
+                    // Centralised path selection: snapshot what the loaded
+                    // model+backend can do (ExecutionCapabilities), what the
+                    // operator overrode (ExecutionOptions, the TS_* switches) and
+                    // what this step's requests need (ExecutionStepFeatures), then
+                    // ask the planner for the candidate chain. All the "which
+                    // path?" logic lives in ExecutionPlanner.PlanStep; this method
+                    // only executes the plan. Options/capabilities are snapshotted
+                    // per step because several are env-var backed and tests toggle
+                    // them at runtime.
+                    var options = ExecutionOptions.FromEnvironment();
+                    var caps = ExecutionCapabilities.FromModel(_model);
+                    var features = ComputeStepFeatures(output, caps);
+                    var plan = ExecutionPlanner.PlanStep(caps, options, PlanConfig, features);
 
-                if (plan.SpeculationUnprofitable)
-                    WarnSpeculationUnprofitableOnce();
-                if (plan.SpeculationRefusal != null)
-                    WarnSpeculationRefusedOnce(plan.SpeculationRefusal);
-                LogPlanTransition(plan);
+                    if (plan.SpeculationUnprofitable)
+                        WarnSpeculationUnprofitableOnce();
+                    if (plan.SpeculationRefusal != null)
+                        WarnSpeculationRefusedOnce(plan.SpeculationRefusal);
+                    LogPlanTransition(plan);
 
-                for (int i = 0; i < plan.Candidates.Count; i++)
-                {
-                    if (i > 0)
+                    for (int i = 0; i < plan.Candidates.Count; i++)
                     {
-                        // The Information plan line above reports the SELECTED
-                        // candidate; when that candidate declines at runtime the
-                        // user must hear that what actually ran is the fallback,
-                        // or the log claims the opposite of what is happening.
-                        // Once per transition; Debug afterwards.
-                        string transition = plan.Candidates[i - 1] + "->" + plan.Candidates[i];
-                        if (_fallbackTransitionsWarned.Add(transition))
+                        if (i > 0)
                         {
-                            _logger.LogWarning(
-                                "BatchExecutor: the {Declined} path declined at runtime; executing on " +
-                                "{Next} instead. Reported once per transition; later occurrences log at Debug.",
-                                plan.Candidates[i - 1], plan.Candidates[i]);
-                            _lastPlanDescription = null;
+                            // The Information plan line above reports the SELECTED
+                            // candidate; when that candidate declines at runtime the
+                            // user must hear that what actually ran is the fallback,
+                            // or the log claims the opposite of what is happening.
+                            // Once per transition; Debug afterwards.
+                            string transition = plan.Candidates[i - 1] + "->" + plan.Candidates[i];
+                            if (_fallbackTransitionsWarned.Add(transition))
+                            {
+                                _logger.LogWarning(
+                                    "BatchExecutor: the {Declined} path declined at runtime; executing on " +
+                                    "{Next} instead. Reported once per transition; later occurrences log at Debug.",
+                                    plan.Candidates[i - 1], plan.Candidates[i]);
+                                _lastPlanDescription = null;
+                            }
+                            else
+                            {
+                                _logger.LogDebug(
+                                    "BatchExecutor: {Declined} declined this step; falling back to {Next}.",
+                                    plan.Candidates[i - 1], plan.Candidates[i]);
+                            }
                         }
-                        else
+                        long pathStarted = _stepLog ? Stopwatch.GetTimestamp() : 0;
+                        var results = TryExecutePath(plan.Candidates[i], output, options);
+                        if (results != null)
                         {
-                            _logger.LogDebug(
-                                "BatchExecutor: {Declined} declined this step; falling back to {Next}.",
-                                plan.Candidates[i - 1], plan.Candidates[i]);
+                            if (_cbDebug)
+                                TraceStepResults(plan.Candidates[i], output, results);
+                            if (_stepLog)
+                                LogStepTiming(plan.Candidates[i], pathStarted, results);
+                            return results;
                         }
                     }
-                    long pathStarted = _stepLog ? Stopwatch.GetTimestamp() : 0;
-                    var results = TryExecutePath(plan.Candidates[i], output, options);
-                    if (results != null)
-                    {
-                        if (_cbDebug)
-                            TraceStepResults(plan.Candidates[i], output, results);
-                        if (_stepLog)
-                            LogStepTiming(plan.Candidates[i], pathStarted, results);
-                        return results;
-                    }
-                }
 
-                // Unreachable: the planner always terminates the chain with a
-                // path that cannot decline (PerSequence). Kept as a hard
-                // fallback so a planner bug degrades to correctness, not loss.
-                return ExecuteStepPerSequence(output);
+                    // Unreachable: the planner always terminates the chain with a
+                    // path that cannot decline (PerSequence). Kept as a hard
+                    // fallback so a planner bug degrades to correctness, not loss.
+                    return ExecuteStepPerSequence(output);
+                }
+                finally
+                {
+                    _stepAdapterActive = false;
+                    adapterModel?.SelectStepAdapter(null);
+                }
             }
+        }
+
+        // True while the current step runs with a request adapter (SelectStepAdapter).
+        // Speculation stays off for such a step: no drafter or verify trunk applies the
+        // adapter. Never set on a base step, so base traffic speculates exactly as before.
+        private bool _stepAdapterActive;
+
+        /// <summary>Whether this step may arm or continue speculative decoding.</summary>
+        private bool SpeculationEnabledThisStep => Speculation.Enabled && !_stepAdapterActive;
+
+        /// <summary>Select <see cref="SchedulerOutput.Adapter"/> on the model for this step,
+        /// after checking that every scheduled sequence runs with exactly that adapter.
+        /// Returns the model to clear the selection on, or null for a base step. A step that
+        /// mixes adapters, or names one the model cannot apply, throws before anything is
+        /// selected or forwarded, and the engine fails that step's sequences only.</summary>
+        private IAdapterAwareModel? SelectStepAdapter(SchedulerOutput output)
+        {
+            IRequestAdapter? adapter = output.Adapter;
+            foreach (var work in output.ScheduledWork)
+            {
+                if (!ReferenceEquals(work.Sequence.Adapter, adapter))
+                    throw new InvalidOperationException(
+                        $"A step may run one request adapter: {work.Sequence.RequestId} runs with " +
+                        $"{work.Sequence.Adapter?.Id ?? "the base model"}, but the step was scheduled for " +
+                        $"{adapter?.Id ?? "the base model"}.");
+            }
+            if (adapter == null)
+                return null;
+            if (_model is not IAdapterAwareModel aware)
+                throw new InvalidOperationException(
+                    $"The loaded model cannot apply request adapters, so LoRA adapter {adapter.Id} cannot run.");
+            // Bound when the adapter was loaded; a model loaded after that, or an adapter a
+            // late request still holds after its release, is bound here, once.
+            if (!aware.TryBindAdapter(adapter, out string? error))
+                throw new InvalidOperationException(
+                    error ?? $"LoRA adapter {adapter.Id} cannot be applied to the loaded model.");
+            aware.SelectStepAdapter(adapter);
+            _stepAdapterActive = true;
+            return aware;
         }
 
         private long _cbStepIndex;
@@ -477,6 +529,7 @@ namespace TensorSharp.Runtime.Scheduling
                 SoloKvInPagedStorage = soloPaged,
                 SoloHasFusedCache = soloFused,
                 SoloRequiresOwnershipSwap = soloSwap,
+                AdapterActive = output.Adapter != null,
             };
         }
 
@@ -2026,7 +2079,7 @@ namespace TensorSharp.Runtime.Scheduling
         private SequenceStepResult? TryExecuteSpeculativeStep(
             SequenceState seq, ScheduledSequenceWork work, int prevComputed)
         {
-            if (!Speculation.Enabled)
+            if (!SpeculationEnabledThisStep)
                 return null;
             if (_model is not ISpeculativeTarget spec)
                 return null;
@@ -2446,7 +2499,7 @@ namespace TensorSharp.Runtime.Scheduling
             SequenceState seq, int prevComputed, [NotNullWhen(true)] out SequenceStepResult? result)
         {
             result = null;
-            if (!Speculation.Enabled || prevComputed <= 0 || !CanSpeculate(seq))
+            if (!SpeculationEnabledThisStep || prevComputed <= 0 || !CanSpeculate(seq))
                 return false;
             if (_model is not ISpeculativeTarget spec || !spec.SpeculationProfitable)
                 return false;
@@ -2514,7 +2567,7 @@ namespace TensorSharp.Runtime.Scheduling
         private bool TryBatchedSpeculativeDecode(List<ScheduledSequenceWork> decodeWork, List<SequenceStepResult> results)
         {
             int n = decodeWork.Count;
-            if (!Speculation.Enabled || n < 1)
+            if (!SpeculationEnabledThisStep || n < 1)
                 return false;
             if (_model is not ISpeculativeTarget spec || _model is not IBatchedSpeculativeTarget batched
                 || !spec.SpeculationProfitable || !spec.SpecTrunkFollowsBoundCache)

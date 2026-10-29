@@ -207,6 +207,14 @@ sharded projection (96 for Qwen, 84 for GLM). Distributed layer split and tensor
 parallelism produced bit-identical full-vocabulary logits for both models on a
 3,400-token teacher-forced probe. These figures qualify this route only.
 
+DeepSeek V4.1 Flash 1017 (UD-IQ2_XXS, 300.5 GB) was measured on a second pair of
+pods (two A40s each, 100 GB container limit, network model storage) with
+`--n-cpu-moe 0`: layer split 163-179 prefill / 25.2-25.9 decode tok/s at 2,048
+random tokens, TP 56-58 / 9.4-9.7 with exact prefill (139 / 9.2 with the default
+YOCO replay). Cold host-mapped Engram reads, not the network, bound layer split
+there; see [DeepSeek V4.1](models/deepseek41.md#current-limits-and-tensor-parallel-work).
+Both placements give bit-identical logits, also on a 23,357-token probe.
+
 Peer sockets have no built-in authentication or encryption. Use trusted private
 networking or authenticated tunnels.
 

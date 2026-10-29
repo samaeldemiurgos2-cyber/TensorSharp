@@ -97,11 +97,13 @@ public sealed class DistributedModelControlTests : IDisposable
             DistributedTensorParallelBackends = [BackendType.GgmlCuda],
         };
         ModelBase.ValidateDistributedTensorParallelism(descriptor, BackendType.GgmlCuda);
-        foreach (var backend in new[] { BackendType.Cuda, BackendType.GgmlVulkan })
+        foreach ((var backend, string option) in new[] { (BackendType.Cuda, "cuda"), (BackendType.GgmlVulkan, "ggml_vulkan") })
         {
             var error = Assert.Throws<NotSupportedException>(() => ModelBase.ValidateDistributedTensorParallelism(descriptor, backend));
             Assert.Contains("native-distributed-probe", error.Message);
-            Assert.Contains(backend.ToString(), error.Message);
+            // Both backends in the spelling --backend accepts, not the enum names.
+            Assert.Contains($"on --backend {option}.", error.Message);
+            Assert.Contains("--backend ggml_cuda", error.Message);
         }
     }
 

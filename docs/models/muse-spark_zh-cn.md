@@ -337,6 +337,8 @@ F16 活动与未修改的配对分析（`docs/validation/muse-spark/q3-final-v4r
 隔离的生命周期审计 `docs/validation/muse-spark/lifecycle-completed-review/accepted-audit.json` 和
 最终已应用源码回执 `docs/validation/muse-spark/final-applied-source/receipt.json`（本地验证记录，未提交到 Git）。
 修复后的库上没有重跑整模型推理和计时。
+此后分页注意力会话改由进程级注册表持有（`ggml_ops_internal.h` 中的 `ThreadCacheRegistry`）：
+模型卸载和 `TSGgml_Shutdown` 会释放每个线程的会话，退出的线程会移交其会话，而不是在退出过程中释放它们。
 
 ## 启动分片模型
 

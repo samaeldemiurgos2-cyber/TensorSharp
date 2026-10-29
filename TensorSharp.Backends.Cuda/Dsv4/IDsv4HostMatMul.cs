@@ -59,5 +59,14 @@ namespace TensorSharp.Cuda
         /// output.
         /// </summary>
         bool TryMatMulBatch(int ggmlType, int inDim, int inputRowStride, ReadOnlySpan<Job> jobs);
+
+        /// <summary>
+        /// Whether <see cref="TryMatMulBatch"/> implements <paramref name="ggmlType"/> weights
+        /// whose rows hold <paramref name="inDim"/> values. The engine asks for every offloaded
+        /// expert tensor before it uploads anything, so a layer the host cannot run is refused at
+        /// load rather than on the first token routed through it. The default answers yes and
+        /// leaves the refusal to <see cref="TryMatMulBatch"/>.
+        /// </summary>
+        bool SupportsType(int ggmlType, int inDim) => true;
     }
 }

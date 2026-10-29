@@ -858,7 +858,7 @@ namespace TensorSharp.Cuda
             // ceil(rows/128) sweeps with NO f16 dequant round trip, so it beats the
             // dequant+cuBLAS route up to ~TS_CUDA_Q80_MMQ_MAX_ROWS rows; above that
             // cuBLAS' larger tiles win and the F16 route below takes over.
-            if (Q80MmqEnabled && ggmlType == 8 && q8Kernel == 0
+            if (Q80MmqEnabled && kernels.HasQ80Mmq && ggmlType == 8 && q8Kernel == 0
                 && rows >= F16GemmMinRows && rows <= Q80MmqMaxRows && (inDim & 31) == 0)
             {
                 if (Q80Mmq2Enabled && (inDim & 255) == 0)

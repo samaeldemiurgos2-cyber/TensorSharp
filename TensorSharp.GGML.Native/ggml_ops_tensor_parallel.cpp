@@ -81,6 +81,10 @@ namespace tsg
         TpComm g_tp_comm;
         std::mutex g_tp_comm_mutex;
 
+        // tp_device_allreduce_usable's verdict: -1 not probed yet, 0 no, 1 yes.
+        // It describes the communicator it ran on, so tp_comm_free forgets it.
+        std::atomic<int> g_tp_device_ar_usable{-1};
+
         // Set a process environment variable so that native getenv() sees it —
         // the backend and NCCL both read their configuration that way.
         void tp_setenv(const char* name, const char* value)
@@ -265,6 +269,7 @@ namespace tsg
         g_tp_comm.free_fn = nullptr;
         g_tp_comm.allreduce_fn = nullptr;
         g_tp_comm.attempted = false;
+        g_tp_device_ar_usable.store(-1, std::memory_order_release);
     }
 
     // Whether the backend's collective can actually reduce, verified once by
@@ -276,16 +281,16 @@ namespace tsg
     bool tp_device_allreduce_usable()
     {
         static std::mutex probe_mutex;
-        static int cached = -1;
 
         std::lock_guard<std::mutex> lock(probe_mutex);
-        if (cached >= 0)
-            return cached == 1;
+        const int known = g_tp_device_ar_usable.load(std::memory_order_acquire);
+        if (known >= 0)
+            return known == 1;
 
         const int n = g_device_count.load(std::memory_order_acquire);
         if (n <= 1 || !tp_comm_ensure())
         {
-            cached = 0;
+            g_tp_device_ar_usable.store(0, std::memory_order_release);
             return false;
         }
 
@@ -303,7 +308,7 @@ namespace tsg
                 probe[r] = ensure_ar_scratch_locked(r, probe_elems);
                 if (probe[r] == nullptr)
                 {
-                    cached = 0;
+                    g_tp_device_ar_usable.store(0, std::memory_order_release);
                     return false;
                 }
             }
@@ -323,7 +328,7 @@ namespace tsg
                 tsg::sync_backend(g_backend);
             }
         }
-        cached = ok ? 1 : 0;
+        g_tp_device_ar_usable.store(ok ? 1 : 0, std::memory_order_release);
         return ok;
     }
 
@@ -1471,6 +1476,19 @@ static int tsg_multi_device_init(int backendType, const int* deviceIndices, int 
             }
         }
 
+        // The backends below get replaced: rank 0's when its GPU changes, every
+        // other rank's always. The tensor-parallel communicator was built over the
+        // old ones and keeps them - ggml's collective context and the exact F32
+        // NCCL transport both take each rank's stream from the backend they
+        // recorded, on every AllReduce. Release it now, while those backends are
+        // still alive (the F32 transport synchronizes them on the way out), so the
+        // collective resolved below is built over the new ones (a layer split
+        // builds none). Kept, the next group's first large device AllReduce read a
+        // freed backend (SIGSEGV in ggml_backend_cuda_comm_allreduce_nccl on a
+        // real 2-GPU host), and the F32 transport refused every collective of a
+        // regrouped device set.
+        tsg::tp_comm_free();
+
         // Rank 0's backend already exists. If it is not the requested device,
         // replace it — the caller picks the device order.
         {
@@ -1575,6 +1593,9 @@ TSG_EXPORT int TSGgml_TensorParallelInitLoopback(int backendType, int count)
         }
         if (!tsg::ensure_backend(backendType))
             return 0;
+        // As in tsg_multi_device_init: the communicator holds the backends the
+        // loop below frees.
+        tsg::tp_comm_free();
         tsg::dev(0).device_index = 0;
         for (int r = 1; r < count; ++r)
         {

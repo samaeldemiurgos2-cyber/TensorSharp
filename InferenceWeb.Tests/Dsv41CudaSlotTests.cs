@@ -272,9 +272,10 @@ public sealed class Dsv41CudaSlotTests
     /// with. Across a split each has to reach the device that reads it; before it did, the published
     /// Q2_K checkpoint faulted on its 6-way split (a group read another device's cache pointer). Five
     /// devices put one layer of the five-layer fixture on each, so every group spans a boundary;
-    /// prefill ubatches, single-token steps and a batched step all cross them.
+    /// prefill ubatches, single-token steps and a batched step all cross them. A host with fewer
+    /// devices runs the splits it can hold, so two GPUs still check a boundary.
     /// </summary>
-    [MultiCudaFact(5, FixtureVar, Fixture)]
+    [MultiCudaFact(2, FixtureVar, Fixture)]
     public void ALayerSplit_AnswersAsOneDevice()
     {
         int[] prompt = Stream(31, 45), steps = Stream(32, 6), other = Stream(33, 17);
@@ -297,8 +298,11 @@ public sealed class Dsv41CudaSlotTests
         }
 
         List<float[]> single = Run(1);
+        int devices = CudaDevice.GetDeviceCount();
         foreach (int gpus in new[] { 2, 3, 5 })
         {
+            if (gpus > devices)
+                continue;
             List<float[]> split = Run(gpus);
             for (int i = 0; i < single.Count; i++)
                 AssertClose($"{gpus} devices, forward {i}", split[i], single[i], Exact);

@@ -71,6 +71,19 @@ namespace TensorSharp.Models
 
         protected override bool SupportsSplitGateUpFfn => true;
 
+        // Text LoRA: every projection of a decoder layer and the LM head run through
+        // LinearForward, attn_q/k/v and ffn_gate/up fused or (split FFN) as two weights. The
+        // fused dense FFN graph declines while an adapter is selected.
+        private static readonly System.Collections.Generic.HashSet<string> s_textLoraProjections = new(StringComparer.Ordinal)
+            { "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_output", "ffn_gate", "ffn_up", "ffn_gate_up", "ffn_down" };
+
+        protected override bool SupportsTextLora => true;
+
+        protected override string? TextLoraWeightRefusal(string weightName)
+            => weightName == "output.weight" || IsDecoderLayerProjection(weightName, s_textLoraProjections)
+                ? null
+                : "is not one of the projections hunyuan-dense applies a LoRA delta to";
+
         /// <summary>A plain GQA linear cache: layer count, head geometry and dtype are the
         /// whole identity of what a snapshot of it holds.</summary>
         public override string KVStateFingerprint =>
@@ -94,49 +107,13 @@ namespace TensorSharp.Models
             Console.WriteLine($"  Applied Hunyuan NTK RoPE alpha={alpha}, effective base={Config.RopeBase}");
         }
 
-        private unsafe void FuseQKVWeights()
+        private void FuseQKVWeights()
         {
             int fused = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                string qName = $"blk.{l}.attn_q.weight";
-                string kName = $"blk.{l}.attn_k.weight";
-                string vName = $"blk.{l}.attn_v.weight";
-                string qkvName = $"blk.{l}.attn_qkv.weight";
-
-                if (_quantWeights.TryGetValue(qName, out QuantizedWeight qw) &&
-                    _quantWeights.TryGetValue(kName, out QuantizedWeight kw) &&
-                    _quantWeights.TryGetValue(vName, out QuantizedWeight vw) &&
-                    qw.GgmlType == kw.GgmlType && kw.GgmlType == vw.GgmlType &&
-                    qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
-                {
-                    if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, qw, kw, vw))
-                        continue;
-
-                    _quantWeights[qkvName] = fusedWeight;
-                    _quantWeights.Remove(qName); qw.Dispose();
-                    _quantWeights.Remove(kName); kw.Dispose();
-                    _quantWeights.Remove(vName); vw.Dispose();
+                if (TryFuseQkvWeights(l))
                     fused++;
-                }
-                else if (_weights.TryGetValue(qName, out Tensor qf) &&
-                         _weights.TryGetValue(kName, out Tensor kf) &&
-                         _weights.TryGetValue(vName, out Tensor vf))
-                {
-                    int qDim = (int)qf.Sizes[0];
-                    int kDim = (int)kf.Sizes[0];
-                    int vDim = (int)vf.Sizes[0];
-                    int inDim = (int)qf.Sizes[1];
-                    Tensor fusedTensor = new Tensor(_allocator, DType.Float32, qDim + kDim + vDim, inDim);
-                    using (Tensor s0 = fusedTensor.Narrow(0, 0, qDim)) Ops.Copy(s0, qf);
-                    using (Tensor s1 = fusedTensor.Narrow(0, qDim, kDim)) Ops.Copy(s1, kf);
-                    using (Tensor s2 = fusedTensor.Narrow(0, qDim + kDim, vDim)) Ops.Copy(s2, vf);
-                    _weights[qkvName] = fusedTensor;
-                    _weights.Remove(qName); qf.Dispose();
-                    _weights.Remove(kName); kf.Dispose();
-                    _weights.Remove(vName); vf.Dispose();
-                    fused++;
-                }
             }
             if (fused > 0)
                 Console.WriteLine($"  Fused projections: {fused} QKV");

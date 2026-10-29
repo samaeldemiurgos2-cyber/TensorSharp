@@ -773,7 +773,17 @@ The direct `cuda` engine runs UD-Q2_K_XL's IQ2_XS and IQ3_XXS experts: per-token
 ported from ggml's dot products for decode, which still runs as a captured CUDA graph, and
 the same two layouts decoded into its tensor-core and register-staged grouped kernels for
 prefill. Before the grouped kernels took them, its prefill of this file ran on the slowest
-fallback at about 500 tok/s. The engine has no host-expert seam, so `--n-cpu-moe` there
+fallback at about 500 tok/s. It also runs UD-Q4_K_XL, which stores 43 of its 48 routed down
+projections as Q5_1 (the other five Q8_0) under Q4_K/Q5_K gate/up: decode dots Q5_1 against
+q8_1 activations with dp4a as ggml's `vec_dot_q5_1_q8_1` does (the offset term from the int8
+activation sum), and prefill decodes it into the same grouped kernels, all held to ggml's
+`dequantize_row_q5_1`. Before that the engine refused the file at load, and under
+`--layer-split 2` the two devices' refusals aborted the CLI with an unhandled
+`AggregateException`; an expert layout it does not decode is now refused before any upload,
+with one `error: model load refused:` line naming the tensor. No UD-Q4_K_XL throughput has
+been measured on the direct engine yet. A build without nvcc uses the committed PTX, which must
+be regenerated to include the Q5_1 decoder; until then the engine refuses Q5_1 experts rather
+than decode them as Q8_0. The engine has no host-expert seam, so `--n-cpu-moe` there
 prints a warning and keeps the experts on the GPU. The direct `cuda` engine uses
 `--layer-split N` for multiple GPUs and refuses `--tp N`. On `ggml_cuda`,
 UD-Q2_K_XL supports `--tp 2` with its original quantized weights; see

@@ -28,6 +28,28 @@ public sealed class DistributedNativeArchitectureGateTests
         }
     }
 
+    /// <summary>
+    /// The direct-CUDA engines have no cross-node stage executor or collectives. The refusal has to
+    /// name the backend that has them in the spelling --backend accepts (it used to print the enum
+    /// name GgmlCuda, and the layer-split one named no backend at all).
+    /// </summary>
+    [Theory]
+    [InlineData("deepseek41")]
+    [InlineData("qwen4exp")]
+    [InlineData("glm5next")]
+    public void DirectCudaDistributedRefusalsNameGgmlCuda(string id)
+    {
+        Assert.True(ModelArchitectureRegistry.TryGet(id, out var architecture));
+        var tp = Assert.Throws<NotSupportedException>(() =>
+            ModelBase.ValidateDistributedTensorParallelism(architecture, BackendType.Cuda));
+        Assert.Contains($"Architecture '{id}' does not implement distributed tensor parallelism on --backend cuda", tp.Message);
+        Assert.Contains("Use one of its distributed backends: --backend ggml_cuda.", tp.Message);
+        var layers = Assert.Throws<NotSupportedException>(() =>
+            ModelBase.ValidateDistributedLayerSplit(architecture, BackendType.Cuda));
+        Assert.Contains($"Architecture '{id}' does not implement distributed --layer-split on --backend cuda", layers.Message);
+        Assert.Contains("Its distributed stage executor runs on --backend ggml_cuda", layers.Message);
+    }
+
     [Fact]
     public void FlashSupportDoesNotAdvertiseTheOlderGlmExecutionGraph()
     {

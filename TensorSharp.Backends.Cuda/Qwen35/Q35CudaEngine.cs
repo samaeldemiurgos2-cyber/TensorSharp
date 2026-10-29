@@ -180,7 +180,8 @@ namespace TensorSharp.Cuda
             reason = null;
             try
             {
-                if (CudaKernels.LocatePtxPath("tensorsharp_q35_kernels.ptx") == null)
+                string path = CudaKernels.LocatePtxPath("tensorsharp_q35_kernels.ptx");
+                if (path == null)
                 {
                     reason = "tensorsharp_q35_kernels.ptx is missing (TensorSharp.Backends.Cuda was built without nvcc)";
                     return false;
@@ -191,7 +192,10 @@ namespace TensorSharp.Cuda
                     reason = $"GPU 0 is sm_{device.ComputeCapabilityMajor}{device.ComputeCapabilityMinor}; the kernels need sm_12x FP4 tensor cores";
                     return false;
                 }
-                return true;
+                // A CC 12 GPU is not enough: the image the driver loads must be sm_120a / sm_121a
+                // SASS (a PTX-only or other-architecture build traps in every GEMM), and the
+                // managed path should serve the model rather than the engine refusing it later.
+                return Q35Kernels.ProbeTensorCoreKernels(path, out reason);
             }
             catch (Exception ex)
             {

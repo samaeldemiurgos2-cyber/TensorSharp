@@ -170,6 +170,40 @@ public class SpeculativeExecutionTests
     }
 
     [Fact]
+    public void EngineSpec_LoraAdapterRequest_NeverArmsSpeculation_WhileBaseStillDoes()
+    {
+        // Neither the drafter nor the verify trunk applies a request adapter, so a LoRA
+        // request decodes plainly (every token from the adapted trunk), and a base request
+        // on the same configuration still speculates.
+        const int promptLen = 5;
+        const int maxNew = 40;
+        var adapter = new FakeAdapter();
+
+        var model = new FakeSpeculativeModel();
+        var adapted = RunEngineRequest(model, promptLen, maxNew, specEnabled: true, adapter: adapter);
+
+        Assert.Equal(ExpectedChain(model, promptLen, maxNew), adapted.OutputTokens);
+        Assert.Null(adapted.SpecStats);
+        Assert.Equal(0, model.LinearSpecForwardCalls);
+        Assert.Equal(model.ForwardCalls, model.ForwardsWithAdapter);
+        Assert.True(model.ForwardsWithAdapter > 0);
+        Assert.Null(model.StepAdapter);
+
+        var baseModel = new FakeSpeculativeModel();
+        var plain = RunEngineRequest(baseModel, promptLen, maxNew, specEnabled: true);
+        Assert.Equal(ExpectedChain(baseModel, promptLen, maxNew), plain.OutputTokens);
+        Assert.NotNull(plain.SpecStats);
+        Assert.True(plain.SpecStats.TokensAccepted > 0, "a base request should still speculate");
+        Assert.Equal(0, baseModel.ForwardsWithAdapter);
+    }
+
+    private sealed class FakeAdapter : IRequestAdapter
+    {
+        public string Id => "fake#1";
+        public bool IsRetired => false;
+    }
+
+    [Fact]
     public void EngineSpec_EosInsideAcceptedWindow_StopsAndTruncatesTrailingDrafts()
     {
         const int promptLen = 5;
@@ -797,7 +831,7 @@ public class SpeculativeExecutionTests
 
     private static SequenceState RunEngineRequest(FakeSpeculativeModel model, int promptLen, int maxNewTokens,
         bool specEnabled, bool enablePrefixCaching = false, int soloPrefillChunk = 0, string speculator = null,
-        Action beforeDispose = null)
+        Action beforeDispose = null, IRequestAdapter adapter = null)
     {
         var cfg = new SchedulerConfig
         {
@@ -829,7 +863,7 @@ public class SpeculativeExecutionTests
             FrequencyPenalty = 0f,
         };
         var seq = new SequenceState("mtp-req", Enumerable.Range(1, promptLen).ToList(),
-            maxNewTokens, BlockSize, greedy);
+            maxNewTokens, BlockSize, greedy, adapter: adapter);
         var handle = engine.SubmitRequest(seq);
         var completion = handle.Completion.GetAwaiter().GetResult();
         Assert.True(completion.PrefillElapsedTicks > 0, "The engine must time all prompt chunks even when speculation is armed.");
@@ -1188,8 +1222,22 @@ public class SpeculativeExecutionTests
         Assert.True(decoder.TokensDrafted > 0);
     }
 
-    private sealed class FakeSpeculativeModel : ISpeculativeModel, IPageOnlyPrefixCacheModel
+    private sealed class FakeSpeculativeModel : ISpeculativeModel, IPageOnlyPrefixCacheModel, IAdapterAwareModel
     {
+        // ---- IAdapterAwareModel: a LoRA request's steps select their adapter here ----
+        private readonly HashSet<IRequestAdapter> _boundAdapters = new(ReferenceEqualityComparer.Instance);
+        public IRequestAdapter StepAdapter { get; private set; }
+        public int ForwardsWithAdapter { get; private set; }
+        public bool TryBindAdapter(IRequestAdapter adapter, out string error)
+        {
+            _boundAdapters.Add(adapter);
+            error = null;
+            return true;
+        }
+        public void SelectStepAdapter(IRequestAdapter adapter) => StepAdapter = adapter;
+        public IReadOnlyCollection<IRequestAdapter> BoundAdapters => _boundAdapters.ToArray();
+        public void ReleaseAdapter(IRequestAdapter adapter) => _boundAdapters.Remove(adapter);
+
         // A page family over a resident primary: what the radix cache needs to resume a
         // conversation's next turn from this fake.
         public PrefixCacheCapabilities GetPrefixCacheCapabilities() => new()
@@ -1296,6 +1344,7 @@ public class SpeculativeExecutionTests
         public float[] Forward(int[] tokens)
         {
             ForwardCalls++;
+            if (StepAdapter != null) ForwardsWithAdapter++;
             // Plain path (MTP disabled / disarmed): same truth stream.
             var logits = new float[VocabSize];
             int startPos = _trunk.Count;

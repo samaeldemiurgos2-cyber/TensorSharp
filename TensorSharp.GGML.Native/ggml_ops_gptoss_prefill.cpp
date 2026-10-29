@@ -116,14 +116,17 @@ struct GptOssPrefillTpSlot
     }
 };
 
-GptOssPrefillTpSlot g_gptoss_prefill_tp[tsg::TSG_MAX_DEVICES];
+// Deliberately leaked, like g_mg_tp in ggml_ops_muse_glimmer.cpp: a static
+// destructor freeing a parked buffer at process exit aborts on ggml_cuda.
+// gptoss_prefill_tp_reset_all is the release path.
+GptOssPrefillTpSlot* const g_gptoss_prefill_tp = new GptOssPrefillTpSlot[tsg::TSG_MAX_DEVICES];
 
 }  // namespace
 
 void gptoss_prefill_tp_reset_all()
 {
-    for (auto& slot : g_gptoss_prefill_tp)
-        slot.reset();
+    for (int r = 0; r < tsg::TSG_MAX_DEVICES; ++r)
+        g_gptoss_prefill_tp[r].reset();
 }
 
 static int gptoss_model_prefill_impl(
