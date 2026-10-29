@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using TensorSharp.Models.Architecture;
@@ -27,14 +28,17 @@ namespace TensorSharp.Models
                 degree is >= 2 and <= 8,
             DescribeMultiGpuPlacement = DescribePlacement,
             LayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.Cuda },
-            ApplyNativeTunables = c => ValidateLoad(c.GgufPath, c.Backend, c.DraftModelPath, c.TpGroup, c.TpDegree),
+            ApplyNativeTunables = c => ValidateLoad(c.GgufPath, c.Backend, c.DraftModelPath, c.TpGroup, c.TpDegree, c.Probe),
             ProjectorFileHints = new[] { "deepseek41.vision.gguf" },
             Factory = c => new DeepSeek41Model(c.GgufPath, c.Backend,
                 c.TpDegree, c.TpGroup, c.DraftModelPath, c.LayerSplitDegree),
         };
 
+        /// <param name="header">The checkpoint's already-open header, when the caller has one
+        /// (the registry's probe, the model's own GGUF); otherwise the first shard's header is read
+        /// from <paramref name="ggufPath"/> for the checks that need it, if that file exists.</param>
         internal static void ValidateLoad(string ggufPath, BackendType backend, string draftModelPath,
-            ITensorParallelGroup tpGroup = null, int tpDegree = 1)
+            ITensorParallelGroup tpGroup = null, int tpDegree = 1, GgufFile header = null)
         {
             // Every backend that has a V4.1 implementation is allowed here:
             // ggml_cuda (the ggml graph), `cuda` (the direct-CUDA engine, which
@@ -121,7 +125,55 @@ namespace TensorSharp.Models
                     $"position. Unset it, set it to 0, or run on ggml_cuda.");
             }
 
+            // Last, because it is the one check that reads the header.
+            if (backend == BackendType.Cuda || backend == BackendType.Cpu)
+            {
+                if (header != null)
+                    RefuseCombinedEngramLayout(backend, header);
+                else if (File.Exists(ggufPath))
+                {
+                    using var file = GgufFile.OpenWithoutSiblingShards(ggufPath);
+                    RefuseCombinedEngramLayout(backend, file);
+                }
+            }
+        }
 
+        /// <summary>
+        /// llama.cpp's Engram layout, which unsloth's DeepSeek-V4.1-Flash-1017 GGUFs use: one
+        /// combined <c>per_layer_token_embd.weight</c> table described by <c>deepseek41.ple.*</c>
+        /// metadata, with <c>blk.N.engram_kv</c> and the fused <c>blk.N.engram_gate</c> (q*k) in
+        /// place of TensorSharp's <c>engram_wkv</c>/<c>engram_q</c>/<c>engram_k</c>. The native
+        /// loader reads both layouts and prefers TensorSharp's when its
+        /// <c>deepseek41.engram.layer_ids</c> is present (has_combined_engram_metadata in
+        /// dsv41_engram_gguf.h); the combined table is also accepted as evidence, for a header
+        /// whose <c>ple</c> keys are missing.
+        /// </summary>
+        internal static bool UsesCombinedEngramLayout(GgufFile header)
+            => !header.Metadata.ContainsKey("deepseek41.engram.layer_ids") &&
+               (header.Metadata.Keys.Any(key => key.StartsWith("deepseek41.ple.", StringComparison.Ordinal)) ||
+                header.Tensors.ContainsKey("per_layer_token_embd.weight"));
+
+        /// <summary>
+        /// The two managed executors -- the direct-CUDA engine and the pure C# one -- read
+        /// Engram through Dsv41EngramData, which knows only TensorSharp's per-layer layout.
+        /// Handed a combined-layout checkpoint they used to fail deep in the executor with
+        /// "Missing or invalid DeepSeek V4.1 GGUF metadata: deepseek41.engram.pad_id", naming
+        /// neither the layout nor the backend that loads it. Refuse from the header instead,
+        /// before a 300 GB checkpoint is mapped.
+        /// </summary>
+        internal static void RefuseCombinedEngramLayout(BackendType backend, GgufFile header)
+        {
+            if ((backend != BackendType.Cuda && backend != BackendType.Cpu) || !UsesCombinedEngramLayout(header))
+                return;
+            string name = backend == BackendType.Cuda ? "cuda" : "cpu";
+            string executor = backend == BackendType.Cuda ? "the direct-CUDA engine" : "the pure C# executor";
+            throw new NotSupportedException(
+                "This DeepSeek V4.1 GGUF stores its Engram tables in llama.cpp's combined layout " +
+                "(deepseek41.ple.* metadata and one per_layer_token_embd.weight table, as in unsloth's " +
+                $"DeepSeek-V4.1-Flash-1017 GGUFs). --backend {name} ({executor}) reads only TensorSharp's " +
+                "per-layer layout (deepseek41.engram.* metadata with blk.N.engram_embd/engram_wkv/engram_q/" +
+                "engram_k), so it cannot load this checkpoint. Use --backend ggml_cuda, which loads both " +
+                "layouts" + (backend == BackendType.Cpu ? " (--backend ggml_cpu for a CPU-only run)." : "."));
         }
 
         /// <summary>

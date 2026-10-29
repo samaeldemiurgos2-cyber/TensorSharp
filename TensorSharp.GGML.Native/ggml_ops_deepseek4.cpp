@@ -4875,7 +4875,8 @@ struct graph_builder
         ggml_tensor * score = ggml_lightning_indexer(ctx, iq, ik, iw, res.inp.lid[dev].kq_mask);
 
         const int64_t k = std::min<int64_t>(hp.indexer_top_k, score->ne[0]);
-        ggml_tensor * top_k = ggml_cont(ctx, ggml_top_k(ctx, score, (int) k));
+        // Deterministic selection; see the note in ggml_ops_deepseek41.inc.
+        ggml_tensor * top_k = ggml_cont(ctx, ggml_argsort_top_k(ctx, score, (int) k));
         return top_k;
     }
 
@@ -5415,7 +5416,7 @@ struct graph_builder
 
         ggml_tensor * score = ggml_lightning_indexer(ctx, iq, ik, iw, lid_mask);
         const int64_t k = std::min<int64_t>(hp.indexer_top_k, score->ne[0]);
-        return ggml_cont(ctx, ggml_top_k(ctx, score, (int) k));
+        return ggml_cont(ctx, ggml_argsort_top_k(ctx, score, (int) k));
     }
 
     ggml_tensor * build_attention_batched(int il, ggml_tensor * cur, ggml_tensor * inp_pos)

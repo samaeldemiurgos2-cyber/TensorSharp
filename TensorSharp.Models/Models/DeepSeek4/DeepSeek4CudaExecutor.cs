@@ -71,9 +71,14 @@ namespace TensorSharp.Models
         /// dependency runs the other way) — same inversion as
         /// <c>ICudaWeightSource</c>.
         /// </summary>
-        private sealed class HostMatMul : IDsv4HostMatMul
+        internal sealed class HostMatMul : IDsv4HostMatMul
         {
             public static readonly HostMatMul Instance = new HostMatMul();
+
+            /// <summary>Exactly the types TryAddmmQuantizedBatch has a direct kernel for; it
+            /// returns false for every other one.</summary>
+            public bool SupportsType(int ggmlType, int inDim)
+                => ManagedQuantizedOps.TryGetActivationPlan((GgmlTensorType)ggmlType, inDim, out _);
 
             public bool TryMatMulBatch(int ggmlType, int inDim, int inputRowStride,
                 ReadOnlySpan<IDsv4HostMatMul.Job> jobs)

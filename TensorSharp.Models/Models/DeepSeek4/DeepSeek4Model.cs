@@ -68,7 +68,7 @@ namespace TensorSharp.Models
                 try
                 {
                     DeepSeek41Architecture.ValidateLoad(ggufPath, backend, ResolveDsparkPath(draftModelPath),
-                        tpGroup, tpDegree);
+                        tpGroup, tpDegree, _gguf);
                 }
                 catch
                 {

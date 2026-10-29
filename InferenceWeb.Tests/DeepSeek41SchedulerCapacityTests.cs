@@ -81,10 +81,12 @@ public sealed class DeepSeek41SchedulerCapacityTests : IDisposable
         using var model = new SlotModel();
         using var engine = new InferenceEngine(model, Config());
         var oversized = Sequence("oversized", 253, 4);
-        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        // The refusal hosts report in one line (the CLI's configuration error, the server's 400).
+        var error = await Assert.ThrowsAsync<ContextLengthExceededException>(() =>
             engine.SubmitRequest(oversized).Completion.WaitAsync(TimeSpan.FromSeconds(10)));
 
         Assert.Contains("each native sequence slot", error.Message);
+        Assert.Equal(256, error.ContextTokens);
         Assert.Equal(SequenceStatus.FinishedError, oversized.Status);
         Assert.Equal(0, oversized.BlockTable.NumBlocks);
         Assert.Equal(0, model.PromptTokensForwarded);

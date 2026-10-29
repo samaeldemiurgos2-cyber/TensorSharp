@@ -308,9 +308,14 @@ def stage_shard(shard, args, stores, log):
         os.fsync(fd)
     except BaseException:
         # An interrupted in-place copy must not remain under the final name.
+        # close() can fail too (a quota-exceeded flush); still remove the file
+        # and let the original error propagate rather than a double-close EBADF.
         if args.in_place:
-            os.close(fd)
-            fd = -1
+            fd_to_close, fd = fd, -1
+            try:
+                os.close(fd_to_close)
+            except OSError:
+                pass
             os.unlink(partial)
         raise
     finally:

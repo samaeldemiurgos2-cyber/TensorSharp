@@ -313,14 +313,18 @@ ggml_tensor * build_attention_v41(int il, ggml_tensor * cur, ggml_tensor * pos)
                 ggml_tensor * blocks = fused_node(TSG_DSV41_CANDIDATE_SCORES, GGML_TYPE_F32,
                     (plan.n_kv + hp.candidate_block - 1) / hp.candidate_block, nt, 1, 1,
                     { scores, pos }, dev, hp.candidate_block);
-                ggml_tensor * selected = ggml_cont(ctx, ggml_top_k(ctx, blocks, std::min<int64_t>(hp.candidate_topk, blocks->ne[0])));
+                // Selections use ggml_argsort_top_k, not ggml_top_k: ggml-cuda's radix top-k picks
+                // among tied scores and orders its output by atomic arrival, so the kept set and the
+                // gathered decode order changed from run to run (and between TP nodes, which each run
+                // every selection) at long context. The sort is deterministic.
+                ggml_tensor * selected = ggml_cont(ctx, ggml_argsort_top_k(ctx, blocks, (int) std::min<int64_t>(hp.candidate_topk, blocks->ne[0])));
                 v41_candidate_scores = blocks;
                 v41_candidate_top = selected;
                 v41_candidates = fused_node(TSG_DSV41_CANDIDATE_MASK, GGML_TYPE_F16,
                     plan.n_kv, nt, 1, 1, { blocks, selected }, dev, hp.candidate_block);
             }
             trace_v41(scores, il, "index_scores");
-            ggml_tensor * top = ggml_cont(ctx, ggml_top_k(ctx, scores, std::min<int64_t>(hp.indexer_top_k, plan.n_kv)));
+            ggml_tensor * top = ggml_cont(ctx, ggml_argsort_top_k(ctx, scores, (int) std::min<int64_t>(hp.indexer_top_k, plan.n_kv)));
             trace_v41(top, il, "index_top");
             v41_shared_top = top;
             // Gathered decode consumes the selected row IDs directly. The
@@ -531,11 +535,11 @@ ggml_tensor * build_attention_v41_batched(int il, ggml_tensor * cur, ggml_tensor
                     ggml_tensor * blocks = fused_node(TSG_DSV41_CANDIDATE_SCORES, GGML_TYPE_F32,
                         (plan.n_kv + hp.candidate_block - 1) / hp.candidate_block, 1, 1, 1,
                         { scores, pos_i }, dev, hp.candidate_block);
-                    ggml_tensor * chosen = ggml_cont(ctx, ggml_top_k(ctx, blocks, std::min<int64_t>(hp.candidate_topk, blocks->ne[0])));
+                    ggml_tensor * chosen = ggml_cont(ctx, ggml_argsort_top_k(ctx, blocks, (int) std::min<int64_t>(hp.candidate_topk, blocks->ne[0])));
                     v41_bd_candidates[i] = fused_node(TSG_DSV41_CANDIDATE_MASK, GGML_TYPE_F16,
                         plan.n_kv, 1, 1, 1, { blocks, chosen }, dev, hp.candidate_block);
                 }
-                ggml_tensor * top = ggml_cont(ctx, ggml_top_k(ctx, scores, std::min<int64_t>(hp.indexer_top_k, plan.n_kv)));
+                ggml_tensor * top = ggml_cont(ctx, ggml_argsort_top_k(ctx, scores, (int) std::min<int64_t>(hp.indexer_top_k, plan.n_kv)));
                 v41_bd_shared_top[i] = top;
                 v41_bd_shared_mask[i] = B.gather_mask[dev] ? nullptr : build_top_k_mask(pi.kq_mask, top);
             }

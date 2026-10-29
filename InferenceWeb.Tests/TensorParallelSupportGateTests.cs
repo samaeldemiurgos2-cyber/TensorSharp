@@ -200,6 +200,19 @@ public class TensorParallelSupportGateTests
         Assert.Equal(aliases.Count, aliases.Distinct().Count());
     }
 
+    [Fact]
+    public void NemotronCpuTensorParallel_IsNotUserReachable()
+    {
+        // NemotronModel accepts BackendType.Cpu with a caller-supplied group as a
+        // model-free test seam (NemotronExpertScaleTests). Users must not reach it:
+        // --tp on cpu, with or without a group, is refused before any model loads.
+        ITensorParallelGroup group = null;
+        var ex = Assert.Throws<NotSupportedException>(() => Resolve("nemotron_h", BackendType.Cpu, 2, ref group, out _));
+        Assert.Contains("multi-device GPU backend", ex.Message);
+        group = new MuseSparkTensorParallelTests.CpuGroup(2);
+        Assert.Throws<NotSupportedException>(() => Resolve("nemotron_h", BackendType.Cpu, 2, ref group, out _));
+    }
+
     /// <summary>Minimal live group: the gate only reads whether one exists.</summary>
     private sealed class StubTpGroup : ITensorParallelGroup
     {
