@@ -282,6 +282,61 @@ Evidence:
 Lesson: "loads and prints the right config" is not evidence. Diff the file's tensor list against what the
 forward reads, for every published file of the family.
 
+### G7 -- Tensor parallelism for Super VL and Bolt -- **IMPLEMENTED, NOT YET RUN**
+
+The per-tensor `.scale` handling, the down-scale fold, the batched TP decode kernel's up scales and the
+per-layer router are covered under G2/G6 and "Still unverified". On top of those, `--tp` still refused
+Bolt's per-block MoE config, the fast expert-parallel MoE path refused latent MoE (both models) and NVFP4
+up-scaled experts (Super VL), and the server could not host a TP Nemotron at all.
+
+What changed:
+
+| Piece | Change |
+|---|---|
+| Expert-parallel (EP) MoE | Now serves latent MoE (each rank's kernel reads the latent projection) and per-block expert counts (each layer is partitioned on its own). New native entry `TSGgml_MoEFFNPrefillRouteScaledF32` (TensorSharp-owned `ggml_ops_moe.cpp`; ggml is unchanged) multiplies the ReLU^2 projection by one scale per route before the activation, so Super VL's NVFP4 experts run EP too. A route the kernel neutralises (weight 0) takes the scale of the expert it is pointed at, so it cannot overflow into `Inf * 0 = NaN`. |
+| Per-block MoE (Bolt) | The refusal in `InitPerLayerMoEConfig` is gone; sharding and the expert loops use each layer's own counts. The per-expert (Megatron) split refuses, naming the tensor, an expert width the TP degree cannot split between quant blocks instead of silently dropping the remainder. |
+| Across nodes | Image/audio embeddings exist only on the driver. A forward whose tokens hold `<image>`/`<so_embedding>` syncs the driver's embedding rows to every node with one AllReduce (the driver contributes them, every other rank zeros); the decision is taken from the tokens, which every node sees. The multimodal warm-up is skipped across nodes, since only nodes given the mmproj would join its collectives. |
+| Server (KV snapshots) | `NemotronModel.TensorParallelSnapshot.cs`: each rank's K/V heads are a contiguous run of the single-device block layout, so the block format is unchanged. Across nodes the driver broadcasts each extract/inject (`ModelBase.BroadcastModelControl`) and the bytes move as raw bytes over the TCP mesh (`ICrossNodeByteGroup`, protocol 4): an inject sends the driver's block to every node, an extract gathers each node's head shards on the driver. |
+
+Tests: `NemotronExpertParallelTests` runs the new kernel on the GGML CPU backend against a C# reference
+and checks the per-rank route table; `TcpCommunicatorTests` covers the byte broadcast and gather. There is
+no CPU harness for the Nemotron TP forward itself; the snapshot path was run only as two processes sharing
+one RTX 5090 (Lightning), before this branch was rebased onto the maintainer's changes.
+
+Limits that remain:
+- The server serves a TP Nemotron on the per-sequence route (one sequence's forward at a time). Run the
+  server as node 0 and `TensorSharp.Cli` as every other node. Each owner swap re-injects the incoming
+  sequence's pages, its ~50 MB Mamba2 state included (Lightning), so the interconnect bounds concurrent
+  serving; with the engine's 16-token pages for this family a swap is one mirrored inject per page.
+- MTP/DFlash speculation is not mirrored to worker nodes.
+- `--n-cpu-moe` with TP has not been run.
+
+#### DGX Spark test plan (two nodes, one GB10 each)
+
+Same model, backend and flags on both nodes; node 0 is the driver and prints the output. For the server,
+start `TensorSharp.Server.Host` with the same `--tp 1 --tp-node-id 0 --tp-peers ...` on node 0 instead of the
+CLI driver, and the CLI worker on node 1.
+
+```bash
+# node 0 (driver)
+TensorSharp.Cli --model <model.gguf> [--mmproj <mmproj.gguf>] --backend ggml_cuda --tp 1 \
+  --tp-node-id 0 --tp-peers <spark0>:9500,<spark1>:9500 --temperature 0 --max-tokens 64 --prompt "<prompt>"
+# node 1 (worker)
+TensorSharp.Cli --model <model.gguf> --backend ggml_cuda --tp 1 \
+  --tp-node-id 1 --tp-peers <spark0>:9500,<spark1>:9500
+```
+
+1. **Load banner.** Expect `Nemotron MoE: expert-parallel across 2 GPU(s), N experts per GPU per layer` (Super VL:
+   256; Bolt: a range) and, for Bolt, `MoE per block: ...`. `per-expert tensor parallelism (<reason>)` means EP was
+   refused and gives the reason.
+2. **Logits parity, the real check.** Run the same prompt once single-device and once across the two nodes with
+   `TS_DUMP_LOGITS=<file>` on node 0, then compare the two float32 dumps (cosine ~1, same argmax). Text alone can
+   differ at near-ties.
+3. **Greedy text** on a few prompts, both models, `--temperature 0`.
+4. **Images** (Super VL, Bolt): one `--image` prompt across nodes; the worker does not need `--mmproj`.
+5. **Debugging aids:** `TS_TP_SCALE_DEBUG=1` prints each sharded weight's scale as it is applied;
+   `CUDA_LAUNCH_BLOCKING=1` for an exact failing kernel.
+
 ## 5. Summary
 
 **Validated on a DGX Spark (GB10) on 2026-10-24/25. Both models now produce correct output.** The
@@ -372,12 +427,12 @@ the feature on the handle being non-zero and fall back.
   - **Super VL NVFP4:** `--tp 2` is no longer refused, but the file does not fit two A40s with ECC
     enabled (below). `--tp 2` is the only degree, since the attention layers have 2 KV heads.
   - **Super VL Q4_0:** has no sidecars and was never refused.
-  - **Bolt:** still refused under `--tp`, now by the per-block MoE check rather than the sidecar gate.
+  - **Bolt:** no longer refused under `--tp`; each block's own expert count and top-k are used (G7).
 
-  Expert parallelism is not used for these models. They are latent MoE, and their kernel has no
-  pre-activation scale hook for up-scaled experts. They run the per-expert row split, which refuses an
-  expert width that does not split on quant-block boundaries. `EnsureNemotronTpAppliesExpertScales` is
-  the permanent fail-closed guard.
+  Expert parallelism now serves these models (G7): every rank's kernel reads the latent projection,
+  and `TSGgml_MoEFFNPrefillRouteScaledF32` applies each route's up scale before ReLU^2. A model whose
+  stacked experts cannot be used for EP falls back to the per-expert row split, which refuses an expert
+  width that does not split on quant-block boundaries.
 
   This is covered by synthetic tests only (`NemotronExpertScaleTests`, TP against one device and
   against folded twins). Besides the CPU tests, a gated `ggml_cuda` `--tp 2` test

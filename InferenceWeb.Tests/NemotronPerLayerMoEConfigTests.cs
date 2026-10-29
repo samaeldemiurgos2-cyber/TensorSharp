@@ -204,10 +204,11 @@ public sealed class NemotronPerLayerMoEConfigTests : IDisposable
     }
 
     [Fact]
-    public void PerLayerFixture_StillRefusesTensorParallelism()
+    public void PerLayerFixture_UnderTensorParallelism_FollowsTheSingleDeviceTrajectory()
     {
-        // With scalar .scale sidecars too: before the TP weight-scale opt-in the
-        // sidecar gate refused such a file first, so this check never ran.
+        // Bolt-shaped: each MoE block has its own expert count and top-k, with scalar
+        // .scale sidecars and NVFP4 expert scales. TP used to refuse a per-block config;
+        // every rank now routes and shards each layer by its own counts.
         string path = new NemotronSyntheticModelBuilder
         {
             Layout = "AMAM",
@@ -216,9 +217,11 @@ public sealed class NemotronPerLayerMoEConfigTests : IDisposable
             Scaled = true,
         }.Write(Path.Combine(_directory, "per-layer-tp.gguf"));
 
-        var ex = Assert.Throws<NotSupportedException>(() =>
-            new NemotronModel(path, BackendType.Cpu, 2, new MuseSparkTensorParallelTests.CpuGroup(2)));
-        Assert.Contains("per-block", ex.Message);
+        using var single = new NemotronModel(path, BackendType.Cpu);
+        var group = new MuseSparkTensorParallelTests.CpuGroup(2);
+        using var tp = new NemotronModel(path, BackendType.Cpu, 2, group);
+        NemotronExpertScaleTests.AssertSameTrajectory(single, tp, 2e-3f);
+        Assert.True(group.Reductions > 0);
     }
 
     private static T Field<T>(object model, string name)

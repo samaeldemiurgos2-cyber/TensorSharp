@@ -17,7 +17,7 @@ namespace TensorSharp.Distributed
     /// This minimises network traffic: only one buffer per AllReduce
     /// crosses the network, regardless of how many local GPUs participate.
     /// </summary>
-    public sealed class DistributedTensorParallelGroup : ITensorParallelGroup, INestedTensorParallelGroup, IDistributedExecutionGroup
+    public sealed class DistributedTensorParallelGroup : ITensorParallelGroup, INestedTensorParallelGroup, IDistributedExecutionGroup, ICrossNodeByteGroup
     {
         /// <summary>The group that owns this node's GPUs.</summary>
         public ITensorParallelGroup LocalGroup => _localGroup;
@@ -140,6 +140,10 @@ namespace TensorSharp.Distributed
                 throw new ArgumentOutOfRangeException(nameof(count));
             _tcp.AllReduce(buffer, count);
         }
+
+        public void CrossNodeBroadcastBytes(Span<byte> buffer) => _tcp.BroadcastBytes(buffer);
+
+        public void CrossNodeGatherBytes(Span<byte> buffer) => _tcp.GatherBytesToRoot(buffer);
 
         public void Synchronize()
         {

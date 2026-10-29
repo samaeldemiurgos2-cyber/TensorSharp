@@ -85,37 +85,12 @@ namespace TensorSharp.Models
         /// apply or decline on the scale exactly as on one device.</item>
         /// <item>Routed experts: the per-expert down scale is folded into the route weights
         /// (FoldExpertDownScale) for every TP MoE path, and the per-expert up scale is
-        /// applied before ReLU^2 by the batched decode kernel (up_scales) and the
-        /// per-expert loop (ApplyExpertUpScale). Expert parallelism, whose kernel has no
-        /// pre-activation hook, is not used for a model with up scales
-        /// (CanUseNemotronExpertParallelMoE), and EnsureNemotronTpAppliesExpertScales
-        /// refuses the load if that ever changes.</item>
+        /// applied before ReLU^2 by the batched decode kernel (up_scales), the per-expert
+        /// loop (ApplyExpertUpScale) and expert parallelism, whose MoEFFNPrefill kernel
+        /// takes each route's up scale (route_up_scales, BuildExpertParallelRoutes).</item>
         /// </list>
         /// </summary>
         protected override bool SupportsTensorParallelWeightScales => true;
-
-        /// <summary>
-        /// Fail-closed backstop, kept permanently: refuse a tensor-parallel load whose
-        /// chosen MoE path cannot apply a layer's per-expert NVFP4 scales. The opt-in
-        /// above is only honest while this holds. Per-expert scales are VECTOR sidecars,
-        /// which the load-time sidecar gate (scalar .scale only) never sees, so without
-        /// this a GGUF whose only NVFP4 tensors are the routed experts would load and
-        /// generate garbage.
-        /// </summary>
-        private void EnsureNemotronTpAppliesExpertScales()
-        {
-            if (!UsesExpertParallelMoE)
-                return;
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                if (_layerTypes[l] == LayerType.FFN && HasExpertUpScale(l))
-                    throw new NotSupportedException(
-                        $"Nemotron TP: MoE layer {l} carries per-expert NVFP4 up-projection scales, which must be " +
-                        "applied before the ReLU^2 activation, and the expert-parallel MoE kernel has no " +
-                        "pre-activation scale hook. Run without --tp, or use a GGUF whose expert scales are " +
-                        "folded into the quantized blocks.");
-            }
-        }
 
         // ====================================================================
         // TP constraint validation
@@ -280,7 +255,8 @@ namespace TensorSharp.Models
 
                 // Router weight: replicated (stays in _weights)
 
-                for (int e = 0; e < _numExperts; e++)
+                // Bolt gives each block its own expert count.
+                for (int e = 0; e < _numExpertsPerLayer[layer]; e++)
                 {
                     ShardNemotronExpertColumnParallel(prefix + $"ffn_up_exps.{e}.weight");
                     ShardNemotronExpertRowParallel(prefix + $"ffn_down_exps.{e}.weight");
@@ -348,6 +324,12 @@ namespace TensorSharp.Models
 
             if (_quantWeights.TryGetValue(weightName, out var qw))
             {
+                // A remainder would be silently dropped: every rank must own the same
+                // whole number of the expert's output rows.
+                if (qw.Ne1 % globalTp != 0)
+                    throw new InvalidOperationException(
+                        $"Nemotron TP: expert weight '{weightName}' has {qw.Ne1} output rows, not divisible by " +
+                        $"{globalTp} ranks. Use a TP degree that divides the expert width, or run without --tp.");
                 long rowsPerShard = qw.Ne1 / globalTp;
                 long rowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
                 long bytesPerShard = rowsPerShard * rowBytes;
@@ -370,6 +352,9 @@ namespace TensorSharp.Models
             }
             else if (_weights.TryGetValue(weightName, out var w))
             {
+                if (w.Sizes[0] % globalTp != 0)
+                    throw new InvalidOperationException(
+                        $"Nemotron TP: expert weight '{weightName}' has {w.Sizes[0]} output rows, not divisible by {globalTp} ranks.");
                 long shardSize = w.Sizes[0] / globalTp;
                 var shards = new Tensor[tp];
                 for (int r = 0; r < tp; r++)
@@ -398,6 +383,14 @@ namespace TensorSharp.Models
                 long blockSize = GgufFile.GetBlockSize(type);
                 long typeSize = GgufFile.GetTypeSize(type);
                 long blocksPerRow = qw.Ne0 / blockSize;
+                // The row-parallel split cuts each row between quant blocks. Bolt's IQ2_XXS
+                // blocks are 256 wide, so an expert width of 1536 is 6 blocks: fine for 2
+                // ranks, not for 4. A remainder would silently drop the tail blocks.
+                if (qw.Ne0 % blockSize != 0 || blocksPerRow % globalTp != 0)
+                    throw new InvalidOperationException(
+                        $"Nemotron TP: expert weight '{weightName}' is {qw.Ne0} wide ({blocksPerRow} blocks of {blockSize} " +
+                        $"in {type}), which {globalTp} ranks cannot split between quant blocks. Use a TP degree that " +
+                        "divides the block count, or run without --tp.");
                 long blocksPerShard = blocksPerRow / globalTp;
                 long ne0PerShard = blocksPerShard * blockSize;
                 long srcRowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
@@ -434,6 +427,9 @@ namespace TensorSharp.Models
             }
             else if (_weights.TryGetValue(weightName, out var w))
             {
+                if (w.Sizes[1] % globalTp != 0)
+                    throw new InvalidOperationException(
+                        $"Nemotron TP: expert weight '{weightName}' is {w.Sizes[1]} wide, not divisible by {globalTp} ranks.");
                 long shardSize = w.Sizes[1] / globalTp;
                 var shards = new Tensor[tp];
                 for (int r = 0; r < tp; r++)
@@ -592,6 +588,17 @@ namespace TensorSharp.Models
             Tensor hidden0 = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t1;
 
+            // Across nodes only the driver encoded the image/audio: a worker's embedding
+            // of the same placeholder tokens is the plain token embedding. Decided from
+            // the tokens alone, which every node sees, so the nodes always agree on
+            // whether to take part in the sync below.
+            bool syncEmbeddingAcrossNodes = TpNodeCount > 1 && ContainsMultimodalPlaceholder(tokens);
+            if (TpNodeCount > 1 && !syncEmbeddingAcrossNodes
+                && (_pendingVisionEmbeddings.Count > 0 || _pendingAudioEmbeddings.Count > 0))
+                throw new InvalidOperationException(
+                    "Nemotron TP across nodes: multimodal embeddings are pending for a forward with no <image> or " +
+                    "<so_embedding> placeholder token, so the worker nodes could not tell to receive them.");
+
             // Inject pending multimodal (vision/audio) embeddings on rank 0 before
             // broadcasting (mirrors the non-TP ForwardCore). Without this, image/
             // audio input is silently dropped under TP.
@@ -610,6 +617,9 @@ namespace TensorSharp.Models
                 }
                 _pendingAudioEmbeddings.Clear();
             }
+
+            if (syncEmbeddingAcrossNodes)
+                hidden0 = SyncDriverEmbeddingAcrossNodes(hidden0);
 
             // Broadcast embedding to all GPUs.
             Tensor[] hidden = BroadcastTensorToAllRanks(hidden0);
@@ -666,6 +676,52 @@ namespace TensorSharp.Models
             _forwardCount++;
             _forwardSw.Stop();
             return _logitsBuffer;
+        }
+
+        private int _imagePlaceholderTokenId = int.MinValue;
+        private int _audioPlaceholderTokenId = int.MinValue;
+
+        /// <summary>Whether <paramref name="tokens"/> holds a placeholder the multimodal
+        /// injector replaces with encoder output (<c>&lt;image&gt;</c>, <c>&lt;so_embedding&gt;</c>).</summary>
+        private bool ContainsMultimodalPlaceholder(int[] tokens)
+        {
+            if (_imagePlaceholderTokenId == int.MinValue)
+            {
+                _imagePlaceholderTokenId = Tokenizer?.LookupToken("<image>") ?? -1;
+                _audioPlaceholderTokenId = Tokenizer?.LookupToken("<so_embedding>") ?? -1;
+            }
+            foreach (int t in tokens)
+                if ((t == _imagePlaceholderTokenId && t >= 0) || (t == _audioPlaceholderTokenId && t >= 0))
+                    return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Give every node the driver's embedding rows. The driver (global rank 0)
+        /// contributes its rows - with the encoded image/audio injected - and every other
+        /// rank contributes zeros, so the AllReduce sum is the driver's tensor on every
+        /// rank. One extra collective of [seqLen, hidden], only for a forward that holds
+        /// a multimodal placeholder.
+        /// </summary>
+        private Tensor SyncDriverEmbeddingAcrossNodes(Tensor hidden0)
+        {
+            int tp = TpDegree;
+            var parts = new Tensor[tp];
+            parts[0] = hidden0;
+            if (TpRankOffset != 0)
+                Ops.Fill(hidden0, 0f);
+            for (int r = 1; r < tp; r++)
+            {
+                parts[r] = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, hidden0.Sizes);
+                Ops.Fill(parts[r], 0f);
+            }
+            _tpGroup.AllReduce(parts);
+            // The cross-node reduce writes the sum back through the host copy; make the
+            // device copy current before any kernel reads it.
+            hidden0.EnsureDeviceCurrent();
+            for (int r = 1; r < tp; r++)
+                parts[r].Dispose();
+            return hidden0;
         }
 
         // ====================================================================
@@ -874,8 +930,12 @@ namespace TensorSharp.Models
 
             // Latent-in projection (replicated): when present, experts operate in
             // latent space and the accumulated result is projected back to hidden
-            // size via ffn_latent_out after the AllReduce.
+            // size via ffn_latent_out after the AllReduce. Computed once on rank 0;
+            // every rank's kernel reads it (on GGML that is the same host buffer).
             Tensor latentIn = hasLatent ? LinearForward(normed[0], prefix + "ffn_latent_in.weight") : null;
+            var expertInputs = new Tensor[tp];
+            for (int r = 0; r < tp; r++)
+                expertInputs[r] = hasLatent ? ReplicateTensorToRank(latentIn, r) : normed[r];
 
             // 2. Router (replicated — identical routing on every rank): computed
             //    ONCE on rank 0 where the unsharded router weight lives, through the
@@ -919,7 +979,7 @@ namespace TensorSharp.Models
             //    top-6 x 2 ranks that is 288 synchronous device round trips per token,
             //    which is what pinned both GPUs at 10-20% utilisation during decode.
             Tensor[] results =
-                TryNemotronMoEExpertParallel(layer, seqLen, expertOutDim, normed,
+                TryNemotronMoEExpertParallel(layer, seqLen, expertOutDim, expertInputs,
                     selectedExperts, routeWeightsAll)
                 ?? TryTpMoeBatchedExpertDecode(
                     layer, seqLen, expertOutDim, hasLatent, latentIn, normed,
@@ -959,7 +1019,7 @@ namespace TensorSharp.Models
                 _tpGroup.RunPerRank(r =>
                 {
                     var alloc = _tpGroup.GetAllocator(r);
-                    Tensor expertInput = hasLatent ? latentIn : normed[r];
+                    Tensor expertInput = expertInputs[r];
                     int expertInDim = (int)expertInput.Sizes[1];
                     long inRowBytes = (long)expertInDim * sizeof(float);
 
@@ -1019,6 +1079,8 @@ namespace TensorSharp.Models
                 });
             }
 
+            for (int r = 1; r < tp; r++)
+                if (hasLatent && !ReferenceEquals(expertInputs[r], latentIn)) expertInputs[r].Dispose();
             latentIn?.Dispose();
 
             // 3. AllReduce the expert accumulation across ranks.
@@ -1119,10 +1181,11 @@ namespace TensorSharp.Models
                 if (_layerTypes[l] != LayerType.FFN)
                     continue;
 
-                var up = new QuantizedWeight[_numExperts][];
-                var down = new QuantizedWeight[_numExperts][];
-                bool ok = true;
-                for (int e = 0; e < _numExperts; e++)
+                int layerExperts = _numExpertsPerLayer[l];
+                var up = new QuantizedWeight[layerExperts][];
+                var down = new QuantizedWeight[layerExperts][];
+                bool ok = layerExperts > 0;
+                for (int e = 0; e < layerExperts; e++)
                 {
                     if (!_tpQuantWeights.TryGetValue($"blk.{l}.ffn_up_exps.{e}.weight", out up[e])
                         || !_tpQuantWeights.TryGetValue($"blk.{l}.ffn_down_exps.{e}.weight", out down[e])
@@ -1144,6 +1207,7 @@ namespace TensorSharp.Models
             if (ready == 0)
                 return;
 
+            // _numExpertsUsed is the largest top-k of any layer (InitPerLayerMoEConfig).
             _tpMoeUpPtrs = new IntPtr[tp][];
             _tpMoeDownPtrs = new IntPtr[tp][];
             _tpMoeUpScales = new float[tp][];

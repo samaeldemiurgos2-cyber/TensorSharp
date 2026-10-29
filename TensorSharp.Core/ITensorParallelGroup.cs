@@ -108,4 +108,19 @@ namespace TensorSharp
         /// </summary>
         void CrossNodeAllReduce(float[] buffer, int count);
     }
+
+    /// <summary>
+    /// Raw host-byte movement between the nodes of a multi-node group, for state that
+    /// is copied rather than summed (KV snapshots): no device staging, no float encoding.
+    /// Every node must call each operation at the same point, like any collective.
+    /// </summary>
+    public interface ICrossNodeByteGroup
+    {
+        /// <summary>Node 0's <paramref name="buffer"/> replaces every other node's.</summary>
+        void CrossNodeBroadcastBytes(Span<byte> buffer);
+
+        /// <summary>Each node passes the bytes it owns and zeros elsewhere; node 0 ends
+        /// with their union (bitwise OR). Other nodes' buffers are left unchanged.</summary>
+        void CrossNodeGatherBytes(Span<byte> buffer);
+    }
 }

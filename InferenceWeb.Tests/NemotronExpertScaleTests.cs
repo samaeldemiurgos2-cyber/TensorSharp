@@ -294,7 +294,7 @@ public sealed class NemotronExpertScaleTests : IDisposable
     /// feeding both models the reference's greedy tokens and comparing every step's
     /// logits.
     /// </summary>
-    private static void AssertSameTrajectory(NemotronModel reference, NemotronModel model, float tolerance)
+    internal static void AssertSameTrajectory(NemotronModel reference, NemotronModel model, float tolerance)
         => AssertFollows(Trajectory(reference), model, tolerance);
 
     /// <summary>One step of the trajectory: its input tokens and the reference's logits.</summary>

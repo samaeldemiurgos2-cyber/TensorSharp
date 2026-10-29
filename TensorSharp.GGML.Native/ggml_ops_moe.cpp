@@ -451,6 +451,16 @@ namespace
         const float* up_bias = nullptr;
         const float* down_bias = nullptr;
 
+        // Optional f32 [seq_len, n_used] multiplier on the single expert projection of
+        // the ReLU-squared activation, applied to the matmul output BEFORE the
+        // activation (and before any bias). A quantized projection whose true weight
+        // is (blocks x scale) - NVFP4's scale2 - needs its scale here: relu^2(s*z) is
+        // s^2*relu^2(z), so deferring s into the routing weights squares a value 1/s
+        // too large, which overflows the activation's quantized copy for s ~1e-5.
+        // Per ROUTE rather than per expert so a caller can give a route it
+        // neutralises (weight 0) the scale of the expert it points that route at.
+        const float* route_up_scales = nullptr;
+
         // Muse Spark normalizes each scaled expert output before routing/sum.
         // This is not the post-aggregation norm used by Gemma's residual path.
         const float* post_expert_norm = nullptr;
@@ -763,6 +773,7 @@ namespace
         ggml_tensor* gate_bias_t = nullptr;
         ggml_tensor* up_bias_t = nullptr;
         ggml_tensor* down_bias_t = nullptr;
+        ggml_tensor* route_up_scale_t = nullptr;
         std::int64_t gate_bias_dim = 0;
         std::size_t hidden_bytes = 0;
         float* out_buffer_ptr = nullptr;
@@ -846,7 +857,7 @@ namespace
             // Large inputs and weights remain externally bound, not copied.
             for (auto* leaf : { b.hidden_t, b.gate_w, b.up_w, b.down_w, b.ids_t,
                     b.weights_t, b.gate_bias_t, b.up_bias_t, b.down_bias_t,
-                    b.post_norm_w_t, b.post_expert_norm_t })
+                    b.post_norm_w_t, b.post_expert_norm_t, b.route_up_scale_t })
                 if (leaf != nullptr) ggml_set_input(leaf);
             ggml_set_output(b.hidden_out_t);
             reused_scratch = alloc_spark_cpu_moe_scratch(cpu, graph);
@@ -866,6 +877,10 @@ namespace
         ggml_backend_tensor_set(b.weights_t, p.routing_weights, 0,
             static_cast<std::size_t>(p.seq_len) *
             static_cast<std::size_t>(p.n_used) * sizeof(float));
+        if (b.route_up_scale_t != nullptr)
+            ggml_backend_tensor_set(b.route_up_scale_t, p.route_up_scales, 0,
+                static_cast<std::size_t>(p.seq_len) *
+                static_cast<std::size_t>(p.n_used) * sizeof(float));
 
         if (b.post_expert_norm_t != nullptr)
             ggml_backend_tensor_set(b.post_expert_norm_t, p.post_expert_norm, 0,
@@ -1115,6 +1130,17 @@ namespace
         ggml_tensor* weights_t = ggml_new_tensor_3d(
             ctx, GGML_TYPE_F32, 1, n_used, seq_len);
 
+        // Optional per-route pre-activation scale, same [1, n_used, seq_len] shape
+        // (see MoEFFNGraphParams::route_up_scales). Only the single-projection
+        // activation defines which projection it scales.
+        if (p.route_up_scales != nullptr && !single_projection_activation)
+        {
+            set_last_error("MoE prefill: route_up_scales is only defined for the single-projection ReLU-squared activation.");
+            return 0;
+        }
+        ggml_tensor* route_up_scale_t = p.route_up_scales != nullptr
+            ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, seq_len) : nullptr;
+
         // Optional per-expert biases. ggml_add_id consumes a 2D [bias_dim, num_experts]
         // f32 tensor and adds bias[:, ids[u, t]] to result[:, u, t].
         if (p.post_expert_norm != nullptr &&
@@ -1167,7 +1193,7 @@ namespace
         // hundred KB at most. The hidden input is not pinned: it can be tokens x
         // hidden large, and every kernel that reads it (the expert matmuls)
         // quantizes or gathers it before writing anything.
-        for (ggml_tensor* uploaded : { ids_t, weights_t, gate_bias_t, up_bias_t, down_bias_t, post_norm_w_t, post_expert_norm_t })
+        for (ggml_tensor* uploaded : { ids_t, weights_t, gate_bias_t, up_bias_t, down_bias_t, post_norm_w_t, post_expert_norm_t, route_up_scale_t })
         {
             if (uploaded != nullptr)
             {
@@ -1196,6 +1222,16 @@ namespace
             {
                 set_last_error("MoE prefill: ggml_mul_mat_id(up) failed.");
                 return 0;
+            }
+            if (route_up_scale_t != nullptr)
+            {
+                // [n_ff, n_used, seq_len] x [1, n_used, seq_len]: one scalar per route.
+                gate_proj = ggml_mul(ctx, gate_proj, route_up_scale_t);
+                if (gate_proj == nullptr)
+                {
+                    set_last_error("MoE prefill: route up-scale multiply failed.");
+                    return 0;
+                }
             }
             if (gate_bias_t != nullptr)
             {
@@ -1458,6 +1494,7 @@ namespace
             b.gate_bias_t = gate_bias_t;
             b.up_bias_t = up_bias_t;
             b.down_bias_t = down_bias_t;
+            b.route_up_scale_t = route_up_scale_t;
             b.gate_bias_dim = gate_bias_dim;
             b.hidden_bytes = hidden_bytes;
             b.out_buffer_ptr = residual_mode ? residual_in_out : hidden_out;
@@ -1630,6 +1667,10 @@ namespace
         ggml_backend_tensor_set(weights_t, routing_weights, 0,
             static_cast<std::size_t>(seq_len) *
             static_cast<std::size_t>(n_used) * sizeof(float));
+        if (route_up_scale_t != nullptr)
+            ggml_backend_tensor_set(route_up_scale_t, p.route_up_scales, 0,
+                static_cast<std::size_t>(seq_len) *
+                static_cast<std::size_t>(n_used) * sizeof(float));
 
         // Per-expert biases: small (n_experts × ffn_dim or hidden_dim × 4 bytes).
         // Upload directly from the caller's host arrays each call.
@@ -1725,9 +1766,11 @@ namespace
         float oai_limit,
         int run_on_cpu,
         const float* post_expert_norm = nullptr,
-        float post_expert_norm_eps = 1e-8f)
+        float post_expert_norm_eps = 1e-8f,
+        const float* route_up_scales = nullptr)
     {
         MoEFFNGraphParams p;
+        p.route_up_scales = route_up_scales;
         p.post_expert_norm = post_expert_norm;
         p.post_expert_norm_eps = post_expert_norm_eps;
         p.hidden_in = hidden_in;
@@ -2488,6 +2531,41 @@ extern "C"
         }
         catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
         catch (...) { set_last_error("Unknown error in Muse Spark MoE."); return 0; }
+    }
+
+    // TSGgml_MoEFFNPrefillSwiGLUQuantF32 plus route_up_scales: f32 [seq_len, n_used],
+    // one multiplier per route on the single ReLU-squared projection, applied to the
+    // matmul output before the activation (MoEFFNGraphParams::route_up_scales).
+    // Nemotron's NVFP4 experts need it: their per-expert scale2 must be applied
+    // before the squaring. A separate ABI keeps every existing caller unchanged.
+    TSG_EXPORT int TSGgml_MoEFFNPrefillRouteScaledF32(
+        float* hidden_in, float* hidden_out, int seq_len, int hidden_dim, int n_ff,
+        int num_experts, int n_used, const std::int32_t* selected_experts, const float* routing_weights,
+        void* gate_data, int gate_type, std::int64_t gate_ne0, std::int64_t gate_ne1, std::int64_t gate_total_bytes,
+        void* up_data, int up_type, std::int64_t up_ne0, std::int64_t up_ne1, std::int64_t up_total_bytes,
+        void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_total_bytes,
+        const float* gate_bias, const float* up_bias, const float* down_bias,
+        int activation_type, float oai_alpha, float oai_limit, int run_on_cpu,
+        const float* route_up_scales)
+    {
+        try
+        {
+            if (route_up_scales == nullptr)
+            {
+                set_last_error("MoE prefill: route_up_scales is required by this entry point.");
+                return 0;
+            }
+            return moe_ffn_prefill_swiglu_quant_f32_impl(
+                hidden_in, hidden_out, seq_len, hidden_dim, n_ff,
+                num_experts, n_used, selected_experts, routing_weights,
+                gate_data, gate_type, gate_ne0, gate_ne1, gate_total_bytes,
+                up_data, up_type, up_ne0, up_ne1, up_total_bytes,
+                down_data, down_type, down_ne0, down_ne1, down_total_bytes,
+                gate_bias, up_bias, down_bias, activation_type, oai_alpha, oai_limit,
+                run_on_cpu, nullptr, 1e-8f, route_up_scales);
+        }
+        catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+        catch (...) { set_last_error("Unknown error in route-scaled MoE prefill."); return 0; }
     }
 
     // Gemma 4 MoE residual-fused GEGLU kernel.
