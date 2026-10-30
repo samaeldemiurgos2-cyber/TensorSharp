@@ -33,9 +33,22 @@ public sealed class TextLoraModelParityTests : IDisposable
 {
     private const int Layers = 2;
     private readonly string _dir = Directory.CreateTempSubdirectory("ts-lora-parity-").FullName;
+    private readonly KvCacheDtype _restoreKvDtype = KvCacheDtypeConfig.Current;
+    private readonly bool _restoreKvExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+
+    // The adapter and its merged twin are compared through the same K/V cache: F32, pinned. Left to
+    // the model-aligned default, the cache dtype came from the run's history, not the row. That
+    // default is process-wide and only ever raised (KvCacheDtypeConfig.ApplyModelDtypeDefault): the
+    // first model with sub-F32 weights sets F16 and nothing sets it back. So the all-F32 rows ran
+    // with an F16 cache after any F16-layer row or quantized model, and two F16-rounded caches whose
+    // F32 inputs differ by rounding put LoRA-vs-merged at 1.2e-5..2.5e-5 on direct cuda (6e-7..1.1e-6
+    // with an F32 cache). Run first in a process, an F16-projection Nemotron row instead built its
+    // F32-weight twin with an F32 cache and its base with F16, 2.7e-4 apart on managed cpu.
+    public TextLoraModelParityTests() => KvCacheDtypeConfig.Set(KvCacheDtype.F32);
 
     public void Dispose()
     {
+        KvCacheDtypeConfig.RestoreForTests(_restoreKvDtype, _restoreKvExplicit);
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
     }
 

@@ -191,10 +191,11 @@ public class CudaBackendTests
                         expected += l * rr;
                     }
 
-                    // The handle allows tensor-op (TF32) SGEMM: 64 products of unit-scale values
-                    // round to ~5e-4, and cuBLAS 13's kernels landed at 5.1e-4 where cuBLAS 12's
-                    // stayed under it. A transposed-operand bug is off by O(1).
-                    Assert.InRange(MathF.Abs(expected - actual[(b * rows + r) * cols + c]), 0.0f, 1e-3f);
+                    // F32 operands (the default-math handle, CudaCublasHandle.Create): 9.5e-7 against
+                    // this float reference on sm_86 with cuBLAS 13.8. Under the old tensor-op handle
+                    // cuBLAS 13 rounded this shape's operands to half on some GPUs (5.1e-4), which the
+                    // bound widened to 1e-3 to absorb. A transposed-operand bug is off by O(1).
+                    Assert.InRange(MathF.Abs(expected - actual[(b * rows + r) * cols + c]), 0.0f, 1e-5f);
                 }
             }
         }

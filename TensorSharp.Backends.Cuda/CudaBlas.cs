@@ -3,9 +3,22 @@ using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
 {
+    /// <summary>
+    /// F32 <c>Ops.Addmm</c> / <c>Ops.AddmmBatch</c> on cuBLAS. <c>cublasSgemm</c> and
+    /// <c>cublasSgemmStridedBatched</c> take no compute type: their operands stay F32 because the
+    /// shared handle is in <c>CUBLAS_DEFAULT_MATH</c> (see <see cref="CudaCublasHandle.Create"/>).
+    /// ModelBase's F32 routers, LoRA deltas and every other <c>Ops.Addmm</c> on direct CUDA reach
+    /// cuBLAS here. A <paramref name="computeType"/> other than <see cref="Unnamed"/> runs the same
+    /// product through <c>cublasGemmEx</c> / <c>cublasGemmStridedBatchedEx</c> with that compute type
+    /// (<see cref="CudaHalfOperandGemm"/>: the sites that accept half operands, by name).
+    /// </summary>
     internal static class CudaBlas
     {
-        public static bool TryAddmm(Tensor result, float beta, Tensor src, float alpha, Tensor m1, Tensor m2)
+        /// <summary>No compute type named: <c>cublasSgemm</c>, F32 under the default-math handle.</summary>
+        internal const int Unnamed = -1;
+
+        public static bool TryAddmm(Tensor result, float beta, Tensor src, float alpha, Tensor m1, Tensor m2,
+            int computeType = Unnamed)
         {
             if (!TryGetCudaStorage(result, out CudaStorage resultStorage) ||
                 !TryGetCudaStorage(src, out CudaStorage srcStorage) ||
@@ -69,27 +82,44 @@ namespace TensorSharp.Cuda
             int ldb = shared;
             int ldc = cols;
 
-            CublasApi.cublasSgemm(
-                allocator.Blas.Handle,
-                transa,
-                CublasApi.CUBLAS_OP_N,
-                cols,
-                rows,
-                shared,
-                ref alpha,
-                aPtr,
-                lda,
-                bPtr,
-                ldb,
-                ref beta,
-                cPtr,
-                ldc).ThrowOnCublasError();
+            if (computeType == Unnamed)
+            {
+                CublasApi.cublasSgemm(
+                    allocator.Blas.Handle,
+                    transa,
+                    CublasApi.CUBLAS_OP_N,
+                    cols,
+                    rows,
+                    shared,
+                    ref alpha,
+                    aPtr,
+                    lda,
+                    bPtr,
+                    ldb,
+                    ref beta,
+                    cPtr,
+                    ldc).ThrowOnCublasError();
+            }
+            else
+            {
+                CublasApi.cublasGemmEx(
+                    allocator.Blas.Handle,
+                    transa, CublasApi.CUBLAS_OP_N,
+                    cols, rows, shared,
+                    ref alpha,
+                    aPtr, CublasApi.CUDA_R_32F, lda,
+                    bPtr, CublasApi.CUDA_R_32F, ldb,
+                    ref beta,
+                    cPtr, CublasApi.CUDA_R_32F, ldc,
+                    computeType, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            }
 
             resultStorage.MarkDeviceModified();
             return true;
         }
 
-        public static bool TryAddmmBatch(Tensor result, float beta, Tensor src, float alpha, Tensor m1, Tensor m2)
+        public static bool TryAddmmBatch(Tensor result, float beta, Tensor src, float alpha, Tensor m1, Tensor m2,
+            int computeType = Unnamed)
         {
             if (!TryGetCudaStorage(result, out CudaStorage resultStorage) ||
                 !TryGetCudaStorage(src, out CudaStorage srcStorage) ||
@@ -156,25 +186,42 @@ namespace TensorSharp.Cuda
             IntPtr bPtr = m1Storage.DevicePtrAtElement(m1.StorageOffset);
             IntPtr cPtr = resultStorage.DevicePtrAtElement(result.StorageOffset);
 
-            CublasApi.cublasSgemmStridedBatched(
-                allocator.Blas.Handle,
-                transa,
-                CublasApi.CUBLAS_OP_N,
-                cols,
-                rows,
-                shared,
-                ref alpha,
-                aPtr,
-                lda,
-                checked(m2.Strides[0]),
-                bPtr,
-                ldb,
-                checked(m1.Strides[0]),
-                ref beta,
-                cPtr,
-                ldc,
-                checked(result.Strides[0]),
-                batch).ThrowOnCublasError();
+            if (computeType == Unnamed)
+            {
+                CublasApi.cublasSgemmStridedBatched(
+                    allocator.Blas.Handle,
+                    transa,
+                    CublasApi.CUBLAS_OP_N,
+                    cols,
+                    rows,
+                    shared,
+                    ref alpha,
+                    aPtr,
+                    lda,
+                    checked(m2.Strides[0]),
+                    bPtr,
+                    ldb,
+                    checked(m1.Strides[0]),
+                    ref beta,
+                    cPtr,
+                    ldc,
+                    checked(result.Strides[0]),
+                    batch).ThrowOnCublasError();
+            }
+            else
+            {
+                CublasApi.cublasGemmStridedBatchedEx(
+                    allocator.Blas.Handle,
+                    transa, CublasApi.CUBLAS_OP_N,
+                    cols, rows, shared,
+                    ref alpha,
+                    aPtr, CublasApi.CUDA_R_32F, lda, checked(m2.Strides[0]),
+                    bPtr, CublasApi.CUDA_R_32F, ldb, checked(m1.Strides[0]),
+                    ref beta,
+                    cPtr, CublasApi.CUDA_R_32F, ldc, checked(result.Strides[0]),
+                    batch,
+                    computeType, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            }
 
             resultStorage.MarkDeviceModified();
             return true;

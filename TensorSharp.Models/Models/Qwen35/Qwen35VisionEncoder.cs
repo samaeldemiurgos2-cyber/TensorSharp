@@ -475,7 +475,10 @@ namespace TensorSharp.Models
             }
             int outDim = (int)weightView2D.Sizes[0];
             var result = new Tensor(_allocator, DType.Float32, numPatches, outDim);
-            Ops.Addmm(result, 0, result, 1.0f, im2col, weightT);
+            // The vision tower's GEMMs (patch embedding, LinearForwardWithBias, attention) take half operands
+            // by name on direct CUDA (HalfOperandGemm), as ggml runs an F16 mmproj: exact F32 is 2.8x on
+            // the projections.
+            HalfOperandGemm.Addmm(result, 0, result, 1.0f, im2col, weightT);
             im2col.Dispose();
 
             if (_weights.TryGetValue(biasName, out var bias))
@@ -1169,11 +1172,11 @@ namespace TensorSharp.Models
             if (chunkSize >= numPatches)
             {
                 var scores = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, numPatches);
-                Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
+                HalfOperandGemm.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
                 Ops.Softmax(scores, scores);
 
                 var attnOutput = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, headDim);
-                Ops.AddmmBatch(attnOutput, 0, attnOutput, 1.0f, scores, vHeads);
+                HalfOperandGemm.AddmmBatch(attnOutput, 0, attnOutput, 1.0f, scores, vHeads);
                 scores.Dispose();
 
                 using var transposed = attnOutput.Transpose(0, 1);
@@ -1199,11 +1202,11 @@ namespace TensorSharp.Models
                     using var qChunkContig = Ops.NewContiguous(qChunkView);
 
                     using var scoresChunk = new Tensor(_allocator, DType.Float32, _numHeads, qLen, numPatches);
-                    Ops.AddmmBatch(scoresChunk, 0, scoresChunk, scale, qChunkContig, kT);
+                    HalfOperandGemm.AddmmBatch(scoresChunk, 0, scoresChunk, scale, qChunkContig, kT);
                     Ops.Softmax(scoresChunk, scoresChunk);
 
                     using var outChunkHeadFirst = new Tensor(_allocator, DType.Float32, _numHeads, qLen, headDim);
-                    Ops.AddmmBatch(outChunkHeadFirst, 0, outChunkHeadFirst, 1.0f, scoresChunk, vHeads);
+                    HalfOperandGemm.AddmmBatch(outChunkHeadFirst, 0, outChunkHeadFirst, 1.0f, scoresChunk, vHeads);
 
                     using var outChunkSeqMajor = outChunkHeadFirst.Transpose(0, 1);
                     using var outChunkContig = Ops.NewContiguous(outChunkSeqMajor);
@@ -1336,7 +1339,7 @@ namespace TensorSharp.Models
             Tensor contiguousInput = input.IsContiguous() ? null : Ops.NewContiguous(input);
             Tensor src = contiguousInput ?? input;
 
-            Ops.Addmm(result, 0, result, 1.0f, src, weightT);
+            HalfOperandGemm.Addmm(result, 0, result, 1.0f, src, weightT);
 
             contiguousInput?.Dispose();
 

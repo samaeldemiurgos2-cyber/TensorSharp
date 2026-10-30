@@ -243,12 +243,27 @@ namespace TensorSharp.Cuda
         /// cuBLAS, for operands already in <paramref name="wType"/>/<paramref name="aType"/>
         /// device layout. F32 accumulate, F32 output.
         /// </summary>
+        /// <remarks>
+        /// F32 operands compute as F32 by name (<c>CUBLAS_COMPUTE_32F_PEDANTIC</c>), not by the handle's
+        /// math mode. The F32 weights here are the small dense tensors whose outputs pick things:
+        /// every engine's <c>MatMulF32</c> past its GEMV rows (MoE routers, DeepSeek V4's
+        /// hyper-connection mixers, Qwen3.8's GDN gates and indexer projections, GLM's indexer head
+        /// weights) and F32 <c>QuantizedWeight</c>s. Rounded operands moved DeepSeek V4's routing; the
+        /// TensorSharp-owned ggml path pins the same compute type (ggml_ops_matmul_precision.cu). Its
+        /// cost against <c>CUBLAS_COMPUTE_32F</c> under the default mode depends on the GPU: 0.90-1.00x on
+        /// an RTX 3080 Laptop, 1.05-1.11x on an A40 at the engines' 512-row shapes (under 0.5 ms per
+        /// 512-row prefill). 16-bit operands (F16/BF16 weights, and activations this
+        /// file converts on purpose) keep <c>CUBLAS_COMPUTE_32F</c>: tensor cores, F32 accumulation.
+        /// </remarks>
         private static void RunGemm(
             CudaAllocator allocator, IntPtr weightPtr, int wType, IntPtr aPtr, int aType,
             IntPtr resultPtr, int inDim, int outDim, int rows)
         {
             allocator.Blas.SetStream(allocator.Stream.Handle);
             float alpha = 1.0f, beta = 0.0f;
+            int computeType = wType == CublasApi.CUDA_R_32F || aType == CublasApi.CUDA_R_32F
+                ? CublasApi.CUBLAS_COMPUTE_32F_PEDANTIC
+                : CublasApi.CUBLAS_COMPUTE_32F;
             CublasApi.cublasGemmEx(
                 allocator.Blas.Handle,
                 CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
@@ -258,7 +273,7 @@ namespace TensorSharp.Cuda
                 aPtr, aType, inDim,
                 ref beta,
                 resultPtr, CublasApi.CUDA_R_32F, outDim,
-                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+                computeType, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
         }
 
         private static void RunF16Gemm(

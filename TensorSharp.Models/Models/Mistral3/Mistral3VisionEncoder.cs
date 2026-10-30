@@ -471,11 +471,14 @@ namespace TensorSharp.Models
 
             using var kT = kHeads.Transpose(1, 2);
             var scores = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, numPatches);
-            Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
+            // The vision tower's GEMMs (these two and LinearForward's) take half operands by name on direct
+            // CUDA (HalfOperandGemm), as ggml runs an F16 mmproj: exact F32 is 2.6x per image (5400 patches:
+            // +0.8 s on an RTX 3080 Laptop), 3.7x for this P x V.
+            HalfOperandGemm.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
             Ops.Softmax(scores, scores);
 
             var attnOutput = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, _headDim);
-            Ops.AddmmBatch(attnOutput, 0, attnOutput, 1.0f, scores, vHeads);
+            HalfOperandGemm.AddmmBatch(attnOutput, 0, attnOutput, 1.0f, scores, vHeads);
             scores.Dispose();
 
             using var transposed = attnOutput.Transpose(0, 1);
@@ -627,7 +630,7 @@ namespace TensorSharp.Models
 
             Tensor contiguousInput = input.IsContiguous() ? null : Ops.NewContiguous(input);
             Tensor src = contiguousInput ?? input;
-            Ops.Addmm(result, 0, result, 1.0f, src, GetOrCreateTransposedWeight(weightName));
+            HalfOperandGemm.Addmm(result, 0, result, 1.0f, src, GetOrCreateTransposedWeight(weightName));
 
             contiguousInput?.Dispose();
             return result;

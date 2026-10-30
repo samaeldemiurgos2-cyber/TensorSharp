@@ -581,7 +581,7 @@ TensorSharp 采用分层系统结构：
 
 4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps` / `GgmlOps.dll`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Windows/Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。除原生量化 matmul（Q4_K_M、Q8_0 等，无需反量化到 FP32）外，还提供分页注意力（`TSGgml_PagedAttentionForward`，含 / 不含注意力 sinks 两种版本）以及架构特定的批处理内核（Mamba2、GatedDeltaNet）。
 
-5. **TensorSharp.Backends.Cuda** 是 Direct CUDA 路径。它使用 CUDA Driver API 管理设备、上下文与存储，用 cuBLAS 执行 Float32 GEMM，用 PTX 内核覆盖热点标量与 Transformer 辅助算子，并对尚未实现的原生内核使用 CPU 回退。
+5. **TensorSharp.Backends.Cuda** 是 Direct CUDA 路径。它使用 CUDA Driver API 管理设备、上下文与存储，用 cuBLAS 执行 Float32 GEMM，用 PTX 内核覆盖热点标量与 Transformer 辅助算子，并对尚未实现的原生内核使用 CPU 回退。Float32 GEMM 在任何形状与行数下都保持 Float32 操作数，除非调用点显式声明近似：共享 cuBLAS 句柄保持 `CUBLAS_DEFAULT_MATH`，各引擎的 F32 投影（router、hyper-connection 混合矩阵、门控）显式使用 `CUBLAS_COMPUTE_32F_PEDANTIC`。近似计算只由调用点显式选择并注明原因：TF32 用于 embedding 编码器的 TF32 策略与 MiniMax-H3 的大型映射稠密 GEMM；半精度操作数（经 `CudaHalfOperandGemm` 使用 `CUBLAS_COMPUTE_32F_FAST_16F`）用于 ggml 同样以半精度操作数运行的大批量注意力、视觉编码器与 VAE GEMM。决定专家选择或门控的计算两者都不使用。F16/BF16 操作数的 GEMM 使用张量核心并以 F32 累加。
 
 6. **TensorSharp.Backends.MLX** 是 Apple Silicon 上的 MLX 路径。它封装 [mlx-c](https://github.com/ml-explore/mlx-c)（`libmlxc`），提供分配器、存储、异步 worker 派发、量化 / 融合 / 编译内核、MoE 专家 offload，以及对未实现算子的 CPU 回退层。
 
