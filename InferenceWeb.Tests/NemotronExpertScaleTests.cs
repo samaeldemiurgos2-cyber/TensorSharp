@@ -240,29 +240,46 @@ public sealed class NemotronExpertScaleTests : IDisposable
     }
 
     [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
-    [InlineData(false, true, false)]
-    [InlineData(true, true, false)]
-    [InlineData(false, false, false)]
-    [InlineData(false, true, true)]
-    [InlineData(true, true, true)]
-    [InlineData(false, false, true)]
-    public void GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin(bool latent, bool expertUpScales, bool wide)
+    // Expert parallelism: top-3 of 8 experts, so each rank's 4 whole experts can hold a token's routes.
+    [InlineData(false, true, false, true)]
+    [InlineData(true, true, false, true)]
+    [InlineData(false, false, false, true)]
+    [InlineData(false, true, true, true)]
+    [InlineData(true, true, true, true)]
+    [InlineData(false, false, true, true)]
+    // The per-expert split: top-5 of 8 is more routes than a rank's 4 experts, so expert parallelism declines.
+    [InlineData(false, true, false, false)]
+    [InlineData(true, true, false, false)]
+    [InlineData(false, true, true, false)]
+    [InlineData(true, true, true, false)]
+    public void GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin(bool latent, bool expertUpScales, bool wide, bool expertParallel)
     {
-        // The cpu seam above runs only the per-expert host loop. On the GGML backends
-        // --tp decodes a layer with up scales through TSGgml_MoEExpertsForwardF32 on
-        // each rank's shards (up scale before ReLU^2, down scale folded into the route
-        // weights), and a layer with a down scale alone through expert parallelism.
+        // The cpu seam above runs only the per-expert host loop. On the GGML backends --tp
+        // serves a MoE layer one of two ways, and both must apply the per-expert NVFP4
+        // scales: the down scale folded into the route weights, the up scale before ReLU^2.
+        // - Expert parallelism, when every rank owns a whole share of each layer's experts
+        //   and at least as many as a token routes to. Each rank runs its own experts through
+        //   TSGgml_MoEFFNPrefillRouteScaledF32, prefill and decode alike, with every route's
+        //   up scale (routeUpScales); a latent layer's experts read the latent projection.
+        //   A model with up scales, or a latent MoE, used to be kept off this path.
+        // - Otherwise the per-expert split: every rank holds a slice of every expert, decode
+        //   runs TSGgml_MoEExpertsForwardF32 on the rank's shards (up_scales) and prefill
+        //   the per-expert host loop.
         // One GPU runs this with GGML_CUDA_DEVICES=2. At the builder's widths (ExpertFf
-        // 64, LatentWidth 32) every rank's expert shard is under 4 KiB, which the native
+        // 64, LatentWidth 32) every rank's per-expert shard is under 4 KiB, which the native
         // binders upload through its cache key on every call: the batched expert decode
         // read the key's own memory as the weight (NaN from the first decode step, or an
         // access violation), and the one-device reference faulted reading released host
         // bytes (see GgmlCudaSingle_ScaledSidecarsMatchFoldedTwin). Wide (ExpertFf 128,
         // LatentWidth 96) puts every shard over 4 KiB, where the device cache serves it.
         int expertFf = wide ? 128 : 64, latentWidth = wide ? 96 : NemotronSyntheticModelBuilder.LatentDim;
-        var builder = new NemotronSyntheticModelBuilder { Latent = latent, LatentWidth = latentWidth, ExpertFf = expertFf };
+        int topK = expertParallel ? 3 : 5;
+        var builder = new NemotronSyntheticModelBuilder { Latent = latent, LatentWidth = latentWidth, ExpertFf = expertFf, TopK = topK };
         string scaled = Write("scaled.gguf", new NemotronSyntheticModelBuilder
-            { Latent = latent, LatentWidth = latentWidth, ExpertFf = expertFf, Scaled = true, ExpertUpScales = expertUpScales });
+        {
+            Latent = latent, LatentWidth = latentWidth, ExpertFf = expertFf, TopK = topK,
+            Scaled = true, ExpertUpScales = expertUpScales,
+        });
         string twin = Write("twin.gguf", builder);
 
         // The TP degree is process-global native state that the last model loaded sets,
@@ -272,20 +289,32 @@ public sealed class NemotronExpertScaleTests : IDisposable
             expected = Trajectory(reference);
 
         using var tp = Assert.IsType<NemotronModel>(ModelBase.Create(scaled, BackendType.GgmlCuda, tpDegree: 2));
-        Assert.Equal(expertUpScales, Field<bool>(tp, "_tpMoeBatchedDecodeReady"));
-        Assert.Equal(expertUpScales, Field<object>(tp, "_tpStackedUp") == null);
+        int[] moeLayers = Enumerable.Range(0, builder.Layout.Length).Where(l => builder.Layout[l] == 'M').ToArray();
+
+        // The experts carry an up scale on every MoE layer, or (down scale only) on none:
+        // an up-scale row cannot match the twin below by having no up scale to apply.
+        float[][] upScales = Field<float[][]>(tp, "_layerExpertUpScale");
+        Assert.All(moeLayers, l => Assert.Equal(expertUpScales, upScales[l] != null));
+
+        // Which path serves the layers. Expert parallelism builds only the stacked shards;
+        // the per-expert split builds the shards the batched decode runs on.
+        Assert.True(expertParallel == (Field<object>(tp, "_tpStackedUp") != null),
+            expertParallel
+                ? "expert parallelism declined this model, so its up-scale path went untested"
+                : "expert parallelism took a top-5-of-8 model; these rows need another way to reach the per-expert split");
+        Assert.Equal(!expertParallel, Field<bool>(tp, "_tpMoeBatchedDecodeReady"));
+
         // The per-expert split matches one device exactly here; expert parallelism's
         // ggml_mul_mat_id sums in another order (up to ~0.02). A missing or misplaced
         // expert scale moves the logits by whole units.
         AssertFollows(expected, tp, 5e-2f);
 
-        // With up scales (on every MoE layer) the batched kernel must have run on each MoE
-        // layer at every single-token step: a decline to the per-expert loop still matches
-        // the twin, and only this count tells the two apart. With a down scale alone
-        // expert parallelism serves decode and the batched path never runs.
-        int moeLayers = builder.Layout.Count(kind => kind == 'M');
+        // On the per-expert split the batched kernel must have run on each MoE layer at
+        // every single-token step: a decline to the per-expert loop still matches the
+        // twin, and only this count tells the two apart. Under expert parallelism the
+        // expert-parallel kernel serves decode too, and the batched path never runs.
         int decodeSteps = expected.Count(step => step.Tokens.Length == 1);
-        Assert.Equal(expertUpScales ? (long)moeLayers * decodeSteps : 0L, tp.TpMoeBatchedDecodeCallCount);
+        Assert.Equal(expertParallel ? 0L : (long)moeLayers.Length * decodeSteps, tp.TpMoeBatchedDecodeCallCount);
     }
 
     /// <summary>

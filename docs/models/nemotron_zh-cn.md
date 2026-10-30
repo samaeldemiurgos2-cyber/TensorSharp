@@ -90,32 +90,40 @@ mmproj。支持的来龙去脉与验证情况见[设计说明](../design/nemotro
 - **Super VL** 在 `--tp 2` 下两个文件都会被接受。NVFP4 文件过去会被拒绝，因为 TP 不应用它的 `.scale`
   sidecar；Q4_0 文件没有 sidecar，从未被拒绝。TP 现在会应用 NVFP4 scale：逐张量的 `.scale`、
   折叠进路由权重的逐 expert down scale，以及在 ReLU^2 之前应用的逐 expert up scale。
-  - 它的 MoE 走逐 expert 的行切分，不走 expert parallelism，因为 latent MoE 不使用 expert parallelism。
+  - 在 GGML 后端上它的 MoE 应当走 expert parallelism：按加载时的规则，每个 rank 持有 512 个 expert 中的 256 个，
+    expert 读取 latent 投影，`TSGgml_MoEFFNPrefillRouteScaledF32` 在 ReLU^2 之前为每条路由应用 up scale。这是从
+    代码推出的，还没有用真实文件加载确认过；加载时的提示行会说明实际走了哪条路径。若模型的 expert 无法这样
+    切分（某层 expert 数不能被 TP 度整除，或每个 rank 的 expert 少于该层的 top-k），则回退到逐 expert 的行切分。
   - 行切分会拒绝无法按每 rank 整数个量化块切开的 expert 宽度。2688 在 `--tp 2` 下对 NVFP4（64 值一块）和
     Q4_0 都没问题。
-  - 这条路径只有合成测试覆盖（`NemotronExpertScaleTests`）。除 CPU 上的测试外，还有一个受门控的 `ggml_cuda`
-    `--tp 2` 测试（`GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin`），覆盖 TP 批量 expert decode（up scale
-    经 `TSGgml_MoEExpertsForwardF32` 在 ReLU^2 之前应用）和 expert-parallel 的 down scale 路径（仅非 latent 层）。它需要
+  - 这两条路径都只有合成测试覆盖（`NemotronExpertScaleTests`）。除 CPU 上的测试外，还有一个受门控的 `ggml_cuda`
+    `--tp 2` 测试（`GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin`），覆盖 expert parallelism（普通与 latent
+    expert，有无 up scale 都有），以及在 top-k 大于每个 rank 所持 expert 数时的逐 expert 切分，其批量 expert decode
+    经 `TSGgml_MoEExpertsForwardF32` 在 ReLU^2 之前应用 up scale。测试会检查每种情况实际走的是哪条路径。它需要
     `TS_TEST_GGML_BACKEND=cuda`，并且需要两张 GPU 或 `GGML_CUDA_DEVICES=2`（在一张 GPU
-    上模拟两个设备）；本地验证用的是模拟模式。Super VL 的真实 `--tp 2` 生成还没有在 GPU 上完整跑通过。
+    上模拟两个设备）；两种方式都已通过：在一张 RTX 3080 上模拟，以及在两张 A40 上。
+    Super VL 的真实 `--tp 2` 生成还没有在 GPU 上完整跑通过。
   - 切分并不均匀：除了一半的路由 expert，rank 0 还持有全部 Mamba2、latent、共享 expert、router 与 LM head 权重。
     NVFP4 文件放不进两张开启 ECC 的 A40（48 GB，每张 46,068 MiB，约 45.0 GiB 可用）：rank 0 在预加载权重时显存
     不足。按张量形状估算，rank 0 仅权重就约 41.8 GiB，只给 KV cache、工作区和加载时的其他分配留下约 3 GiB；
     rank 1 的权重约 29.8 GiB。关闭 ECC 时，48 GB 显卡（A40、RTX A6000 或 RTX 6000 Ada）报告约 49,140 MiB
     （约 48.0 GiB 可用），rank 0 会剩下约 6 GiB；这类显卡均未实测，能否放下未知。Q4_0 文件在 `--tp 2` 下能否
     放下尚未实测。
-- **Bolt** 在 `--tp` 下会被拒绝："Nemotron per-block MoE configuration (Nemotron Puzzle/Bolt) is not yet
-  supported under tensor parallelism."
+- **Bolt** 在 `--tp` 下不再被拒绝：每个 MoE 块使用自己的 expert 数和 top-k。只有当每个块的 expert 都能均分到各
+  rank、且每个 rank 至少持有该块 top-k 个 expert 时才走 expert parallelism，否则走逐 expert 的行切分，加载时的
+  提示行会说明走了哪条。目前没有记录到完成的 Bolt `--tp` 运行（见设计说明 G7）。
 
-**`--n-cpu-moe` / `--cpu-moe` 对这两个模型都节省不了显存。** Nemotron 的单设备 MoE 路径没有实现该卸载，也没有任何
-警告提示，而 CLI 和服务端仍会打印 "MoE CPU offload active"。
+**在单设备上，`--n-cpu-moe` / `--cpu-moe` 对这两个模型都节省不了显存。** Nemotron 的单设备 MoE 路径没有实现该
+卸载，也没有任何警告提示，而 CLI 和服务端仍会打印 "MoE CPU offload active"。
 - 在 `ggml_cuda` 上，所选层的 expert 只是跳过加载时上传，在 MoE kernel 首次使用时仍会上传。
 - 在 `cuda` 上，加载时会上传全部量化权重。
-- 在 `--tp` 下，只有 `ggml_cuda` 上的 expert-parallel MoE 会把 expert 留在主机端，而 latent MoE 从不使用
-  expert parallelism。
+- 在 `--tp` 下，只有 `ggml_cuda` 上的 expert-parallel MoE 会把 expert 留在主机端：它跳过所选层 expert 分片的
+  上传，在主机上计算这些 expert。自 PR #305 起这条路径也服务 latent MoE，因此现在两个模型都可能走它，但
+  `--n-cpu-moe` 配合 `--tp` 还没有在任一模型上运行过。
 
 因此 Super VL NVFP4 需要一块足够大的设备。在 `--tp 2` 下，它的 rank 0 需要一张可用显存多于开启 ECC 的 A40
-（约 45.0 GiB）的 GPU，而这样的配置尚未验证。Q4_0 文件在 `--tp 2` 下能否放下尚未实测。卸载无济于事。
+（约 45.0 GiB）的 GPU，而这样的配置尚未验证。Q4_0 文件在 `--tp 2` 下能否放下尚未实测。在单设备上卸载无济于
+事；在 `--tp 2` 下，`--n-cpu-moe` 可以把每个 rank 的部分 expert 留在主机端，但能否让 rank 0 放进 A40 尚未实测。
 
 ```bash
 hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --local-dir models

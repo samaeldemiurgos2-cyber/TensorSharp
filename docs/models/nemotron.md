@@ -100,16 +100,22 @@ support was added and what was validated.
   TP did not apply its `.scale` sidecars; the Q4_0 file has none and never was. TP now applies the
   NVFP4 scales: per-tensor `.scale`, the per-expert down scale folded into the routing weights, and
   the per-expert up scale before ReLU^2.
-  - Its MoE runs as a per-expert row split, not expert parallelism, which is not used for latent MoE.
-  - The split refuses an expert width that does not divide into whole quant blocks per rank. 2688 is
+  - On the GGML backends its MoE should run expert-parallel: by the load-time rule each rank owns
+    256 of the 512 experts, the experts read the latent projection, and
+    `TSGgml_MoEFFNPrefillRouteScaledF32` applies each route's up scale before ReLU^2. This is read
+    from the code; no load of the real file has confirmed it, and the load banner names the path a
+    load took. A model whose experts cannot be split that way (a layer's expert count not divisible
+    by the TP degree, or fewer experts per rank than its top-k) falls back to a per-expert row split.
+  - The row split refuses an expert width that does not divide into whole quant blocks per rank. 2688 is
     fine at `--tp 2` for NVFP4 (64-value blocks) and Q4_0.
-  - This path is covered by synthetic tests only (`NemotronExpertScaleTests`). Besides the CPU tests,
+  - Both paths are covered by synthetic tests only (`NemotronExpertScaleTests`). Besides the CPU tests,
     a gated `ggml_cuda` `--tp 2` test (`GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin`) runs
-    the TP batched expert decode, with the up scales applied before ReLU^2 through
-    `TSGgml_MoEExpertsForwardF32`, and the expert-parallel down-scale path (non-latent layers only).
-    It needs `TS_TEST_GGML_BACKEND=cuda` and either two GPUs or
-    `GGML_CUDA_DEVICES=2`, which emulates two devices on one GPU; the local validation used the
-    emulated mode. No real Super VL `--tp 2` generation has completed on GPUs.
+    expert parallelism (plain and latent experts, with and without up scales) and, at a top-k larger
+    than a rank's share of the experts, the per-expert split, whose batched expert decode applies the
+    up scales through `TSGgml_MoEExpertsForwardF32`. It checks which path served each case.
+    It needs `TS_TEST_GGML_BACKEND=cuda` and either two GPUs or `GGML_CUDA_DEVICES=2`, which
+    emulates two devices on one GPU. It has passed both ways: emulated on one RTX 3080 and on two
+    A40s. No real Super VL `--tp 2` generation has completed on GPUs.
   - The split is uneven: besides its half of the routed experts, rank 0 holds all of the Mamba2,
     latent, shared-expert, router and LM-head weights. The NVFP4 file does not fit two A40s with ECC
     enabled (48 GB, 46,068 MiB or about 45.0 GiB usable each): rank 0 ran out of memory while
@@ -119,21 +125,27 @@ support was added and what was validated.
     report about 49,140 MiB (about 48.0 GiB usable), which would leave rank 0 about 6 GiB. None has
     been measured, so whether the file fits there is unknown.
     The Q4_0 file's `--tp 2` fit has not been measured.
-- **Bolt** is refused under `--tp`: "Nemotron per-block MoE configuration (Nemotron Puzzle/Bolt) is not
-  yet supported under tensor parallelism."
+- **Bolt** is no longer refused under `--tp`: each MoE block's own expert count and top-k are used.
+  It runs expert-parallel only if every block's experts divide evenly over the ranks with at least
+  that block's top-k on each rank; otherwise it takes the per-expert row split, and the load banner
+  says which. No completed Bolt `--tp` run is recorded (design note, G7).
 
-**`--n-cpu-moe` / `--cpu-moe` save no VRAM for either model.** Nemotron's single-device MoE path does
-not implement the offload, and nothing warns about it. The CLI and server still log "MoE CPU offload
-active".
+**On one device, `--n-cpu-moe` / `--cpu-moe` save no VRAM for either model.** Nemotron's single-device
+MoE path does not implement the offload, and nothing warns about it. The CLI and server still log "MoE
+CPU offload active".
 - On `ggml_cuda`, the selected layers' experts skip the load-time upload but are uploaded when the MoE
   kernel first uses them.
 - On `cuda`, every quantized weight is uploaded at load.
-- Under `--tp`, only expert-parallel MoE on `ggml_cuda` keeps experts on the host, and expert
-  parallelism is never used for a latent MoE.
+- Under `--tp`, only expert-parallel MoE on `ggml_cuda` keeps experts on the host: it skips uploading
+  the selected layers' expert shards and multiplies those experts on the host. Since PR #305 that
+  path also serves latent MoE, so it can now serve both models, but `--n-cpu-moe` with `--tp` has not
+  been run on either.
 
 So Super VL NVFP4 needs one large device. Under `--tp 2`, its rank 0 needs a GPU with more usable
 memory than an A40 with ECC enabled (about 45.0 GiB), and no such setup has been validated. The Q4_0
-file's `--tp 2` fit has not been measured. Offload does not help.
+file's `--tp 2` fit has not been measured. On one device offload does not help. Under `--tp 2`,
+`--n-cpu-moe` could keep some of each rank's experts on the host, but whether that brings rank 0
+within an A40 is unmeasured.
 
 ```bash
 hf download nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --local-dir models

@@ -149,7 +149,8 @@ stacked expert tensor's last dim) and `_numExpertsUsedPerLayer[]` (from the `exp
 scalar fallback). `_numExperts`/`_numExpertsUsed` are grown to the observed maximum so every pre-allocated
 routing buffer still fits; `MoEForward` and `TryMoEPrefillBatchedByExpert` route against the per-layer
 counts. Uniform checkpoints are binary-identical to before (per-layer == global). Per-block under **tensor
-parallelism is rejected with a clear error** for now (the TP MoE paths are not per-layer aware yet).
+parallelism was at first rejected with a clear error** (the TP MoE paths were not per-layer aware); G7
+removed that refusal.
 
 Note: Bolt's experts are `IQ2_XXS` (type 16), so G2 (NVFP4 per-expert scale2) does **not** apply to Bolt --
 it only affects the 120B NVFP4 file.
@@ -171,10 +172,10 @@ treatment in `69201abb`.
 Lesson for the next shape review: "the managed routing data structures support N" is not the same as
 "every native kernel on the path supports N". Check the kernel's own argument validation.
 
-CPU offload does not cover these experts. 512 NVFP4 experts are about 1.6 GB per MoE layer
-(512 x 2 x 1024 x 2688 values at 36 bytes per 64), and Nemotron's single-device MoE path does not
-implement `--n-cpu-moe` (section 6). Under `--tp`, only expert parallelism honours the flag, and that
-path is never taken for a latent MoE.
+On one device, CPU offload does not cover these experts. 512 NVFP4 experts are about 1.6 GB per MoE
+layer (512 x 2 x 1024 x 2688 values at 36 bytes per 64), and Nemotron's single-device MoE path does
+not implement `--n-cpu-moe` (section 6). Under `--tp`, only expert parallelism honours the flag. Since
+G7 that path also serves latent MoE, but `--n-cpu-moe` with `--tp` has not been run.
 
 ### G4 -- BF16 non-expert weights -- **verified already covered (confirmed on Spark)**
 
@@ -436,13 +437,14 @@ the feature on the handle being non-zero and fall back.
 
   This is covered by synthetic tests only (`NemotronExpertScaleTests`, TP against one device and
   against folded twins). Besides the CPU tests, a gated `ggml_cuda` `--tp 2` test
-  (`GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin`) runs the TP batched expert decode, with the
-  up scales applied before ReLU^2 through `TSGgml_MoEExpertsForwardF32`, and the expert-parallel
-  down-scale path (non-latent layers only). It needs
-  `TS_TEST_GGML_BACKEND=cuda` and either two GPUs or
-  `GGML_CUDA_DEVICES=2`, which emulates two devices on one GPU; the local validation used the emulated
-  mode. No real Super VL `--tp 2` generation has completed on GPUs. On two A40s with ECC enabled
-  (48 GB, about 45.0 GiB usable each) the NVFP4 GGUF does not fit: rank 0, which besides its half of
+  (`GgmlCudaTensorParallel_ScaledSidecarsMatchFoldedTwin`) runs both TP MoE paths and checks which one
+  served each case: EP for plain and latent experts, with and without up scales
+  (`TSGgml_MoEFFNPrefillRouteScaledF32`), and, at a top-k larger than a rank's share of the experts,
+  the per-expert split, whose batched expert decode applies the up scales before ReLU^2 through
+  `TSGgml_MoEExpertsForwardF32`. It needs `TS_TEST_GGML_BACKEND=cuda` and either two GPUs or
+  `GGML_CUDA_DEVICES=2`, which emulates two devices on one GPU. It has passed both ways: emulated on
+  one RTX 3080 and on two A40s. No real Super VL `--tp 2` generation has completed on GPUs. On two
+  A40s with ECC enabled (48 GB, about 45.0 GiB usable each) the NVFP4 GGUF does not fit: rank 0, which besides its half of
   the routed experts holds all of the Mamba2, latent, shared-expert, router and LM-head weights, runs
   out of memory while preloading its weights. Estimated from the tensor shapes, rank 0's weights alone
   come to about 41.8 GiB and rank 1's to about 29.8 GiB. With ECC off, 48 GB cards (an A40, RTX A6000
@@ -456,8 +458,9 @@ the feature on the handle being non-zero and fall back.
     kernel first uses them;
   - on `cuda`, every quantized weight is uploaded at load.
 
-  Only expert-parallel MoE under `--tp` on `ggml_cuda` keeps experts on the host, and that path is never
-  taken for Super VL or Bolt.
+  Only expert-parallel MoE under `--tp` on `ggml_cuda` keeps experts on the host. Since G7 that path
+  can serve Super VL and Bolt, but `--n-cpu-moe` with `--tp` has not been run on either, so whether it
+  lowers rank 0's footprint enough for two A40s is unmeasured.
 - **Group-16/head_dim-128 flash prefill kernel:** restricted to `windowSize == 0`. It implements sliding
   windows, but only full attention has been run. Builds that compile the kernels locally with nvcc have
   it, and so does the committed compute_75 baseline PTX used without nvcc: it was refreshed with CUDA
