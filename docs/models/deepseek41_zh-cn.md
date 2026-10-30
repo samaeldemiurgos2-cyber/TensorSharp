@@ -694,7 +694,16 @@ attention 会把 Q 与 softmax 权重收窄到 F16，而 cache 量化可能放�
 1.1e-7（相对 L2 7.4e-7），分块内核为 8.9e-8（4.8e-7）。稀疏 query 也与同一调用中的其他 query
 无关——query 0 单独计算、在 9 个 query 中、在 512 个 query 中逐位相同——因此提示词的结果不取决于
 prefill 如何切成 micro-batch。（在 YOCO 有界重放下，把提示拆成多次 prefill 调用则不同：每次调用
-保留各自的最后 140 个位置，见下文。）`TS_DSV41_SPARSE_FA=0` 恢复分块 prefill。
+保留各自的最后 140 个位置，见下文。）关闭有界重放时，只要每次调用都结束在 micro-batch 边界上
+（除最后一次外，每次调用的长度都是 prefill micro-batch 宽度 `TS_DSV4_UBATCH` 的整数倍），拆成几次
+调用也不影响结果：一个 micro-batch 的 key 范围（因而它走稀疏还是分块内核）只取决于它自己的位置。
+若某次调用结束在 micro-batch 中间——调用比 micro-batch 短，或前缀复用、回退从任意位置继续——其后的
+位置会被分进不同的 micro-batch，而投影与 MoE 对 micro-batch 宽度并不不变，因此这样的拆分与整段
+prefill 只在 F32 舍入（经模型放大后）的范围内一致。早期版本把每个 micro-batch 都补齐到整次调用末尾
+所在的桶，因此同一提示一次调用 prefill 与按 256 token 分次 prefill 会让部分 micro-batch 走不同内核，
+留下不同的 cache（`Dsv41PrefillSplitTests`）。修复保留了分次的结果：整段提示前面的 micro-batch 现在
+走分块内核，而早期版本走稀疏内核，因此一旦某个 micro-batch 过去的补齐宽度达到 2,048 个 key（micro-batch
+为 256 时从 1,025 个提示 token 起），其 cache 与 logits 就可能与早期版本不同。`TS_DSV41_SPARSE_FA=0` 恢复分块 prefill。
 
 CUDA 用 MQA 内核执行这些压缩调用：V4.1 的 64 个头共用一个 K=V 头，因此一个 block 每个 key 分块
 只加载一次、供四个头共用，而不是每个头各加载一次。这使稀疏开销在 1,024 个 query 时恒为

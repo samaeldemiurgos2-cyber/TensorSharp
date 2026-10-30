@@ -1056,6 +1056,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_test(NAME deepseek4-ubatch-plan COMMAND GgmlOpsDsv4UbatchPlanTest)
     set_tests_properties(deepseek4-ubatch-plan PROPERTIES TIMEOUT 60)
 
+    # DeepSeek V4.1: a micro-batch's attention width (and so its attention
+    # kernel) must not depend on the forward call that contains it, or a
+    # prompt prefilled whole and in chunks builds different caches. Header-only.
+    add_executable(GgmlOpsDsv41CallInvarianceTest tests/dsv41_call_invariance_test.cpp)
+    target_include_directories(GgmlOpsDsv41CallInvarianceTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME deepseek41-call-invariant-attention-width COMMAND GgmlOpsDsv41CallInvarianceTest)
+    set_tests_properties(deepseek41-call-invariant-attention-width PROPERTIES TIMEOUT 60)
+
     add_executable(GgmlOpsLayerPartitionTest tests/layer_partition_test.cpp)
     target_include_directories(GgmlOpsLayerPartitionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME distributed-layer-byte-partition COMMAND GgmlOpsLayerPartitionTest)

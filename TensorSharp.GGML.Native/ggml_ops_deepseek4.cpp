@@ -48,6 +48,7 @@
 #include "dsv41_dspark.h"
 #include "ggml_ops_precision_policy.h"
 #include "dsv4_ubatch_plan.h"
+#include "dsv4_comp_bucket.h"
 #include "dsv41_retention.h"
 #include "dsv41_engram_io.h"
 #include "dsv41_engram_advice.h"
@@ -4029,14 +4030,11 @@ static comp_plan build_comp_plan(
     // at bucket doublings, so the graph cache and the pipelined prefill reuse
     // entries across long position stretches instead of re-building (and
     // device-synchronizing on fresh arena allocations) every 1024 positions.
-    // hint_rows (the whole forward call's final row count, capped by the
-    // caller) makes every chunk of one prefill share a single bucket.
-    {
-        int64_t bucket = 256;
-        const int64_t needed = std::max<int64_t>(std::max(plan.n_kv, hint_rows), 1);
-        while (bucket < needed) bucket <<= 1;
-        plan.n_kv = std::min(bucket, kv_rows);
-    }
+    // hint_rows is the caller's row floor (tsg_dsv4_plan::comp_floor_rows):
+    // plain V4's whole forward call's final row count, so every chunk of one
+    // prefill shares a single bucket; none for V4.1, whose bucket must depend
+    // only on the micro-batch because its attention kernel follows the width.
+    plan.n_kv = tsg_dsv4_plan::comp_bucket_rows(plan.n_kv, hint_rows, kv_rows);
 
     std::sort(persist.begin(), persist.end(), [](const persist_row & a, const persist_row & b) { return a.dst < b.dst; });
     for (const auto & r : persist)
@@ -4783,11 +4781,13 @@ struct graph_builder
                 // ggml's CUDA FA narrows Q and softmax weights to F16 even
                 // with F32 accumulation. V4.1 quantization/routing can amplify
                 // those lost bits, so keep the complete attention path F32.
-                // Prefill chunks of more than the decode-class width over at
-                // least 8,192 keys attend to their compacted window + top-k
-                // rows (on by default; TS_DSV41_SPARSE_FA=0 restores tiled
-                // prefill). Verify and decode keep the split-key kernel. The
-                // gate and its measurements live in ggml_ops_precision_policy.h.
+                // Prefill micro-batches of more than the decode-class width
+                // whose K extent (raw ring plus the micro-batch's own bucket of
+                // compressed rows, dsv4_comp_bucket.h) reaches 2,048 keys
+                // attend to their compacted window + top-k rows (on by default;
+                // TS_DSV41_SPARSE_FA=0 restores tiled prefill). Verify and
+                // decode keep the split-key kernel. The gate and its
+                // measurements live in ggml_ops_precision_policy.h.
                 const int capacity = tsg_dsv41_owned_sparse_capacity(q->ne[2], n_kv, hp.n_swa, hp.indexer_top_k,
                     getenv("TS_DSV41_SPARSE_FA"));
                 cur = tsg_attention_f32_on_backend(ctx, res.sched, m.dev_backends[attention_device],
@@ -6314,17 +6314,24 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
     const dsv4_hparams & hp = m.hp;
     static const int perf_build = []() { const char * e = getenv("TS_DSV4_PERF"); return e ? atoi(e) : 0; }();
 
-    // Uniform shape across a forward call: bucket by the call's final
-    // position (capped so very long prefills don't over-pad early attention)
-    // and decide the indexer skip by the final position, so every chunk of a
-    // prefill shares one graph-shape pair and the pipeline never stalls on a
-    // mid-flight allocation.
+    // Plain V4 keeps a uniform shape across a forward call: it buckets by the
+    // call's final position (capped so very long prefills don't over-pad
+    // early attention) and decides the indexer skip by the final position, so
+    // every chunk of a prefill shares one graph-shape pair and the pipeline
+    // never stalls on a mid-flight allocation.
+    //
+    // V4.1 buckets each micro-batch by its own positions. Its attention width
+    // chooses the owned kernel (sparse or tiled) and the split-key partition
+    // count, so a call-end bucket made a prompt prefilled whole and the same
+    // prompt prefilled in chunks build different caches and logits
+    // (tsg_dsv4_plan::comp_floor_rows). V4.1 never pipelines its prefill.
     const int64_t pos_end = std::max(m.pos_end_hint, p0 + nt);
-    const int64_t hint = std::min<int64_t>(pos_end, 8192);
 
     const int cr = hp.v41 ? 2 : CSA_RATIO, hr = hp.v41 ? 1 : HCA_RATIO;
-    comp_plan plan_csa = build_comp_plan(p0, nt, cr, !hp.v41, (hp.v41 ? cr : 2 * cr) + m.state_extra, m.n_csa_rows, hint / cr);
-    comp_plan plan_hca = build_comp_plan(p0, nt, hr, false, hr + m.state_extra, m.n_hca_rows, hint / hr);
+    comp_plan plan_csa = build_comp_plan(p0, nt, cr, !hp.v41, (hp.v41 ? cr : 2 * cr) + m.state_extra, m.n_csa_rows,
+        tsg_dsv4_plan::comp_floor_rows(hp.v41, m.pos_end_hint, p0, nt, cr));
+    comp_plan plan_hca = build_comp_plan(p0, nt, hr, false, hr + m.state_extra, m.n_hca_rows,
+        tsg_dsv4_plan::comp_floor_rows(hp.v41, m.pos_end_hint, p0, nt, hr));
     comp_plan plan_lid = plan_csa;
 
     uint64_t sig = 14695981039346656037ull ^ (uint64_t) nt;
@@ -6919,12 +6926,12 @@ static graph_build_result * dsv4_acquire_batched_graph(
         B.slot_id = slot_ids[i];
         B.p0 = positions[i];
         const int64_t pos_end = B.p0 + 1;
-        const int64_t hint = std::min<int64_t>(pos_end, 8192);
-        B.plan_csa = build_comp_plan(B.p0, 1, cr, !hp.v41, (hp.v41 ? cr : 2 * cr) + m.state_extra, m.n_csa_rows, hint / cr);
-        B.plan_hca = build_comp_plan(B.p0, 1, hr, false, hr + m.state_extra, m.n_hca_rows, hint / hr);
+        auto floor_rows = [&](int64_t ratio) { return tsg_dsv4_plan::comp_floor_rows(hp.v41, pos_end, B.p0, 1, ratio); };
+        B.plan_csa = build_comp_plan(B.p0, 1, cr, !hp.v41, (hp.v41 ? cr : 2 * cr) + m.state_extra, m.n_csa_rows, floor_rows(cr));
+        B.plan_hca = build_comp_plan(B.p0, 1, hr, false, hr + m.state_extra, m.n_hca_rows, floor_rows(hr));
         B.plan_lid = B.plan_csa;
         if (!hp.v41)
-            B.plan_lid = build_comp_plan(B.p0, 1, CSA_RATIO, true, 2 * CSA_RATIO + m.state_extra, m.n_csa_rows, hint / CSA_RATIO);
+            B.plan_lid = build_comp_plan(B.p0, 1, CSA_RATIO, true, 2 * CSA_RATIO + m.state_extra, m.n_csa_rows, floor_rows(CSA_RATIO));
         B.skip_topk = pos_end <= (int64_t) hp.indexer_top_k * (hp.v41 ? cr : CSA_RATIO);
         B.use_gather = hp.v41 && dsv41_use_gather(m, 1, B.p0);
         B.compact_raw = hp.v41 && dsv41_use_compact_raw_gather(m, 1, B.p0);

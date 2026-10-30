@@ -970,7 +970,23 @@ independent of the other queries in its launch -- query 0 alone, in 9 queries
 and in 512 is bit-identical -- so a prompt's result does not depend on how
 prefill chunked it into micro-batches. (Splitting a prompt into separate prefill
 CALLS is different under YOCO bounded replay, which keeps each call's own last
-140 positions; see below.) `TS_DSV41_SPARSE_FA=0` restores tiled prefill.
+140 positions; see below.) With bounded replay off, splitting a prompt into
+calls that end on micro-batch boundaries (every call but the last a multiple of
+the prefill micro-batch, `TS_DSV4_UBATCH`) does not change the result either: a
+micro-batch's key extent, and so whether it runs sparse or tiled, depends only
+on its own positions. A call that ends inside a micro-batch -- calls shorter
+than the micro-batch, or a prefix reuse or rewind that resumes at an arbitrary
+position -- groups the following positions into different micro-batches, and
+the projections and MoE are not invariant to the micro-batch width, so such a
+split agrees with the whole prompt only to F32 rounding as the model amplifies
+it. Earlier builds padded every micro-batch to the bucket of the whole call's
+end, so a prompt prefilled in one call and in 256-token calls ran some
+micro-batches on different kernels and left different caches
+(`Dsv41PrefillSplitTests`). The fix kept the chunked result: a whole prompt's
+early micro-batches now run tiled where earlier builds ran them sparse, so its
+caches and logits can differ from those builds' once a micro-batch's padded
+width used to reach 2,048 keys (from 1,025 prompt tokens at micro-batch 256).
+`TS_DSV41_SPARSE_FA=0` restores tiled prefill.
 
 CUDA runs these compacted launches on an MQA kernel: V4.1's 64 heads share one
 K=V head, so a block loads each key tile once for four heads instead of once

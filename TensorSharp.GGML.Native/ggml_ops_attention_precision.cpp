@@ -260,6 +260,10 @@ static ggml_tensor * attention_impl(ggml_context * ctx, ggml_tensor * q, ggml_te
     // then independent of the launch width as well -- a sparse query computed
     // alone equals the same query inside a 9- or 512-query launch bit for bit
     // -- and a prompt's result does not depend on how prefill chunked it.
+    // Whether a launch is sparse at all follows its key extent; DeepSeek V4.1
+    // sizes that extent from the launch's own micro-batch (dsv4_comp_bucket.h),
+    // never from how far the caller's forward call reaches, so the choice of
+    // kernel is chunking-invariant as well.
     // DeepSeek V4.1 launches (64 heads, more than 8 queries) already had one
     // partition per row, so its outputs are unchanged by this bound.
     const int64_t query_rows = q->ne[1] * q->ne[2] * q->ne[3];
