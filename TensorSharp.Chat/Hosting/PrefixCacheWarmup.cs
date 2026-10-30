@@ -125,6 +125,11 @@ namespace TensorSharp.Server.Hosting
             if (frames == null) throw new ArgumentNullException(nameof(frames));
 
             var clock = Stopwatch.StartNew();
+            // The warm-up's one token is worthless: TS_DUMP_LOGITS must hold the first token
+            // of the first REAL request (FirstTokenLogitsDump). The scope is this flow's, and the
+            // request records it when it is created, so the warm-up stays excluded even if a
+            // cancellation returns from here while it is still in the engine.
+            using IDisposable noDump = TensorSharp.Runtime.Scheduling.FirstTokenLogitsDump.Suppress();
             try
             {
                 JsonElement body = BuildRequest(sessionId, think);

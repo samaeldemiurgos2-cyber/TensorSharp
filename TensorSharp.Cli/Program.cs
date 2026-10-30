@@ -40,6 +40,9 @@ namespace TensorSharp.Cli
         static void Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
+            // TS_DUMP_LOGITS: drop an earlier run's vector before anything can fail, so a run that
+            // never reaches its first token leaves no file that looks like its own.
+            FirstTokenLogitsDump.ClearStaleOutputs();
 
             // Merge in options from a --config <file.json> before anything reads
             // argv. File-derived tokens are spliced in ahead of the real command
@@ -1607,21 +1610,13 @@ namespace TensorSharp.Cli
             using var inference = new CliInferenceSession(model,
                 SchedulerConfig.FromEnvironment().WithSpeculation(
                     SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin)), _log);
-            for (int w = 0; w < warmupInferenceRuns; w++)
-            {
-                int warmupDecodeTokens = Math.Min(maxTokens, 4);
-                _log.LogInformation(LogEventIds.HostConfiguration,
-                    "cli.inference.warmup run={Run}/{Total} decodeTokens={DecodeTokens}",
-                    w + 1, warmupInferenceRuns, warmupDecodeTokens);
-                _ = RunInference(model, rawText, imagePaths, warmupDecodeTokens, audioPaths,
+            RunWarmupPasses(model, inference, warmupInferenceRuns, maxTokens,
+                warmupDecodeTokens => _ = RunInference(model, rawText, imagePaths, warmupDecodeTokens, audioPaths,
                     isVideo: videoPath != null, samplingConfig: samplingConfig,
                     enableThinking: enableThinking, tools: tools, silent: true,
                     preserveAllInput: pdfPath != null,
                     specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
-                    systemPrompt: systemPrompt, inference: inference);
-                inference.StartNewConversation();
-                model.ResetForwardTiming();
-            }
+                    systemPrompt: systemPrompt, inference: inference));
 
             // With skills in play the model may answer by asking to read one first. Those
             // reads are served here, in process, and the loop re-enters — so a single-shot
@@ -2944,7 +2939,7 @@ namespace TensorSharp.Cli
         /// benchmark can be run twice (e.g. before and after a change) and the outputs
         /// compared.
         /// </summary>
-        static void RunBenchmark(
+        internal static void RunBenchmark(
             ModelBase model,
             int prefillTokens,
             int decodeTokens,
@@ -3044,6 +3039,10 @@ namespace TensorSharp.Cli
                 prefillSw.Stop();
                 double prefillMs = prefillSw.Elapsed.TotalMilliseconds;
                 double prefillTps = prefillTokens / (prefillMs / 1000.0);
+                // TS_DUMP_LOGITS: run 1's prompt row, before decode reuses the logits buffer.
+                if (run == 0 && FirstTokenLogitsDump.IsArmed)
+                    CaptureDirectPrefill(logits, prefillIds, chunked ? "ForwardRefill" : "Forward", "cli-benchmark", vocab,
+                        fixedTokens ? "argmax (fixed-token decode feeds its own ids)" : "argmax");
 
                 int next = -1;
                 if (!fixedTokens && decodeTokens > 0)
@@ -3270,6 +3269,47 @@ namespace TensorSharp.Cli
             return sampledTokens;
         }
 
+        /// <summary>
+        /// <c>--warmup-runs N</c>: run the full inference path <paramref name="runs"/> times, with at
+        /// most 4 decode tokens each, before the timed pass, starting a new conversation and clearing
+        /// the forward timing after each. A warm-up run is a real request, so it is submitted inside
+        /// <see cref="FirstTokenLogitsDump.Suppress"/>: TS_DUMP_LOGITS must hold the timed run's first
+        /// token, not a warm-up's.
+        /// </summary>
+        internal static void RunWarmupPasses(ModelBase model, CliInferenceSession inference, int runs, int maxTokens,
+            Action<int> runOnce)
+        {
+            for (int w = 0; w < runs; w++)
+            {
+                int warmupDecodeTokens = Math.Min(maxTokens, 4);
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "cli.inference.warmup run={Run}/{Total} decodeTokens={DecodeTokens}",
+                    w + 1, runs, warmupDecodeTokens);
+                using (FirstTokenLogitsDump.Suppress())
+                    runOnce(warmupDecodeTokens);
+                inference.StartNewConversation();
+                model.ResetForwardTiming();
+            }
+        }
+
+        /// <summary>TS_DUMP_LOGITS for a CLI loop that runs the prompt itself instead of through the
+        /// inference engine: the prompt's last-row logits as the first-token vector, with the greedy
+        /// pick those loops take from them.</summary>
+        internal static void CaptureDirectPrefill(float[] logits, IReadOnlyList<int> prompt, string path,
+            string source, int vocab, string tokenSource = "argmax")
+        {
+            if (logits == null)
+                return;
+            var dump = FirstTokenLogitsDump.TryCapture(logits, new FirstTokenLogitsInfo
+            {
+                Source = source,
+                PromptTokens = prompt.Count,
+                PromptFingerprint = FirstTokenLogitsDump.Fingerprint(prompt),
+                PrefillSteps = new[] { new PrefillStepTrace(path, prompt.Count) },
+            });
+            dump?.Complete(SampleGreedyFromLogits(logits, vocab), tokenSource);
+        }
+
         static int SampleGreedyFromLogits(float[] logits, int vocab)
         {
             int idx = 0;
@@ -3308,12 +3348,14 @@ namespace TensorSharp.Cli
             for (int i = 0; i < prefillTokens; i++)
                 prefillIds[i] = basisToken + (i % 17);
 
-            int[] DecodeWith(System.Func<int[], float[]> prefill)
+            int[] DecodeWith(System.Func<int[], float[]> prefill, string path)
             {
                 model.ResetKVCache();
                 var sw = Stopwatch.StartNew();
                 float[] logits = prefill(prefillIds);
                 sw.Stop();
+                if (FirstTokenLogitsDump.IsArmed)
+                    CaptureDirectPrefill(logits, prefillIds, path, "cli-chunked-prefill-check", vocab);
                 int firstSampled = SampleGreedyFromLogits(logits, vocab);
                 var decoded = new int[decodeTokens];
                 int next = firstSampled;
@@ -3333,10 +3375,10 @@ namespace TensorSharp.Cli
             }
 
             _log.LogInformation(LogEventIds.CliBenchmark, "Pass 1: Forward (non-chunked)");
-            int[] tokensForward = DecodeWith(t => model.Forward(t));
+            int[] tokensForward = DecodeWith(t => model.Forward(t), "Forward");
 
             _log.LogInformation(LogEventIds.CliBenchmark, "Pass 2: ForwardRefill (chunked)");
-            int[] tokensRefill = DecodeWith(t => model.ForwardRefill(t));
+            int[] tokensRefill = DecodeWith(t => model.ForwardRefill(t), "ForwardRefill");
 
             int matches = 0;
             for (int i = 0; i < decodeTokens; i++)
@@ -3780,6 +3822,8 @@ namespace TensorSharp.Cli
 
             model.ResetKVCache();
             float[] logits = model.Forward(inputTokens.ToArray());
+            if (FirstTokenLogitsDump.IsArmed)
+                CaptureDirectPrefill(logits, inputTokens, "Forward", "cli-test", model.Config.VocabSize);
             var engineTokens = new List<int>();
 
             for (int step = 0; step < maxTokens; step++)

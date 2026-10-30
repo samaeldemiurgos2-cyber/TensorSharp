@@ -153,8 +153,12 @@ async Task<int> FirstTokenAsync(int[] tokens, string id)
 
 // Warm-up: loads CUDA kernels, JITs hot paths, allocates pools.
 Console.WriteLine("[prefill-bench] warming up...");
-_ = await TtftMsAsync(MakePrompt(256, 0), "warm");
-_ = await TtftMsAsync(MakePrompt(256, 1), "warm2");
+// (Excluded from TS_DUMP_LOGITS: the dump must hold a measured request's first token.)
+using (FirstTokenLogitsDump.Suppress())
+{
+    _ = await TtftMsAsync(MakePrompt(256, 0), "warm");
+    _ = await TtftMsAsync(MakePrompt(256, 1), "warm2");
+}
 
 // Correctness: the batched (fused-FFN) path's first greedy token must match the
 // single-sequence ForwardRefill argmax for the same prompt. Run this on

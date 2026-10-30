@@ -2733,7 +2733,11 @@ namespace TensorSharp.Models
                 if (loraAudit) CloseLoraForwardAudit();
             }
             ThrowIfBackendFailed();
-            return DumpLogitsIfRequested(logits);
+            // TS_DUMP_LOGITS is not taken here: the first forward is not the prompt's last row
+            // when a prompt runs as several forwards, or never runs through Forward at all
+            // (batched / fused prefill). The engine's sampler and the CLI's direct prefill
+            // loops take it where the first token is chosen (FirstTokenLogitsDump).
+            return logits;
         }
 
         /// <summary>
@@ -2813,31 +2817,9 @@ namespace TensorSharp.Models
                 || detail.Contains("Insufficient Memory", StringComparison.OrdinalIgnoreCase)
                 || detail.Contains("out of memory", StringComparison.OrdinalIgnoreCase));
 
-        /// <summary>
-        /// Write the FIRST forward's logits to TS_DUMP_LOGITS when set, then stop.
-        /// Comparing two executors by their generated TEXT is a poor test: greedy
-        /// decoding turns a near-tie into a visibly different sentence, and a
-        /// genuinely broken implementation and a 2-bit expert-pick flip look the
-        /// same from the outside. The logit vector distinguishes them - a correct
-        /// port stays highly correlated even when the argmax moves.
-        /// </summary>
-        private float[] DumpLogitsIfRequested(float[] logits)
-        {
-            // WarmUpKernels runs its own Forward calls (a dummy decode token and a
-            // dummy prefill) BEFORE the real prompt. Dumping those compares two
-            // executors on throwaway input and says nothing about the model.
-            if (_logitsDumped || _inWarmup || logits == null) return logits;
-            string path = Environment.GetEnvironmentVariable("TS_DUMP_LOGITS");
-            if (string.IsNullOrEmpty(path)) return logits;
-            _logitsDumped = true;
-            using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Create, System.IO.FileAccess.Write))
-            using (var bw = new System.IO.BinaryWriter(fs))
-                foreach (float v in logits) bw.Write(v);
-            return logits;
-        }
-
-        private bool _logitsDumped;
-        /// <summary>Set while WarmUpKernels drives its throwaway forwards.</summary>
+        /// <summary>Set while WarmUpKernels drives its throwaway forwards. (Warm-up forwards are
+        /// never sampled by the inference engine, so the TS_DUMP_LOGITS first-token dump cannot see
+        /// them; see FirstTokenLogitsDump.)</summary>
         protected bool _inWarmup;
 
         public float[] ForwardRefill(int[] tokens)

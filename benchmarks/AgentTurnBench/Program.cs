@@ -104,7 +104,10 @@ internal static class Program
         {
             Console.WriteLine($"[agent-turn-bench] warm-up pass {pass + 1}/{o.Warmup}");
             var warmup = new Bench(model, o);
-            await warmup.RunAsync();
+            // TS_DUMP_LOGITS (run-parallel-case --agent-turn --dump-logits) must hold the measured
+            // pass's first token, not a warm-up pass's.
+            using (TensorSharp.Runtime.Scheduling.FirstTokenLogitsDump.Suppress())
+                await warmup.RunAsync();
             if (o.Out != null) warmup.WriteJson(o.Out + $".warmup{pass + 1}.json");
             if (warmup.Failures != 0)
             {

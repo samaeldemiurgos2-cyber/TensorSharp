@@ -78,6 +78,9 @@ namespace TensorSharp.Runtime.Scheduling
             SamplingConfig = samplingConfig ?? SamplingConfig.Default;
             Status = SequenceStatus.Waiting;
             SubmittedAt = DateTime.UtcNow;
+            // TS_DUMP_LOGITS: a request created inside FirstTokenLogitsDump.Suppress() (a warm-up)
+            // is never the dumped one, even if it samples after its caller's scope has ended.
+            ExcludedFromFirstTokenDump = FirstTokenLogitsDump.DumpPath != null && FirstTokenLogitsDump.IsSuppressedHere;
             UserTag = userTag;
             MediaSpans = mediaSpans is { Count: > 0 }
                 ? new List<PromptMediaSpan>(mediaSpans)
@@ -295,6 +298,19 @@ namespace TensorSharp.Runtime.Scheduling
         // counters; cache resets and preemption must not erase performed work.
         internal long ReplayPrefillElapsedTicks { get; set; }
         internal long ReplayDecodeElapsedTicks { get; set; }
+
+        /// <summary>TS_DUMP_LOGITS only (<see cref="FirstTokenLogitsDump"/>): every forward that ran
+        /// part of this prompt, with the path that served it, so the dump's sidecar can say how the
+        /// row it holds was produced. Null, and never allocated, while the dump is off.</summary>
+        internal List<PrefillStepTrace>? DumpPrefillSteps { get; private set; }
+
+        /// <summary>TS_DUMP_LOGITS only: this request was submitted inside
+        /// <see cref="FirstTokenLogitsDump.Suppress"/> (a warm-up), so its first token is never dumped.
+        /// Fixed at construction, on the submitting flow.</summary>
+        internal bool ExcludedFromFirstTokenDump { get; }
+
+        internal void NoteDumpPrefillStep(string path, int tokens)
+            => (DumpPrefillSteps ??= new List<PrefillStepTrace>()).Add(new PrefillStepTrace(path, tokens));
 
         /// <summary>True when this sequence reuses the model's LIVE KV cache
         /// directly (its prompt extends exactly the tokens still resident in the

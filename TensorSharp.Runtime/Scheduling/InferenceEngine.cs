@@ -65,6 +65,8 @@ namespace TensorSharp.Runtime.Scheduling
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
             ArgumentNullException.ThrowIfNull(cfg);
+            // TS_DUMP_LOGITS: an earlier run's vector must not survive a run that never samples.
+            FirstTokenLogitsDump.ClearStaleOutputs();
             if (cfg.BlockSize <= 0) cfg = cfg.WithBlockSize(PreferredBlockSize(model));
             _logger = logger ?? NullLogger.Instance;
             if (!cfg.MixedStepPrefillBudgetChosen
