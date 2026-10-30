@@ -148,15 +148,15 @@ bash build-linux.sh --cuda --cuda-arch='86-real;89-real'</code></pre>
     <thead><tr><th>Archive</th><th>Native backend(s) bundled</th><th>Format</th></tr></thead>
     <tbody>
       <tr><td><code>win-x64-cpu</code></td><td>GGML CPU</td><td>.zip</td></tr>
-      <tr><td><code>win-x64-cuda</code></td><td>GGML CUDA + pure-C# CUDA (PTX) + CUDA 12.x runtime</td><td>.zip</td></tr>
+      <tr><td><code>win-x64-cuda</code></td><td>GGML CUDA + pure-C# CUDA (compute_75 PTX + SASS fatbin) + CUDA 13 runtime</td><td>.zip</td></tr>
       <tr><td><code>linux-x64-cpu</code></td><td>GGML CPU</td><td>.tar.gz</td></tr>
-      <tr><td><code>linux-x64-cuda</code></td><td>GGML CUDA + pure-C# CUDA (PTX) + CUDA 12.x runtime</td><td>.tar.gz</td></tr>
+      <tr><td><code>linux-x64-cuda</code></td><td>GGML CUDA + pure-C# CUDA (compute_75 PTX + SASS fatbin) + CUDA 13 runtime</td><td>.tar.gz</td></tr>
       <tr><td><code>osx-arm64</code></td><td>GGML Metal + MLX</td><td>.tar.gz</td></tr>
       <tr><td><code>linux-arm64-cuda13-GB10</code> (experimental)</td><td>GGML CUDA for SM121a + pure-C# CUDA (<code>compute_121</code> PTX) + CUDA 13 runtime, for NVIDIA GB10 / DGX Spark</td><td>.tar.gz</td></tr>
     </tbody>
   </table>
   </div>
-  <p class="page-foot-note">Each release contains both a CLI and a Server file for every suffix above. The <code>-cuda</code> archives still require an NVIDIA GPU and compatible driver; the macOS archives require Apple Silicon. Source builds remain available. <a href="tensoragent.html#downloads">TensorAgent Desktop has separate DMG/PKG/ZIP and MSI/ZIP packages</a>; these CLI/server archives do not install the app.</p>
+  <p class="page-foot-note">Each release contains both a CLI and a Server file for every suffix above. The <code>-cuda</code> archives need a Turing or newer NVIDIA GPU (compute capability 7.5+) and a CUDA 13 driver (R580 or newer); releases up to v2026.10.23 bundled a CUDA 12 runtime and are no longer supported. The macOS archives require Apple Silicon. Source builds remain available. <a href="tensoragent.html#downloads">TensorAgent Desktop has separate DMG/PKG/ZIP and MSI/ZIP packages</a>; these CLI/server archives do not install the app.</p>
   <p class="page-foot-note">The GB10 archives are built by <code>eng/Dockerfile.gb10</code> on a hosted Linux ARM64 runner with no GPU: CUDA 13.0.2, .NET SDK 10.0.401 and an unmodified, pinned ggml revision. The release job checks dependency loading and startup in a clean Ubuntu 24.04 image, not model inference, and publishes <code>SHA256SUMS</code> plus a validation record beside the two archives. The recorded GB10 hardware smoke test predates the upstream ggml reintegration and does not certify the current code. Older releases may not contain these archives; check the assets of the specific release. Building the image locally is covered in the repository's <code>DEVELOPMENT.md</code>.</p>
 
   <div class="content-footer">

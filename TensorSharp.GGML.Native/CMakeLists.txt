@@ -144,10 +144,10 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     # identification too.
     #
     # Applied on every MSVC host rather than above a fixed MSVC_VERSION: nvcc's
-    # ceiling moves with the toolkit (CUDA 12.6 stops at MSVC 19.49 - the
-    # VS 2026 / 14.5x case from discussion #130 - but CUDA 12.4 already stops at
-    # 19.39, so VS 2022 17.10+ hits the identical error), and the flag is simply
-    # a no-op when the toolset is one nvcc already supports.
+    # ceiling moves with the toolkit (CUDA 13.4's host_config.h accepts
+    # _MSC_VER < 1960; older CUDA 13 releases were not checked against VS 2026's
+    # 14.5x toolsets, the case from discussion #130), and the flag is simply a
+    # no-op when the toolset is one nvcc already supports.
     if (MSVC AND NOT "${CMAKE_CUDA_FLAGS}" MATCHES "allow-unsupported-compiler")
         string(APPEND CMAKE_CUDA_FLAGS " -allow-unsupported-compiler")
         message(STATUS "MSVC ${MSVC_VERSION}: adding -allow-unsupported-compiler to CMAKE_CUDA_FLAGS so nvcc accepts this host toolset (no-op when it already does)")
@@ -158,8 +158,48 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "" FORCE)
     endif()
+    # TensorSharp builds only with CUDA 13 or newer (CUDA 12 is not supported).
+    # Probe the nvcc CMake is about to identify, in CMake's own order:
+    # CMAKE_CUDA_COMPILER, else CUDACXX, else CMake's compiler search, which looks
+    # at PATH first and at CUDA_PATH last (tsg_cuda_compiler_search.cmake). An old
+    # toolkit then fails here with a clear message instead of somewhere inside the
+    # ggml-cuda build. The CUDAToolkit_VERSION check after find_package below is the
+    # authoritative gate; it also covers Visual Studio generators, whose nvcc comes
+    # from the VS CUDA toolset and is not probed here.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/tsg_cuda_compiler_search.cmake")
+    set(_tsg_nvcc_probe "${CMAKE_CUDA_COMPILER}")
+    if (NOT _tsg_nvcc_probe AND NOT "$ENV{CUDACXX}" STREQUAL "")
+        set(_tsg_nvcc_probe "$ENV{CUDACXX}")
+    endif()
+    if (NOT _tsg_nvcc_probe)
+        tsg_find_cuda_compiler(_tsg_nvcc_probe "${CMAKE_GENERATOR}")
+    endif()
+    if (_tsg_nvcc_probe)
+        execute_process(COMMAND "${_tsg_nvcc_probe}" --version
+                        OUTPUT_VARIABLE _tsg_nvcc_version_text ERROR_QUIET RESULT_VARIABLE _tsg_nvcc_version_result)
+        if (_tsg_nvcc_version_result EQUAL 0 AND _tsg_nvcc_version_text MATCHES "release ([0-9]+)\\.([0-9]+),")
+            if (CMAKE_MATCH_1 LESS 13)
+                message(FATAL_ERROR "TensorSharp requires CUDA 13 or newer; found CUDA ${CMAKE_MATCH_1}.${CMAKE_MATCH_2} (${_tsg_nvcc_probe}). CUDA 12 is not supported: install a CUDA 13 toolkit, or point CMAKE_CUDA_COMPILER / CUDACXX at one.")
+            endif()
+        endif()
+    endif()
+    # CUDA 13 compiles nothing below compute capability 7.5 (Turing); say so before CMake
+    # hands such an entry to nvcc during compiler identification.
+    foreach (_tsg_cuda_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if (_tsg_cuda_arch MATCHES "^(native|all|all-major)$")
+            continue()
+        endif()
+        string(REGEX REPLACE "(-real|-virtual)$" "" _tsg_cuda_arch_number "${_tsg_cuda_arch}")
+        string(REGEX REPLACE "[a-z]+$" "" _tsg_cuda_arch_number "${_tsg_cuda_arch_number}")
+        if (_tsg_cuda_arch_number MATCHES "^[0-9]+$" AND _tsg_cuda_arch_number LESS 75)
+            message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES entry '${_tsg_cuda_arch}' is below 75: CUDA 13 supports compute capability 7.5 (Turing) and newer only.")
+        endif()
+    endforeach()
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    if (CUDAToolkit_VERSION VERSION_LESS 13.0)
+        message(FATAL_ERROR "TensorSharp requires CUDA 13 or newer; found CUDA ${CUDAToolkit_VERSION} (${CMAKE_CUDA_COMPILER}). CUDA 12 is not supported.")
+    endif()
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
@@ -524,6 +564,12 @@ set_target_properties(GgmlOps PROPERTIES
 )
 
 if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
+    # The CUDA 13 pre-check must probe the nvcc CMake itself would pick (PATH before
+    # CUDA_PATH). Script-only: fake nvcc files, no toolkit and no GPU needed.
+    add_test(NAME cuda-compiler-search-order
+        COMMAND ${CMAKE_COMMAND} -DTSG_TEST_WORK_DIR=${CMAKE_BINARY_DIR}/artifacts/cuda-compiler-search
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_compiler_search_test.cmake")
+
     add_executable(GgmlOpsMiniMaxH3GraphInputsTest ../eng/validation/minimax-h3-graph-inputs.cpp)
     target_include_directories(GgmlOpsMiniMaxH3GraphInputsTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(GgmlOpsMiniMaxH3GraphInputsTest PRIVATE ggml-cpu ggml-base)
@@ -1339,24 +1385,42 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         add_test(NAME qwen-image21-vae-shortcuts-cuda COMMAND GgmlOpsQwenImage21VaeShortcutTest cuda)
         set_tests_properties(qwen-image21-vae-shortcuts-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
         if (WIN32 AND TSG_HAVE_CUDNN)
-            # Isolated optional-runtime failure fixture. Never replace any real
+            # Isolated optional-runtime failure fixtures. Never replace any real
             # cuDNN installation: the loader sees only these build artifacts.
-            add_library(GgmlOpsMissingCudnnFixture SHARED tests/cudnn_missing_symbols.cpp)
-            set_target_properties(GgmlOpsMissingCudnnFixture PROPERTIES
-                OUTPUT_NAME cudnn64_9
-                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/qwen-image21-missing-cudnn")
-            foreach(sibling IN ITEMS cudnn_graph64_9 cudnn_ops64_9 cudnn_heuristic64_9 cudnn_engines_precompiled64_9)
-                add_custom_command(TARGET GgmlOpsMissingCudnnFixture POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "$<TARGET_FILE:GgmlOpsMissingCudnnFixture>"
-                        "$<TARGET_FILE_DIR:GgmlOpsMissingCudnnFixture>/${sibling}.dll")
+            #   missing: reports this build's CUDA major, then lacks every cuDNN entry
+            #            (an incomplete export table);
+            #   cuda12:  exports every entry but reports a CUDA 12.8 build, which the
+            #            loader must decline on the CUDA major before calling any of them.
+            foreach(fixture IN ITEMS missing cuda12)
+                if (fixture STREQUAL "missing")
+                    set(fixture_target GgmlOpsMissingCudnnFixture)
+                    set(fixture_source tests/cudnn_missing_symbols.cpp)
+                else()
+                    set(fixture_target GgmlOpsCuda12CudnnFixture)
+                    set(fixture_source tests/cudnn_cuda12_build.cpp)
+                endif()
+                set(fixture_dir "${CMAKE_BINARY_DIR}/artifacts/qwen-image21-${fixture}-cudnn")
+                add_library(${fixture_target} SHARED ${fixture_source})
+                target_include_directories(${fixture_target} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+                # Both fixtures are cudnn64_9: keep their import libraries apart too.
+                set_target_properties(${fixture_target} PROPERTIES
+                    OUTPUT_NAME cudnn64_9
+                    RUNTIME_OUTPUT_DIRECTORY "${fixture_dir}"
+                    ARCHIVE_OUTPUT_DIRECTORY "${fixture_dir}"
+                    LIBRARY_OUTPUT_DIRECTORY "${fixture_dir}")
+                foreach(sibling IN ITEMS cudnn_graph64_9 cudnn_ops64_9 cudnn_heuristic64_9 cudnn_engines_precompiled64_9)
+                    add_custom_command(TARGET ${fixture_target} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "$<TARGET_FILE:${fixture_target}>"
+                            "$<TARGET_FILE_DIR:${fixture_target}>/${sibling}.dll")
+                endforeach()
+                add_dependencies(GgmlOpsQwenImage21VaeShortcutTest ${fixture_target})
+                add_test(NAME qwen-image21-vae-${fixture}-cudnn-cuda
+                    COMMAND GgmlOpsQwenImage21VaeShortcutTest cuda --${fixture}-cudnn-runtime)
+                set_tests_properties(qwen-image21-vae-${fixture}-cudnn-cuda PROPERTIES
+                    ENVIRONMENT "TS_CUDNN_DIR=$<TARGET_FILE_DIR:${fixture_target}>;TS_VAE_CUDNN_CONV=1;TS_WAN_VAE_CUDNN_CONV=1"
+                    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
             endforeach()
-            add_dependencies(GgmlOpsQwenImage21VaeShortcutTest GgmlOpsMissingCudnnFixture)
-            add_test(NAME qwen-image21-vae-missing-cudnn-cuda
-                COMMAND GgmlOpsQwenImage21VaeShortcutTest cuda --missing-cudnn-runtime)
-            set_tests_properties(qwen-image21-vae-missing-cudnn-cuda PROPERTIES
-                ENVIRONMENT "TS_CUDNN_DIR=$<TARGET_FILE_DIR:GgmlOpsMissingCudnnFixture>;TS_VAE_CUDNN_CONV=1;TS_WAN_VAE_CUDNN_CONV=1"
-                SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
         endif()
     endif()
 endif()

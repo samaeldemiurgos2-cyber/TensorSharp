@@ -71,8 +71,8 @@ benchmarks finish. Use an unchanged upstream checkout and frozen native hash:
 ```sh
 python3 eng/validation/embeddinggemma2-cuda-k8-projection-run.py \
   --mode quality --output docs/validation/k8-quality-new \
-  --nvcc /usr/local/cuda-12.8/bin/nvcc \
-  --host-compiler /usr/bin/g++ --cuda-root /usr/local/cuda-12.8 \
+  --nvcc /usr/local/cuda/bin/nvcc \
+  --host-compiler /usr/bin/g++ --cuda-root /usr/local/cuda \
   --native /absolute/frozen/libGgmlOps.so \
   --expected-native-sha256 ACTUAL_FROZEN_SHA256 \
   --ggml /absolute/unchanged/ggml

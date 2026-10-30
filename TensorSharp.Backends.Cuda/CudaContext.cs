@@ -25,6 +25,9 @@ namespace TensorSharp.Cuda
             CudaLibraryResolver.Register();
             CudaDriverApi.cuInit(0).ThrowOnError();
             CudaDriverApi.cuDeviceGet(out int device, deviceId).ThrowOnError();
+            // A CUDA 12 driver or a pre-Turing GPU cannot run CUDA 13 code: say so here,
+            // instead of failing later on a bare module-load error.
+            CudaRequirements.EnsureSupported(device);
 
             // cuBLAS and the CUDA runtime use the device primary context. Retaining
             // it keeps the direct backend compatible with GGML CUDA probing and WSL.

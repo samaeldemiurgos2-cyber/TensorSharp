@@ -28,11 +28,13 @@
 
 # CUDA toolkit / OS for both stages. Override at build time to match the CUDA
 # version your target driver supports (the *devel* and *runtime* tags must
-# share the same CUDA_VERSION). The default, 13.4.3, needs a CUDA 13 driver
-# (R580 or newer) for its runtime, and the default PTX-only CUDA_ARCHS below is
-# JIT-compiled by the driver, which must then support CUDA 13.4 itself. On an
-# older host driver build with `--build-arg CUDA_VERSION=12.2.2` (JIT-compiles
-# on any driver >= 535) or give CUDA_ARCHS a `-real` arch (SASS, no JIT).
+# share the same CUDA_VERSION). TensorSharp builds only with CUDA 13; CUDA 12
+# is not supported. The default, 13.4.3, needs a CUDA 13 driver (R580 or newer)
+# for its runtime, and the default PTX-only CUDA_ARCHS below is JIT-compiled by
+# the driver, which must then support CUDA 13.4 itself. On an older CUDA 13
+# driver give CUDA_ARCHS a `-real` arch (SASS, no JIT), or pin an older 13.x
+# toolkit whose PTX that driver can JIT (check the nvidia/cuda tag exists).
+# Drivers older than R580 cannot run CUDA 13 code at all.
 ARG CUDA_VERSION=13.4.3
 ARG UBUNTU_VERSION=22.04
 

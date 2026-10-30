@@ -48,6 +48,62 @@ namespace InferenceWeb.Tests
         public static string CudaDevicesSkip(int count) =>
             CudaSkip ?? (CudaDevices.Value >= count ? null : $"Requires {count} CUDA devices; {CudaDevices.Value} visible.");
 
+        /// <summary>
+        /// Skip reason for a test about a file nvcc writes into the test output's cuda_kernels
+        /// folder (a kernel module's PTX or fatbin), or null when this build wrote it. A build
+        /// without nvcc copies the committed PTX baseline there instead, and writes no fatbin and
+        /// no module that has no baseline (tensorsharp_q35_kernels), which would leave such a
+        /// test nothing to check.
+        /// </summary>
+        public static string NvccOutputSkip(string fileName)
+        {
+            string built = Path.Combine(AppContext.BaseDirectory, "cuda_kernels", fileName);
+            if (!File.Exists(built))
+                return $"Requires an nvcc build: the test output has no cuda_kernels/{fileName}.";
+            for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
+            {
+                string committed = Path.Combine(dir.FullName, "TensorSharp.Backends.Cuda", "native", "ptx", fileName);
+                if (File.Exists(committed))
+                    return File.ReadAllBytes(built).AsSpan().SequenceEqual(File.ReadAllBytes(committed))
+                        ? $"Requires an nvcc build: cuda_kernels/{fileName} is the committed baseline."
+                        : null;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Skip reason for a test that launches a direct-CUDA kernel whose body is guarded by
+        /// <c>__CUDA_ARCH__ &gt;= 800</c> (tensor-core MMA, cp.async), or null when the
+        /// <paramref name="module"/> the test loads keeps those bodies on device 0. The committed
+        /// compute_75 baseline (what a build without nvcc loads) and an nvcc build for an sm_7x
+        /// GPU compile them to nothing or to a trap. The engines never launch them there
+        /// (<c>CudaKernels.ArchGuardedKernelsUsable</c>), and a test that did would read
+        /// unwritten output. The arch is the module PTX's <c>.target</c>, which an nvcc build's
+        /// fatbin shares.
+        /// </summary>
+        public static string TensorCoreKernelsSkip(string module)
+        {
+            if (CudaSkip != null)
+                return CudaSkip;
+            try
+            {
+                string path = TensorSharp.Cuda.CudaKernels.LocatePtxPath(module + ".ptx");
+                if (path == null)
+                    return $"Requires {module}.ptx.";
+                int arch = TensorSharp.Cuda.CudaModule.ParsePtxTargetArch(File.ReadAllBytes(path));
+                var device = TensorSharp.Cuda.CudaDevice.GetDevice(0);
+                int sm = device.ComputeCapabilityMajor * 10 + device.ComputeCapabilityMinor;
+                return TensorSharp.Cuda.CudaKernels.ArchGuardedKernelsUsable(arch, device.ComputeCapabilityMajor) && sm >= arch
+                    ? null
+                    : $"Requires sm_80+ tensor-core kernel bodies: {module} is compiled for sm_{arch} and GPU 0 is sm_{sm}. " +
+                      "The committed compute_75 baseline (a build without nvcc) and an nvcc build for an older GPU compile them to nothing.";
+            }
+            catch (Exception ex)
+            {
+                return $"Requires a readable {module} module and GPU 0 ({ex.GetType().Name}: {ex.Message}).";
+            }
+        }
+
         public static string MlxSkip =>
             MlxAvailable.Value ? null : "Requires the MLX native backend.";
 
@@ -279,6 +335,22 @@ namespace InferenceWeb.Tests
                 ?? (modelEnvVar == null ? null : TestGates.ModelSkip(modelEnvVar, ggufContains));
         }
 
+        /// <summary>A file the test needs nvcc to have written into cuda_kernels; skips without it (<see cref="TestGates.NvccOutputSkip"/>).</summary>
+        public string NvccOutput
+        {
+            get => _nvccOutput;
+            set { _nvccOutput = value; Skip ??= TestGates.NvccOutputSkip(value); }
+        }
+        private string _nvccOutput;
+
+        /// <summary>The kernel module whose sm_80+ tensor-core kernels the test launches; skips where they have no body (<see cref="TestGates.TensorCoreKernelsSkip"/>).</summary>
+        public string TensorCoreModule
+        {
+            get => _tensorCoreModule;
+            set { _tensorCoreModule = value; Skip ??= TestGates.TensorCoreKernelsSkip(value); }
+        }
+        private string _tensorCoreModule;
+
         /// <summary>The GGML backend the test constructs; skips unless the process pins it (<see cref="TestGates.GgmlPinSkip"/>).</summary>
         public BackendType GgmlBackend
         {
@@ -327,6 +399,28 @@ namespace InferenceWeb.Tests
             RequiresValue = modelEnvVar == null ? "Cuda" : "Cuda,Models";
             Skip = TestGates.CudaSkip
                 ?? (modelEnvVar == null ? null : TestGates.ModelSkip(modelEnvVar, ggufContains));
+        }
+
+        /// <summary>The kernel module whose sm_80+ tensor-core kernels the test launches; skips where they have no body (<see cref="TestGates.TensorCoreKernelsSkip"/>).</summary>
+        public string TensorCoreModule
+        {
+            get => _tensorCoreModule;
+            set { _tensorCoreModule = value; Skip ??= TestGates.TensorCoreKernelsSkip(value); }
+        }
+        private string _tensorCoreModule;
+    }
+
+    /// <summary>
+    /// [Fact] about a file nvcc writes into the test output's cuda_kernels folder: skips
+    /// visibly in a build without nvcc (<see cref="TestGates.NvccOutputSkip"/>). It needs no
+    /// GPU, so it carries no Requires trait.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class NvccFactAttribute : FactAttribute
+    {
+        public NvccFactAttribute(string fileName)
+        {
+            Skip = TestGates.NvccOutputSkip(fileName);
         }
     }
 

@@ -1,5 +1,6 @@
 param(
-    [string]$FallbackArch = "compute_61"
+    [string]$FallbackArch = "compute_75",
+    [string]$Nvcc = "nvcc"
 )
 
 function Normalize-Arch([string]$value) {
@@ -24,11 +25,11 @@ if (-not [string]::IsNullOrWhiteSpace($envArch)) {
 }
 
 $fallback = Normalize-Arch $FallbackArch
-if ([string]::IsNullOrWhiteSpace($fallback)) { $fallback = "compute_61" }
+if ([string]::IsNullOrWhiteSpace($fallback)) { $fallback = "compute_75" }
 
 $supported = @()
 try {
-    $supported = @(nvcc --list-gpu-arch 2>$null | ForEach-Object {
+    $supported = @(& $Nvcc --list-gpu-arch 2>$null | ForEach-Object {
         if ($_ -match 'compute_(\d{2,3})') { [int]$Matches[1] }
     } | Sort-Object -Unique)
 } catch {
@@ -63,7 +64,8 @@ if ($gpuLines.Count -gt 0 -and $gpuLines[$gpuIndex] -match ',\s*(\d+)\.(\d+)') {
     $detected = [int]("$($Matches[1])$($Matches[2])")
 }
 
-if ($detected -gt 0) {
+# CUDA 13 compiles nothing below compute_75; an older (unsupported) GPU gets the fallback.
+if ($detected -ge 75) {
     if ($supported.Count -eq 0 -or $supported -contains $detected) {
         Write-Output "compute_$detected"
         exit 0
@@ -76,9 +78,11 @@ if ($detected -gt 0) {
     }
 }
 
+# A fallback this nvcc cannot compile moves up to the oldest architecture it can,
+# never to its newest one: the fallback must stay loadable on as many GPUs as possible.
 $fallbackNumber = Get-ArchNumber $fallback
 if ($supported.Count -gt 0 -and $fallbackNumber -gt 0 -and -not ($supported -contains $fallbackNumber)) {
-    $bestFallback = @($supported | Select-Object -Last 1)
+    $bestFallback = @($supported | Where-Object { $_ -ge $fallbackNumber } | Select-Object -First 1)
     if ($bestFallback.Count -gt 0) {
         Write-Output "compute_$($bestFallback[0])"
         exit 0

@@ -1,7 +1,8 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 // Standalone Linux LD_PRELOAD diagnostic; no inference or upstream source edits.
-// CUDA 12.8 CUPTI Activity API, CUpti_ActivityKernel9:
+// CUDA 13 CUPTI Activity API: KERNEL / CONCURRENT_KERNEL records are CUpti_ActivityKernel13
+// in the CUDA 13.4 cupti_activity.h (confirm it in the installed header):
 // https://docs.nvidia.com/cupti/api/group__CUPTI__ACTIVITY__API.html
 #include <cupti.h>
 #include <cupti_activity.h>
@@ -60,7 +61,7 @@ void CUPTIAPI completed(CUcontext context, uint32_t stream, uint8_t * buffer, si
         CUptiResult result;
         while ((result = cuptiActivityGetNextRecord(buffer, valid, &record)) == CUPTI_SUCCESS) {
             if (record->kind != CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL && record->kind != CUPTI_ACTIVITY_KIND_KERNEL) continue;
-            const auto & kernel = *reinterpret_cast<const CUpti_ActivityKernel9 *>(record);
+            const auto & kernel = *reinterpret_cast<const CUpti_ActivityKernel13 *>(record);
             if (!kernel.start || kernel.end < kernel.start || !kernel.end) { ++data->incomplete; continue; }
             std::string name = kernel.name ? kernel.name : "(unnamed)";
             int status = 0; char * demangled = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
@@ -84,6 +85,10 @@ __attribute__((constructor)) void initialize() noexcept {
     try {
         data = new state; data->output = output;
         failure("API version", cuptiGetVersion(&data->api_version));
+        // The record layout read above is that of the headers this hook was compiled against.
+        if (data->api_version != CUPTI_API_VERSION) {
+            data->errors.emplace_back("Requires the CUPTI API version this hook was compiled against (CUDA 13 record layouts)."); return;
+        }
         const auto registration = cuptiActivityRegisterCallbacks(requested, completed);
         failure("register buffers", registration);
         if (registration == CUPTI_SUCCESS) {

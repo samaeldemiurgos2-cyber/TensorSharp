@@ -42,23 +42,17 @@ namespace TensorSharp.Cuda.Interop
             return IntPtr.Zero;
         }
 
-        private static IEnumerable<string> GetCublasCandidates()
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                yield return "cublas64_13.dll";
-                yield return "cublas64_12.dll";
-                yield return "cublas64_11.dll";
-                yield break;
-            }
+        private static IEnumerable<string> GetCublasCandidates() =>
+            GetCublasCandidates(RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
 
-            // Prefer versioned runtime libraries; unversioned symlinks can point
-            // at stubs or a different toolkit than the native GGML bridge uses.
-            // CUDA 13 first: the release builds bundle it next to the GGML bridge.
-            yield return "libcublas.so.13";
-            yield return "libcublas.so.12";
-            yield return "libcublas.so.11";
-            yield return "libcublas.so";
+        /// <summary>
+        /// cuBLAS 13 only. TensorSharp is built against CUDA 13, so an older cuBLAS (or an
+        /// unversioned libcublas.so, which can point at one or at a stub) must never be picked
+        /// up: a missing CUDA 13 runtime fails as DllNotFoundException instead of mixing majors.
+        /// </summary>
+        internal static IEnumerable<string> GetCublasCandidates(bool windows)
+        {
+            yield return windows ? "cublas64_13.dll" : "libcublas.so.13";
         }
 
         private static void EnsureWindowsCudaPath()
@@ -84,27 +78,50 @@ namespace TensorSharp.Cuda.Interop
 
         private static IEnumerable<string> EnumerateCudaBinDirectories()
         {
-            // CUDA 13 installs its DLLs in bin\x64, earlier toolkits in bin.
-            foreach (string variableName in new[] { "CUDA_PATH", "CUDA_HOME" })
-            {
-                string root = Environment.GetEnvironmentVariable(variableName);
-                if (!string.IsNullOrWhiteSpace(root))
-                {
-                    yield return Path.Combine(root, "bin", "x64");
-                    yield return Path.Combine(root, "bin");
-                }
-            }
-
             string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
             string cudaRoot = Path.Combine(programFiles, "NVIDIA GPU Computing Toolkit", "CUDA");
-            if (!Directory.Exists(cudaRoot))
-                yield break;
+            return EnumerateCudaBinDirectories(
+                Environment.GetEnvironmentVariable("CUDA_PATH"),
+                Environment.GetEnvironmentVariable("CUDA_HOME"),
+                Directory.Exists(cudaRoot) ? Directory.EnumerateDirectories(cudaRoot, "v*") : Array.Empty<string>());
+        }
 
-            foreach (string versionDir in Directory.EnumerateDirectories(cudaRoot, "v*").OrderByDescending(path => path))
+        /// <summary>
+        /// The Windows directories that may hold the CUDA 13 runtime DLLs, newest first. CUDA 13
+        /// installs them in bin\x64 (its bin holds only tools), so that is the only directory
+        /// probed, and of the installed toolkit folders only v13 and newer are considered.
+        /// </summary>
+        internal static IEnumerable<string> EnumerateCudaBinDirectories(
+            string cudaPath, string cudaHome, IEnumerable<string> installedToolkitDirectories)
+        {
+            foreach (string root in new[] { cudaPath, cudaHome })
             {
-                yield return Path.Combine(versionDir, "bin", "x64");
-                yield return Path.Combine(versionDir, "bin");
+                if (!string.IsNullOrWhiteSpace(root))
+                    yield return Path.Combine(root, "bin", "x64");
             }
+
+            foreach (string versionDir in OrderCuda13ToolkitDirectories(installedToolkitDirectories))
+                yield return Path.Combine(versionDir, "bin", "x64");
+        }
+
+        /// <summary>
+        /// The "vMAJOR.MINOR" toolkit folders of CUDA 13 or newer, newest first by parsed
+        /// version (v13.10 sorts above v13.4, which an ordinal sort would get wrong).
+        /// </summary>
+        internal static IEnumerable<string> OrderCuda13ToolkitDirectories(IEnumerable<string> directories)
+        {
+            return directories
+                .Select(path => (Dir: path, Version: ParseToolkitVersion(Path.GetFileName(path.TrimEnd('\\', '/')))))
+                .Where(entry => entry.Version != null && entry.Version.Major >= 13)
+                .OrderByDescending(entry => entry.Version)
+                .Select(entry => entry.Dir);
+        }
+
+        private static Version ParseToolkitVersion(string folderName)
+        {
+            if (string.IsNullOrEmpty(folderName) || folderName.Length < 2 || char.ToLowerInvariant(folderName[0]) != 'v')
+                return null;
+            return Version.TryParse(folderName.Substring(1), out Version version) ? version : null;
         }
     }
 }

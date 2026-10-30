@@ -16,7 +16,8 @@
 //
 // Build (no TensorSharp header or library is linked; libGgmlOps is dlopen'ed):
 //   g++ -std=c++17 -O2 minimax-m3-native-bench.cpp -ldl -lpthread -o minimax-m3-native-bench
-// With per-kernel GPU timing from CUPTI activity records (--cupti):
+// With per-kernel GPU timing from CUPTI activity records (--cupti; CUDA 13 CUPTI headers,
+// whose current KERNEL / MEMCPY records are CUpti_ActivityKernel13 / CUpti_ActivityMemcpy7):
 //   g++ -std=c++17 -O2 -DMM3_BENCH_CUPTI -I/usr/local/cuda/include minimax-m3-native-bench.cpp \
 //       -ldl -lpthread -o minimax-m3-native-bench      (libcupti is dlopen'ed: MM3_CUPTI_LIB)
 //
@@ -180,12 +181,12 @@ namespace
         {
             if (rec->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL || rec->kind == CUPTI_ACTIVITY_KIND_KERNEL)
             {
-                auto * k = (CUpti_ActivityKernel9 *) rec;
+                auto * k = (CUpti_ActivityKernel13 *) rec;
                 g_recs.push_back({ k->start, k->end, k->deviceId, k->name ? k->name : "?" });
             }
             else if (rec->kind == CUPTI_ACTIVITY_KIND_MEMCPY)
             {
-                auto * c = (CUpti_ActivityMemcpy5 *) rec;
+                auto * c = (CUpti_ActivityMemcpy7 *) rec;
                 g_copies.push_back({ c->start, c->end, c->deviceId, c->bytes, c->copyKind });
             }
             else if (rec->kind == CUPTI_ACTIVITY_KIND_MEMCPY2)

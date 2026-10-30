@@ -144,7 +144,7 @@ public static class CudaMiniMaxH3Ops
     private static void GemmMapped(CudaAllocator allocator,IntPtr weight,IntPtr input,IntPtr output,int rows,int inner,int columns,int outputStride,int storageType,bool forcePedantic=false)
     {
         float alpha=1,beta=0;
-        // CUDA12.8 cublas_api.h: 69 = COMPUTE_32F_PEDANTIC,
+        // CUDA 13.4 cublas_api.h:208-212: 69 = COMPUTE_32F_PEDANTIC,
         // 77 = COMPUTE_32F_FAST_TF32. This choice is per-call; shared math mode
         // remains unchanged. TF32 retains F32's exponent range.
         int compute=forcePedantic || (long)rows*inner*columns <= 16_000_000 || (storageType == 30 && Bf16Pedantic) ? 69 : 77;
@@ -272,7 +272,7 @@ public static class CudaMiniMaxH3Ops
         allocator.Blas.SetStream(allocator.Stream.Handle);
         float alpha=1;
         int rows=checked((int)input.Sizes[0]), inner=checked((int)input.Sizes[1]), columns=checked((int)weight.Sizes[0]);
-        // CUDA12.8 cublas_api.h: CUBLAS_COMPUTE_32F_PEDANTIC = 69.
+        // CUDA 13.4 cublas_api.h:208-212: CUBLAS_COMPUTE_32F_PEDANTIC = 69.
         CublasApi.cublasGemmEx(allocator.Blas.Handle,CublasApi.CUBLAS_OP_T,CublasApi.CUBLAS_OP_N,
             columns,rows,inner,ref alpha,ws.DevicePtrAtElement(weight.StorageOffset),CublasApi.CUDA_R_32F,inner,
             xs.DevicePtrAtElement(input.StorageOffset),CublasApi.CUDA_R_32F,inner,ref beta,

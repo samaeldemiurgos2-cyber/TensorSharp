@@ -781,9 +781,10 @@ activation sum), and prefill decodes it into the same grouped kernels, all held 
 `--layer-split 2` the two devices' refusals aborted the CLI with an unhandled
 `AggregateException`; an expert layout it does not decode is now refused before any upload,
 with one `error: model load refused:` line naming the tensor. No UD-Q4_K_XL throughput has
-been measured on the direct engine yet. A build without nvcc uses the committed PTX, which must
-be regenerated to include the Q5_1 decoder; until then the engine refuses Q5_1 experts rather
-than decode them as Q8_0. The engine has no host-expert seam, so `--n-cpu-moe` there
+been measured on the direct engine yet. A build without nvcc uses the committed PTX, which
+includes the Q5_1 decoder; a kernel module built from source older than that decoder makes the
+engine refuse Q5_1 experts rather than decode them as Q8_0. The engine has no host-expert seam,
+so `--n-cpu-moe` there
 prints a warning and keeps the experts on the GPU. The direct `cuda` engine uses
 `--layer-split N` for multiple GPUs and refuses `--tp N`. On `ggml_cuda`,
 UD-Q2_K_XL supports `--tp 2` with its original quantized weights; see

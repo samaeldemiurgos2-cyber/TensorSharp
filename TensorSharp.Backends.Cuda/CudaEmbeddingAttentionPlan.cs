@@ -51,8 +51,8 @@ public sealed class CudaEmbeddingAttentionPlan : IDisposable
     public const int MaximumWindowSequence = 2048;
     public const int MaximumMaskEntries = 4;
     public const long MaskBudgetBytes = 64L * 1024 * 1024;
-    public const int ComputeType = 69; // CUBLAS_COMPUTE_32F_PEDANTIC, CUDA12.8.
-    public const int Tf32ComputeType = 77; // CUBLAS_COMPUTE_32F_FAST_TF32, CUDA12.8.
+    public const int ComputeType = 69; // CUBLAS_COMPUTE_32F_PEDANTIC, CUDA 13.4 cublas_api.h.
+    public const int Tf32ComputeType = 77; // CUBLAS_COMPUTE_32F_FAST_TF32, CUDA 13.4 cublas_api.h.
     internal static bool SupportsFastTf32(int computeCapabilityMajor) => computeCapabilityMajor >= 8;
 
     public CudaEmbeddingAttentionPlan(CudaAllocator allocator, int headTile = 2,

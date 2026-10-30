@@ -26,7 +26,7 @@ internal static class Program
         if (args.Length == 0 || args.Contains("--help"))
         {
             Console.WriteLine("--model PATH --output PATH [--source-dir DIR] [--warmup 3] [--repeats 9] [--calls 4] [--device 0] [--quality-only | --weights-only]");
-            Console.WriteLine("Standalone Linux CUDA12 cuBLAS cached F32 layout comparison; no TensorSharp model routing or PTX changes.");
+            Console.WriteLine("Standalone Linux CUDA 13 cuBLAS cached F32 layout comparison; no TensorSharp model routing or PTX changes.");
             return 0;
         }
         var options = new Dictionary<string,string>();

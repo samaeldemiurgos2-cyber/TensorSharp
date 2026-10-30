@@ -62,15 +62,10 @@ __device__ __forceinline__ float ts_q35_sigmoid(float x) { return 1.0f / (1.0f +
 __device__ __forceinline__ float ts_q35_silu(float x) { return x / (1.0f + expf(-x)); }
 __device__ __forceinline__ float ts_q35_softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 
+// dp4a is native on every target CUDA 13 compiles (compute_75 and newer).
 __device__ __forceinline__ int ts_q35_dp4a(int a, int b, int c)
 {
-#if __CUDA_ARCH__ >= 610
     return __dp4a(a, b, c);
-#else
-    const int8_t* a8 = (const int8_t*)&a;
-    const int8_t* b8 = (const int8_t*)&b;
-    return c + a8[0] * b8[0] + a8[1] * b8[1] + a8[2] * b8[2] + a8[3] * b8[3];
-#endif
 }
 
 // UE4M3 block scale as ggml-cuda decodes it: the NaN codes read as zero, and the value is
@@ -502,27 +497,47 @@ __device__ __forceinline__ uint32_t ts_q35_smem_u32(const void* p)
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
+// cp.async and ldmatrix need sm_80. Below it (the compute_75 fallback, or sm_75 SASS in a
+// release fatbin) these helpers trap like the MMA ones, so the module still builds; ts_q35_caps
+// reports 0 there and Q35Kernels never launches a GEMM.
 __device__ __forceinline__ void ts_q35_cp16(void* dst, const void* src, bool valid)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                  :: "r"(ts_q35_smem_u32(dst)), "l"(src), "r"(valid ? 16 : 0));
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void ts_q35_cp_commit()
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;\n" ::);
+#else
+    __trap();
+#endif
 }
 
 template <int N>
 __device__ __forceinline__ void ts_q35_cp_wait()
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void ts_q35_ldsm_x4(uint32_t (&r)[4], const void* p)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(ts_q35_smem_u32(p)));
+#else
+    r[0] = r[1] = r[2] = r[3] = 0;
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void ts_q35_mma_fp4(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
@@ -551,8 +566,12 @@ struct TsQ35GemmSmem
 
 __device__ __forceinline__ void ts_q35_cp8(void* dst, const void* src, bool valid)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n"
                  :: "r"(ts_q35_smem_u32(dst)), "l"(src), "r"(valid ? 8 : 0));
+#else
+    __trap();
+#endif
 }
 
 template <int BN, int WM, int WN, int STAGES, int BK = TS_Q35_BK, bool COLS_FAST = false, bool SWIGLU = false>

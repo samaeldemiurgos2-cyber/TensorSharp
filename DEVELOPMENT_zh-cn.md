@@ -27,8 +27,8 @@ dotnet --list-sdks
 
 - **`git` 与网络访问：** GGML/CUDA 原生构建会在首次构建时从 [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) 克隆 ggml 源码到 `ExternalProjects/ggml/`（参见 `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`）。克隆默认跟踪 ggml 的默认分支（`master`）；可用 `TENSORSHARP_GGML_GIT_REF` 指定其他引用，或在克隆完成后设置 `TENSORSHARP_GGML_NO_UPDATE=1` 跳过网络更新（用于离线重建）
 - **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具——GGML 以源码形式内嵌 Metal kernel 并在运行时编译，因此构建期不需要 Metal 编译器。若需使用 MLX 后端，还需通过 `bash TensorSharp.Backends.MLX/build-native-macos.sh` 从 `TensorSharp.Backends.MLX/Native/` 构建 `libmlxc`；该构建**会**编译 Metal shader，因此需要**完整的 Xcode 以及 Metal 工具链**，仅安装命令行工具是不够的。首次构建时 `eng/ensure-metal-toolchain.sh` 会自动完成这一准备工作，详见[构建原生 MLX 库](#构建原生-mlx-库仅-macos)
-- **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA 工具包：发行版使用 CUDA 13.4 构建（CUDA 12.x 仍可构建；CUDA 13 不再支持 Turing 之前的 GPU，且 CUDA 13 构建需要 CUDA 13 驱动，即 R580 或更新版本）。纯 C# `cuda` 后端的内核会编译为 PTX 外加一个包含所检测 GPU 的 SASS 的 fatbin（可用 `CudaFatbinArchitectures` 列出更多架构，例如 `75,86,89,90,120`），因此在比工具包更旧、无法 JIT 新版 PTX 的驱动上也能加载。装有多个工具包时，可用 `CUDACXX`（或 `-DCMAKE_CUDA_COMPILER=`）指定用哪个 `nvcc` 构建；`build-windows.ps1` 会优先采用它而不是 `PATH`/`CUDA_PATH`，把选择打印在 `Configuring ...` 一行中，并丢弃使用其他编译器配置过的构建树（CMake 只在首次配置时缓存 CUDA 编译器，此后便会忽略 `CUDACXX`）。注意 CMake 仅在非 Visual Studio 生成器下读取 `CUDACXX`；使用 `Visual Studio NN` 生成器时请改用 `-T cuda=<版本或路径>`。Visual Studio 2026 的 MSVC 14.5x 工具集比当前 CUDA 工具包官方支持的宿主编译器更新，构建会自动向 `nvcc` 传递 `-allow-unsupported-compiler`；请同时安装“适用于 Windows 的 C++ CMake 工具”组件，以便构建使用 Ninja 生成器（Visual Studio 生成器还额外需要为对应 VS 版本提供 MSBuild 集成的 CUDA 工具包）。**cuDNN 会自动准备**：首次 CUDA 构建时由 `eng/fetch-cudnn.ps1` 下载到 `ExternalProjects/cudnn/`（下载约 1.8 GB，磁盘占用约 1.1 GB，只解出 `include/` 与 `bin/`），使 Wan / Qwen-Image VAE 的卷积可以走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。已安装的版本（`TS_CUDNN_DIR`、`CUDNN_DIR`、`CUDA_PATH`）优先于下载，`TENSORSHARP_CUDNN=OFF` 可完全跳过；构建不与它链接——运行时用 `LoadLibrary` 解析，因此有没有它，构建与产物都照常工作
-- **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA 工具包：发行版使用 CUDA 13.4 构建（CUDA 12.x 仍可构建；CUDA 13 不再支持 Turing 之前的 GPU，且 CUDA 13 构建需要 CUDA 13 驱动，即 R580 或更新版本）。纯 C# `cuda` 后端的内核会编译为 PTX 外加一个包含所检测 GPU 的 SASS 的 fatbin（可用 `CudaFatbinArchitectures` 列出更多架构，例如 `75,86,89,90,120`），因此在比工具包更旧、无法 JIT 新版 PTX 的驱动上也能加载。**cuDNN 会自动准备**：首次 CUDA 构建时，`eng/fetch-cudnn.sh` 会从 NVIDIA 公开的 redist 渠道把固定版本下载到 `ExternalProjects/cudnn/`（无需账号，也无需点选许可），Wan / Qwen-Image VAE 的卷积随后走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。系统上已装的 cuDNN（`libcudnn9-dev-cuda-13`（CUDA 12 工具包对应 `-cuda-12`）、`CUDA_HOME`、`TS_CUDNN_DIR`）优先于下载。它严格可选：获取失败不会让构建失败，编译期只需要头文件，库本身在运行时用 `dlopen` 解析，因此带 cuDNN 构建出的二进制在没有 cuDNN 的机器上照样能跑。`TENSORSHARP_CUDNN=OFF` 完全跳过；configure 阶段会打印实际生效的是哪一条
+- **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA 13 工具包。TensorSharp 只支持用 CUDA 13 构建（发行版使用 13.4）：需要 Turing 或更新的 GPU（compute capability 7.5+，CUDA 13 能编译的最低目标）以及 CUDA 13 驱动（R580 或更新版本）；遇到 CUDA 12 的 `nvcc` 时构建会报错停止。纯 C# `cuda` 后端的内核会编译为 PTX 外加一个包含所检测 GPU 的 SASS 的 fatbin（可用 `CudaFatbinArchitectures` 列出更多架构，例如 `75,86,89,90,120`），因此在比工具包更旧、无法 JIT 新版 PTX 的驱动上也能加载。装有多个工具包时，可用 `CUDACXX`（或 `-DCMAKE_CUDA_COMPILER=`）指定用哪个 `nvcc` 构建（`cuda` 后端的 PTX 构建同样遵循 `CUDACXX`，除非用 `-p:CudaNvcc` 指定）；`build-windows.ps1` 会优先采用它而不是 `PATH`/`CUDA_PATH`，把选择打印在 `Configuring ...` 一行中，并丢弃使用其他编译器配置过的构建树（CMake 只在首次配置时缓存 CUDA 编译器，此后便会忽略 `CUDACXX`）。注意 CMake 仅在非 Visual Studio 生成器下读取 `CUDACXX`；使用 `Visual Studio NN` 生成器时请改用 `-T cuda=<版本或路径>`。Visual Studio 2026 的 MSVC 14.5x 工具集比当前 CUDA 工具包官方支持的宿主编译器更新，构建会自动向 `nvcc` 传递 `-allow-unsupported-compiler`；请同时安装“适用于 Windows 的 C++ CMake 工具”组件，以便构建使用 Ninja 生成器（Visual Studio 生成器还额外需要为对应 VS 版本提供 MSBuild 集成的 CUDA 工具包）。**cuDNN 会自动准备**：首次 CUDA 构建时由 `eng/fetch-cudnn.ps1` 下载到 `ExternalProjects/cudnn/`（下载约 1.8 GB，磁盘占用约 1.1 GB，只解出 `include/` 与 `bin/`），使 Wan / Qwen-Image VAE 的卷积可以走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。已安装的版本（`TS_CUDNN_DIR`、`CUDNN_DIR`、`CUDA_PATH`）优先于下载，`TENSORSHARP_CUDNN=OFF` 可完全跳过；构建不与它链接——运行时用 `LoadLibrary` 解析，因此有没有它，构建与产物都照常工作
+- **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA 13 工具包。TensorSharp 只支持用 CUDA 13 构建（发行版使用 13.4）：需要 Turing 或更新的 GPU（compute capability 7.5+，CUDA 13 能编译的最低目标）以及 CUDA 13 驱动（R580 或更新版本）；遇到 CUDA 12 的 `nvcc` 时构建会报错停止。纯 C# `cuda` 后端的内核会编译为 PTX 外加一个包含所检测 GPU 的 SASS 的 fatbin（可用 `CudaFatbinArchitectures` 列出更多架构，例如 `75,86,89,90,120`），因此在比工具包更旧、无法 JIT 新版 PTX 的驱动上也能加载。**cuDNN 会自动准备**：首次 CUDA 构建时，`eng/fetch-cudnn.sh` 会从 NVIDIA 公开的 redist 渠道把固定版本下载到 `ExternalProjects/cudnn/`（无需账号，也无需点选许可），Wan / Qwen-Image VAE 的卷积随后走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。系统上已装的 cuDNN（`libcudnn9-dev-cuda-13`、`CUDA_HOME`、`TS_CUDNN_DIR`）优先于下载；运行时会忽略为其他 CUDA 主版本构建的 cuDNN（例如 `-cuda-12` 包）并给出警告。它严格可选：获取失败不会让构建失败，编译期只需要头文件，库本身在运行时用 `dlopen` 解析，因此带 cuDNN 构建出的二进制在没有 cuDNN 的机器上照样能跑。`TENSORSHARP_CUDNN=OFF` 完全跳过；configure 阶段会打印实际生效的是哪一条
 - **Windows（GGML Vulkan 后端）：** 这里同样需要 CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具——Vulkan 工具链的准备和后端的编译都由 CMake 完成，缺少它会在 `eng/fetch-vulkan-toolchain.ps1` 阶段就失败。Visual Studio 的“适用于 Windows 的 C++ CMake 工具”组件同时自带 `cmake.exe` 与 `ninja.exe`，两者都不在 `PATH` 上时 `build-windows.ps1` 会回退到该副本；否则请从 [cmake.org/download](https://cmake.org/download/) 安装 CMake。原生构建**仅支持 x64**——`build-windows.ps1` 会自行导入 `vcvars64` 环境，包括覆盖已经激活的 *x86* 环境（普通的“Developer PowerShell for VS”默认是 x86，而 ggml 的 Vulkan 后端无法以 32 位编译）。机器有 Vulkan 运行时（每个较新的 GPU 驱动都带的 `System32\vulkan-1.dll`）时自动启用。已安装 [LunarG Vulkan SDK](https://vulkan.lunarg.com/) 时直接使用；未安装时构建会通过 `eng/fetch-vulkan-toolchain.ps1` 自动把便携工具链（Vulkan-Headers、由系统 loader 生成的 vulkan-1 导入库、glslc、SPIRV-Headers）准备到 `ExternalProjects/vulkan-toolchain/`。用 `build-windows.ps1 --no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF` 退出。运行时需要支持 Vulkan 1.3 的 GPU 驱动
 - **Linux（GGML Vulkan 后端）：** 已安装 Vulkan loader（`libvulkan.so.1`）时自动启用。存在发行版开发包时直接使用（`apt install libvulkan-dev glslc spirv-headers`）；否则构建会通过 `eng/fetch-vulkan-toolchain.sh` 把缺失的部分（Vulkan-Headers、shaderc CI 预编译的 glslc、SPIRV-Headers）自动下载到 `ExternalProjects/vulkan-toolchain/`。用 `build-linux.sh --no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF` 退出
 - GGUF 模型文件（例如来自 [Hugging Face](https://huggingface.co)）
@@ -141,11 +141,13 @@ Direct `cuda` 后端由托管 C# 代码和 PTX 内核组成。执行 `dotnet bui
 
 修改 `.cu` 内核后，请显式刷新提交的 PTX 基线并提交差异——没有 `nvcc` 的机器运行的是提交的 PTX，未刷新的内核改动会让这些机器悄悄运行过期内核：
 
-```powershell
-dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -p:TensorSharpUpdateCommittedPtx=true
+```bash
+python3 eng/install-cuda-redist.py --version 13.0.3 --dest /opt/cuda-13.0.3   # 只需一次，与其他工具包并存
+dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -c Release \
+  -p:TensorSharpUpdateCommittedPtx=true -p:CudaNvcc=/opt/cuda-13.0.3/bin/nvcc
 ```
 
-提交的基线以 `compute_61` 为目标，刷新时请使用 CUDA 12 工具包：CUDA 13 只能编译 `compute_75` 及更新的目标，检测到 CUDA 13 的 `nvcc` 时刷新会提前失败。普通构建仍自动检测 GPU（未检测到 GPU 时，CUDA 13 回退到 `compute_75`，CUDA 12 回退到 `compute_61`）。
+提交的基线以 `compute_75`（CUDA 13 能编译的最低架构）为目标，并在 Linux 上由 `nvcc` 13.0 构建：其 PTX（ISA 9.0）可被所有 CUDA 13 驱动（R580 或更新）JIT，而驱动不接受比自身更新的 PTX。刷新时 `CudaArch=auto` 与 `native` 都解析为该目标，其他显式目标会被拒绝；所用的 `nvcc`（`-p:CudaNvcc`，否则取 `CUDACXX`，再否则取 `PATH` 上的那个）报告的版本不是 13.0 时会在编译前失败，生成的 PTX 不全是 `release 13.0`、`.version 9.0`、`.target sm_75` 时会在复制前失败。Qwen3.5 内核（`tensorsharp_q35_kernels.cu`，只支持 sm_80+）不会被复制。请在 Linux 上刷新：Windows 的 `nvcc` 中 `long` 为 32 位。普通构建仍自动检测 GPU（未检测到 GPU 时回退到 `compute_75`），遇到 CUDA 12 的 `nvcc` 会报错停止；针对特定 GPU 的本地构建不要设置 `TensorSharpUpdateCommittedPtx`。
 
 #### Apple Silicon 上的 Metal 4 tensor API
 
@@ -318,7 +320,7 @@ docker run --rm --gpus all --network none \
 
 五次隔离的 CLI 运行使用内置 prompt 与 `--max-tokens 16 --temperature 0 --seed 123 --warmup-runs 1`，限制为四个 CPU 与 16 GiB 容器内存。每次运行在四 token 预热后重置 KV 缓存，测量 19 个输入 / 16 个输出 token。prefill 中位数为 **440.4 tokens/s**（438.5–451.7），decode 中位数为 **76.9 tokens/s**（76.3–77.5）。容器 `memory.peak` 最大为 **737,058,816 字节**（约 703 MiB）；该 cgroup 计数**不是** GPU/统一内存的总用量，运行时另外报告了 1,836 MB 驻留设备的量化权重，二者不可相加。这些短暂的热运行只是可复现性基线，不是长上下文基准，也不构成 CPU 对 GPU 的加速结论。
 
-这些检查只覆盖单设备 GB10 上的 Qwen 文本冒烟与上面列出的 kernel/媒体契约，并非全部模型家族。GB10 上的 CUDA 12、其他 ARM64 NVIDIA 产品、多 GPU/多 Spark 运行、Vulkan/MLX、可选的 cuDNN 加速以及完整的图像/视频生成都不在验证范围内。GB10 上可能出现通用的集成 GPU 性能警告，它并不是本机与 CPU 的实测对比。做硬件检查前请明确预留 Spark；常规 CI 不得占用正在运行的 vLLM 实例的资源。上游重新整合改变了推理与精度实现，因此这些历史硬件计数与耗时不能为重新整合后的代码背书；托管 CI 会重新检查当前的 CPU 与归档路径，硬件资格验证需重做后才能沿用这些测量结果。
+这些检查只覆盖单设备 GB10 上的 Qwen 文本冒烟与上面列出的 kernel/媒体契约，并非全部模型家族。其他 ARM64 NVIDIA 产品、多 GPU/多 Spark 运行、Vulkan/MLX、可选的 cuDNN 加速以及完整的图像/视频生成都不在验证范围内。GB10 上可能出现通用的集成 GPU 性能警告，它并不是本机与 CPU 的实测对比。做硬件检查前请明确预留 Spark；常规 CI 不得占用正在运行的 vLLM 实例的资源。上游重新整合改变了推理与精度实现，因此这些历史硬件计数与耗时不能为重新整合后的代码背书；托管 CI 会重新检查当前的 CPU 与归档路径，硬件资格验证需重做后才能沿用这些测量结果。
 
 
 ## 项目结构
@@ -546,7 +548,8 @@ git push origin vX.Y.Z.W
 
 **状态核验于 2026-09-25**：最新发行版是 [v2026.09.01](https://github.com/zhongkaifu/TensorSharp/releases/tag/v2026.09.01)（2026-09-17），此前依次为 [v3.4.0.0](https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.4.0.0)（2026-09-12）与 [v3.3.0.0](https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.3.0.0)（2026-08-30）。每个发行版都发布服务端与 **TensorSharp.Cli** 的十个自包含应用归档，内含 .NET 10 运行时与原生库：下方五种平台/后端后缀各有一份 Server 归档和一份 CLI 归档。请到 [Releases 页面](https://github.com/zhongkaifu/TensorSharp/releases)检查更新版本，不要假定这份带日期的状态会永远代表最新发行。
 
-已发布的归档矩阵（v3.3.0.0 至 v2026.09.01）如下：
+其后又发布了 v2026.10.03、v2026.10.11 与 v2026.10.23，仍使用 CUDA 12.6 运行时构建。
+已发布的归档矩阵（v3.3.0.0 至 v2026.10.23）如下：
 
 | 归档后缀 | 内置的原生后端 | 格式 |
 |---|---|---|
@@ -556,7 +559,7 @@ git push origin vX.Y.Z.W
 | `linux-x64-cuda` | GGML CUDA + 纯 C# CUDA（PTX）+ CUDA 12.x 运行时 | `.tar.gz` |
 | `osx-arm64` | GGML Metal + MLX | `.tar.gz` |
 
-从下一个发行版起，`-cuda` 归档改用 CUDA 13.4 构建：随附其运行时（`*.so.13` / `*64_13.dll`），在 PTX 旁附带 SASS fatbin，并需要 CUDA 13 驱动（R580 或更新版本）。上表描述的是已发布的发行版。
+这些 `-cuda` 归档（截至 v2026.10.23）随附 CUDA 12 运行时，已不再支持。从下一个发行版起，`-cuda` 归档改用 CUDA 13.4 构建：随附其运行时（`*.so.13` / `*64_13.dll`），附带 compute_75 PTX 与 sm_75/80/86/89/90/120 的 SASS fatbin，需要 Turing 或更新的 GPU 以及 CUDA 13 驱动（R580 或更新版本）。
 
 另有实验性的 GB10 目标，通过 [GB10 Docker 流水线](#gb10--dgx-spark-构建容器实验性)生成 `linux-arm64-cuda13-GB10` 的 CLI 与 Server.Host 归档。目前还没有任何已发布的发行版包含它（v3.3.0.0 至 v2026.09.01 只有上面五种后缀）；请查看具体发行版的资产，不要假定其中包含它。
 

@@ -46,7 +46,7 @@ dotnet --list-sdks
 | Machine | Value to use below | Native source-build prerequisites |
 | --- | --- | --- |
 | Apple Silicon Mac | `ggml_metal` | Git, curl, CMake 3.20+ and Xcode command-line tools. |
-| Windows / Linux + NVIDIA | `ggml_cuda` | CMake, a C++ toolchain, NVIDIA driver and matching CUDA Toolkit; Windows needs Visual Studio C++ build tools. |
+| Windows / Linux + NVIDIA | `ggml_cuda` | CMake, a C++ toolchain, a CUDA 13 Toolkit and a CUDA 13 driver (R580+) on a Turing or newer GPU; Windows needs Visual Studio C++ build tools. |
 | Windows / Linux + Vulkan GPU | `ggml_vulkan` | CMake, C++/Vulkan build tools and a Vulkan 1.3 driver. |
 | CPU, no GPU | `ggml_cpu` | CMake 3.20+ and a C++ compiler; this is still a native build. |
 
@@ -215,11 +215,9 @@ Reuse options through [JSON configuration files](../config/README.md); configura
 <details>
 <summary>Compatibility notes for existing advanced deployments</summary>
 
-For native ggml source builds, `TENSORSHARP_GGML_NO_UPDATE=1` skips subsequent network updates. The [cache guide](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md#radix-prefix-cache) retains default Radix behavior, `TS_SCHED_PREFIX_CACHE=0`, `--no-prefix-cache` and server disk checkpoints. The earlier guide's environment-specific Ubuntu settings remain below for matching CUDA/package-source environments; they are not part of the normal first run:
+For native ggml source builds, `TENSORSHARP_GGML_NO_UPDATE=1` skips subsequent network updates. The [cache guide](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md#radix-prefix-cache) retains default Radix behavior, `TS_SCHED_PREFIX_CACHE=0`, `--no-prefix-cache` and server disk checkpoints. The earlier guide's environment-specific Ubuntu setting remains below for matching package-source environments; it is not part of the normal first run:
 
 ```bash
-# RunPod Ubuntu 24.04 images using this CUDA compatibility directory:
-export LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
 # Older Ubuntu releases needing the .NET backports package source:
 add-apt-repository ppa:dotnet/backports
 apt update && apt install dotnet-sdk-10.0

@@ -148,15 +148,15 @@ bash build-linux.sh --cuda --cuda-arch='86-real;89-real'</code></pre>
     <thead><tr><th>归档</th><th>捆绑的原生后端</th><th>格式</th></tr></thead>
     <tbody>
       <tr><td><code>win-x64-cpu</code></td><td>GGML CPU</td><td>.zip</td></tr>
-      <tr><td><code>win-x64-cuda</code></td><td>GGML CUDA + 纯 C# CUDA (PTX) + CUDA 12.x 运行时</td><td>.zip</td></tr>
+      <tr><td><code>win-x64-cuda</code></td><td>GGML CUDA + 纯 C# CUDA（compute_75 PTX + SASS fatbin）+ CUDA 13 运行时</td><td>.zip</td></tr>
       <tr><td><code>linux-x64-cpu</code></td><td>GGML CPU</td><td>.tar.gz</td></tr>
-      <tr><td><code>linux-x64-cuda</code></td><td>GGML CUDA + 纯 C# CUDA (PTX) + CUDA 12.x 运行时</td><td>.tar.gz</td></tr>
+      <tr><td><code>linux-x64-cuda</code></td><td>GGML CUDA + 纯 C# CUDA（compute_75 PTX + SASS fatbin）+ CUDA 13 运行时</td><td>.tar.gz</td></tr>
       <tr><td><code>osx-arm64</code></td><td>GGML Metal + MLX</td><td>.tar.gz</td></tr>
       <tr><td><code>linux-arm64-cuda13-GB10</code>（实验性）</td><td>面向 SM121a 的 GGML CUDA + 纯 C# CUDA（<code>compute_121</code> PTX）+ CUDA 13 运行时，用于 NVIDIA GB10 / DGX Spark</td><td>.tar.gz</td></tr>
     </tbody>
   </table>
   </div>
-  <p class="page-foot-note">每个发行版的每个后缀都有 CLI 与 Server 两个文件。<code>-cuda</code> 归档仍需 NVIDIA GPU 与兼容驱动；macOS 归档需要 Apple Silicon。仍可选择从源码构建。<a href="tensoragent_zh-cn.html#downloads">TensorAgent 桌面版另有 DMG/PKG/ZIP 和 MSI/ZIP 发行包</a>；这些 CLI/Server 归档不会安装应用。</p>
+  <p class="page-foot-note">每个发行版的每个后缀都有 CLI 与 Server 两个文件。<code>-cuda</code> 归档需要 Turing 或更新的 NVIDIA GPU（compute capability 7.5+）及 CUDA 13 驱动（R580 或更新）；v2026.10.23 及更早的发行版随附 CUDA 12 运行时，已不再支持。macOS 归档需要 Apple Silicon。仍可选择从源码构建。<a href="tensoragent_zh-cn.html#downloads">TensorAgent 桌面版另有 DMG/PKG/ZIP 和 MSI/ZIP 发行包</a>；这些 CLI/Server 归档不会安装应用。</p>
   <p class="page-foot-note">GB10 归档由 <code>eng/Dockerfile.gb10</code> 在不带 GPU 的托管 Linux ARM64 runner 上构建：CUDA 13.0.2、.NET SDK 10.0.401，以及一个固定且未修改的 ggml 版本。发布任务在干净的 Ubuntu 24.04 镜像中检查依赖加载与启动，而不做模型推理，并在两个归档旁发布 <code>SHA256SUMS</code> 与一份验证记录。已记录的 GB10 硬件冒烟测试早于上游 ggml 重新集成，不能为当前代码背书。较早的发行版可能不含这些归档，请查看具体发行版的资源列表。本地构建该镜像的方法见仓库中的 <code>DEVELOPMENT.md</code>。</p>
 
   <div class="content-footer">

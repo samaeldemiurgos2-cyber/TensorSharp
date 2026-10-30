@@ -405,9 +405,9 @@ Two traps if you build on the host instead of in the container:
   same 404 is fatal (`exited with code -1` -> MSB3073). Use `-p:TensorSharpSkipGgmlNative=true`;
   `CopyGgmlNativeBinary` has no skip condition, so it still copies the fresh `.so`.
 
-The committed PTX baseline targets `compute_61`, and **nvcc 13 dropped `compute_61`** (it lists
-`compute_75`..`compute_121`), so the baseline cannot be refreshed on a Spark. Refresh it on a host with
-a CUDA 12.x nvcc (`-p:TensorSharpUpdateCommittedPtx=true -p:CudaArch=compute_61`):
+The committed PTX baseline targets `compute_75` and is refreshed with nvcc 13.0 on Linux
+(`-p:TensorSharpUpdateCommittedPtx=true -p:CudaNvcc=<13.0>/bin/nvcc`); any host with a 13.0 nvcc can
+refresh it, a Spark included once one is installed side by side:
 `CommittedPtx_HasAnEntryForEveryKernelInTheSource` fails until every kernel in the source is in it.
 Any newly added kernel must still be resolved with `GetOptionalFunction`, not `GetFunction`: the latter
 calls `ThrowOnError` and handles are resolved eagerly in the `CudaKernels` constructor, so a missing
@@ -460,8 +460,8 @@ the feature on the handle being non-zero and fall back.
   taken for Super VL or Bolt.
 - **Group-16/head_dim-128 flash prefill kernel:** restricted to `windowSize == 0`. It implements sliding
   windows, but only full attention has been run. Builds that compile the kernels locally with nvcc have
-  it, and so does the committed compute_61 baseline PTX used without nvcc: it was refreshed with CUDA
-  12.8, and `CommittedPtx_HasAnEntryForEveryKernelInTheSource` keeps it current. Its body has no
+  it, and so does the committed compute_75 baseline PTX used without nvcc: it was refreshed with CUDA
+  13.0, and `CommittedPtx_HasAnEntryForEveryKernelInTheSource` keeps it current. Its body has no
   `__CUDA_ARCH__ >= 800` guard, so unlike the vision MMA and Q8_0 MMQ kernels it is not disabled when
   the loaded code targets a lower arch.
 

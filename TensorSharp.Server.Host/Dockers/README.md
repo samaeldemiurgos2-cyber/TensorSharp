@@ -225,11 +225,13 @@ docker build -f Dockerfile \
 ```
 
 Pin the CUDA toolkit with `--build-arg CUDA_VERSION=<version>` (the `-devel` and
-`-runtime` tags share it). The default, 13.4.3, needs a CUDA 13 driver (R580 or
-newer), and with the default PTX-only `CUDA_ARCHS` the driver must also support
-CUDA 13.4 to JIT-compile it. For an older host driver use
-`--build-arg CUDA_VERSION=12.2.2` (JIT-compiles on any driver ≥ 535) or a `-real`
-architecture.
+`-runtime` tags share it). TensorSharp builds only with CUDA 13; CUDA 12 is not
+supported. The default, 13.4.3, needs a CUDA 13 driver (R580 or newer), and with
+the default PTX-only `CUDA_ARCHS` the driver must also support CUDA 13.4 to
+JIT-compile it. For an older CUDA 13 driver, set `CUDA_ARCHS` to a `-real`
+architecture (SASS, no JIT), or pin an older 13.x toolkit whose PTX that driver
+can JIT (check that the matching `nvidia/cuda` tag exists). Drivers older than
+R580 cannot run CUDA 13 code.
 
 ## Build OOM-killed (exit code 137 / `OOMKilled`)
 

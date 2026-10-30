@@ -68,6 +68,7 @@
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.cu" />
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.cuh" />
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/CMakeLists.txt" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.cmake" />
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/$(GgmlNativeBuildScript)" Condition="'$(GgmlNativeBuildScript)' != ''" />
     <!-- The build script defers to these helper scripts (VS discovery, ggml
          checkout, Vulkan toolchain provisioning); a fix there must re-run the
@@ -80,7 +81,9 @@
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/../eng/fetch-vulkan-toolchain.sh" Condition="!$([MSBuild]::IsOSPlatform('Windows')) And !$([MSBuild]::IsOSPlatform('OSX'))" />
     <GgmlNativeSource Include="$(MSBuildProjectFullPath)" />
   </ItemGroup>
-  <!-- Records the native build config (currently the CUDA on/off selection). The
+  <!-- Records the native build config (the CUDA/Vulkan on/off selection, plus the CUDA
+       toolkit and architectures, so swapping nvcc - CUDA 13.2 to 13.4, say - or the arch
+       list rebuilds instead of keeping a binary from the old toolkit). The
        stamp is only rewritten when the config actually changes, so an unchanged
        config does not bump its timestamp and therefore does not invalidate the
        incremental check. A changed config bumps it past the binary, forcing a
@@ -88,7 +91,7 @@
        sources are otherwise unchanged. -->
   <Target Name="_PrepareGgmlNativeIncremental" Condition="'$(GgmlNativeBuildScript)' != ''">
     <PropertyGroup>
-      <_GgmlNativeConfigKey>cuda=$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA);vulkan=$(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)</_GgmlNativeConfigKey>
+      <_GgmlNativeConfigKey>cuda=$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA);vulkan=$(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN);cudacxx=$(CUDACXX);cudapath=$(CUDA_PATH);cudahome=$(CUDA_HOME);archs=$(TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES)</_GgmlNativeConfigKey>
       <_GgmlNativeConfigStamp>$(IntermediateOutputPath)$(GgmlNativeConfigStampName)</_GgmlNativeConfigStamp>
     </PropertyGroup>
     <ReadLinesFromFile File="$(_GgmlNativeConfigStamp)" Condition="Exists('$(_GgmlNativeConfigStamp)')">

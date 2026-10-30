@@ -10,6 +10,11 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName)]
         public static partial int cuInit(uint flags);
 
+        /// <summary>The CUDA version the installed driver supports, 1000 * major + 10 * minor
+        /// (13050 for a CUDA 13.5 driver). TensorSharp needs 13000 or newer.</summary>
+        [LibraryImport(LibName)]
+        public static partial int cuDriverGetVersion(out int driverVersion);
+
         [LibraryImport(LibName)]
         public static partial int cuDeviceGet(out int device, int ordinal);
 
@@ -30,12 +35,6 @@ namespace TensorSharp.Cuda.Interop
 
         [LibraryImport(LibName)]
         public static partial int cuCtxGetDevice(out int device);
-
-        [LibraryImport(LibName, EntryPoint = "cuCtxCreate_v2")]
-        public static partial int cuCtxCreate(out IntPtr ctx, uint flags, int device);
-
-        [LibraryImport(LibName, EntryPoint = "cuCtxDestroy_v2")]
-        public static partial int cuCtxDestroy(IntPtr ctx);
 
         [LibraryImport(LibName)]
         public static partial int cuCtxSetCurrent(IntPtr ctx);
@@ -113,8 +112,12 @@ namespace TensorSharp.Cuda.Interop
 
         // CUfunction_attribute: the virtual architecture (major * 10 + minor) the code the
         // driver loaded for a function was compiled from, i.e. its __CUDA_ARCH__ / 10: 86 for
-        // sm_86 SASS, 61 for compute_61 PTX the driver JIT-compiled for a newer GPU.
+        // sm_86 SASS, 75 for compute_75 PTX the driver JIT-compiled for a newer GPU.
         public const int CU_FUNC_ATTRIBUTE_PTX_VERSION = 5;
+
+        // CUfunction_attribute: the architecture (major * 10 + minor) of the binary the driver
+        // actually runs - the GPU's own sm for JIT-compiled PTX.
+        public const int CU_FUNC_ATTRIBUTE_BINARY_VERSION = 6;
 
         [LibraryImport(LibName)]
         public static partial int cuLaunchKernel(

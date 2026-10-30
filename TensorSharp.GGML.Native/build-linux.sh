@@ -39,6 +39,40 @@ has_cuda_toolkit() {
     return 1
 }
 
+# The nvcc CMake will use: -DCMAKE_CUDA_COMPILER=..., else CUDACXX, else nvcc on
+# PATH, else CUDA_HOME/CUDA_PATH. Prints nothing (and fails) when there is none.
+resolve_nvcc() {
+    local arg
+    for arg in ${EXTRA_CMAKE_ARGS[@]+"${EXTRA_CMAKE_ARGS[@]}"}; do
+        case "${arg}" in
+            -DCMAKE_CUDA_COMPILER=*|-DCMAKE_CUDA_COMPILER:*=*)
+                echo "${arg#*=}"
+                return 0
+                ;;
+        esac
+    done
+    if [[ -n "${CUDACXX:-}" ]]; then
+        echo "${CUDACXX}"
+        return 0
+    fi
+    if command -v nvcc >/dev/null 2>&1; then
+        command -v nvcc
+        return 0
+    fi
+    local cuda_home="${CUDA_HOME:-${CUDA_PATH:-}}"
+    if [[ -n "${cuda_home}" && -x "${cuda_home}/bin/nvcc" ]]; then
+        echo "${cuda_home}/bin/nvcc"
+        return 0
+    fi
+    return 1
+}
+
+# "13.4" from `nvcc --version` ("Cuda compilation tools, release 13.4, V13.4.92"),
+# or nothing when the compiler cannot be run or prints no release line.
+nvcc_release() {
+    "$1" --version 2>/dev/null | sed -nE 's/.*release ([0-9]+)\.([0-9]+),.*/\1.\2/p' | head -n 1
+}
+
 # Prints the system Vulkan loader library path (preferring the dev symlink
 # libvulkan.so over the runtime soname libvulkan.so.1 — CMake accepts a full
 # path in Vulkan_LIBRARY either way). Fails when no loader is installed, which
@@ -236,6 +270,11 @@ detect_local_cuda_architectures() {
                 gsub(/[[:space:]]/, "", $0)
                 if ($0 ~ /^[0-9]+\.[0-9]+$/) {
                     split($0, cap, ".")
+                    # CUDA 13 compiles nothing below compute capability 7.5 (Turing).
+                    if (cap[1] * 10 + cap[2] < 75) {
+                        printf("warning: skipping GPU of compute capability %s: CUDA 13 supports 7.5 (Turing) and newer only.\n", $0) > "/dev/stderr"
+                        next
+                    }
                     arch = cap[1] cap[2] "-real"
                     if (!(arch in seen)) {
                         seen[arch] = 1
@@ -334,6 +373,70 @@ if [[ -z "${ENABLE_CUDA}" ]]; then
     ENABLE_CUDA="OFF"
 fi
 
+# TensorSharp builds only with CUDA 13 or newer, whether CUDA was requested or
+# auto-detected: a CUDA 12 nvcc is an error, never a silent CPU-only build.
+NVCC_PATH=""
+if [[ "${ENABLE_CUDA}" == "ON" ]] && NVCC_PATH="$(resolve_nvcc)"; then
+    # A bare name (CUDACXX=nvcc) resolves against PATH, as CMake resolves it.
+    if [[ "${NVCC_PATH}" != */* ]]; then
+        NVCC_PATH="$(command -v "${NVCC_PATH}" || echo "${NVCC_PATH}")"
+    fi
+    NVCC_RELEASE="$(nvcc_release "${NVCC_PATH}" || true)"
+    if [[ -z "${NVCC_RELEASE}" ]]; then
+        echo "error: CUDA 13+ required, but '${NVCC_PATH} --version' reports no 'release X.Y,' line." >&2
+        echo "       Install a CUDA 13 toolkit, point CUDACXX at its nvcc, or pass --no-cuda for a CPU-only build." >&2
+        exit 1
+    fi
+    if (( ${NVCC_RELEASE%%.*} < 13 )); then
+        echo "error: CUDA 13+ required (found ${NVCC_RELEASE} at ${NVCC_PATH}); CUDA 12 is not supported." >&2
+        echo "       Install a CUDA 13 toolkit and put it first on PATH (or point CUDACXX at its nvcc)," >&2
+        echo "       or pass --no-cuda for a CPU-only build." >&2
+        exit 1
+    fi
+    echo "Using nvcc ${NVCC_RELEASE} (${NVCC_PATH})."
+    # Hand CMake exactly the compiler that passed the check above.
+    if [[ -z "${CUDACXX:-}" ]]; then
+        export CUDACXX="${NVCC_PATH}"
+    fi
+
+    # CMake caches the full compiler path and never swaps compilers inside a tree,
+    # so a tree configured against another toolkit (CUDA 12.8, or 13.2 before a
+    # move to 13.4) would keep building with it. Start such a tree over.
+    #
+    # Comparing paths alone misses a toolkit swapped behind an unchanged path:
+    # update-alternatives moving /usr/local/cuda from 12.8 to 13.2 leaves the cached
+    # and current realpaths equal. CMake identifies a compiler only once per tree
+    # (CMakeFiles/<cmake version>/CMakeCUDACompiler.cmake, read back on every
+    # reconfigure), so it would go on reporting 12.8 and the CUDA 13 gate in
+    # CMakeLists.txt would reject a working 13.2 nvcc. Compare that recorded toolkit
+    # version with the one the nvcc reports now as well.
+    if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+        stale_reason=""
+        cached_nvcc="$(awk -F= '/^CMAKE_CUDA_COMPILER:/ { print $2; exit }' "${BUILD_DIR}/CMakeCache.txt")"
+        if [[ -n "${cached_nvcc}" ]]; then
+            cached_real="$(readlink -f "${cached_nvcc}" 2>/dev/null || echo "${cached_nvcc}")"
+            resolved_real="$(readlink -f "${NVCC_PATH}" 2>/dev/null || echo "${NVCC_PATH}")"
+            if [[ "${cached_real}" != "${resolved_real}" ]]; then
+                stale_reason="CUDA compiler changed ('${cached_nvcc}' -> '${NVCC_PATH}')"
+            fi
+        fi
+        if [[ -z "${stale_reason}" ]]; then
+            for identified in "${BUILD_DIR}"/CMakeFiles/*/CMakeCUDACompiler.cmake; do
+                [[ -f "${identified}" ]] || continue
+                identified_release="$(awk -F'"' '/^set\(CMAKE_CUDA_COMPILER_TOOLKIT_VERSION / { split($2, v, "."); if (v[1] != "" && v[2] != "") print v[1] "." v[2]; exit }' "${identified}")"
+                if [[ -n "${identified_release}" && "${identified_release}" != "${NVCC_RELEASE}" ]]; then
+                    stale_reason="the build tree was configured with CUDA ${identified_release}, but ${NVCC_PATH} is now CUDA ${NVCC_RELEASE}"
+                    break
+                fi
+            done
+        fi
+        if [[ -n "${stale_reason}" ]]; then
+            echo "${stale_reason}; removing ${BUILD_DIR} to reconfigure from scratch."
+            rm -rf "${BUILD_DIR}"
+        fi
+    fi
+fi
+
 # Vulkan: an explicit choice (--vulkan/--no-vulkan or
 # TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN) wins and sticks via the CMake cache;
 # TENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT records that the cached value was
@@ -398,7 +501,7 @@ if [[ "${ENABLE_CUDA}" == "ON" ]]; then
     elif [[ -n "${CUDA_ARCHITECTURES}" ]]; then
         CUDA_ARCH_SUMMARY="${CUDA_ARCHITECTURES}"
     else
-        CUDA_ARCH_SUMMARY="ggml default"
+        CUDA_ARCH_SUMMARY="native"
     fi
 fi
 

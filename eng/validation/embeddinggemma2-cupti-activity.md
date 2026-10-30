@@ -1,5 +1,8 @@
-This Linux diagnostic records CUDA kernel activity timestamps using CUDA 12.8
-CUPTI, without hardware performance counters or production instrumentation.
+This Linux diagnostic records CUDA kernel activity timestamps using the CUDA 13
+CUPTI Activity API (`CUpti_ActivityKernel13` records in CUDA 13.4; build it against
+the installed CUDA 13 toolkit), without hardware performance counters or
+production instrumentation. It refuses a CUPTI runtime whose API version differs
+from the headers it was compiled against.
 It does not establish service latency or model quality. Kernel intervals can
 overlap; summed kernel durations exclude host code and memory copies.
 

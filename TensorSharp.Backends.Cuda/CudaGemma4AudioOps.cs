@@ -31,7 +31,7 @@ public static class CudaGemma4AudioOps
             ref alpha, w, CublasApi.CUDA_R_32F, checked((int)weight.Sizes[1]),
             x, CublasApi.CUDA_R_32F, checked((int)input.Sizes[1]), ref beta,
             y, CublasApi.CUDA_R_32F, checked((int)weight.Sizes[1]),
-            69 /* CUBLAS_COMPUTE_32F_PEDANTIC, CUDA12.8 */, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            69 /* CUBLAS_COMPUTE_32F_PEDANTIC, CUDA 13.4 cublas_api.h */, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
         ys.MarkDeviceModified(); return true;
     }
 

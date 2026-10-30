@@ -9,8 +9,9 @@ from pathlib import Path
 def attribute(report, patches, blocks=16, width=768):
     if (report.get('schema_version') != 2 or report.get('completed') is not True or
             report.get('diagnostic') is not True or report.get('hardware_counters') is not False or
-            report.get('cupti_api_version') != 26 or report.get('errors') != []):
-        raise ValueError('Require a complete CUDA12.8 activity-only capture')
+            not isinstance(report.get('cupti_api_version'), int) or report['cupti_api_version'] < 130000 or
+            report.get('errors') != []):
+        raise ValueError('Require a complete CUDA 13 activity-only capture')
     for field in ('dropped','incomplete','callback_exceptions','truncated','invalid_buffers'):
         if report.get(field) != 0:
             raise ValueError(field + ' must be zero')

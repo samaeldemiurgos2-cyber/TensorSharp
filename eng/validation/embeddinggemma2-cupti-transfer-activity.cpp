@@ -1,8 +1,9 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 // Separate Linux LD_PRELOAD diagnostic derived from embeddinggemma2-cupti-activity.cpp.
-// CUDA 12.8 CUPTI API 26: CUpti_ActivityKernel9 and CUpti_ActivityMemcpy6.
-// https://docs.nvidia.com/cupti/12.8.1/api/structCUpti__ActivityMemcpy6.html
+// CUDA 13 CUPTI: CUpti_ActivityKernel13 and CUpti_ActivityMemcpy7, the current KERNEL and
+// MEMCPY records in the CUDA 13.4 headers (confirm them in the installed cupti_activity.h).
+// https://docs.nvidia.com/cupti/api/structCUpti__ActivityMemcpy7.html
 // No inference, production, upstream, math-mode, or environment-selector changes.
 #include <cupti.h>
 #include <cupti_activity.h>
@@ -50,7 +51,8 @@ struct state {
 state* data = nullptr;
 constexpr size_t max_events = 65536; // Combined kernel + memcpy bound.
 constexpr size_t activity_buffer_bytes = 8 * 1024 * 1024;
-constexpr uint32_t expected_api_version = 26;
+// The record layouts below are those of the CUPTI headers this hook was compiled against.
+constexpr uint32_t expected_api_version = CUPTI_API_VERSION;
 
 std::string quoted(const std::string& value) {
     std::string result = "\"";
@@ -111,10 +113,10 @@ void CUPTIAPI completed(CUcontext context, uint32_t stream, uint8_t* buffer, siz
                     ++data->invalid_buffers; break;
                 }
                 if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL || record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
-                    if (!contains_record(record, sizeof(CUpti_ActivityKernel9), buffer, valid)) {
+                    if (!contains_record(record, sizeof(CUpti_ActivityKernel13), buffer, valid)) {
                         ++data->invalid_buffers; break;
                     }
-                    const auto& kernel = *reinterpret_cast<const CUpti_ActivityKernel9*>(record);
+                    const auto& kernel = *reinterpret_cast<const CUpti_ActivityKernel13*>(record);
                     if (!kernel.start || kernel.end < kernel.start || !kernel.end) { ++data->incomplete; continue; }
                     std::string name = kernel.name ? kernel.name : "(unnamed)";
                     int status = 0;
@@ -127,10 +129,10 @@ void CUPTIAPI completed(CUcontext context, uint32_t stream, uint8_t* buffer, siz
                             kernel.deviceId, kernel.contextId, kernel.streamId, kernel.correlationId});
                     else ++data->truncated;
                 } else if (record->kind == CUPTI_ACTIVITY_KIND_MEMCPY) {
-                    if (!contains_record(record, sizeof(CUpti_ActivityMemcpy6), buffer, valid)) {
+                    if (!contains_record(record, sizeof(CUpti_ActivityMemcpy7), buffer, valid)) {
                         ++data->invalid_buffers; break;
                     }
-                    const auto& copy = *reinterpret_cast<const CUpti_ActivityMemcpy6*>(record);
+                    const auto& copy = *reinterpret_cast<const CUpti_ActivityMemcpy7*>(record);
                     if (!copy.start || copy.end < copy.start || !copy.end) { ++data->incomplete; continue; }
                     std::lock_guard<std::mutex> lock(data->mutex);
                     if (data->kernels.size() + data->copies.size() < max_events)
@@ -163,9 +165,10 @@ __attribute__((constructor)) void initialize() noexcept {
             return;
         }
         failure("API version", cuptiGetVersion(&data->api_version));
-        // The versioned record layouts below are qualified only against CUDA12.8.
+        // The versioned record layouts are those of the CUPTI headers this hook was compiled
+        // against (CUDA 13); any other runtime API version could lay records out differently.
         if (data->api_version != expected_api_version) {
-            data->errors.emplace_back("Requires CUPTI API26 / CUDA12.8 record layouts."); return;
+            data->errors.emplace_back("Requires the CUPTI API version this hook was compiled against (CUDA 13 record layouts)."); return;
         }
         const auto registration = cuptiActivityRegisterCallbacks(requested, completed);
         failure("register buffers", registration);
@@ -217,7 +220,7 @@ __attribute__((destructor)) void finalize() noexcept {
         output << std::setprecision(17) << "{\"schema_version\":2,\"completed\":" << (complete ? "true" : "false")
             << ",\"diagnostic\":true,\"hardware_counters\":false,\"paired_performance_claim\":false"
             << ",\"cupti_api_version\":" << data->api_version
-            << ",\"kernel_record_type\":\"CUpti_ActivityKernel9\",\"memcpy_record_type\":\"CUpti_ActivityMemcpy6\""
+            << ",\"kernel_record_type\":\"CUpti_ActivityKernel13\",\"memcpy_record_type\":\"CUpti_ActivityMemcpy7\""
             << ",\"kernels_enabled\":" << (data->kernels_enabled ? "true" : "false")
             << ",\"memcpy_enabled\":" << (data->memcpy_enabled ? "true" : "false")
             << ",\"dropped\":" << data->dropped << ",\"incomplete\":" << data->incomplete

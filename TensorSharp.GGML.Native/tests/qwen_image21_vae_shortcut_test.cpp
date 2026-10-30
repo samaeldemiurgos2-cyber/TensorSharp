@@ -386,8 +386,10 @@ int main(int argc, char** argv) {
         const bool metal = argc >= 2 && std::string(argv[1]) == "metal";
         const bool vulkan = argc >= 2 && std::string(argv[1]) == "vulkan";
         const bool missing_cudnn = argc == 3 && std::string(argv[2]) == "--missing-cudnn-runtime";
+        const bool cuda12_cudnn = argc == 3 && std::string(argv[2]) == "--cuda12-cudnn-runtime";
         require(argc <= 3 && (argc == 1 || cuda || metal || vulkan || std::string(argv[1]) == "cpu") &&
-            (argc < 3 || (cuda && missing_cudnn)), "usage: test [cpu|cuda|metal|vulkan] [--missing-cudnn-runtime]");
+            (argc < 3 || (cuda && (missing_cudnn || cuda12_cudnn))),
+            "usage: test [cpu|cuda|metal|vulkan] [--missing-cudnn-runtime|--cuda12-cudnn-runtime]");
         const char* backend_name = cuda ? "cuda" : metal ? "metal" : vulkan ? "vulkan" : "cpu";
         if (cuda || vulkan) g_relative_tolerance = 1e-3;
         if (vulkan) g_fused_high_range = false;
@@ -402,17 +404,35 @@ int main(int argc, char** argv) {
         literal_cases(); synthetic_cases(); invalid_cases();
         if (!metal) high_range_convolution_cases();
         high_range_matrix_convolution_cases();
-        if (missing_cudnn) {
+        if (missing_cudnn || cuda12_cudnn) {
 #if defined(_WIN32)
-            // Confirm this process actually probed our incomplete runtime.
+            // Confirm this process actually probed our stand-in runtime.
             // Otherwise a missing/misplaced fixture could silently test the
             // installed vendor library instead of the intended failure path.
             const HMODULE fixture = GetModuleHandleW(L"cudnn64_9.dll");
-            require(fixture && GetProcAddress(fixture,"TensorSharpMissingCudnnFixture") &&
-                !GetProcAddress(fixture,"cudnnCreate"), "missing-symbol cuDNN fixture was not probed");
-            std::puts("PASS missing-symbol cuDNN fixture: F32 ggml fallback verified");
+            using CountFn = int (*)();
+            const auto version_queries = fixture
+                ? reinterpret_cast<CountFn>(GetProcAddress(fixture, "TensorSharpCudnnFixtureVersionQueries")) : nullptr;
+            // The loader asks for the CUDA major before anything else; a query proves
+            // it reached this library's export table.
+            require(version_queries && version_queries() > 0, "the cuDNN loader never queried the fixture's CUDA version");
+            if (missing_cudnn) {
+                // The CUDA major matches, so the decline must come from the absent entries.
+                require(GetProcAddress(fixture, "TensorSharpMissingCudnnFixture") &&
+                    !GetProcAddress(fixture, "cudnnCreate"), "missing-symbol cuDNN fixture was not probed");
+                std::puts("PASS missing-symbol cuDNN fixture: CUDA major accepted, incomplete export table declined, "
+                    "F32 ggml fallback verified");
+            } else {
+                // Every entry exists, so only the CUDA-major check can have declined it.
+                const auto entry_calls = reinterpret_cast<CountFn>(GetProcAddress(fixture, "TensorSharpCudnnFixtureEntryCalls"));
+                require(GetProcAddress(fixture, "TensorSharpCuda12CudnnFixture") && GetProcAddress(fixture, "cudnnCreate") &&
+                    entry_calls, "CUDA 12 cuDNN fixture was not probed");
+                require(entry_calls() == 0, "a cuDNN built for CUDA 12 was called instead of declined");
+                std::puts("PASS CUDA 12 cuDNN fixture: declined on the CUDA major before any call, "
+                    "F32 ggml fallback verified");
+            }
 #else
-            throw std::runtime_error("missing-cuDNN fixture requires Windows");
+            throw std::runtime_error("stand-in cuDNN fixtures require Windows");
 #endif
         }
         TSGgml_ReleaseReuseComputeBuffers();

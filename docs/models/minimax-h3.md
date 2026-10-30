@@ -312,10 +312,11 @@ reversed pairs. The default keeps expanded F32 decoder weights. Decoder loading
 is lazy on direct backends, so encoder-only requests avoid that expansion; the
 first decode's deferred loading must be included in cold timing.
 
-The repository CUDA PTX snapshot was built with CUDA 12.8 for sm120; actual A40 execution
-uses locally compiled sm86 PTX. The latest addition retains all 160 preceding
-entry bodies unchanged and appends one H3 conversion entry. No ggml patches
-are applied.
+These A40 runs used locally compiled sm86 PTX. The committed PTX snapshot of that
+time, built with CUDA 12.8 for sm120, kept all 160 preceding entry bodies unchanged
+and appended one H3 conversion entry. The committed modules have since become a
+compute_75 baseline built by CUDA 13.0 (see [Development](../../DEVELOPMENT.md)).
+No ggml patches are applied.
 
 ### Long-sequence attention on Metal
 

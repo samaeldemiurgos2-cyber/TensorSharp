@@ -100,15 +100,10 @@ __device__ __forceinline__ int get_int_b4(const void* x, int i32)
     return reinterpret_cast<const int*>(x)[i32];
 }
 
+// dp4a is native on every target CUDA 13 compiles (compute_75 and newer).
 __device__ __forceinline__ int dp4a_i8(int a, int b, int c)
 {
-#if __CUDA_ARCH__ >= 610
     return __dp4a(a, b, c);
-#else
-    const int8_t* a8 = reinterpret_cast<const int8_t*>(&a);
-    const int8_t* b8 = reinterpret_cast<const int8_t*>(&b);
-    return c + a8[0] * b8[0] + a8[1] * b8[1] + a8[2] * b8[2] + a8[3] * b8[3];
-#endif
 }
 
 // UE4M3 (unsigned E4M3, bias 7) scale byte -> fp32, halved to cancel the
@@ -5885,12 +5880,12 @@ extern "C" __global__ void ts_quantize_q8_1_rows_f32(
     int rows)
 {
     int q8_blocks = in_dim / TS_QK8_1;
-    long total = (long)rows * q8_blocks;
-    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)rows * q8_blocks;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total)
         return;
     int r = (int)(idx / q8_blocks);
-    int qb = (int)(idx - (long)r * q8_blocks);
+    int qb = (int)(idx - (long long)r * q8_blocks);
     quantize_q8_1_block(input + (size_t)r * in_dim + (size_t)qb * TS_QK8_1, out + idx);
 }
 
@@ -5960,12 +5955,12 @@ extern "C" __global__ void ts_quantize_q8_1_split_rows_f32(
     int rows)
 {
     int q8_blocks = in_dim / TS_QK8_1;
-    long total = (long)rows * q8_blocks;
-    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)rows * q8_blocks;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total)
         return;
     int r = (int)(idx / q8_blocks);
-    int qb = (int)(idx - (long)r * q8_blocks);
+    int qb = (int)(idx - (long long)r * q8_blocks);
     // The mmq2 route guarantees in_dim % 256 == 0, so every block's floats and
     // qs bytes are 16-byte aligned: read 8 float4s, write 2 int4s (the scalar
     // per-byte form of this kernel measured ~7x slower - 8% of prefill GPU).
@@ -7910,9 +7905,11 @@ extern "C" __global__ void ts_moe_expert_down_dp4a_f32(
 // up expert weights unfused): dst[i] = silu(a[i]) * b[i]. Used by the on-device
 // SwiGLU MoE decode after the gate and up projections write distinct [n_used,n_ff]
 // tensors. In-place safe when dst == a.
-extern "C" __global__ void ts_silu_mul_f32(float* dst, const float* a, const float* b, long n)
+// n is long long, not long: long is 32-bit under Windows nvcc, which would make the PTX
+// parameter (and the index) host-dependent. The managed launcher passes a 64-bit long.
+extern "C" __global__ void ts_silu_mul_f32(float* dst, const float* a, const float* b, long long n)
 {
-    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n)
         return;
     float x = a[i];

@@ -7,7 +7,7 @@
 //
 // The committed direct-CUDA PTX (native/ptx/tensorsharp_kernels.ptx) is what every
 // machine without nvcc loads, so it is a tracked artifact that has to keep up with
-// the kernel source - and it is a compute_61 baseline, so the kernels whose bodies
+// the kernel source - and it is a compute_75 baseline, so the kernels whose bodies
 // are guarded by __CUDA_ARCH__ >= 800 compile to a trap or to nothing in it. Their
 // symbols still resolve, which is why availability must come from the module's
 // compile target and never from a successful symbol lookup alone.
@@ -40,17 +40,31 @@ public sealed class CudaKernelAvailabilityTests
     private static string CommittedPtx => RepoFile("TensorSharp.Backends.Cuda", "native", "ptx", "tensorsharp_kernels.ptx");
 
     /// <summary>
-    /// Every committed baseline keeps up with its source. Refresh with a CUDA 12.x nvcc
-    /// (CUDA 13 no longer compiles compute_61):
-    /// <c>dotnet build TensorSharp.Backends.Cuda -c Release -p:TensorSharpUpdateCommittedPtx=true -p:CudaArch=compute_61</c>.
+    /// The committed baselines as native/ptx holds them, so a module added there is covered by
+    /// every theory over them without editing a list
+    /// (<see cref="CommittedPtx_IsExactlyThePortableModules_NeverQ35"/> pins the set).
+    /// </summary>
+    public static TheoryData<string> CommittedModules()
+    {
+        var modules = new TheoryData<string>();
+        foreach (string module in CommittedModuleNames())
+            modules.Add(module);
+        return modules;
+    }
+
+    private static string[] CommittedModuleNames() =>
+        Directory.GetFiles(Path.GetDirectoryName(CommittedPtx)!, "*.ptx")
+            .Select(path => Path.GetFileNameWithoutExtension(path))
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+    /// <summary>
+    /// Every committed baseline keeps up with its source. Refresh on Linux with nvcc 13.0:
+    /// <c>dotnet build TensorSharp.Backends.Cuda -c Release -p:TensorSharpUpdateCommittedPtx=true -p:CudaNvcc=&lt;13.0&gt;/bin/nvcc</c>.
     /// tensorsharp_q35_kernels has no committed baseline by design (its engine needs nvcc).
     /// </summary>
     [Theory]
-    [InlineData("tensorsharp_kernels")]
-    [InlineData("tensorsharp_dsv4_kernels")]
-    [InlineData("tensorsharp_glm_kernels")]
-    [InlineData("tensorsharp_q4e_kernels")]
-    [InlineData("tensorsharp_ltx25")]
+    [MemberData(nameof(CommittedModules))]
     public void CommittedPtx_HasAnEntryForEveryKernelInTheSource(string module)
     {
         string source = RepoFile("TensorSharp.Backends.Cuda", "native", "kernels", module + ".cu");
@@ -58,7 +72,7 @@ public sealed class CudaKernelAvailabilityTests
         var missing = KernelNames(source).Except(PtxEntries(ptx)).OrderBy(n => n).ToList();
         Assert.True(missing.Count == 0,
             $"The committed {module}.ptx has no .entry for: " + string.Join(", ", missing) +
-            ". Refresh native/ptx with a CUDA 12.x nvcc.");
+            ". Refresh native/ptx with nvcc 13.0 (see DEVELOPMENT.md).");
     }
 
     [Fact]
@@ -78,31 +92,77 @@ public sealed class CudaKernelAvailabilityTests
         Assert.True(stale.Count == 0, "PTX entries with no kernel in the source: " + string.Join(", ", stale));
     }
 
-    [Fact]
+    [NvccFact("tensorsharp_kernels.ptx")]
     public void LocallyBuiltPtx_WhenPresent_HasEveryKernel()
     {
         // With nvcc on PATH the build compiles the source into the test output; that
         // PTX must then cover the whole source. (Without nvcc the output holds the
-        // committed baseline, which the skipped test above covers.)
+        // committed baseline, which the theories above cover, and this test skips.)
         string built = Path.Combine(AppContext.BaseDirectory, "cuda_kernels", "tensorsharp_kernels.ptx");
-        if (!File.Exists(built) || File.ReadAllBytes(built).AsSpan().SequenceEqual(File.ReadAllBytes(CommittedPtx)))
-            return;
         var missing = KernelNames(KernelSource).Except(PtxEntries(built)).OrderBy(n => n).ToList();
         Assert.True(missing.Count == 0, "The locally built PTX has no .entry for: " + string.Join(", ", missing));
     }
 
-    [Fact]
-    public void CommittedBaseline_IsCompute61_AndNeverEnablesArchGuardedKernels()
+    /// <summary>
+    /// The committed baselines are what a driver JITs when there is no nvcc, so each must be
+    /// compute_75 PTX from nvcc 13.0 (ISA 9.0): the oldest architecture CUDA 13 compiles, in
+    /// the oldest ISA any CUDA 13 driver accepts. Newer PTX fails to load on an older CUDA 13
+    /// driver (CUDA_ERROR_UNSUPPORTED_PTX_VERSION).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(CommittedModules))]
+    public void CommittedPtx_IsCompute75FromNvcc130(string module)
     {
-        Assert.Equal(61, CudaModule.ParsePtxTargetArch(File.ReadAllBytes(CommittedPtx)));
+        byte[] ptx = File.ReadAllBytes(RepoFile("TensorSharp.Backends.Cuda", "native", "ptx", module + ".ptx"));
+        string head = System.Text.Encoding.ASCII.GetString(ptx, 0, Math.Min(ptx.Length, 4096));
+        Assert.Contains("Cuda compilation tools, release 13.0,", head);
+        Assert.Matches(new Regex(@"(?m)^\.version 9\.0\r?$"), head);
+        Assert.Equal(75, CudaModule.ParsePtxTargetArch(ptx));
+    }
+
+    [Fact]
+    public void CommittedPtx_IsExactlyThePortableModules_NeverQ35()
+    {
+        // Every module a build without nvcc loads ships a baseline. The qwen35 one never
+        // does: its engine's GEMMs need sm_120a SASS (CommittedBaseline=false in the csproj;
+        // a refresh never copies it).
+        Assert.Equal(
+            new[] { "tensorsharp_dsv4_kernels", "tensorsharp_glm_kernels", "tensorsharp_kernels", "tensorsharp_ltx25", "tensorsharp_q4e_kernels" },
+            CommittedModuleNames());
+    }
+
+    /// <summary>
+    /// Every committed baseline JIT-compiles on this machine's driver, and each of its entries
+    /// resolves and reports compute_75. The header theory above only implies that a CUDA 13
+    /// driver accepts them; the glm, q4e and ltx25 modules load only for their own models, so
+    /// nothing else proves it for them. Run with CUDA_CACHE_DISABLE=1 so the driver compiles
+    /// instead of reusing a cached image.
+    /// </summary>
+    [CudaTheory]
+    [MemberData(nameof(CommittedModules))]
+    public void CommittedPtx_JitCompilesOnThisDriver(string module)
+    {
+        string path = RepoFile("TensorSharp.Backends.Cuda", "native", "ptx", module + ".ptx");
+        using var allocator = new CudaAllocator();
+        allocator.Context.MakeCurrent();
+        using var loaded = CudaModule.LoadFromBytes(File.ReadAllBytes(path));
+        var entries = PtxEntries(path);
+        Assert.NotEmpty(entries);
+        foreach (string entry in entries)
+            Assert.Equal(75, loaded.CompiledArchOf(entry));   // resolves the entry, or throws
+    }
+
+    [Fact]
+    public void CommittedBaseline_IsCompute75_AndNeverEnablesArchGuardedKernels()
+    {
+        Assert.Equal(75, CudaModule.ParsePtxTargetArch(File.ReadAllBytes(CommittedPtx)));
         Assert.Equal(86, CudaModule.ParsePtxTargetArch(System.Text.Encoding.ASCII.GetBytes("//\n// header\n.version 9.2\n.target sm_86\n.address_size 64\n")));
         Assert.Equal(120, CudaModule.ParsePtxTargetArch(System.Text.Encoding.ASCII.GetBytes(".version 8.7\n.target sm_120a\n")));
         Assert.Equal(0, CudaModule.ParsePtxTargetArch(System.Text.Encoding.ASCII.GetBytes("// .target sm_90 in a comment\n")));
         Assert.Equal(0, CudaModule.ParsePtxTargetArch(Array.Empty<byte>()));
 
-        foreach (int ccMajor in new[] { 6, 7, 8, 9, 10, 12 })
-            Assert.False(CudaKernels.ArchGuardedKernelsUsable(61, ccMajor));
-        Assert.False(CudaKernels.ArchGuardedKernelsUsable(75, 8));
+        foreach (int ccMajor in new[] { 7, 8, 9, 10, 12 })
+            Assert.False(CudaKernels.ArchGuardedKernelsUsable(75, ccMajor));
         Assert.False(CudaKernels.ArchGuardedKernelsUsable(0, 9));
         Assert.False(CudaKernels.ArchGuardedKernelsUsable(86, 7));
         Assert.True(CudaKernels.ArchGuardedKernelsUsable(80, 8));
@@ -116,14 +176,14 @@ public sealed class CudaKernelAvailabilityTests
         using var allocator = new CudaAllocator();
         allocator.Context.MakeCurrent();
 
-        // The baseline loads on any GPU (the driver JITs its compute_61 PTX), and its
+        // The baseline loads on any GPU (the driver JITs its compute_75 PTX), and its
         // missing optional kernels must not stop it. The sm_80+ kernels it does carry
         // are empty or trap there, so they must read as unavailable. The JIT output is
         // SASS for this GPU, so this also proves the arch comes from what the code was
-        // compiled from (61), not from the binary the driver produced.
+        // compiled from (75), not from the binary the driver produced.
         using (var baseline = CudaKernels.FromModule(CudaModule.LoadFromBytes(File.ReadAllBytes(CommittedPtx))))
         {
-            Assert.Equal(61, baseline.CompiledArch);
+            Assert.Equal(75, baseline.CompiledArch);
             Assert.False(baseline.HasQ80Mmq);
             foreach (int headDim in new[] { 64, 72, 80, 96, 112, 128 })
                 Assert.False(baseline.HasVisionAttentionMma(headDim));
@@ -149,22 +209,16 @@ public sealed class CudaKernelAvailabilityTests
     /// sm_80+ GPU the driver runs that GPU's SASS, compiled with __CUDA_ARCH__ &gt;= 800, so the
     /// tensor-core kernels carry their real bodies and must stay enabled although the PTX
     /// header says sm_75. Rebuilt from the local nvcc output: its fatbin beside a stub PTX
-    /// that targets sm_75.
+    /// that targets sm_75. Needs an nvcc build (the committed PTX has no fatbin) for an sm_80+
+    /// GPU at or below this one, so the fatbin's code runs here; skips anywhere else.
     /// </summary>
-    [CudaFact]
+    [CudaFact(NvccOutput = "tensorsharp_kernels.fatbin", TensorCoreModule = "tensorsharp_kernels")]
     public void FatbinBesideALowerPtxTarget_KeepsTensorCoreKernelsOfTheLoadedSass()
     {
         using var allocator = new CudaAllocator();
         allocator.Context.MakeCurrent();
-        var device = CudaDevice.GetDevice(allocator.DeviceId);
         string built = Path.Combine(AppContext.BaseDirectory, "cuda_kernels");
-        // Needs an nvcc build (the committed PTX has no fatbin) for an sm_80+ GPU at or below
-        // this one, so the fatbin's code runs here.
-        if (!File.Exists(Path.Combine(built, "tensorsharp_kernels.fatbin")))
-            return;
         int builtArch = CudaModule.ParsePtxTargetArch(File.ReadAllBytes(Path.Combine(built, "tensorsharp_kernels.ptx")));
-        if (builtArch < 80 || device.ComputeCapabilityMajor * 10 + device.ComputeCapabilityMinor < builtArch)
-            return;
 
         string dir = Directory.CreateTempSubdirectory("ts-release-fatbin-").FullName;
         try
@@ -201,12 +255,11 @@ public sealed class CudaKernelAvailabilityTests
     /// up front - the support check falls back to the managed path - instead of loading and
     /// killing the context on the first prompt.
     /// </summary>
-    [CudaFact]
+    [CudaFact(NvccOutput = "tensorsharp_q35_kernels.ptx")]   // an nvcc-only module
     public void Q35Module_WithoutFp4TensorCoreCode_IsRefusedBeforeAnyGemm()
     {
         string path = CudaKernels.LocatePtxPath("tensorsharp_q35_kernels.ptx");
-        if (path == null)
-            return;   // nvcc-only module: nothing to load
+        Assert.NotNull(path);
         using var allocator = new CudaAllocator();
         allocator.Context.MakeCurrent();
         var device = CudaDevice.GetDevice(allocator.DeviceId);

@@ -134,7 +134,8 @@ bool siblings_present(const std::string& dir)
     }
     return true;
 }
-const char* const kCudnnNames[] = { "cudnn64_9.dll", "cudnn64_8.dll" };
+// cuDNN 9 is the only major with CUDA 13 builds.
+const char* const kCudnnNames[] = { "cudnn64_9.dll" };
 const char kSep = '\\';
 // The Windows redistributable puts the DLLs in bin\x64; a system install or a
 // hand-assembled directory may use bin\ or the root.
@@ -147,7 +148,9 @@ void* lib_sym(LibHandle h, const char* n) { return dlsym(h, n); }
 // The Linux packages ship one libcudnn.so.9 plus sub-libraries resolved through
 // RUNPATH=$ORIGIN, so dlopen by absolute path already finds them.
 bool siblings_present(const std::string&) { return true; }
-const char* const kCudnnNames[] = { "libcudnn.so.9", "libcudnn.so.8", "libcudnn.so" };
+// cuDNN 9 is the only major with CUDA 13 builds; the unversioned libcudnn.so can
+// point at any of them.
+const char* const kCudnnNames[] = { "libcudnn.so.9" };
 const char kSep = '/';
 const char* const kLibSubdirs[] = { "lib", "lib64", "" };
 #endif
@@ -185,6 +188,24 @@ CudnnApi& api()
         CudnnApi r;
         LibHandle h = open_cudnn();
         if (h == nullptr) return r;
+        // cuda12 and cuda13 builds of cuDNN 9 share every file name, so the CUDA
+        // major a build targets is the only thing that tells them apart - and a
+        // cuda12 build loads cublasLt64_12 / nvrtc64_120_0, which a CUDA 13 install
+        // does not have. Decline the cuDNN path (never abort) on any mismatch.
+        // Every cuDNN 9 exports cudnnGetCudartVersion; a library without it has an
+        // incomplete export table, declined like a missing entry below.
+        using GetCudartVersionFn = size_t (CUDNNWINAPI *)(void);
+        auto getCudartVersion = (GetCudartVersionFn) lib_sym(h, "cudnnGetCudartVersion");
+        if (getCudartVersion == nullptr) return r;
+        const size_t cudnnCudart = getCudartVersion();
+        if (cudnnCudart / 1000 != CUDART_VERSION / 1000)
+        {
+            std::fprintf(stderr,
+                "tsg_cudnn: ignoring cuDNN built for CUDA %zu.%zu; this build needs a CUDA %d build of cuDNN 9 "
+                "(e.g. libcudnn9-cuda-%d, or eng/fetch-cudnn). Falling back to im2col+GEMM convolutions.\n",
+                cudnnCudart / 1000, cudnnCudart % 1000 / 10, CUDART_VERSION / 1000, CUDART_VERSION / 1000);
+            return r;
+        }
         bool ok = true;
 #define TSG_CUDNN_LOAD(name)                                    \
         r.fn_##name = (decltype(&::name)) lib_sym(h, #name);    \

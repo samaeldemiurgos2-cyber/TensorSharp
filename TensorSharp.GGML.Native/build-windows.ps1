@@ -147,6 +147,54 @@ function Resolve-CudaToolkitBinDir {
     return ""
 }
 
+function Get-NvccRelease([string] $Nvcc) {
+    # "13.4" from `nvcc --version` ("Cuda compilation tools, release 13.4, V13.4.92"),
+    # or "" when the compiler cannot be run or prints no release line.
+    try {
+        $text = (& $Nvcc --version 2>$null) -join "`n"
+    }
+    catch {
+        return ""
+    }
+    if ($text -match 'release (\d+)\.(\d+),') {
+        return "$($Matches[1]).$($Matches[2])"
+    }
+    return ""
+}
+
+function Resolve-EffectiveCudaCompiler {
+    # The nvcc CMake will identify: the explicit CUDACXX / -DCMAKE_CUDA_COMPILER
+    # choice, else the first nvcc.exe on PATH (Resolve-CudaToolkitBinDir has
+    # already put a CUDA_PATH/CUDA_HOME toolkit there when PATH had none).
+    $explicit = Resolve-ExplicitCudaCompilerPath
+    if (-not [string]::IsNullOrWhiteSpace($explicit)) {
+        return $explicit
+    }
+    $command = @(Get-Command nvcc.exe -CommandType Application -ErrorAction SilentlyContinue) | Select-Object -First 1
+    if ($null -ne $command) {
+        return $command.Source
+    }
+    return ""
+}
+
+function Assert-Cuda13Toolkit([string] $Nvcc) {
+    # TensorSharp builds only with CUDA 13 or newer, whether CUDA was requested or
+    # auto-detected: a CUDA 12 nvcc is an error, never a silent CPU-only build.
+    if ([string]::IsNullOrWhiteSpace($Nvcc)) {
+        return
+    }
+    $release = Get-NvccRelease $Nvcc
+    if ([string]::IsNullOrWhiteSpace($release)) {
+        throw ("CUDA 13+ required, but '$Nvcc --version' reports no 'release X.Y,' line. Install a CUDA 13 toolkit, " +
+            "point CUDACXX at its nvcc, or pass --no-cuda for a CPU-only build.")
+    }
+    if ([int]($release.Split('.')[0]) -lt 13) {
+        throw ("CUDA 13+ required (found $release at $Nvcc); CUDA 12 is not supported. Install a CUDA 13 toolkit and " +
+            "put it first on PATH (or point CUDACXX at its nvcc), or pass --no-cuda for a CPU-only build.")
+    }
+    Write-Host "Using nvcc $release ($Nvcc)."
+}
+
 function Read-CachedBackendSetting([string] $CacheVariable) {
     $cacheFile = Join-Path $BuildDir "CMakeCache.txt"
     if (-not (Test-Path $cacheFile)) {
@@ -176,6 +224,12 @@ function Detect-LocalCudaArchitectures {
     foreach ($cap in $caps) {
         $clean = ($cap -as [string]).Trim()
         if ($clean -notmatch '^([0-9]+)\.([0-9]+)$') {
+            continue
+        }
+
+        # CUDA 13 compiles nothing below compute capability 7.5 (Turing).
+        if ([int]$Matches[1] * 10 + [int]$Matches[2] -lt 75) {
+            Write-Warning "Skipping GPU of compute capability ${clean}: CUDA 13 supports 7.5 (Turing) and newer only."
             continue
         }
 
@@ -451,6 +505,9 @@ if ($EnableCuda -eq "ON") {
 
         $env:PATH = "$CudaBinDir;$env:PATH"
     }
+
+    $EffectiveCudaCompiler = Resolve-EffectiveCudaCompiler
+    Assert-Cuda13Toolkit $EffectiveCudaCompiler
 }
 
 if ($EnableCuda -eq "ON" -and [string]::IsNullOrWhiteSpace($CudaArchitectures) -and -not $UserSetCudaArchitectures) {
@@ -469,7 +526,7 @@ if ($EnableCuda -eq "ON") {
         $CudaArchSummary = $CudaArchitectures
     }
     else {
-        $CudaArchSummary = "ggml default"
+        $CudaArchSummary = "native"
     }
 }
 
@@ -563,7 +620,7 @@ if ($EnableCuda -eq "ON" -and $effectiveGenerator -like "Visual Studio*" -and $n
     # The "Visual Studio NN" generators find nvcc through the CUDA toolkit's
     # MSBuild integration (CUDA *.props under the VS instance), not through
     # PATH. The CUDA installer only lays that integration down for VS versions
-    # it supports - e.g. CUDA 12.x predates VS 2026 - and without it the
+    # it supports - e.g. CUDA toolkits that predate VS 2026 - and without it the
     # configure fails with the opaque "No CMAKE_CUDA_COMPILER could be found".
     $cudaBuildCustomizations = Join-Path $VisualStudio.Path "MSBuild\Microsoft\VC"
     $hasCudaVsIntegration = (Test-Path $cudaBuildCustomizations) -and
@@ -626,7 +683,20 @@ if (-not [string]::IsNullOrWhiteSpace($CachedPointerSize) -and $CachedPointerSiz
 # therefore ignored, which is what "it was not being picked up" meant in
 # discussion #130. CMake also refuses to swap a compiler inside an existing tree,
 # so the only fix is to start the tree over, exactly as for a generator change.
-if (-not [string]::IsNullOrWhiteSpace($ExplicitCudaCompiler)) {
+# A tree configured with an older toolkit (a CUDA 12 nvcc, or one since removed)
+# cannot be reused: CMake would keep driving the cached compiler. Start it over.
+if ($EnableCuda -eq "ON") {
+    $CachedCudaCompiler = Read-CachedCudaCompiler
+    if (-not [string]::IsNullOrWhiteSpace($CachedCudaCompiler)) {
+        $cachedRelease = if (Test-Path $CachedCudaCompiler) { Get-NvccRelease $CachedCudaCompiler } else { "" }
+        if ([string]::IsNullOrWhiteSpace($cachedRelease) -or [int]($cachedRelease.Split('.')[0]) -lt 13) {
+            Write-Host "The cached CUDA compiler '$CachedCudaCompiler' is missing or older than CUDA 13; removing $BuildDir to reconfigure from scratch."
+            Remove-Item -Recurse -Force $BuildDir
+        }
+    }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ExplicitCudaCompiler) -and (Test-Path $BuildDir)) {
     $CachedCudaCompiler = Read-CachedCudaCompiler
     # CMake writes the cache entry with forward slashes; $ExplicitCudaCompiler is
     # already a resolved full path.

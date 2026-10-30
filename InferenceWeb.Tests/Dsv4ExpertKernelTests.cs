@@ -21,7 +21,10 @@ public sealed class Dsv4ExpertKernelTests
     private const int Tokens = 40;
     private const int Used = 2;
 
-    [CudaTheory]
+    // The kernel's body is guarded by __CUDA_ARCH__ >= 800: the committed compute_75 baseline (a
+    // build without nvcc) and a build for an sm_7x GPU compile it to nothing, and the engine
+    // never launches it there (HasMoeMma), so the test skips rather than read unwritten output.
+    [CudaTheory(TensorCoreModule = "tensorsharp_dsv4_kernels")]
     [InlineData((int)GgmlTensorType.Q2_K)]
     [InlineData((int)GgmlTensorType.Q3_K)]
     [InlineData((int)GgmlTensorType.Q4_K)]
@@ -67,6 +70,7 @@ public sealed class Dsv4ExpertKernelTests
         using var allocator = new CudaAllocator(0);
         allocator.Context.MakeCurrent();
         using var kernels = Dsv4Kernels.Create();
+        Assert.True(kernels.HasMoeMma, "The gate read an sm_80+ module, but the loaded one disables its tensor-core expert kernel.");
         using var gateW = Up(allocator, gate);
         using var upW = Up(allocator, up);
         using var actT = Up(allocator, act);

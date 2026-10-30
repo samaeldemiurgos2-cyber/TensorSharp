@@ -156,7 +156,7 @@ namespace TensorSharp.Cuda
                     throw new NotSupportedException(
                         $"[{tag}] {ExpertName(layer, role, w)} is Q5_1, and the loaded tensorsharp_dsv4_kernels module " +
                         "was built from kernel source older than its Q5_1 expert decoder (a committed PTX baseline not " +
-                        "yet regenerated). Rebuild TensorSharp.Backends.Cuda with nvcc on PATH, or run this model with " +
+                        "yet regenerated). Rebuild TensorSharp.Backends.Cuda with a CUDA 13 nvcc on PATH, or run this model with " +
                         "--backend ggml_cuda.");
                 }
             }
@@ -192,7 +192,7 @@ namespace TensorSharp.Cuda
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
             bool perSlot = nt <= perSlotMaxRows;
-            // HasMoeMma: from the committed compute_61 PTX the tensor-core kernel compiles to an
+            // HasMoeMma: from the committed compute_75 PTX the tensor-core kernel compiles to an
             // empty body and would leave ffnOut unwritten; the staged route serves those builds.
             bool mma = !perSlot && dk.HasMoeMma
                 && GroupedSupportsType(guType) && GroupedSupportsType(downType)

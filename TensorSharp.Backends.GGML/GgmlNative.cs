@@ -7322,27 +7322,42 @@ internal enum GgmlIndexReductionOp
 
         private static IEnumerable<string> EnumerateWindowsNativeDependencyDirectories()
         {
-            // CUDA 13 installs its DLLs in bin\x64, earlier toolkits in bin.
-            foreach (string variableName in new[] { "CUDA_PATH", "CUDA_HOME" })
-            {
-                string root = Environment.GetEnvironmentVariable(variableName);
-                if (!string.IsNullOrWhiteSpace(root))
-                {
-                    yield return Path.Combine(root, "bin", "x64");
-                    yield return Path.Combine(root, "bin");
-                }
-            }
-
             string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
             string cudaRoot = Path.Combine(programFiles, "NVIDIA GPU Computing Toolkit", "CUDA");
-            if (!Directory.Exists(cudaRoot))
-                yield break;
+            return EnumerateWindowsNativeDependencyDirectories(
+                Environment.GetEnvironmentVariable("CUDA_PATH"),
+                Environment.GetEnvironmentVariable("CUDA_HOME"),
+                Directory.Exists(cudaRoot) ? Directory.EnumerateDirectories(cudaRoot, "v*") : Array.Empty<string>());
+        }
 
-            foreach (string versionDir in Directory.EnumerateDirectories(cudaRoot, "v*").OrderByDescending(path => path))
+        /// <summary>
+        /// Where GgmlOps.dll (cublas64_13.dll) and cuDNN (cublasLt64_13.dll, nvrtc64_130_0.dll)
+        /// find the CUDA 13 runtime. CUDA 13 installs its DLLs in bin\x64 (its bin holds only
+        /// tools), so that is the only directory probed, and of the installed toolkit folders
+        /// only v13 and newer are considered, newest first by parsed version.
+        /// </summary>
+        internal static IEnumerable<string> EnumerateWindowsNativeDependencyDirectories(
+            string cudaPath, string cudaHome, IEnumerable<string> installedToolkitDirectories)
+        {
+            foreach (string root in new[] { cudaPath, cudaHome })
             {
-                yield return Path.Combine(versionDir, "bin", "x64");
-                yield return Path.Combine(versionDir, "bin");
+                if (!string.IsNullOrWhiteSpace(root))
+                    yield return Path.Combine(root, "bin", "x64");
             }
+
+            var toolkits = installedToolkitDirectories
+                .Select(path => (Dir: path, Version: ParseCudaToolkitFolderVersion(Path.GetFileName(path.TrimEnd('\\', '/')))))
+                .Where(entry => entry.Version != null && entry.Version.Major >= 13)
+                .OrderByDescending(entry => entry.Version);
+            foreach (var toolkit in toolkits)
+                yield return Path.Combine(toolkit.Dir, "bin", "x64");
+        }
+
+        private static Version ParseCudaToolkitFolderVersion(string folderName)
+        {
+            if (string.IsNullOrEmpty(folderName) || folderName.Length < 2 || char.ToLowerInvariant(folderName[0]) != 'v')
+                return null;
+            return Version.TryParse(folderName.Substring(1), out Version version) ? version : null;
         }
 
         private static bool IsRepoRoot(string path)

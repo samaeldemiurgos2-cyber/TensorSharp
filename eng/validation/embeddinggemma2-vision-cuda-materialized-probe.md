@@ -69,9 +69,9 @@ runner invocation is:
 ```sh
 python3 eng/validation/embeddinggemma2-vision-cuda-materialized-probe-run.py \
   --mode quality --output docs/validation/materialized-attention-quality-new \
-  --nvcc /usr/local/cuda-12.8/bin/nvcc \
+  --nvcc /usr/local/cuda/bin/nvcc \
   --host-compiler /usr/bin/x86_64-linux-gnu-g++-13 \
-  --cuda-root /usr/local/cuda-12.8 \
+  --cuda-root /usr/local/cuda \
   --native /absolute/frozen/libGgmlOps.so --expected-native-sha256 FROZEN_SHA \
   --ggml /absolute/unchanged/ggml \
   --baseline-source /absolute/TensorSharp.GGML.Native/ggml_ops_attention_precision.cu \

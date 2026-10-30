@@ -16,7 +16,7 @@
 # Environment:
 #   TENSORSHARP_CUDNN=OFF|0|false  skip entirely (the VAE stays on im2col+GEMM)
 #   TENSORSHARP_CUDNN_VERSION      override the pinned cuDNN version
-#   TENSORSHARP_CUDNN_CUDA_MAJOR   override the CUDA major (default: probe nvcc, else 12)
+#   TENSORSHARP_CUDNN_CUDA_MAJOR   override the CUDA major (default: probe nvcc, else 13)
 #   TS_CUDNN_DIR / CUDNN_DIR       use an existing cuDNN install and download nothing
 #   TENSORSHARP_GGML_NO_UPDATE     keep whatever is already provisioned
 #
@@ -27,6 +27,9 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# The documented CUDNN_DIR override, captured before CUDNN_DIR is reused below for
+# the provisioned copy.
+USER_CUDNN_DIR="${CUDNN_DIR:-}"
 CUDNN_DIR="${REPO_ROOT}/ExternalProjects/cudnn"
 MARKER="${CUDNN_DIR}/.complete"
 
@@ -53,14 +56,17 @@ is_true() {
 cuda_major() {
     if [ -n "${TENSORSHARP_CUDNN_CUDA_MAJOR:-}" ]; then printf '%s' "${TENSORSHARP_CUDNN_CUDA_MAJOR}"; return; fi
     local nvcc=""
-    if command -v nvcc >/dev/null 2>&1; then nvcc="$(command -v nvcc)"
+    # The build scripts export CUDACXX as the nvcc they checked; follow it first.
+    if [ -n "${CUDACXX:-}" ] && [ -x "${CUDACXX}" ]; then nvcc="${CUDACXX}"
+    elif command -v nvcc >/dev/null 2>&1; then nvcc="$(command -v nvcc)"
     elif [ -x "${CUDA_HOME:-/usr/local/cuda}/bin/nvcc" ]; then nvcc="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"; fi
     if [ -n "$nvcc" ]; then
         local v
         v="$("$nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9]*\)\..*/\1/p' | head -1)"
         if [ -n "$v" ]; then printf '%s' "$v"; return; fi
     fi
-    printf '12'
+    # TensorSharp builds only with CUDA 13.
+    printf '13'
 }
 
 if is_off; then
@@ -70,7 +76,7 @@ fi
 
 # An existing cuDNN wins: nothing to download, and the user's own version is the one
 # they meant to build against.
-for d in "${TS_CUDNN_DIR:-}" "${CUDNN_DIR_ENV:-}" "${CUDA_HOME:-}" /usr /usr/local/cuda; do
+for d in "${TS_CUDNN_DIR:-}" "${USER_CUDNN_DIR}" "${CUDA_HOME:-}" /usr /usr/local/cuda; do
     [ -n "$d" ] || continue
     if [ -f "$d/include/cudnn.h" ]; then
         step "using the cuDNN already installed at $d"

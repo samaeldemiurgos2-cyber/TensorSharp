@@ -31,7 +31,8 @@ name: Engine Comparison (TensorSharp vs llama.cpp)
 # smoke runs) only pay incremental costs.
 #
 # Self-hosted runner required: [self-hosted, tensorsharp-cuda]
-#   - Linux + NVIDIA GPU with the CUDA toolkit (nvcc) on PATH
+#   - Linux + NVIDIA GPU with a CUDA 13 toolkit (nvcc) on PATH and an R580+
+#     driver (CUDA 12 is not supported; the build fails on an older nvcc)
 #   - .NET 10 SDK, cmake, git, python3 + pip on PATH
 #   - ~40 GB free disk for llama.cpp builds + model files
 
@@ -115,6 +116,11 @@ jobs:
           python3 --version
           nvidia-smi || true
           df -h "$BENCH_HOME" .
+
+      - name: Require a CUDA 13 toolkit
+        run: |
+          nvcc --version
+          nvcc --version | grep -Eq 'release (1[3-9]|[2-9][0-9])\.' || { echo "CUDA 13+ required: TensorSharp no longer builds with CUDA 12."; exit 1; }
 
       - name: Build TensorSharp native GGML library (CUDA)
         run: bash TensorSharp.GGML.Native/build-linux.sh --cuda

@@ -70,7 +70,7 @@ namespace TensorSharp.Cuda
             {
                 throw new InvalidOperationException(
                     "tensorsharp_glm_kernels.ptx could not be located next to the application or under " +
-                    "a 'cuda_kernels' folder. Build TensorSharp.Backends.Cuda with nvcc on the PATH.");
+                    "a 'cuda_kernels' folder. Build TensorSharp.Backends.Cuda with a CUDA 13 nvcc on the PATH.");
             }
             return new GlmKernels(CudaModule.LoadFromFile(path));
         }

@@ -54,10 +54,11 @@ contains_number() {
     return 1
 }
 
-fallback=$(normalize_arch "${1:-compute_61}")
+fallback=$(normalize_arch "${1:-compute_75}")
 if [ -z "$fallback" ]; then
-    fallback=compute_61
+    fallback=compute_75
 fi
+nvcc=${2:-nvcc}
 
 env_arch=$(normalize_arch "${TENSORSHARP_CUDA_ARCH:-}")
 if [ -n "$env_arch" ]; then
@@ -65,7 +66,7 @@ if [ -n "$env_arch" ]; then
     exit 0
 fi
 
-supported=$(nvcc --list-gpu-arch 2>/dev/null | sed -nE 's/^compute_([0-9]{2,3})$/\1/p' | sort -n -u)
+supported=$("$nvcc" --list-gpu-arch 2>/dev/null | sed -nE 's/^compute_([0-9]{2,3})$/\1/p' | sort -n -u)
 
 gpu_lines=$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null)
 gpu_index=0
@@ -83,7 +84,8 @@ fi
 gpu_line=$(printf '%s\n' "$gpu_lines" | awk -v n=$((gpu_index + 1)) 'NR == n { print; exit }')
 detected=$(printf '%s\n' "$gpu_line" | sed -nE 's/.*,[[:space:]]*([0-9]+)[.]([0-9]+).*/\1\2/p')
 
-if [ -n "$detected" ] && [ "$detected" -gt 0 ] 2>/dev/null; then
+# CUDA 13 compiles nothing below compute_75; an older (unsupported) GPU gets the fallback.
+if [ -n "$detected" ] && [ "$detected" -ge 75 ] 2>/dev/null; then
     if [ -z "$supported" ] || contains_number "$detected"; then
         printf 'compute_%s\n' "$detected"
         exit 0
@@ -102,11 +104,16 @@ if [ -n "$detected" ] && [ "$detected" -gt 0 ] 2>/dev/null; then
     fi
 fi
 
+# A fallback this nvcc cannot compile moves up to the oldest architecture it can,
+# never to its newest one: the fallback must stay loadable on as many GPUs as possible.
 fallback_number=$(arch_number "$fallback")
 if [ -n "$supported" ] && [ "$fallback_number" -gt 0 ] 2>/dev/null && ! contains_number "$fallback_number"; then
     best_fallback=
     for arch in $supported; do
-        best_fallback=$arch
+        if [ "$arch" -ge "$fallback_number" ]; then
+            best_fallback=$arch
+            break
+        fi
     done
 
     if [ -n "$best_fallback" ]; then

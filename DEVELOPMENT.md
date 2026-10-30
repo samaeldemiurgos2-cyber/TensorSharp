@@ -27,8 +27,8 @@ See Microsoft's [cross-platform .NET installation overview](https://learn.micros
 
 - **`git` and network access:** the GGML/CUDA native builds clone the ggml sources from [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) into `ExternalProjects/ggml/` on first build (see `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`). The clone tracks ggml's default branch (`master`); pin a different ref with `TENSORSHARP_GGML_GIT_REF`, or set `TENSORSHARP_GGML_NO_UPDATE=1` to skip the network update once cloned (offline rebuilds)
 - **macOS (Metal backend):** CMake 3.20+ and the Xcode command-line tools for building the native GGML library — it embeds its Metal kernels as source and compiles them at run time, so it needs no Metal compiler at build time. The MLX backend additionally builds `libmlxc` from `TensorSharp.Backends.MLX/Native/` via `bash TensorSharp.Backends.MLX/build-native-macos.sh`, and that build *does* compile Metal shaders, so it needs a **full Xcode plus the Metal toolchain** — the command-line tools alone are not enough. `eng/ensure-metal-toolchain.sh` provisions this automatically on first build; see [Build the native MLX library](#build-the-native-mlx-library-macos-only)
-- **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 or 2026 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus a CUDA toolkit with cuBLAS: CUDA 13.4 is what the releases build with (CUDA 12.x still builds; CUDA 13 dropped the pre-Turing GPUs, and CUDA 13 builds need a CUDA 13 driver, R580 or newer). The pure-C# `cuda` backend's kernels are then compiled to PTX plus a fatbin of SASS for the detected GPU (`CudaFatbinArchitectures` lists more, e.g. `75,86,89,90,120`), so they also load on a driver older than the toolkit, which cannot JIT the toolkit's newer PTX. With several toolkits installed, `CUDACXX` (or `-DCMAKE_CUDA_COMPILER=`) selects which `nvcc` to build with; `build-windows.ps1` honours it ahead of `PATH`/`CUDA_PATH`, prints the choice in the `Configuring ...` line, and discards a build tree that was configured against a different one (CMake caches the CUDA compiler on the first configure and otherwise ignores `CUDACXX` from then on). Note CMake reads `CUDACXX` only for non-Visual-Studio generators; under a `Visual Studio NN` generator use `-T cuda=<version-or-path>` instead. With Visual Studio 2026, whose MSVC 14.5x toolset is newer than current CUDA toolkits officially accept as a host compiler, the build passes `-allow-unsupported-compiler` to `nvcc` automatically; include the "C++ CMake tools for Windows" component so the build can use the Ninja generator (the Visual Studio generator additionally needs a CUDA toolkit that ships MSBuild integration for your VS version). **cuDNN is provisioned automatically** by `eng/fetch-cudnn.ps1` into `ExternalProjects/cudnn/` on the first CUDA build (~1.8 GB download, ~1.1 GB on disk; only `include/` and `bin/` are kept) so the Wan / Qwen-Image VAE convolutions can use it instead of ggml's im2col+GEMM lowering. An existing install (`TS_CUDNN_DIR`, `CUDNN_DIR`, `CUDA_PATH`) is used ahead of the download, `TENSORSHARP_CUDNN=OFF` skips it, and nothing is linked against it — the runtime resolves it with `LoadLibrary`, so the build and the resulting binaries work with or without it
-- **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus a CUDA toolkit with cuBLAS: CUDA 13.4 is what the releases build with (CUDA 12.x still builds; CUDA 13 dropped the pre-Turing GPUs, and CUDA 13 builds need a CUDA 13 driver, R580 or newer). The pure-C# `cuda` backend's kernels are then compiled to PTX plus a fatbin of SASS for the detected GPU (`CudaFatbinArchitectures` lists more, e.g. `75,86,89,90,120`), so they also load on a driver older than the toolkit, which cannot JIT the toolkit's newer PTX. **cuDNN is provisioned automatically**: `eng/fetch-cudnn.sh` downloads the pinned redistributable from NVIDIA's public redist channel into `ExternalProjects/cudnn/` on the first CUDA build (no account or licence click needed), and the Wan / Qwen-Image VAE then runs its convolutions through cuDNN instead of ggml's im2col+GEMM lowering. An already-installed cuDNN (`libcudnn9-dev-cuda-13`, or `-cuda-12` with a CUDA 12 toolkit, `CUDA_HOME`, `TS_CUDNN_DIR`) is used ahead of the download. It is strictly optional: the fetch never fails the build, only the headers are needed to compile, and the library itself is resolved with `dlopen` at run time, so a binary built with cuDNN still runs on a machine without it. `TENSORSHARP_CUDNN=OFF` skips it entirely; the configure step prints which path applies
+- **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 or 2026 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus a CUDA 13 toolkit with cuBLAS. TensorSharp builds only with CUDA 13 (the releases use 13.4): it needs a Turing or newer GPU (compute capability 7.5+, the oldest target CUDA 13 compiles) and a CUDA 13 driver (R580 or newer), and the build stops with an error on a CUDA 12 `nvcc`. The pure-C# `cuda` backend's kernels are then compiled to PTX plus a fatbin of SASS for the detected GPU (`CudaFatbinArchitectures` lists more, e.g. `75,86,89,90,120`), so they also load on a driver older than the toolkit, which cannot JIT the toolkit's newer PTX. With several toolkits installed, `CUDACXX` (or `-DCMAKE_CUDA_COMPILER=`) selects which `nvcc` to build with (the `cuda` backend's PTX build follows `CUDACXX` too, unless `-p:CudaNvcc` pins one); `build-windows.ps1` honours it ahead of `PATH`/`CUDA_PATH`, prints the choice in the `Configuring ...` line, and discards a build tree that was configured against a different one (CMake caches the CUDA compiler on the first configure and otherwise ignores `CUDACXX` from then on). Note CMake reads `CUDACXX` only for non-Visual-Studio generators; under a `Visual Studio NN` generator use `-T cuda=<version-or-path>` instead. With Visual Studio 2026, whose MSVC 14.5x toolset is newer than current CUDA toolkits officially accept as a host compiler, the build passes `-allow-unsupported-compiler` to `nvcc` automatically; include the "C++ CMake tools for Windows" component so the build can use the Ninja generator (the Visual Studio generator additionally needs a CUDA toolkit that ships MSBuild integration for your VS version). **cuDNN is provisioned automatically** by `eng/fetch-cudnn.ps1` into `ExternalProjects/cudnn/` on the first CUDA build (~1.8 GB download, ~1.1 GB on disk; only `include/` and `bin/` are kept) so the Wan / Qwen-Image VAE convolutions can use it instead of ggml's im2col+GEMM lowering. An existing install (`TS_CUDNN_DIR`, `CUDNN_DIR`, `CUDA_PATH`) is used ahead of the download, `TENSORSHARP_CUDNN=OFF` skips it, and nothing is linked against it — the runtime resolves it with `LoadLibrary`, so the build and the resulting binaries work with or without it
+- **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus a CUDA 13 toolkit with cuBLAS. TensorSharp builds only with CUDA 13 (the releases use 13.4): it needs a Turing or newer GPU (compute capability 7.5+, the oldest target CUDA 13 compiles) and a CUDA 13 driver (R580 or newer), and the build stops with an error on a CUDA 12 `nvcc`. The pure-C# `cuda` backend's kernels are then compiled to PTX plus a fatbin of SASS for the detected GPU (`CudaFatbinArchitectures` lists more, e.g. `75,86,89,90,120`), so they also load on a driver older than the toolkit, which cannot JIT the toolkit's newer PTX. **cuDNN is provisioned automatically**: `eng/fetch-cudnn.sh` downloads the pinned redistributable from NVIDIA's public redist channel into `ExternalProjects/cudnn/` on the first CUDA build (no account or licence click needed), and the Wan / Qwen-Image VAE then runs its convolutions through cuDNN instead of ggml's im2col+GEMM lowering. An already-installed cuDNN (`libcudnn9-dev-cuda-13`, `CUDA_HOME`, `TS_CUDNN_DIR`) is used ahead of the download; at run time a cuDNN built for another CUDA major (a `-cuda-12` package) is ignored with a warning. It is strictly optional: the fetch never fails the build, only the headers are needed to compile, and the library itself is resolved with `dlopen` at run time, so a binary built with cuDNN still runs on a machine without it. `TENSORSHARP_CUDNN=OFF` skips it entirely; the configure step prints which path applies
 - **Windows (GGML Vulkan backend):** CMake 3.20+ and the Visual Studio 2022 or 2026 C++ build tools are required here too — the Vulkan toolchain is provisioned *and* the backend is compiled with CMake, so a machine without it fails early in `eng/fetch-vulkan-toolchain.ps1`. Visual Studio's "C++ CMake tools for Windows" component ships both `cmake.exe` and `ninja.exe`, and `build-windows.ps1` falls back to that copy when neither is on `PATH`; otherwise install CMake from [cmake.org/download](https://cmake.org/download/). The native build is **x64 only** — `build-windows.ps1` imports the `vcvars64` environment itself, including over an already-active *x86* one (a plain "Developer PowerShell for VS" defaults to x86, and ggml's Vulkan backend does not compile 32-bit). The backend is enabled automatically when the machine has a Vulkan runtime (`System32\vulkan-1.dll`, shipped by every recent GPU driver). With a [LunarG Vulkan SDK](https://vulkan.lunarg.com/) installed it is used directly; without one the build auto-provisions a portable toolchain (Vulkan-Headers, a vulkan-1 import library generated from the system loader, glslc, SPIRV-Headers) into `ExternalProjects/vulkan-toolchain/` via `eng/fetch-vulkan-toolchain.ps1`. Opt out with `build-windows.ps1 --no-vulkan` or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`. A GPU driver with Vulkan 1.3 support is required at runtime
 - **Linux (GGML Vulkan backend):** enabled automatically when a Vulkan loader (`libvulkan.so.1`) is installed. Distro dev packages are used when present (`apt install libvulkan-dev glslc spirv-headers`); otherwise the build auto-provisions the missing pieces (Vulkan-Headers, glslc from the shaderc CI prebuilts, SPIRV-Headers) into `ExternalProjects/vulkan-toolchain/` via `eng/fetch-vulkan-toolchain.sh`. Opt out with `build-linux.sh --no-vulkan` or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`
 - GGUF model files (e.g., from [Hugging Face](https://huggingface.co))
@@ -141,18 +141,24 @@ The direct `cuda` backend is built as managed C# plus PTX kernels. During `dotne
 
 After editing a `.cu` kernel, refresh the committed PTX baseline explicitly and commit the diff — machines without `nvcc` run the committed PTX, so an unrefreshed kernel change ships silently-stale kernels to them:
 
-```powershell
-dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -p:TensorSharpUpdateCommittedPtx=true
+```bash
+python3 eng/install-cuda-redist.py --version 13.0.3 --dest /opt/cuda-13.0.3   # once, side by side
+dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -c Release \
+  -p:TensorSharpUpdateCommittedPtx=true -p:CudaNvcc=/opt/cuda-13.0.3/bin/nvcc
 ```
 
-The committed baseline targets `compute_61` so it can load on older supported
-GPUs when `nvcc` is unavailable. The refresh command resolves `CudaArch=auto`
-and `native` to this portable target; it rejects an explicit newer target.
-Use a CUDA 12 toolkit to refresh the baseline: CUDA 13 compiles `compute_75` and
-newer only, and the refresh fails early when it finds a CUDA 13 `nvcc`. Ordinary
-builds retain automatic GPU detection (with no GPU detected they fall back to
-`compute_75` on CUDA 13 and `compute_61` on CUDA 12), and GPU-specific local
-builds should omit `TensorSharpUpdateCommittedPtx`.
+The committed baseline targets `compute_75`, the oldest architecture CUDA 13 compiles,
+and is built by `nvcc` 13.0 on Linux, whose PTX (ISA 9.0) every CUDA 13 driver (R580 or
+newer) can JIT; a driver rejects PTX newer than itself. The refresh resolves
+`CudaArch=auto` and `native` to that target and rejects any other explicit
+target; it fails before compiling unless the `nvcc` it runs (`-p:CudaNvcc`,
+else `CUDACXX`, else the one on `PATH`) reports release 13.0, and before copying unless every
+produced PTX reads `release 13.0`, `.version 9.0` and `.target sm_75`. The Qwen3.5
+kernels (`tensorsharp_q35_kernels.cu`, sm_80+ only) are never copied. Refresh on
+Linux: Windows `nvcc` makes `long` 32-bit. Ordinary builds keep automatic GPU
+detection (with no GPU detected they fall back to `compute_75`) and stop with an
+error on a CUDA 12 `nvcc`; GPU-specific local builds should omit
+`TensorSharpUpdateCommittedPtx`.
 
 #### Metal 4 tensor API on Apple silicon
 
@@ -430,7 +436,7 @@ weights. Do not add the two counters. These short warm runs are a reproducibilit
 baseline, not a long-context benchmark or a CPU-versus-GPU speedup claim.
 
 These checks cover the single-device GB10 Qwen text smoke and the listed
-kernel/media contracts, not every model family. CUDA 12 on GB10, other ARM64 NVIDIA products,
+kernel/media contracts, not every model family. Other ARM64 NVIDIA products,
 multi-GPU/multi-Spark operation, Vulkan/MLX, optional cuDNN acceleration and full
 image/video generation are outside this validation. A generic integrated-GPU
 performance warning may appear on GB10; it is not a measured comparison against
@@ -667,7 +673,8 @@ git push origin vX.Y.Z.W
 
 **Status verified 2026-09-25:** the latest release is [v2026.09.01](https://github.com/zhongkaifu/TensorSharp/releases/tag/v2026.09.01) (2026-09-17), after [v3.4.0.0](https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.4.0.0) (2026-09-12) and [v3.3.0.0](https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.3.0.0) (2026-08-30). Each publishes ten self-contained application archives of the server and **TensorSharp.Cli**, including the .NET 10 runtime and native libraries: one Server archive and one CLI archive for each of the five platform/backend suffixes below. Check the [Releases page](https://github.com/zhongkaifu/TensorSharp/releases) for newer versions instead of assuming that this stamped version remains latest.
 
-The published archive matrix (v3.3.0.0 through v2026.09.01) is:
+Tags v2026.10.03, v2026.10.11 and v2026.10.23 followed, still built with a CUDA 12.6 runtime.
+The published archive matrix (v3.3.0.0 through v2026.10.23) is:
 
 | Archive suffix | Native backend(s) bundled | Format |
 |---|---|---|
@@ -677,9 +684,11 @@ The published archive matrix (v3.3.0.0 through v2026.09.01) is:
 | `linux-x64-cuda` | GGML CUDA + pure-C# CUDA (PTX) + CUDA 12.x runtime | `.tar.gz` |
 | `osx-arm64` | GGML Metal + MLX | `.tar.gz` |
 
-From the next release on, the `-cuda` archives are built with CUDA 13.4: they bundle
-its runtime (`*.so.13` / `*64_13.dll`), ship SASS fatbins beside the PTX, and need a
-CUDA 13 driver (R580 or newer). The table above describes the published releases.
+These `-cuda` archives (through v2026.10.23) bundle a CUDA 12 runtime and are no
+longer supported. From the next release on, the `-cuda` archives are built with
+CUDA 13.4: they bundle its runtime (`*.so.13` / `*64_13.dll`), ship compute_75 PTX
+with SASS fatbins for sm_75/80/86/89/90/120, and need a Turing or newer GPU and a
+CUDA 13 driver (R580 or newer).
 
 The additional experimental GB10 target produces
 `linux-arm64-cuda13-GB10` CLI and Server.Host archives via the
