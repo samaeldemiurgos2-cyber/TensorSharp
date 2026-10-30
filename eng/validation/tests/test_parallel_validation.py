@@ -471,5 +471,111 @@ class LogitGateTests(unittest.TestCase):
                 logits.compare(left, right)
 
 
+class FirstTokenSidecarTests(unittest.TestCase):
+    """TS_DUMP_LOGITS vectors are comparable only as rows for the same prompt."""
+
+    @staticmethod
+    def meta(**overrides):
+        value = {"semantics": "first-generated-token", "count": 2, "prompt_tokens": 34,
+                 "prompt_fingerprint": "00000000deadbeef"}
+        value.update(overrides)
+        return value
+
+    def test_same_prompt_is_comparable(self):
+        self.assertEqual(logits.comparability(self.meta(), self.meta()), ("comparable", []))
+
+    def test_a_different_prompt_or_semantics_is_not_comparable(self):
+        for overrides in ({"prompt_tokens": 32}, {"prompt_fingerprint": "1"}, {"semantics": "first-forward"}, {"count": 3}):
+            status, reasons = logits.comparability(self.meta(), self.meta(**overrides))
+            self.assertEqual(status, "not_comparable", overrides)
+            self.assertTrue(reasons)
+
+    def test_missing_sidecar_is_unknown_never_comparable(self):
+        self.assertEqual(logits.comparability(None, self.meta())[0], "unknown")
+        self.assertEqual(logits.comparability(self.meta(), None)[0], "unknown")
+
+    def run_main(self, reference_meta, candidate_meta, *extra, vectors=None, raw_sidecars=None):
+        from array import array
+        vectors = vectors or ([1., 2.], [1., 2.])
+        raw_sidecars = raw_sidecars or (None, None)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = []
+            for name, meta, vector, raw in zip(("ref", "cand"), (reference_meta, candidate_meta), vectors, raw_sidecars):
+                path = root / f"{name}.f32"
+                path.write_bytes(array("f", vector).tobytes())
+                if raw is not None:
+                    Path(str(path) + ".json").write_text(raw)
+                elif meta is not None:
+                    Path(str(path) + ".json").write_text(json.dumps(meta))
+                paths.append(str(path))
+            out = root / "report.json"
+            argv = ["compare-parallel-logits.py", *paths, "--output", str(out), "--min-cosine", ".99", *extra]
+            with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                code = logits.main()
+            return code, json.loads(out.read_text())
+
+    def test_identical_vectors_for_different_prompts_fail(self):
+        code, report = self.run_main(self.meta(), self.meta(prompt_tokens=33))
+        self.assertEqual((code, report["status"], report["comparability"]), (1, "failed", "not_comparable"))
+
+    def test_missing_sidecar_passes_only_without_require_sidecar(self):
+        code, report = self.run_main(None, self.meta())
+        self.assertEqual((code, report["status"], report["comparability"]), (0, "passed", "unknown"))
+        code, report = self.run_main(None, self.meta(), "--require-sidecar")
+        self.assertEqual((code, report["status"]), (1, "failed"))
+
+    def test_matching_sidecars_pass(self):
+        code, report = self.run_main(self.meta(), self.meta())
+        self.assertEqual((code, report["status"], report["comparability"]), (0, "passed", "comparable"))
+
+    @staticmethod
+    def sha(vector):
+        from array import array
+        import hashlib
+        return hashlib.sha256(array("f", vector).tobytes()).hexdigest()
+
+    def test_sidecar_that_describes_its_vector_passes(self):
+        meta = self.meta(argmax=1, vector_sha256=self.sha([1., 2.]))
+        code, report = self.run_main(meta, meta)
+        self.assertEqual((code, report["status"], report["comparability"]), (0, "passed", "comparable"))
+        self.assertTrue(all(sidecar is None for sidecar in (report["reference_first_token"], report["candidate_first_token"])))
+
+    def test_stale_sidecar_beside_another_vector_is_not_comparable(self):
+        # The review repro: a first-forward build rewrote cand.f32 next to an older new-semantics sidecar.
+        fresh = self.meta(argmax=1, vector_sha256=self.sha([1., 2.]))
+        for stale in (self.meta(argmax=1), fresh):   # argmax alone, then the vector hash
+            code, report = self.run_main(fresh, stale, vectors=([1., 2.], [2., 1.]))
+            self.assertEqual((code, report["status"], report["comparability"]), (1, "failed", "not_comparable"), stale)
+            self.assertTrue(any("stale" in reason for reason in report["comparability_reasons"]))
+        # Same argmax, different bytes: only the hash can tell.
+        code, report = self.run_main(fresh, fresh, vectors=([1., 2.], [1., 3.]))
+        self.assertEqual((code, report["comparability"]), (1, "not_comparable"))
+        self.assertTrue(any("vector_sha256" in reason for reason in report["comparability_reasons"]))
+
+    def test_sidecar_count_must_match_its_vector(self):
+        code, report = self.run_main(self.meta(), self.meta(count=3))
+        self.assertEqual((code, report["comparability"]), (1, "not_comparable"))
+
+    def test_unreadable_sidecar_fails_instead_of_crashing(self):
+        for raw in ('{"semantics": "first-gen', '[1, 2]'):
+            code, report = self.run_main(self.meta(), None, raw_sidecars=(None, raw))
+            self.assertEqual((code, report["status"], report["comparability"]), (1, "failed", "not_comparable"), raw)
+
+    def test_media_or_adapter_difference_is_not_comparable(self):
+        for overrides in ({"media_spans": 1}, {"adapter": "style#1"}):
+            status, _ = logits.comparability(self.meta(media_spans=0), self.meta(**{"media_spans": 0, **overrides}))
+            self.assertEqual(status, "not_comparable", overrides)
+        # A sidecar written before these fields existed means "no media, no adapter".
+        self.assertEqual(logits.comparability(self.meta(), self.meta(media_spans=0))[0], "comparable")
+        self.assertEqual(logits.comparability(self.meta(), self.meta(media_spans=2))[0], "not_comparable")
+
+    def test_first_token_check_reports_whether_the_vector_chose_it(self):
+        check = logits.first_token_check(self.meta(first_token=1, first_token_source="sampled"), [1., 2.])
+        self.assertTrue(check["argmax_is_first_token"])
+        check = logits.first_token_check(self.meta(first_token=0, first_token_source="forced-thinking-end"), [1., 2.])
+        self.assertFalse(check["argmax_is_first_token"])
+
+
 if __name__ == "__main__":
     unittest.main()

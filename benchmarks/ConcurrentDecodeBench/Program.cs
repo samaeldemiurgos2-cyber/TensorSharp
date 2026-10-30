@@ -97,8 +97,9 @@ static double Median(List<double> values)
         : ordered[middle];
 }
 
-// warm
-await RunConc(1, "warmup");
+// warm (excluded from TS_DUMP_LOGITS: the dump must hold a measured request's first token)
+using (FirstTokenLogitsDump.Suppress())
+    await RunConc(1, "warmup");
 
 // Correctness: greedy solo token streams (the ground truth: each prompt run alone),
 // then assert the concurrent run reproduces them EXACTLY for the same prompts.

@@ -100,9 +100,10 @@ applied to the ACTIVATION with VPSIGNB) is what closed most of the remaining gap
 Still ~5.7x off `ggml_cpu` on prefill and ~2.4x on decode.
 
 **Quality: close, and the token difference is a near-tie rather than a defect.**
-Comparing the PREFILL logits directly (`TS_DUMP_LOGITS`, which skips the warmup
-forwards -- comparing those instead measures two executors on a throwaway token
-and is meaningless):
+Comparing the PREFILL logits directly (`TS_DUMP_LOGITS`, which never dumps the
+warmup forwards -- comparing those instead measures two executors on a throwaway
+token and is meaningless; measured when it held the first non-warmup forward, it
+now holds the logits that choose the first generated token, the last prompt row):
 
 - cosine **0.9567** over the 154880-wide vocabulary;
 - native argmax `1986` at 18.71 with `16360` at 18.60 -- 0.11 apart;

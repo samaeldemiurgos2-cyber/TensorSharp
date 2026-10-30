@@ -2007,7 +2007,7 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
 | 默认计算后端 | 服务端：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`；CLI：所有平台均为 `ggml_cpu` | `BACKEND`（仅服务端） | `--backend` |
-| 首次前向 logits 导出（后端 A/B） | 关闭 | `TS_DUMP_LOGITS=<路径>` 把**第一次真实前向**的 logits 以原始 float32 一次性写入该路径，并刻意跳过预热前向（`WarmUpKernels` 会先跑一次丢弃用的 decode 和 prefill，导出那几次等于在一个无意义的 token 上比较两个执行器）。这样就能用 logit 向量而不是生成文本来比较两个后端——贪心解码会把一次几乎打平的比分变成一句明显不同的话 | — |
+| 首个生成 token 的 logits 导出（后端 A/B） | 关闭 | `TS_DUMP_LOGITS=<路径>` 以原始 float32 一次性写出**决定第一个生成 token 的 logits**：整个提示词处理完之后的最后一行，不论提示词怎么跑的（一次前向或分多块、逐序列 / fused / 批量 prefill、`--tp`、`--layer-split`、`--benchmark` 的 `Forward` 或 `ForwardRefill`）。绝不会是预热前向、decode 前向或预热请求（`--warmup-runs`、服务端前缀缓存预热、benchmark 预热轮）。旁边的 `<路径>.json` 记录向量的 SHA-256、提示词长度与指纹、每一次 prefill 前向及其所属的计划路径、以及第一个 token，因此 `eng/validation/compare-parallel-logits.py` 能拒绝来自不同提示词的向量和过期的 sidecar。多个请求并发时，导出的是最先采样的那个请求这样就能用 logit 向量而不是生成文本来比较两个后端——贪心解码会把一次几乎打平的比分变成一句明显不同的话 | — |
 | MLX 后端库查找 | 优先探测应用目录 | `TENSORSHARP_MLX_LIBRARY`（`libmlxc` 完整路径）、`TENSORSHARP_MLX_LIBRARY_DIR`（目录） | — |
 | MLX 流水化贪心 decode（仅 CLI `--benchmark`） | 满足条件时启用 | — | — |
 | 使用 `mlock(2)` 钉住 GGUF mmap，使权重常驻 | 启用 | `TS_MLX_MLOCK_GGUF=0` 关闭 | — |

@@ -297,7 +297,7 @@ def main():
     p.add_argument("--media-projector", type=Path, help="Projector passed to the server's --mmproj and hashed in evidence")
     p.add_argument("--media-scenarios", default="image_ocr,multi_image,image_follow_up")
     p.add_argument("--media-max-tokens", type=int, default=256)
-    p.add_argument("--dump-logits", action="store_true", help="Dump the first non-warmup forward's F32 logits")
+    p.add_argument("--dump-logits", action="store_true", help="Dump the F32 logits that choose the first generated token (the last prompt row) plus a .json sidecar")
     p.add_argument("--initial-kv-tokens", type=int, help="Explicit initial GPU KV capacity, for growth validation")
     p.add_argument("args", nargs=argparse.REMAINDER)
     a = p.parse_args()
@@ -332,7 +332,12 @@ def main():
                MAX_CONTEXT=str(a.context), TS_PREFILL_WARMUP_LEN=str(a.warmup_prefill),
                OMP_NUM_THREADS=str(a.cpu_threads), OPENBLAS_NUM_THREADS=str(a.cpu_threads))
     if a.dump_logits:
-        env["TS_DUMP_LOGITS"] = str((a.output / "prefill-logits.bin").resolve())
+        dump = (a.output / "prefill-logits.bin").resolve()
+        # An earlier run's vector or sidecar must not pass for this run's (the engine also clears them).
+        for stale in (dump, Path(str(dump) + ".json")):
+            if stale.exists():
+                stale.unlink()
+        env["TS_DUMP_LOGITS"] = str(dump)
     if a.initial_kv_tokens is not None:
         if a.initial_kv_tokens < 1:
             p.error("--initial-kv-tokens must be positive")

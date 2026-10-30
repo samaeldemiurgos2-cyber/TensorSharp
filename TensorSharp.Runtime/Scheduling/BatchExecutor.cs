@@ -350,6 +350,8 @@ namespace TensorSharp.Runtime.Scheduling
                         var results = TryExecutePath(plan.Candidates[i], output, options);
                         if (results != null)
                         {
+                            if (FirstTokenLogitsDump.IsArmed)
+                                NoteDumpPrefillSteps(plan.Candidates[i], results);
                             if (_cbDebug)
                                 TraceStepResults(plan.Candidates[i], output, results);
                             if (_stepLog)
@@ -470,6 +472,44 @@ namespace TensorSharp.Runtime.Scheduling
             // turn it into a failed step.
             try { Console.Error.WriteLine(sb.ToString()); }
             catch (Exception) { }
+        }
+
+        /// <summary>TS_DUMP_LOGITS: remember which path ran each prompt chunk, for the sidecar of the
+        /// first-token dump (<see cref="FirstTokenLogitsDump"/>). Only while a dump is still owed.</summary>
+        private static void NoteDumpPrefillSteps(ExecutionPathKind path, List<SequenceStepResult> results)
+        {
+            foreach (var r in results)
+            {
+                if (r.IsPrefill && r.Error == null && r.TokensForwarded > 0 && r.Sequence != null
+                    && r.Sequence.OutputTokens.Count == 0 && !r.Sequence.ExcludedFromFirstTokenDump)
+                    r.Sequence.NoteDumpPrefillStep(path.ToString(), r.TokensForwarded);
+            }
+        }
+
+        /// <summary>
+        /// TS_DUMP_LOGITS: the logits <paramref name="seq"/>'s FIRST generated token is about to be
+        /// chosen from - its last prompt row, however the prompt was run - written before the sampler
+        /// can mask or penalize them in place. Null when the dump is off, already written, or there are
+        /// no host logits to write. Callers check <c>OutputTokens.Count == 0</c> and
+        /// <see cref="FirstTokenLogitsDump.IsArmed"/> first, so a run without the variable pays nothing.
+        /// </summary>
+        private static FirstTokenLogitsDump.Capture? CaptureFirstTokenLogits(SequenceState seq)
+        {
+            // A warm-up request (submitted inside FirstTokenLogitsDump.Suppress) is excluded by its
+            // own flag: this runs on the engine worker, whose async flow says nothing about it.
+            if (seq.LastLogits == null || seq.ExcludedFromFirstTokenDump)
+                return null;
+            return FirstTokenLogitsDump.TryCaptureCore(seq.LastLogits, new FirstTokenLogitsInfo
+            {
+                Source = "engine",
+                RequestId = seq.RequestId,
+                PromptTokens = seq.PromptTokens.Count,
+                PromptFingerprint = FirstTokenLogitsDump.Fingerprint(seq.PromptTokens),
+                MediaSpans = seq.MediaSpans.Count,
+                Adapter = seq.Adapter?.Id,
+                PrefixReusedTokens = seq.PrefixCacheReusedTokens,
+                PrefillSteps = seq.DumpPrefillSteps?.ToArray(),
+            });
         }
 
         internal static string DescribeLogits(float[]? logits)
@@ -3392,9 +3432,14 @@ namespace TensorSharp.Runtime.Scheduling
         /// preemption, recompute, rollback — invalidates the stash.</summary>
         private static int TakePendingOrSample(SequenceState seq)
         {
+            // Every path's first token passes through here or PeekPendingOrSample, which is
+            // what makes this the one place the first-token dump can be taken for all of them.
+            var dump = seq.OutputTokens.Count == 0 && FirstTokenLogitsDump.IsArmed
+                ? CaptureFirstTokenLogits(seq) : null;
             if (seq.GetOrCreateSampler().TryGetForcedThinkingToken(seq.OutputTokens, out int thinkingEnd))
             {
                 seq.PendingDeviceToken = null;
+                dump?.Complete(thinkingEnd, "forced-thinking-end");
                 return thinkingEnd;
             }
             if (seq.PendingDeviceToken.HasValue)
@@ -3402,9 +3447,14 @@ namespace TensorSharp.Runtime.Scheduling
                 int t = seq.PendingDeviceToken.Value;
                 seq.PendingDeviceToken = null;
                 if (seq.PendingDevicePosition == seq.NumComputedTokens)
+                {
+                    dump?.Complete(t, "device-pending");
                     return t;
+                }
             }
-            return SampleFromLogits(seq);
+            int sampled = SampleFromLogits(seq);
+            dump?.Complete(sampled, "sampled");
+            return sampled;
         }
 
         /// <summary>Non-destructive form of <see cref="TakePendingOrSample"/> for
@@ -3413,15 +3463,27 @@ namespace TensorSharp.Runtime.Scheduling
         /// leaves the fallback loop a token source.</summary>
         private static int PeekPendingOrSample(SequenceState seq)
         {
+            // A peeked first token is the one the step emits (a decline stashes it for the
+            // fallback), so the dump is taken here as well; it is written once either way.
+            var dump = seq.OutputTokens.Count == 0 && FirstTokenLogitsDump.IsArmed
+                ? CaptureFirstTokenLogits(seq) : null;
             if (seq.GetOrCreateSampler().TryGetForcedThinkingToken(seq.OutputTokens, out int thinkingEnd))
+            {
+                dump?.Complete(thinkingEnd, "forced-thinking-end");
                 return thinkingEnd;
+            }
             if (seq.PendingDeviceToken.HasValue)
             {
                 if (seq.PendingDevicePosition == seq.NumComputedTokens)
+                {
+                    dump?.Complete(seq.PendingDeviceToken.Value, "device-pending");
                     return seq.PendingDeviceToken.Value;
+                }
                 seq.PendingDeviceToken = null;   // stale: position moved under it
             }
-            return SampleFromLogits(seq);
+            int sampled = SampleFromLogits(seq);
+            dump?.Complete(sampled, "sampled");
+            return sampled;
         }
 
         private static int SampleFromLogits(SequenceState seq)
@@ -3742,7 +3804,11 @@ namespace TensorSharp.Runtime.Scheduling
                 lastLogits = _model.Forward(tokens);
                 long forwardTicks = Stopwatch.GetTimestamp() - forwardStarted;
                 if (start < promptTokens)
+                {
                     seq.ReplayPrefillElapsedTicks += forwardTicks;
+                    if (seq.OutputTokens.Count == 0 && FirstTokenLogitsDump.IsArmed)
+                        seq.NoteDumpPrefillStep("Replay", n);
+                }
                 else
                     seq.ReplayDecodeElapsedTicks += forwardTicks;
                 seq.AdvanceComputedTokens(n);

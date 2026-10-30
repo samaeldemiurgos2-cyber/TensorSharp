@@ -262,8 +262,8 @@ breakdown reports it as "Other"; that is not unaccounted overhead.
 
 **This route is not claimed as parity.** The prefill-logit cosine against
 `ggml_cpu` is **0.9567** over the 154880-wide vocabulary (compared with
-`TS_DUMP_LOGITS`, which writes the first *real* forward's logits and skips the
-warm-up ones). The greedy text differs because native's top two logits are 0.11
+`TS_DUMP_LOGITS` when it still held the first non-warm-up forward; it now holds
+the logits that choose the first generated token, i.e. the last prompt row). The greedy text differs because native's top two logits are 0.11
 apart and the managed path ranks them the other way, putting native's pick at
 managed rank 2. That is consistent with 2-bit expert-pick sensitivity -- the same
 effect that makes `TS_BATCHED_FUSED_DECODE=0` useful for an exact serial-path A/B -- but it is **not**
