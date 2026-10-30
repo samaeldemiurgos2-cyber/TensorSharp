@@ -49,13 +49,14 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
 
     private float[][] Run(BackendType backend, Action configure) => Run(backend, configure, Prompt);
 
-    private float[][] Run(BackendType backend, Action configure, int[] prompt)
+    private float[][] Run(BackendType backend, Action configure, int[] prompt, Action<ModelBase>? loaded = null)
     {
         MoeCpuOffloadConfig.Reset();
         configure();
         string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp.gguf"), 16);
         using ModelBase model = ModelBase.Create(path, backend);
         Assert.IsType<Qwen4ExpModel>(model);
+        loaded?.Invoke(model);
         var rows = new float[Steps.Length + 1][];
         rows[0] = (float[])model.ForwardRefill(prompt).Clone();
         for (int i = 0; i < Steps.Length; i++)
@@ -150,8 +151,10 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         try
         {
             float[][] f16 = Run(BackendType.GgmlMetal, () => KvCacheDtypeConfig.Set(KvCacheDtype.F16));
-            float[][] q8 = Run(BackendType.GgmlMetal, () => KvCacheDtypeConfig.Set(KvCacheDtype.Q8_0));
-            Assert.Equal(KvCacheDtype.F16, KvCacheDtypeConfig.Current);
+            float[][] q8 = Run(BackendType.GgmlMetal, () => KvCacheDtypeConfig.Set(KvCacheDtype.Q8_0), Prompt,
+                model => Assert.Equal(KvCacheDtype.F16, model.KvCacheDtype));
+            // The substitution is this model's; the operator's request stays for the next model.
+            Assert.Equal(KvCacheDtype.Q8_0, KvCacheDtypeConfig.Current);
             AssertClose("--kv-cache-dtype q8_0", q8, f16, 0.0);
         }
         finally

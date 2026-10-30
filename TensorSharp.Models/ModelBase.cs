@@ -138,22 +138,24 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// Storage dtype for the per-layer K/V cache tensors. Captured at model
-        /// construction time from <see cref="KvCacheDtypeConfig.Current"/> so the
-        /// rest of the per-model code (cache allocation, write-on-decode,
-        /// attention reads, native-layer-decode bindings) can specialize without
-        /// repeatedly polling the global config.
+        /// construction time from <see cref="KvCacheDtypeConfig.Current"/> (the user's
+        /// explicit choice, or F32) so the rest of the per-model code (cache
+        /// allocation, write-on-decode, attention reads, native-layer-decode bindings)
+        /// can specialize without repeatedly polling the global config. The
+        /// model-aligned default and the block-quantized downgrade below change this
+        /// field only, never the process-wide request.
         /// </summary>
         protected KvCacheDtype _kvCacheDtype = KvCacheDtypeConfig.Current;
 
         /// <summary>
         /// Pick a model-aligned default KV-cache dtype based on the dominant
-        /// weight quantization tier seen in <paramref name="quantWeights"/>.
-        /// Mirrors <see cref="KvCacheDtypeConfig.ApplyModelDtypeDefault"/> but
-        /// is callable from inside a model constructor (after LoadWeights, before
-        /// InitKVCache) so each model picks its own default without forcing the
-        /// CLI front-end to inspect every GGUF file. Honors any explicit user
-        /// choice (env var or <c>--kv-cache-dtype</c> flag) - we only step in
-        /// when the user has left the dtype unset.
+        /// weight quantization tier seen in <paramref name="quantWeights"/>
+        /// (<see cref="KvCacheDtypeConfig.ModelAlignedDefault"/>). Callable from
+        /// inside a model constructor (after LoadWeights, before InitKVCache) so
+        /// each model picks its own default without forcing the CLI front-end to
+        /// inspect every GGUF file. Honors any explicit user choice (env var or
+        /// <c>--kv-cache-dtype</c> flag) - we only step in when the user has left
+        /// the dtype unset.
         /// </summary>
         protected void ApplyModelAlignedKvCacheDefault(IDictionary<string, QuantizedWeight> quantWeights)
         {
@@ -177,8 +179,7 @@ namespace TensorSharp.Models
                 }
             }
 
-            KvCacheDtypeConfig.ApplyModelDtypeDefault(dominant);
-            _kvCacheDtype = KvCacheDtypeConfig.Current;
+            RaiseToModelAlignedKvCacheDefault(dominant);
         }
 
         /// <summary>Resolve the default before a whole-layer stage filters out
@@ -200,8 +201,22 @@ namespace TensorSharp.Models
             long bestBytes = 0;
             foreach (var entry in typeBytes)
                 if (entry.Value > bestBytes) { bestBytes = entry.Value; dominant = entry.Key; }
-            KvCacheDtypeConfig.ApplyModelDtypeDefault(dominant);
-            _kvCacheDtype = KvCacheDtypeConfig.Current;
+            RaiseToModelAlignedKvCacheDefault(dominant);
+        }
+
+        /// <summary>
+        /// Apply <see cref="KvCacheDtypeConfig.ModelAlignedDefault"/> to THIS model only
+        /// (the caller has checked that the user chose no dtype). It is raised from F32
+        /// to F16 and never lowered, exactly as the old process-wide default behaved for
+        /// the first model of a process, so a first load is unchanged; the difference is
+        /// that the next model starts again from the user's request instead of from
+        /// whatever an earlier model chose.
+        /// </summary>
+        private void RaiseToModelAlignedKvCacheDefault(int dominantGgmlType)
+        {
+            if (KvCacheDtypeConfig.ModelAlignedDefault(dominantGgmlType) == KvCacheDtype.F16
+                && _kvCacheDtype == KvCacheDtype.F32)
+                _kvCacheDtype = KvCacheDtype.F16;
         }
 
         /// <summary>
@@ -225,21 +240,22 @@ namespace TensorSharp.Models
         /// architectures that cannot read one (see
         /// <see cref="SupportsBlockQuantizedKvCache"/>), with a message on stderr
         /// naming the substitution. F16 is the right substitute rather than F32:
-        /// it is what <see cref="KvCacheDtypeConfig.ApplyModelDtypeDefault"/>
+        /// it is what <see cref="KvCacheDtypeConfig.ModelAlignedDefault"/>
         /// would have chosen for any quantized model, so the operator gets the
-        /// cache the model would have used anyway instead of an abort.
+        /// cache the model would have used anyway instead of an abort. Only this
+        /// model's cache changes: the operator's request stays in
+        /// <see cref="KvCacheDtypeConfig"/> for the next model, which may read it.
         /// </summary>
         private void RefuseUnsupportedBlockQuantizedKvCache()
         {
             if (SupportsBlockQuantizedKvCache) return;
-            KvCacheDtype requested = KvCacheDtypeConfig.Current;
+            KvCacheDtype requested = _kvCacheDtype;
             if (requested != KvCacheDtype.Q8_0 && requested != KvCacheDtype.Q4_0) return;
 
             Console.Error.WriteLine(
                 $"[kv-cache] {GetType().Name} cannot read a {requested.ToShortString()} K/V cache "
                 + "on any of its attention paths; using f16 instead.");
-            KvCacheDtypeConfig.Set(KvCacheDtype.F16);
-            _kvCacheDtype = KvCacheDtypeConfig.Current;
+            _kvCacheDtype = KvCacheDtype.F16;
         }
 
         /// <summary>
@@ -249,19 +265,20 @@ namespace TensorSharp.Models
         /// ggml_metal config, say - becomes f16 with a line on stderr instead of an
         /// unhandled "MLX dtype mapping does not support Q8_0" at the first cache write.
         /// The memory the request was after is mostly still there: ggml-metal holds a
-        /// host tensor and a Metal mirror of the cache, MLX one device array.
+        /// host tensor and a Metal mirror of the cache, MLX one device array. Like
+        /// <see cref="RefuseUnsupportedBlockQuantizedKvCache"/>, this changes this
+        /// model's cache only, not the operator's request.
         /// </summary>
         private void UseFloatKvCacheOnMlx()
         {
             if (_backend != BackendType.Mlx) return;
-            KvCacheDtype requested = KvCacheDtypeConfig.Current;
+            KvCacheDtype requested = _kvCacheDtype;
             if (requested != KvCacheDtype.Q8_0 && requested != KvCacheDtype.Q4_0) return;
 
             Console.Error.WriteLine(
                 $"[kv-cache] the MLX backend has no {requested.ToShortString()} K/V cache; using f16 "
                 + "(one device copy, where ggml_metal keeps a host tensor and a Metal mirror).");
-            KvCacheDtypeConfig.Set(KvCacheDtype.F16);
-            _kvCacheDtype = KvCacheDtypeConfig.Current;
+            _kvCacheDtype = KvCacheDtype.F16;
         }
 
         public KvCacheDtype KvCacheDtype => _kvCacheDtype;

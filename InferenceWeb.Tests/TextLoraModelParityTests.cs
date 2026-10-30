@@ -37,13 +37,15 @@ public sealed class TextLoraModelParityTests : IDisposable
     private readonly bool _restoreKvExplicit = KvCacheDtypeConfig.IsExplicitlySet;
 
     // The adapter and its merged twin are compared through the same K/V cache: F32, pinned. Left to
-    // the model-aligned default, the cache dtype came from the run's history, not the row. That
-    // default is process-wide and only ever raised (KvCacheDtypeConfig.ApplyModelDtypeDefault): the
-    // first model with sub-F32 weights sets F16 and nothing sets it back. So the all-F32 rows ran
-    // with an F16 cache after any F16-layer row or quantized model, and two F16-rounded caches whose
-    // F32 inputs differ by rounding put LoRA-vs-merged at 1.2e-5..2.5e-5 on direct cuda (6e-7..1.1e-6
-    // with an F32 cache). Run first in a process, an F16-projection Nemotron row instead built its
-    // F32-weight twin with an F32 cache and its base with F16, 2.7e-4 apart on managed cpu.
+    // the model-aligned default, each model picks its cache from its own weights, and the two sides
+    // of a row differ there: the twin's merged weights are written as F32, so it gets an F32 cache,
+    // while a base with F16 layers or projections gets F16. The comparison would then include the
+    // cache's rounding, not just the adapter's: an F16-projection Nemotron row measured 2.7e-4
+    // against its 1e-4 bound on managed cpu. An F16 cache on both sides is no substitute: two
+    // F16-rounded caches whose F32 inputs differ by rounding put the all-F32 rows' LoRA-vs-merged at
+    // 1.2e-5..2.5e-5 on direct cuda, against 6e-7..1.1e-6 with an F32 cache and a 1e-5 bound. (Until
+    // KvCacheDtypeConfig's default became per-model, a process-wide default that only ever went up
+    // decided both from whatever the process had loaded before, so the rows were order-dependent.)
     public TextLoraModelParityTests() => KvCacheDtypeConfig.Set(KvCacheDtype.F32);
 
     public void Dispose()
