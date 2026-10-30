@@ -1491,6 +1491,21 @@ namespace TensorSharp.Models
                 return;
             }
 
+            AttentionDecodeWithWindowHost(q, kCache, vCache, result,
+                numHeads, numKVHeads, keyDim, valDim, attendStart, totalSeqLen);
+            InvalidateTensorDeviceCache(result);
+        }
+
+        /// <summary>
+        /// The F32 / F16 cache body of <see cref="AttentionDecodeWithWindow"/>, which uses no
+        /// model state. Each head's score row spans the whole attended range - the full
+        /// context on a full-causal layer - so it is stackalloc'd only up to
+        /// <see cref="CpuScratch.StackFloatLimit"/> keys and rented past that.
+        /// </summary>
+        internal static unsafe void AttentionDecodeWithWindowHost(Tensor q, Tensor kCache, Tensor vCache,
+            Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
+            int attendStart, int totalSeqLen)
+        {
             bool half = kCache.ElementType == DType.Float16;
             if (half != (vCache.ElementType == DType.Float16))
             {
@@ -1512,15 +1527,31 @@ namespace TensorSharp.Models
             nint qN = (nint)qPtr, rN = (nint)rPtr;
             nint kN = half ? (nint)kPtrH : (nint)kPtrF;
             nint vN = half ? (nint)vPtrH : (nint)vPtrF;
+            int stackLimit = CpuScratch.StackFloatLimit;
 
             void Head(int h)
+            {
+                float[] rented = null;
+                Span<float> scratch = attendLen <= stackLimit
+                    ? stackalloc float[attendLen]
+                    : (rented = CpuScratch.RentFloats(attendLen)).AsSpan(0, attendLen);
+                try
+                {
+                    fixed (float* scores = scratch)
+                        HeadInto(h, scores);
+                }
+                finally
+                {
+                    CpuScratch.Return(rented);
+                }
+            }
+
+            void HeadInto(int h, float* scores)
             {
                 float* qHead = (float*)qN + h * keyDim;
                 int kvHead = h / groupSize;
                 long kBase = (long)kvHead * maxSeqLen * keyDim + (long)attendStart * keyDim;
                 long vBase = (long)kvHead * maxSeqLen * valDim + (long)attendStart * valDim;
-
-                float* scores = stackalloc float[attendLen];
 
                 float maxScore = float.NegativeInfinity;
                 for (int t = 0; t < attendLen; t++)
@@ -1558,8 +1589,6 @@ namespace TensorSharp.Models
                 System.Threading.Tasks.Parallel.For(0, numHeads, Head);
             else
                 for (int h = 0; h < numHeads; h++) Head(h);
-
-            InvalidateTensorDeviceCache(result);
         }
 
         /// <summary>

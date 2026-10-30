@@ -257,12 +257,29 @@ namespace TensorSharp.Models
                 return;
             }
 
-            float* qPtr = GetFloatPtr(q);
-            float* kPtr = GetFloatPtr(kCache);
-            float* vPtr = GetFloatPtr(vCache);
-            float* rPtr = GetFloatPtr(result);
-            int maxSeqLen = (int)kCache.Sizes[1];
+            AttentionDecodeGrouped(GetFloatPtr(q), GetFloatPtr(kCache), GetFloatPtr(vCache), GetFloatPtr(result),
+                numHeads, numKVHeads, headDim, (int)kCache.Sizes[1], totalSeqLen, scale,
+                Environment.ProcessorCount);
+        }
+
+        /// <summary>
+        /// The F32-cache kernel behind <see cref="AttentionDecodePureCS"/>, on raw pointers:
+        /// <paramref name="qPtr"/> and <paramref name="rPtr"/> are (numHeads, headDim), the caches
+        /// (numKVHeads, maxSeqLen, headDim) with keys [0, totalSeqLen) live.
+        /// <paramref name="processorCount"/> sizes the K-split; the model entry point passes
+        /// <see cref="Environment.ProcessorCount"/>, tests pin it to reach each schedule.
+        /// The (groupSize, keys) score scratch is stack memory only up to
+        /// <see cref="CpuScratch.StackFloatLimit"/> floats and rented above it: these blocks run on
+        /// <see cref="CpuWorkerPool"/> workers, and a group of 16 over 13,844 keys (865 KiB)
+        /// overflowed a worker's 512 KiB stack, which aborts the process.
+        /// </summary>
+        internal static unsafe void AttentionDecodeGrouped(float* qPtr, float* kPtr, float* vPtr, float* rPtr,
+            int numHeads, int numKVHeads, int headDim, int maxSeqLen, int totalSeqLen, float scale,
+            int processorCount)
+        {
             int groupSize = numHeads / numKVHeads;
+            // Read on the entering thread and captured by the blocks (see CpuScratch).
+            int stackLimit = CpuScratch.StackFloatLimit;
 
             // GQA-aware decode attention. For each KV head we compute attention for the
             // groupSize query heads that share it, reading K/V from the cache exactly once
@@ -280,7 +297,7 @@ namespace TensorSharp.Models
             // (KV head, K-chunk) pair. Empirically, ~512 K-positions per task is the sweet
             // spot on Apple M-series: smaller chunks lose to scheduler overhead, larger
             // chunks under-utilize cores at long contexts.
-            int procCount = Environment.ProcessorCount;
+            int procCount = processorCount;
             int kSplit = 1;
             if (numKVHeads < procCount && totalSeqLen >= 1024)
             {
@@ -313,10 +330,24 @@ namespace TensorSharp.Models
                         float* kP = (float*)kPtrL;
                         float* vP = (float*)vPtrL;
                         float* rP = (float*)rPtrL;
-                        float* scoresBuf = stackalloc float[groupSizeLocal * totalSeqLenLocal];
-                        AttentionDecodeKVHeadGrouped(kvHead, qP, kP, vP, rP, scoresBuf,
-                            headDimLocal, maxSeqLenLocal, groupSizeLocal,
-                            totalSeqLenLocal, scaleLocal);
+                        int scoreFloats = groupSizeLocal * totalSeqLenLocal;
+                        float[] rented = null;
+                        Span<float> scratch = scoreFloats <= stackLimit
+                            ? stackalloc float[scoreFloats]
+                            : (rented = CpuScratch.RentFloats(scoreFloats)).AsSpan(0, scoreFloats);
+                        try
+                        {
+                            fixed (float* scoresBuf = scratch)
+                            {
+                                AttentionDecodeKVHeadGrouped(kvHead, qP, kP, vP, rP, scoresBuf,
+                                    headDimLocal, maxSeqLenLocal, groupSizeLocal,
+                                    totalSeqLenLocal, scaleLocal);
+                            }
+                        }
+                        finally
+                        {
+                            CpuScratch.Return(rented);
+                        }
                     });
                 }
                 else
@@ -352,10 +383,27 @@ namespace TensorSharp.Models
                                 float* part = (float*)partialPtrL +
                                     (long)taskIdx * partialFloatsPerChunk;
 
-                                float* scoresLocal = stackalloc float[groupSizeLocal * kLen];
-                                AttentionDecodeChunkPartial(kvHead, kStart, kLen, qP, kP, vP,
-                                    part, scoresLocal,
-                                    headDimLocal, maxSeqLenLocal, groupSizeLocal, scaleLocal);
+                                // A chunk is totalSeqLen / kSplit keys and kSplit stops at
+                                // ceil(cores / KV heads) - 2 on a 4-core host with 2 KV heads -
+                                // so this grows with the context too.
+                                int scoreFloats = groupSizeLocal * kLen;
+                                float[] rented = null;
+                                Span<float> scratch = scoreFloats <= stackLimit
+                                    ? stackalloc float[scoreFloats]
+                                    : (rented = CpuScratch.RentFloats(scoreFloats)).AsSpan(0, scoreFloats);
+                                try
+                                {
+                                    fixed (float* scoresLocal = scratch)
+                                    {
+                                        AttentionDecodeChunkPartial(kvHead, kStart, kLen, qP, kP, vP,
+                                            part, scoresLocal,
+                                            headDimLocal, maxSeqLenLocal, groupSizeLocal, scaleLocal);
+                                    }
+                                }
+                                finally
+                                {
+                                    CpuScratch.Return(rented);
+                                }
                             });
 
                             CpuParallel.For(numKVHeadsLocal, kvHead =>
@@ -377,11 +425,26 @@ namespace TensorSharp.Models
             }
             else
             {
-                float* scores = stackalloc float[groupSize * totalSeqLen];
-                for (int kvHead = 0; kvHead < numKVHeads; kvHead++)
+                // On the caller's own thread, whatever its stack: same limit.
+                int scoreFloats = groupSize * totalSeqLen;
+                float[] rented = null;
+                Span<float> scratch = scoreFloats <= stackLimit
+                    ? stackalloc float[scoreFloats]
+                    : (rented = CpuScratch.RentFloats(scoreFloats)).AsSpan(0, scoreFloats);
+                try
                 {
-                    AttentionDecodeKVHeadGrouped(kvHead, qPtr, kPtr, vPtr, rPtr, scores,
-                        headDim, maxSeqLen, groupSize, totalSeqLen, scale);
+                    fixed (float* scores = scratch)
+                    {
+                        for (int kvHead = 0; kvHead < numKVHeads; kvHead++)
+                        {
+                            AttentionDecodeKVHeadGrouped(kvHead, qPtr, kPtr, vPtr, rPtr, scores,
+                                headDim, maxSeqLen, groupSize, totalSeqLen, scale);
+                        }
+                    }
+                }
+                finally
+                {
+                    CpuScratch.Return(rented);
                 }
             }
         }
@@ -706,14 +769,25 @@ namespace TensorSharp.Models
         protected unsafe void AttentionDecodePureCSF16(Tensor q, Tensor kCache, Tensor vCache,
             Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale)
         {
-            float* qPtr = GetFloatPtr(q);
-            ushort* kPtr = TensorComputePrimitives.GetHalfPointer(kCache);
-            ushort* vPtr = TensorComputePrimitives.GetHalfPointer(vCache);
-            float* rPtr = GetFloatPtr(result);
-            int maxSeqLen = (int)kCache.Sizes[1];
-            int groupSize = numHeads / numKVHeads;
+            AttentionDecodeGroupedF16(GetFloatPtr(q),
+                TensorComputePrimitives.GetHalfPointer(kCache), TensorComputePrimitives.GetHalfPointer(vCache),
+                GetFloatPtr(result), numHeads, numKVHeads, headDim, (int)kCache.Sizes[1], totalSeqLen, scale);
+        }
 
-            int procCount = Environment.ProcessorCount;
+        /// <summary>
+        /// The F16-cache kernel behind <see cref="AttentionDecodePureCSF16"/>, on raw pointers
+        /// (layouts as <see cref="AttentionDecodeGrouped"/>). One block per KV head, each with a
+        /// (groupSize, totalSeqLen) score scratch that is stack memory only up to
+        /// <see cref="CpuScratch.StackFloatLimit"/> floats: this is the block that overflowed a
+        /// <see cref="CpuWorkerPool"/> worker for Nemotron-3.5 Lightning at 13,844 keys.
+        /// </summary>
+        internal static unsafe void AttentionDecodeGroupedF16(float* qPtr, ushort* kPtr, ushort* vPtr, float* rPtr,
+            int numHeads, int numKVHeads, int headDim, int maxSeqLen, int totalSeqLen, float scale)
+        {
+            int groupSize = numHeads / numKVHeads;
+            // Read on the entering thread and captured by the blocks (see CpuScratch).
+            int stackLimit = CpuScratch.StackFloatLimit;
+
             bool useParallel = numKVHeads > 1 && (long)numHeads * totalSeqLen >= 4096;
 
             if (useParallel)
@@ -735,19 +809,47 @@ namespace TensorSharp.Models
                     ushort* kP = (ushort*)kPtrL;
                     ushort* vP = (ushort*)vPtrL;
                     float* rP = (float*)rPtrL;
-                    float* scoresBuf = stackalloc float[groupSizeLocal * totalSeqLenLocal];
-                    AttentionDecodeKVHeadGroupedF16(kvHead, qP, kP, vP, rP, scoresBuf,
-                        headDimLocal, maxSeqLenLocal, groupSizeLocal,
-                        totalSeqLenLocal, scaleLocal);
+                    int scoreFloats = groupSizeLocal * totalSeqLenLocal;
+                    float[] rented = null;
+                    Span<float> scratch = scoreFloats <= stackLimit
+                        ? stackalloc float[scoreFloats]
+                        : (rented = CpuScratch.RentFloats(scoreFloats)).AsSpan(0, scoreFloats);
+                    try
+                    {
+                        fixed (float* scoresBuf = scratch)
+                        {
+                            AttentionDecodeKVHeadGroupedF16(kvHead, qP, kP, vP, rP, scoresBuf,
+                                headDimLocal, maxSeqLenLocal, groupSizeLocal,
+                                totalSeqLenLocal, scaleLocal);
+                        }
+                    }
+                    finally
+                    {
+                        CpuScratch.Return(rented);
+                    }
                 });
             }
             else
             {
-                float* scores = stackalloc float[groupSize * totalSeqLen];
-                for (int kvHead = 0; kvHead < numKVHeads; kvHead++)
+                int scoreFloats = groupSize * totalSeqLen;
+                float[] rented = null;
+                Span<float> scratch = scoreFloats <= stackLimit
+                    ? stackalloc float[scoreFloats]
+                    : (rented = CpuScratch.RentFloats(scoreFloats)).AsSpan(0, scoreFloats);
+                try
                 {
-                    AttentionDecodeKVHeadGroupedF16(kvHead, qPtr, kPtr, vPtr, rPtr, scores,
-                        headDim, maxSeqLen, groupSize, totalSeqLen, scale);
+                    fixed (float* scores = scratch)
+                    {
+                        for (int kvHead = 0; kvHead < numKVHeads; kvHead++)
+                        {
+                            AttentionDecodeKVHeadGroupedF16(kvHead, qPtr, kPtr, vPtr, rPtr, scores,
+                                headDim, maxSeqLen, groupSize, totalSeqLen, scale);
+                        }
+                    }
+                }
+                finally
+                {
+                    CpuScratch.Return(rented);
                 }
             }
         }

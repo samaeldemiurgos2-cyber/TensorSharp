@@ -49,6 +49,14 @@ namespace TensorSharp.Models
         // pool deliberately does NOT take every core (see DefaultThreadCountFor).
         private static readonly int SpinsBeforePark = EnvInt("TS_CPU_SPIN", 4096);
 
+        /// <summary>
+        /// Stack reserved for each worker. Smaller than a ThreadPool thread's, and running out of
+        /// stack aborts the process, so a kernel never sizes a stackalloc by its input here: a
+        /// buffer that grows with the context, the heads or the batch goes through
+        /// <see cref="CpuScratch"/>, which keeps it on the stack only up to a quarter of this.
+        /// </summary>
+        internal const int WorkerStackBytes = 512 * 1024;
+
         private static int EnvInt(string name, int fallback)
             => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v >= 0
                 ? v
@@ -82,7 +90,7 @@ namespace TensorSharp.Models
             _threads = new Thread[_workers];
             for (int i = 0; i < _workers; i++)
             {
-                var t = new Thread(WorkerLoop, 512 * 1024)
+                var t = new Thread(WorkerLoop, WorkerStackBytes)
                 {
                     IsBackground = true,
                     Name = "ts-cpu-" + i,

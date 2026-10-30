@@ -778,7 +778,22 @@ namespace TensorSharp.Models
         /// <summary>
         /// Decode attention with sinks for TP (per-rank head subset).
         /// </summary>
-        private unsafe void AttentionDecodeWithSinksTP(
+        private void AttentionDecodeWithSinksTP(
+            Tensor q, Tensor kCache, Tensor vCache, Tensor result,
+            int numHeads, int numKVHeads, int headDim,
+            int attendStart, int attendEnd, float scale, float[] sinks)
+        {
+            AttentionDecodeWithSinksTPHost(q, kCache, vCache, result,
+                numHeads, numKVHeads, headDim, attendStart, attendEnd, scale, sinks);
+            InvalidateTensorDeviceCache(result);
+        }
+
+        /// <summary>
+        /// Host body of <see cref="AttentionDecodeWithSinksTP"/> (no model state). The score
+        /// row spans the attended range - the whole context on a full-attention layer - so it
+        /// is stack memory only up to <see cref="CpuScratch.StackFloatLimit"/> keys.
+        /// </summary>
+        internal static unsafe void AttentionDecodeWithSinksTPHost(
             Tensor q, Tensor kCache, Tensor vCache, Tensor result,
             int numHeads, int numKVHeads, int headDim,
             int attendStart, int attendEnd, float scale, float[] sinks)
@@ -791,51 +806,60 @@ namespace TensorSharp.Models
             int groupSize = numHeads / numKVHeads;
             int kvSeqLen = (int)kCache.Sizes[1];
             // Every head overwrites all scores, so reuse one buffer across heads.
-            Span<float> scores = stackalloc float[attendEnd - attendStart];
-
-            for (int h = 0; h < numHeads; h++)
+            int numScores = attendEnd - attendStart;
+            float[] rented = null;
+            Span<float> scores = numScores <= CpuScratch.StackFloatLimit
+                ? stackalloc float[numScores]
+                : (rented = CpuScratch.RentFloats(numScores)).AsSpan(0, numScores);
+            try
             {
-                int kvH = h / groupSize;
-                float sink = sinks[h];
-                float* qHead = qPtr + h * headDim;
-                float* rHead = rPtr + h * headDim;
-
-                // Compute scores
-                float maxScore = sink;
-                for (int k = attendStart; k < attendEnd; k++)
+                for (int h = 0; h < numHeads; h++)
                 {
-                    float* kHead = kPtr + (kvH * kvSeqLen + k) * headDim;
-                    float dot = 0;
+                    int kvH = h / groupSize;
+                    float sink = sinks[h];
+                    float* qHead = qPtr + h * headDim;
+                    float* rHead = rPtr + h * headDim;
+
+                    // Compute scores
+                    float maxScore = sink;
+                    for (int k = attendStart; k < attendEnd; k++)
+                    {
+                        float* kHead = kPtr + (kvH * kvSeqLen + k) * headDim;
+                        float dot = 0;
+                        for (int d = 0; d < headDim; d++)
+                            dot += qHead[d] * kHead[d];
+                        dot *= scale;
+                        scores[k - attendStart] = dot;
+                        if (dot > maxScore) maxScore = dot;
+                    }
+
+                    // Softmax with sink
+                    float sinkExp = MathF.Exp(sink - maxScore);
+                    float sum = sinkExp;
+                    for (int k = 0; k < scores.Length; k++)
+                    {
+                        scores[k] = MathF.Exp(scores[k] - maxScore);
+                        sum += scores[k];
+                    }
+                    float invSum = 1.0f / sum;
+
+                    // Weighted sum of V
                     for (int d = 0; d < headDim; d++)
-                        dot += qHead[d] * kHead[d];
-                    dot *= scale;
-                    scores[k - attendStart] = dot;
-                    if (dot > maxScore) maxScore = dot;
-                }
+                        rHead[d] = 0;
 
-                // Softmax with sink
-                float sinkExp = MathF.Exp(sink - maxScore);
-                float sum = sinkExp;
-                for (int k = 0; k < scores.Length; k++)
-                {
-                    scores[k] = MathF.Exp(scores[k] - maxScore);
-                    sum += scores[k];
-                }
-                float invSum = 1.0f / sum;
-
-                // Weighted sum of V
-                for (int d = 0; d < headDim; d++)
-                    rHead[d] = 0;
-
-                for (int k = attendStart; k < attendEnd; k++)
-                {
-                    float w = scores[k - attendStart] * invSum;
-                    float* vHead = vPtr + (kvH * kvSeqLen + k) * headDim;
-                    for (int d = 0; d < headDim; d++)
-                        rHead[d] += w * vHead[d];
+                    for (int k = attendStart; k < attendEnd; k++)
+                    {
+                        float w = scores[k - attendStart] * invSum;
+                        float* vHead = vPtr + (kvH * kvSeqLen + k) * headDim;
+                        for (int d = 0; d < headDim; d++)
+                            rHead[d] += w * vHead[d];
+                    }
                 }
             }
-            InvalidateTensorDeviceCache(result);
+            finally
+            {
+                CpuScratch.Return(rented);
+            }
         }
 
         // ====================================================================

@@ -1484,7 +1484,7 @@ namespace TensorSharp.Models
                 if (!attnOk)
                 {
                     AttentionDecodeWithSinks(qTensor, _kvCacheK[layer], _kvCacheV[layer],
-                        attnResult, numHeads, numKVHeads, headDim, totalSeqLen, scale, sinks, isSWA);
+                        attnResult, numHeads, numKVHeads, headDim, totalSeqLen, scale, sinks, isSWA, _slidingWindow);
                 }
                 qTensor.Dispose();
 
@@ -1685,8 +1685,9 @@ namespace TensorSharp.Models
             }
         }
 
-        private unsafe void AttentionDecodeWithSinks(Tensor q, Tensor kCache, Tensor vCache,
-            Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale, float[] sinks, bool isSWA)
+        internal static unsafe void AttentionDecodeWithSinks(Tensor q, Tensor kCache, Tensor vCache,
+            Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale, float[] sinks, bool isSWA,
+            int slidingWindow)
         {
             // Dispatch on KV cache dtype. The fast paths (F32 below, F16 just
             // beneath) are CPU implementations of single-token GQA attention
@@ -1699,7 +1700,7 @@ namespace TensorSharp.Models
             if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
             {
                 AttentionDecodeWithSinksF16(q, kCache, vCache, result,
-                    numHeads, numKVHeads, headDim, totalSeqLen, scale, sinks, isSWA);
+                    numHeads, numKVHeads, headDim, totalSeqLen, scale, sinks, isSWA, slidingWindow);
                 return;
             }
 
@@ -1710,41 +1711,55 @@ namespace TensorSharp.Models
             int maxSeqLen = (int)kCache.Sizes[1];
             int groupSize = numHeads / numKVHeads;
 
-            int startT = isSWA ? Math.Max(0, totalSeqLen - _slidingWindow) : 0;
+            int startT = isSWA ? Math.Max(0, totalSeqLen - slidingWindow) : 0;
             int numScores = totalSeqLen - startT;
-            float* scores = stackalloc float[numScores];
-
-            for (int h = 0; h < numHeads; h++)
+            // One row reused across heads. A full-attention layer's row spans the whole
+            // context, so it is stack memory only up to CpuScratch.StackFloatLimit keys.
+            float[] rented = null;
+            Span<float> scratch = numScores <= CpuScratch.StackFloatLimit
+                ? stackalloc float[numScores]
+                : (rented = CpuScratch.RentFloats(numScores)).AsSpan(0, numScores);
+            try
             {
-                float* qHead = qPtr + h * headDim;
-                int kvHead = h / groupSize;
-                float* kHead = kPtr + kvHead * maxSeqLen * headDim;
-                float* vHead = vPtr + kvHead * maxSeqLen * headDim;
-
-                float maxScore = (sinks != null) ? sinks[h] : float.NegativeInfinity;
-                for (int i = 0; i < numScores; i++)
+                fixed (float* scores = scratch)
                 {
-                    int t = startT + i;
-                    float s = VecDot(qHead, kHead + t * headDim, headDim) * scale;
-                    scores[i] = s;
-                    if (s > maxScore) maxScore = s;
-                }
+                    for (int h = 0; h < numHeads; h++)
+                    {
+                        float* qHead = qPtr + h * headDim;
+                        int kvHead = h / groupSize;
+                        float* kHead = kPtr + kvHead * maxSeqLen * headDim;
+                        float* vHead = vPtr + kvHead * maxSeqLen * headDim;
 
-                float sumExp = (sinks != null) ? MathF.Exp(sinks[h] - maxScore) : 0f;
-                for (int i = 0; i < numScores; i++)
-                {
-                    float e = MathF.Exp(scores[i] - maxScore);
-                    scores[i] = e;
-                    sumExp += e;
-                }
-                float invSum = 1.0f / sumExp;
-                for (int i = 0; i < numScores; i++)
-                    scores[i] *= invSum;
+                        float maxScore = (sinks != null) ? sinks[h] : float.NegativeInfinity;
+                        for (int i = 0; i < numScores; i++)
+                        {
+                            int t = startT + i;
+                            float s = VecDot(qHead, kHead + t * headDim, headDim) * scale;
+                            scores[i] = s;
+                            if (s > maxScore) maxScore = s;
+                        }
 
-                float* rHead = rPtr + h * headDim;
-                VecZero(rHead, headDim);
-                for (int i = 0; i < numScores; i++)
-                    VecScaleAdd(rHead, vHead + (startT + i) * headDim, scores[i], headDim);
+                        float sumExp = (sinks != null) ? MathF.Exp(sinks[h] - maxScore) : 0f;
+                        for (int i = 0; i < numScores; i++)
+                        {
+                            float e = MathF.Exp(scores[i] - maxScore);
+                            scores[i] = e;
+                            sumExp += e;
+                        }
+                        float invSum = 1.0f / sumExp;
+                        for (int i = 0; i < numScores; i++)
+                            scores[i] *= invSum;
+
+                        float* rHead = rPtr + h * headDim;
+                        VecZero(rHead, headDim);
+                        for (int i = 0; i < numScores; i++)
+                            VecScaleAdd(rHead, vHead + (startT + i) * headDim, scores[i], headDim);
+                    }
+                }
+            }
+            finally
+            {
+                CpuScratch.Return(rented);
             }
         }
 
@@ -1755,8 +1770,9 @@ namespace TensorSharp.Models
         /// the F32 path; only the cache load is widened. Parallelised over
         /// query heads to amortise the per-head F16-&gt;F32 widening.
         /// </summary>
-        private unsafe void AttentionDecodeWithSinksF16(Tensor q, Tensor kCache, Tensor vCache,
-            Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale, float[] sinks, bool isSWA)
+        internal static unsafe void AttentionDecodeWithSinksF16(Tensor q, Tensor kCache, Tensor vCache,
+            Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale, float[] sinks, bool isSWA,
+            int slidingWindow)
         {
             long qPtrL = (long)GetFloatPtr(q);
             long kPtrL = (long)TensorComputePrimitives.GetHalfPointer(kCache);
@@ -1765,8 +1781,9 @@ namespace TensorSharp.Models
             int maxSeqLen = (int)kCache.Sizes[1];
             int groupSize = numHeads / numKVHeads;
 
-            int startT = isSWA ? Math.Max(0, totalSeqLen - _slidingWindow) : 0;
+            int startT = isSWA ? Math.Max(0, totalSeqLen - slidingWindow) : 0;
             int numScores = totalSeqLen - startT;
+            int stackLimit = CpuScratch.StackFloatLimit;   // read here, captured per head
             int headDimLocal = headDim;
             int maxSeqLenLocal = maxSeqLen;
             int groupSizeLocal = groupSize;
@@ -1787,35 +1804,47 @@ namespace TensorSharp.Models
                 ushort* kHead = kPtr + kvHead * maxSeqLenLocal * headDimLocal;
                 ushort* vHead = vPtr + kvHead * maxSeqLenLocal * headDimLocal;
 
-                float* scores = stackalloc float[numScoresLocal];
                 float* vF32 = stackalloc float[headDimLocal];
-
-                float maxScore = (sinksLocal != null) ? sinksLocal[h] : float.NegativeInfinity;
-                for (int i = 0; i < numScoresLocal; i++)
+                float[] rented = null;
+                Span<float> scratch = numScoresLocal <= stackLimit
+                    ? stackalloc float[numScoresLocal]
+                    : (rented = CpuScratch.RentFloats(numScoresLocal)).AsSpan(0, numScoresLocal);
+                try
                 {
-                    int t = startTLocal + i;
-                    float s = TensorComputePrimitives.DotF32F16(qHead, kHead + t * headDimLocal, headDimLocal) * scaleLocal;
-                    scores[i] = s;
-                    if (s > maxScore) maxScore = s;
+                    fixed (float* scores = scratch)
+                    {
+                        float maxScore = (sinksLocal != null) ? sinksLocal[h] : float.NegativeInfinity;
+                        for (int i = 0; i < numScoresLocal; i++)
+                        {
+                            int t = startTLocal + i;
+                            float s = TensorComputePrimitives.DotF32F16(qHead, kHead + t * headDimLocal, headDimLocal) * scaleLocal;
+                            scores[i] = s;
+                            if (s > maxScore) maxScore = s;
+                        }
+
+                        float sumExp = (sinksLocal != null) ? MathF.Exp(sinksLocal[h] - maxScore) : 0f;
+                        for (int i = 0; i < numScoresLocal; i++)
+                        {
+                            float e = MathF.Exp(scores[i] - maxScore);
+                            scores[i] = e;
+                            sumExp += e;
+                        }
+                        float invSum = 1.0f / sumExp;
+                        for (int i = 0; i < numScoresLocal; i++)
+                            scores[i] *= invSum;
+
+                        float* rHead = rPtr + h * headDimLocal;
+                        VecZero(rHead, headDimLocal);
+                        for (int i = 0; i < numScoresLocal; i++)
+                        {
+                            TensorComputePrimitives.F16ToF32(vF32, vHead + (startTLocal + i) * headDimLocal, headDimLocal);
+                            VecScaleAdd(rHead, vF32, scores[i], headDimLocal);
+                        }
+                    }
                 }
-
-                float sumExp = (sinksLocal != null) ? MathF.Exp(sinksLocal[h] - maxScore) : 0f;
-                for (int i = 0; i < numScoresLocal; i++)
+                finally
                 {
-                    float e = MathF.Exp(scores[i] - maxScore);
-                    scores[i] = e;
-                    sumExp += e;
-                }
-                float invSum = 1.0f / sumExp;
-                for (int i = 0; i < numScoresLocal; i++)
-                    scores[i] *= invSum;
-
-                float* rHead = rPtr + h * headDimLocal;
-                VecZero(rHead, headDimLocal);
-                for (int i = 0; i < numScoresLocal; i++)
-                {
-                    TensorComputePrimitives.F16ToF32(vF32, vHead + (startTLocal + i) * headDimLocal, headDimLocal);
-                    VecScaleAdd(rHead, vF32, scores[i], headDimLocal);
+                    CpuScratch.Return(rented);
                 }
             });
         }
