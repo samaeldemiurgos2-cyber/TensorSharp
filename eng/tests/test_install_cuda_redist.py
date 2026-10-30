@@ -99,6 +99,33 @@ class InstallCudaRedistTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.install(["cuda_nvcc"], "linux-sbsa")
 
+    def test_cccl_installs_under_either_manifest_spelling(self):
+        # CUDA 13.0.x / 13.2.x manifests call CCCL "cuda_cccl"; 13.4.x calls it "cccl".
+        for listed in ("cuda_cccl", "cccl"):
+            for requested in ("cccl", "cuda_cccl"):
+                with self.subTest(listed=listed, requested=requested):
+                    self.setUp()   # a fresh fixture server and destination per case
+                    self.add_zip(listed, {"include/cuda/std/version": b"cccl"})
+                    dest = self.install([requested], "windows-x86_64")
+                    self.assertEqual((dest / "include" / "cuda" / "std" / "version").read_bytes(), b"cccl")
+                    record = json.loads((dest / "tensorsharp-cuda-redist.json").read_text(encoding="utf-8"))
+                    self.assertEqual(record["components"], [listed])
+
+    def test_default_components_resolve_against_both_cuda13_manifest_layouts(self):
+        for cccl in ("cuda_cccl", "cccl"):
+            with self.subTest(cccl=cccl):
+                manifest = {"release_label": "13.x"}
+                for name in ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", cccl):
+                    manifest[name] = {"linux-x86_64": {"relative_path": f"{name}/a.tar.xz", "sha256": "0" * 64}}
+                resolved = redist.resolve_components(manifest, list(redist.DEFAULT_COMPONENTS), "linux-x86_64")
+                self.assertEqual([name for name, _, _ in resolved][-1], cccl)
+                self.assertEqual(len(resolved), len(redist.DEFAULT_COMPONENTS))
+
+    def test_unknown_component_still_names_the_requested_spelling(self):
+        with self.assertRaises(SystemExit) as raised:
+            redist.resolve_components({"release_label": "13.0.3"}, ["cccl"], "linux-x86_64")
+        self.assertIn("Component 'cccl' is not part of CUDA 13.0.3", str(raised.exception))
+
     def test_members_outside_the_root_are_refused(self):
         self.add_zip("cuda_nvcc", {"../escape.txt": b"x"})
         with self.assertRaises(SystemExit):

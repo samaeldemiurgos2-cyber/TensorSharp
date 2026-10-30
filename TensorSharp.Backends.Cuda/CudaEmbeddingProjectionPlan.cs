@@ -66,11 +66,11 @@ public sealed class CudaEmbeddingProjectionProof
 /// Use on the allocator's serialized stream and dispose before that allocator.</summary>
 public sealed class CudaEmbeddingProjectionPlan : IDisposable
 {
-    /// <summary>CUDA12.8: default F32 compute/intermediates (68), Half A/B,
+    /// <summary>CUDA 13.4 cublas_api.h:208-212: default F32 compute/intermediates (68), Half A/B,
     /// F32 C and F32 alpha/beta. Split-K output reductions remain F32 because
     /// output and accumulator have the same type. No handle math mode changes.
-    /// https://docs.nvidia.com/cuda/archive/12.8.1/cublas/index.html#cublascomputetype-t
-    /// https://docs.nvidia.com/cuda/archive/12.8.1/cublas/index.html#gemm-algorithms-numerical-behavior</summary>
+    /// https://docs.nvidia.com/cuda/cublas/index.html#cublascomputetype-t
+    /// https://docs.nvidia.com/cuda/cublas/index.html#gemm-algorithms-numerical-behavior</summary>
     public const int Float32ComputeType = 68;
     public const int PedanticComputeType = 69;
     public const int MaximumPreparedWeights = 256;

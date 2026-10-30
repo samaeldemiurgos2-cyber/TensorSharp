@@ -71,6 +71,9 @@ jobs:
       - name: Check the CUDA redist installer (local fixtures, no download)
         run: python3 -m unittest eng/tests/test_install_cuda_redist.py
 
+      - name: Check build-linux.sh CUDA build-tree reuse (fake toolchain, no download)
+        run: python3 -m unittest eng/tests/test_build_linux_cuda_tree.py
+
       - name: Run environment-independent tests
         run: >
           dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

@@ -19,7 +19,7 @@ class StackTransferTests(unittest.TestCase):
         copies.append(copy_event(20, 'DtoD'))
         kernels = [event(12 + i * 10, 13 + i * 10, name='vision_kernel<64>') for i in range(16)]
         report = dict(schema_version=2, completed=True, diagnostic=True, hardware_counters=False,
-            cupti_api_version=26, errors=[], dropped=0, incomplete=0, callback_exceptions=0,
+            cupti_api_version=130401, errors=[], dropped=0, incomplete=0, callback_exceptions=0,
             truncated=0, invalid_buffers=0, kernel_count=16, memcpy_record_count=5,
             kernel_events=kernels, memcpy_events=copies)
         probe = dict(completed=True, backend='GGML_CUDA', require_validated_float32_precision=True,
@@ -75,6 +75,12 @@ class StackTransferTests(unittest.TestCase):
             report['memcpy_record_count'] = len(report['memcpy_events'])
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 module.attribute(report, probe, 36)
+
+    def test_cuda12_api26_capture_is_rejected(self):
+        report, probe = self.fixture()
+        report['cupti_api_version'] = 26
+        with self.assertRaisesRegex(ValueError, 'CUDA 13'):
+            module.attribute(report, probe, 36)
 
 
 if __name__ == '__main__':

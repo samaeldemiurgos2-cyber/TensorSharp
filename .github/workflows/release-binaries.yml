@@ -292,8 +292,8 @@ jobs:
           arch: x64
           # Pin the v143 (VS2022) toolset. windows-latest now ships Visual
           # Studio 2026, whose v145 (MSVC 14.5x) toolset is newer than the host
-          # compilers nvcc has supported; 14.44 is accepted by every CUDA 12 and
-          # 13 nvcc and is installed on the image alongside VS2026. This
+          # compilers older CUDA toolkits accept; 14.44 is accepted by every
+          # CUDA 13 nvcc and is installed on the image alongside VS2026. This
           # also sets VCToolsInstallDir, which the TensorSharp.Backends.Cuda
           # PTX compile uses to point nvcc at the right cl.exe.
           toolset: "14.44"

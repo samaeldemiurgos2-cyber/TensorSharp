@@ -4,17 +4,20 @@
 Linux `LD_PRELOAD` hook. It derives the concurrent-kernel collection from
 `embeddinggemma2-cupti-activity.cpp` and additionally enables
 `CUPTI_ACTIVITY_KIND_MEMCPY`. The original tool and its reports are preserved.
-This tool requires the CUDA 12.8 headers and CUPTI API version 26 at runtime;
-another API version produces an incomplete report without enabling activity.
+This tool requires CUDA 13 headers and, at runtime, the CUPTI API version it was
+compiled against (`CUPTI_API_VERSION`, 130401 for CUDA 13.4); another API version
+produces an incomplete report without enabling activity.
 
-The installed CUDA 12.8 `cupti_activity.h` and NVIDIA's
-[Memcpy6 reference](https://docs.nvidia.com/cupti/12.8.1/api/structCUpti__ActivityMemcpy6.html)
-identify `CUpti_ActivityMemcpy6` as the `MEMCPY` record. The
-[activity API reference](https://docs.nvidia.com/cupti/12.8.1/api/group__CUPTI__ACTIVITY__API.html)
+The installed CUDA 13 `cupti_activity.h` and NVIDIA's
+[Memcpy7 reference](https://docs.nvidia.com/cupti/api/structCUpti__ActivityMemcpy7.html)
+identify `CUpti_ActivityMemcpy7` as the `MEMCPY` record (and `CUpti_ActivityKernel13`
+as the kernel record; both verified in the CUDA 13.4 header, so confirm them in the
+installed one before building). The
+[activity API reference](https://docs.nvidia.com/cupti/api/group__CUPTI__ACTIVITY__API.html)
 defines direction kinds, dropped-record queries and buffer callbacks. Peer
 copies use a separate `MEMCPY2` record, which this tool does not enable.
 
-Build against the installed CUDA 12.8 toolkit, using a fresh output directory:
+Build against the installed CUDA 13 toolkit, using a fresh output directory:
 
 ```sh
 g++ -O2 -std=c++17 -fPIC -shared -pthread \
@@ -43,7 +46,7 @@ numeric enum, source/destination memory kinds, flags, bytes, GPU timestamps,
 device/context/stream, driver/runtime correlation IDs, graph IDs and copy count.
 Per-direction summaries retain both record counts and the raw `copy_count_sum`
 because CUDA batch-copy records can represent multiple operations. The actual
-installed CUDA 12.8 header documents `copyCount` as the batch operation count,
+installed CUDA 13.4 header documents `copyCount` as the batch operation count,
 and as 1 for non-batch copies; individual raw `copy_count` values remain visible.
 The combined event
 limit is 65,536, and each requested buffer is 8 MiB. Invalid timestamp records,

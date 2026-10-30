@@ -296,10 +296,10 @@ function Import-VcVarsEnvironment([string] $VcVarsPath) {
             # A toolset is active but nothing identifies its target. Leave it
             # alone: importing would silently retarget a deliberately configured
             # environment - CI pins an older toolset with
-            # `ilammy/msvc-dev-cmd@v1 toolset: "14.44"` because CUDA 12.6 rejects
-            # VS 2026's default 14.5x, and re-running vcvars64 would drag it back
-            # to the default. Warn instead, so a genuinely 32-bit environment
-            # still leaves a trace to explain a later failure.
+            # `ilammy/msvc-dev-cmd@v1 toolset: "14.44"` because older CUDA toolkits
+            # reject VS 2026's default 14.5x host compiler, and re-running vcvars64
+            # would drag it back to the default. Warn instead, so a genuinely
+            # 32-bit environment still leaves a trace to explain a later failure.
             Write-Warning ("An MSVC environment is active (VCToolsInstallDir=$env:VCToolsInstallDir) but its target " +
                 "architecture could not be determined; assuming x64 and using it as-is. This native build is " +
                 "x64-only - if the compile fails inside ggml's Vulkan backend, re-run from a plain PowerShell so " +

@@ -40,9 +40,8 @@ public sealed class CudaKernelAvailabilityTests
     private static string CommittedPtx => RepoFile("TensorSharp.Backends.Cuda", "native", "ptx", "tensorsharp_kernels.ptx");
 
     /// <summary>
-    /// Every committed baseline keeps up with its source. Refresh with a CUDA 12.x nvcc
-    /// (CUDA 13 no longer compiles compute_61):
-    /// <c>dotnet build TensorSharp.Backends.Cuda -c Release -p:TensorSharpUpdateCommittedPtx=true -p:CudaArch=compute_61</c>.
+    /// Every committed baseline keeps up with its source. Refresh on Linux with nvcc 13.0:
+    /// <c>dotnet build TensorSharp.Backends.Cuda -c Release -p:TensorSharpUpdateCommittedPtx=true -p:CudaNvcc=&lt;13.0&gt;/bin/nvcc</c>.
     /// tensorsharp_q35_kernels has no committed baseline by design (its engine needs nvcc).
     /// </summary>
     [Theory]
@@ -58,7 +57,7 @@ public sealed class CudaKernelAvailabilityTests
         var missing = KernelNames(source).Except(PtxEntries(ptx)).OrderBy(n => n).ToList();
         Assert.True(missing.Count == 0,
             $"The committed {module}.ptx has no .entry for: " + string.Join(", ", missing) +
-            ". Refresh native/ptx with a CUDA 12.x nvcc.");
+            ". Refresh native/ptx with nvcc 13.0 (see DEVELOPMENT.md).");
     }
 
     [Fact]

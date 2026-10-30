@@ -55,7 +55,7 @@
 <thead><tr><th scope="col">Machine</th><th scope="col">Value to use below</th><th scope="col">Native source-build prerequisites</th></tr></thead>
 <tbody>
 <tr><td>Apple Silicon Mac</td><td><code>ggml_metal</code></td><td>Git, curl, CMake 3.20+ and Xcode command-line tools.</td></tr>
-<tr><td>Windows / Linux + NVIDIA</td><td><code>ggml_cuda</code></td><td>CMake, a C++ toolchain, NVIDIA driver and matching CUDA Toolkit; Windows needs Visual Studio C++ build tools.</td></tr>
+<tr><td>Windows / Linux + NVIDIA</td><td><code>ggml_cuda</code></td><td>CMake, a C++ toolchain, a CUDA 13 Toolkit and a CUDA 13 driver (R580+) on a Turing or newer GPU; Windows needs Visual Studio C++ build tools.</td></tr>
 <tr><td>Windows / Linux + Vulkan GPU</td><td><code>ggml_vulkan</code></td><td>CMake, C++/Vulkan build tools and a Vulkan 1.3 driver.</td></tr>
 <tr><td>CPU, no GPU</td><td><code>ggml_cpu</code></td><td>CMake 3.20+ and a C++ compiler; this is still a native build.</td></tr>
 </tbody></table></div>
@@ -201,11 +201,9 @@ curl --fail http://127.0.0.1:8080/v1/models</code></pre>
 <details>
 <summary>Compatibility notes for existing advanced deployments</summary>
 
-<p>For native ggml source builds, <code>TENSORSHARP_GGML_NO_UPDATE=1</code> skips subsequent network updates. The <a href="advanced.html#continuous-batching">cache guide</a> retains default Radix behavior, <code>TS_SCHED_PREFIX_CACHE=0</code>, <code>--no-prefix-cache</code> and server disk checkpoints. The earlier guide's environment-specific Ubuntu settings remain below for matching CUDA/package-source environments; they are not part of the normal first run:</p>
+<p>For native ggml source builds, <code>TENSORSHARP_GGML_NO_UPDATE=1</code> skips subsequent network updates. The <a href="advanced.html#continuous-batching">cache guide</a> retains default Radix behavior, <code>TS_SCHED_PREFIX_CACHE=0</code>, <code>--no-prefix-cache</code> and server disk checkpoints. The earlier guide's environment-specific Ubuntu setting remains below for matching package-source environments; it is not part of the normal first run:</p>
 
-<pre data-lang="bash"><code># RunPod Ubuntu 24.04 images using this CUDA compatibility directory:
-export LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
-# Older Ubuntu releases needing the .NET backports package source:
+<pre data-lang="bash"><code># Older Ubuntu releases needing the .NET backports package source:
 add-apt-repository ppa:dotnet/backports
 apt update &amp;&amp; apt install dotnet-sdk-10.0</code></pre>
 

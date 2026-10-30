@@ -62,14 +62,23 @@ graph on Metal, so every edit encoded its reference image on the per-convolution
 path (the decoder's duplicate-up shortcut needs no pad and already ran fused). The
 narrow-normalization fixture still runs on CPU/CUDA only and is not Metal coverage.
 
-On a cuDNN-enabled Windows build, `qwen-image21-vae-missing-cudnn-cuda` runs in a
-fresh process with an isolated stub `cudnn64_9.dll` that exports no cuDNN
-functions. Its sibling DLL names are fixture copies generated in the build
-directory; no installed runtime is modified. This reproduces an incomplete
-runtime export table, which must fall back to full-F32 ggml convolution rather
-than call a null function pointer. The test verifies the stub was actually
-loaded and the complete VAE numerical checks passed. A wholly absent runtime
-returns the same unavailable API state, but is not separately simulated.
+On a cuDNN-enabled Windows build, two tests each run in a fresh process with an
+isolated stub `cudnn64_9.dll`. Its sibling DLL names are fixture copies generated
+in the build directory; no installed runtime is modified.
+
+- `qwen-image21-vae-missing-cudnn-cuda`: the stub reports the CUDA major this
+  build targets (`cudnnGetCudartVersion`), so the loader's CUDA-major check
+  passes, and then exports none of the cuDNN functions the loader resolves. This
+  reproduces an incomplete runtime export table, which must fall back to full-F32
+  ggml convolution rather than call a null function pointer.
+- `qwen-image21-vae-cuda12-cudnn-cuda`: the stub exports every function the
+  loader resolves but reports a CUDA 12.8 build. cuda12 and cuda13 builds of
+  cuDNN 9 share every file name, so the loader must decline it on the CUDA major
+  alone. Each stub function counts its calls, and the test requires none.
+
+Both tests verify that the stub was actually loaded and queried, and that the
+complete VAE numerical checks passed on the ggml fallback. A wholly absent
+runtime returns the same unavailable API state, but is not separately simulated.
 
 Run VAE checks with `TS_VAE_CUDNN_CONV=0` for the ggml path and `=1` for vendor
 offload when available. Unset selects vendor offload automatically for Qwen21.

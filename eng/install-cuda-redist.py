@@ -36,6 +36,13 @@ DEFAULT_BASE_URL = "https://developer.download.nvidia.com/compute/cuda/redist"
 # What TensorSharp.GGML.Native (ggml-cuda: CCCL, cudart, cuBLAS, the driver stub
 # shipped in cuda_cudart) and the TensorSharp.Backends.Cuda kernel compile need.
 DEFAULT_COMPONENTS = ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", "cccl")
+# Components NVIDIA renamed between releases: the manifests of CUDA 13.0.x and 13.2.x
+# call CCCL "cuda_cccl", 13.4.x calls it "cccl". Either spelling installs whichever
+# one the requested release lists, so the default list works for every CUDA 13.
+COMPONENT_ALIASES = {
+    "cccl": ("cccl", "cuda_cccl"),
+    "cuda_cccl": ("cuda_cccl", "cccl"),
+}
 
 
 def detect_platform() -> str:
@@ -61,12 +68,18 @@ def sha256_of(path: Path) -> str:
 
 
 def resolve_components(manifest: dict, names: list[str], target: str) -> list[tuple[str, str, str]]:
-    """(name, relative_path, sha256) for each requested component; every one must exist."""
+    """(name, relative_path, sha256) for each requested component; every one must exist.
+
+    A renamed component (COMPONENT_ALIASES) resolves to the spelling this manifest
+    uses, and the returned name is that spelling.
+    """
     resolved = []
-    for name in names:
+    for requested in names:
+        name = next((alias for alias in COMPONENT_ALIASES.get(requested, (requested,))
+                     if isinstance(manifest.get(alias), dict)), requested)
         entry = manifest.get(name)
         if not isinstance(entry, dict):
-            raise SystemExit(f"Component '{name}' is not part of CUDA {manifest.get('release_label', '?')}.")
+            raise SystemExit(f"Component '{requested}' is not part of CUDA {manifest.get('release_label', '?')}.")
         build = entry.get(target)
         if not isinstance(build, dict) or "relative_path" not in build or "sha256" not in build:
             raise SystemExit(f"Component '{name}' has no {target} archive.")
@@ -134,7 +147,8 @@ def install(version: str, dest: Path, components: list[str], target: str, base_u
     fetch(f"{base_url}/redistrib_{version}.json", manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     dest.mkdir(parents=True, exist_ok=True)
-    for name, relative_path, expected in resolve_components(manifest, components, target):
+    resolved = resolve_components(manifest, components, target)
+    for name, relative_path, expected in resolved:
         archive = work / Path(relative_path).name
         if not archive.exists() or sha256_of(archive) != expected:
             print(f"Downloading {name}: {relative_path}", flush=True)
@@ -150,7 +164,8 @@ def install(version: str, dest: Path, components: list[str], target: str, base_u
     if target.startswith("linux") and (dest / "lib").is_dir() and not (dest / "lib64").exists():
         os.symlink("lib", dest / "lib64")
     (dest / "tensorsharp-cuda-redist.json").write_text(
-        json.dumps({"version": version, "platform": target, "components": components}, indent=2) + "\n",
+        json.dumps({"version": version, "platform": target, "components": [name for name, _, _ in resolved]},
+                   indent=2) + "\n",
         encoding="utf-8")
 
 

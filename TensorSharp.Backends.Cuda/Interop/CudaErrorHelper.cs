@@ -10,11 +10,16 @@ namespace TensorSharp.Cuda.Interop
             if (result == 0)
                 return;
 
+            throw new CudaException(result, GetErrorString(result));
+        }
+
+        /// <summary>The driver's text for a CUresult (cuGetErrorString).</summary>
+        public static string GetErrorString(int result)
+        {
             string message = "Unknown CUDA error";
             if (CudaDriverApi.cuGetErrorString(result, out IntPtr strPtr) == 0 && strPtr != IntPtr.Zero)
                 message = Marshal.PtrToStringAnsi(strPtr) ?? message;
-
-            throw new CudaException(result, message);
+            return message;
         }
 
         public static void ThrowOnCublasError(this int result)

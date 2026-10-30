@@ -8,7 +8,7 @@ internal static class Native
         NativeLibrary.SetDllImportResolver(typeof(Native).Assembly, (name, assembly, search) => name switch
         {
             "cuda_driver" => Load("libcuda.so.1", "/usr/lib/x86_64-linux-gnu/libcuda.so.1"),
-            "cublas_probe" => Load("libcublas.so.12", "/usr/local/cuda/lib64/libcublas.so.12"),
+            "cublas_probe" => Load("libcublas.so.13", "/usr/local/cuda/lib64/libcublas.so.13"),
             _ => IntPtr.Zero
         });
     }

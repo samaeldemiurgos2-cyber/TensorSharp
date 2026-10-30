@@ -73,7 +73,7 @@ namespace TensorSharp.Cuda
         /// <summary>
         /// Whether ts_dsv4_moe_mma_f32 carries its tensor-core body: it is guarded by
         /// __CUDA_ARCH__ &gt;= 800 and compiles to nothing below that, which is what the
-        /// committed compute_61 baseline holds. See CudaKernels.ArchGuardedKernelsUsable.
+        /// committed compute_75 baseline holds. See CudaKernels.ArchGuardedKernelsUsable.
         /// </summary>
         public bool HasMoeMma { get; }
 
@@ -157,7 +157,7 @@ namespace TensorSharp.Cuda
             {
                 throw new InvalidOperationException(
                     "tensorsharp_dsv4_kernels.ptx could not be located next to the application or under " +
-                    "a 'cuda_kernels' folder. Build TensorSharp.Backends.Cuda with nvcc on the PATH.");
+                    "a 'cuda_kernels' folder. Build TensorSharp.Backends.Cuda with a CUDA 13 nvcc on the PATH.");
             }
             return new Dsv4Kernels(CudaModule.LoadFromFile(path));
         }

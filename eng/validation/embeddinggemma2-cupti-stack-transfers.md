@@ -1,7 +1,7 @@
 # CUDA vision stack activation transfers
 
 Use this parser only for one raw `EmbeddingGemma2VisionProbe` forward with
-`--require-ggml-cuda-stack true`, the owned CUDA12.8 CUPTI transfer hook, and
+`--require-ggml-cuda-stack true`, the owned CUDA 13 CUPTI transfer hook, and
 no warmup/repeated benchmark or per-block diagnostic overrides. Preserve the
 raw probe/activity reports and capture source, library, compiler, model and
 runtime hashes before and after execution. The raw vision oracle must pass its

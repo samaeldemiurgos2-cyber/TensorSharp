@@ -50,7 +50,7 @@ dotnet --list-sdks
 | 机器 | 下文使用的值 | 原生源码构建还需要 |
 | --- | --- | --- |
 | Apple Silicon Mac | `ggml_metal` | Git、curl、CMake 3.20+、Xcode 命令行工具。 |
-| Windows / Linux + NVIDIA | `ggml_cuda` | CMake、C++ 工具链、NVIDIA 驱动与匹配的 CUDA Toolkit；Windows 需要 Visual Studio C++ 构建工具。 |
+| Windows / Linux + NVIDIA | `ggml_cuda` | CMake、C++ 工具链、CUDA 13 Toolkit 与 CUDA 13 驱动（R580+），GPU 需为 Turing 或更新；Windows 需要 Visual Studio C++ 构建工具。 |
 | Windows / Linux + Vulkan GPU | `ggml_vulkan` | CMake、C++/Vulkan 构建工具与 Vulkan 1.3 驱动。 |
 | CPU，无 GPU | `ggml_cpu` | CMake 3.20+ 与 C++ 编译器；它仍是原生构建。 |
 
@@ -224,11 +224,9 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipGgmlNative=tru
 <details>
 <summary>已有高级部署的兼容提示</summary>
 
-使用原生 ggml 源码构建时，`TENSORSHARP_GGML_NO_UPDATE=1` 跳过后续网络更新。默认 Radix 前缀缓存、`TS_SCHED_PREFIX_CACHE=0`、`--no-prefix-cache` 与服务端磁盘检查点的关系见[缓存指南](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#radix-前缀缓存)。下面保留原指南的特定 Ubuntu 环境设置，仅在匹配的 CUDA/软件源环境使用，常规首次运行不需要：
+使用原生 ggml 源码构建时，`TENSORSHARP_GGML_NO_UPDATE=1` 跳过后续网络更新。默认 Radix 前缀缓存、`TS_SCHED_PREFIX_CACHE=0`、`--no-prefix-cache` 与服务端磁盘检查点的关系见[缓存指南](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#radix-前缀缓存)。下面保留原指南的特定 Ubuntu 环境设置，仅在匹配的软件源环境使用，常规首次运行不需要：
 
 ```bash
-# RunPod Ubuntu 24.04 images using this CUDA compatibility directory:
-export LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
 # Older Ubuntu releases needing the .NET backports package source:
 add-apt-repository ppa:dotnet/backports
 apt update && apt install dotnet-sdk-10.0

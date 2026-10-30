@@ -18,7 +18,7 @@
 # Environment:
 #   TENSORSHARP_CUDNN=OFF|0|false  skip entirely (the VAE stays on im2col+GEMM)
 #   TENSORSHARP_CUDNN_VERSION      override the pinned cuDNN version
-#   TENSORSHARP_CUDNN_CUDA_MAJOR   override the CUDA major (default: probe nvcc, else 12)
+#   TENSORSHARP_CUDNN_CUDA_MAJOR   override the CUDA major (default: probe nvcc, else 13)
 #   TS_CUDNN_DIR / CUDNN_DIR       use an existing cuDNN install and download nothing
 #   TENSORSHARP_GGML_NO_UPDATE     keep whatever is already provisioned
 #
@@ -61,7 +61,8 @@ function Get-CudaMajor {
             if ($out -match "release\s+(\d+)\.") { return $Matches[1] }
         }
     } catch { }
-    return "12"
+    # TensorSharp builds only with CUDA 13.
+    return "13"
 }
 
 # An existing cuDNN (system install, conda, a pip nvidia-cudnn package) wins: nothing

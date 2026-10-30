@@ -12,7 +12,7 @@ namespace TensorSharp.Cuda;
 /// math mode or unrelated model dispatch.</summary>
 public static class CudaEmbeddingOps
 {
-    // Verified against CUDA12.8 cublas_api.h. cuBLAS compute type is per call.
+    // Verified against CUDA 13.4 cublas_api.h:208-212. cuBLAS compute type is per call.
     private const int Compute32FastTf32 = 77;
     private const int Compute32Pedantic = 69;
     private sealed class Capability

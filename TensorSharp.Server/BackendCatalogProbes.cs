@@ -63,15 +63,20 @@ public static class BackendCatalogProbes
 
     /// <summary>
     /// The probe exceptions swallowed above, one <c>"ggml_metal: reason"</c> line
-    /// per backend, so the startup banner's backend list carries a cause.
+    /// per backend, so the startup banner's backend list carries a cause. The direct
+    /// CUDA probe adds a <c>"cuda: reason"</c> line when the driver loaded but is older
+    /// than CUDA 13, or every GPU is below compute capability 7.5.
     /// </summary>
     public static IReadOnlyList<string> DescribeProbeFailures()
     {
         lock (ProbeFailures)
         {
-            return ProbeFailures
+            var failures = ProbeFailures
                 .Select(kv => "ggml_" + kv.Key.ToString().ToLowerInvariant() + ": " + kv.Value)
-                .ToArray();
+                .ToList();
+            if (CudaDevice.UnavailableReason is string cudaReason)
+                failures.Add("cuda: " + cudaReason);
+            return failures;
         }
     }
 }

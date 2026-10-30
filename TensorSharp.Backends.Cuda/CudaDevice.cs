@@ -28,6 +28,11 @@ namespace TensorSharp.Cuda
         public string TotalMemoryFormatted => $"{TotalMemoryBytes / (1024.0 * 1024 * 1024):F1} GB";
         public string ComputeCapability => $"{ComputeCapabilityMajor}.{ComputeCapabilityMinor}";
 
+        /// <summary>
+        /// True when the driver is CUDA 13 or newer and at least one GPU meets
+        /// <see cref="CudaRequirements"/>. When it is false because of those requirements,
+        /// <see cref="UnavailableReason"/> says why.
+        /// </summary>
         public static bool IsAvailable()
         {
             try
@@ -37,13 +42,19 @@ namespace TensorSharp.Cuda
                     return false;
 
                 NativeLibrary.Free(handle);
-                return ProbeDeviceCount() > 0;
+                return ProbeSupportedDeviceCount() > 0;
             }
             catch
             {
                 return false;
             }
         }
+
+        /// <summary>
+        /// Why the last <see cref="IsAvailable"/> probe found no usable GPU although the driver
+        /// loaded (a CUDA 12 driver, or only GPUs below compute capability 7.5); null otherwise.
+        /// </summary>
+        public static string UnavailableReason { get; private set; }
 
         public static int GetDeviceCount()
         {
@@ -78,12 +89,36 @@ namespace TensorSharp.Cuda
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static int ProbeDeviceCount()
+        private static int ProbeSupportedDeviceCount()
         {
             CudaLibraryResolver.Register();
+            UnavailableReason = null;
+            CudaDriverApi.cuDriverGetVersion(out int driverVersion).ThrowOnError();
+            string driverReason = CudaRequirements.DescribeUnsupportedDriver(driverVersion);
+            if (driverReason != null)
+            {
+                UnavailableReason = driverReason;
+                return 0;
+            }
+
             CudaDriverApi.cuInit(0).ThrowOnError();
             CudaDriverApi.cuDeviceGetCount(out int count).ThrowOnError();
-            return count;
+            int supported = 0;
+            string firstReason = null;
+            for (int ordinal = 0; ordinal < count; ordinal++)
+            {
+                CudaDevice device = GetDevice(ordinal);
+                string reason = CudaRequirements.DescribeUnsupportedDevice(
+                    device.ComputeCapabilityMajor, device.ComputeCapabilityMinor, device.Name);
+                if (reason == null)
+                    supported++;
+                else
+                    firstReason ??= reason;
+            }
+
+            if (supported == 0 && firstReason != null)
+                UnavailableReason = firstReason;
+            return supported;
         }
     }
 }

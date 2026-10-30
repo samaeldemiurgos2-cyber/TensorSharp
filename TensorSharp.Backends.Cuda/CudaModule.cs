@@ -22,12 +22,12 @@ namespace TensorSharp.Cuda
 
         /// <summary>
         /// The SM architecture the code the driver loaded for <paramref name="kernel"/> was
-        /// compiled for, as an integer (61, 75, 86, 120): the <c>__CUDA_ARCH__</c> its body saw,
+        /// compiled for, as an integer (75, 86, 120): the <c>__CUDA_ARCH__</c> its body saw,
         /// over 10. 0 when unknown. Kernels whose bodies are guarded by
         /// <c>__CUDA_ARCH__ &gt;= N</c> compile to a trap or an empty body below N, and a symbol
-        /// lookup cannot tell: the committed portable baseline is compute_61, so on an sm_80+ GPU
-        /// its tensor-core kernels resolve fine and then trap or write nothing. Callers gate such
-        /// kernels on this.
+        /// lookup cannot tell: the committed portable baseline is compute_75 (the oldest target
+        /// CUDA 13 compiles), so on an sm_80+ GPU its tensor-core kernels resolve fine and then
+        /// trap or write nothing. Callers gate such kernels on this.
         /// It is read from the loaded code (CU_FUNC_ATTRIBUTE_PTX_VERSION), not from the PTX
         /// header: a fatbin is built beside a PTX of a lower target (the release archives pair
         /// compute_75 PTX with SASS for sm_75 to sm_120), and the driver runs the SASS for this
@@ -77,7 +77,8 @@ namespace TensorSharp.Cuda
         /// itself (CUDA 13.4 PTX fails on a 13.2 driver). The fatbin is used only when its
         /// <c>.fatbin.sha256</c> sidecar names this PTX, so one left behind by an earlier
         /// build never shadows newer kernels; a fatbin the driver rejects (no SASS for this
-        /// GPU) falls back to the PTX.
+        /// GPU) falls back to the PTX. When the PTX fails too, the exception says why: the PTX
+        /// ISA against the driver's CUDA version, or the PTX target against the GPU.
         /// </summary>
         public static CudaModule LoadFromFile(string path)
         {
@@ -86,18 +87,20 @@ namespace TensorSharp.Cuda
 
             byte[] bytes = File.ReadAllBytes(path);
             byte[] fatbin = TryReadMatchingFatbin(path, bytes);
+            CudaException fatbinFailure = null;
             if (fatbin != null)
             {
                 try
                 {
                     return LoadImage(fatbin, ParsePtxTargetArch(bytes));
                 }
-                catch (CudaException)
+                catch (CudaException ex)
                 {
                     // No SASS for this GPU and PTX the driver cannot JIT; try the PTX file.
+                    fatbinFailure = ex;
                 }
             }
-            return LoadFromBytes(bytes);
+            return LoadFromBytes(bytes, fatbinFailure);
         }
 
         internal static byte[] TryReadMatchingFatbin(string ptxPath, byte[] ptxBytes)
@@ -131,7 +134,9 @@ namespace TensorSharp.Cuda
             }
         }
 
-        public static unsafe CudaModule LoadFromBytes(byte[] ptxBytes)
+        public static CudaModule LoadFromBytes(byte[] ptxBytes) => LoadFromBytes(ptxBytes, null);
+
+        private static unsafe CudaModule LoadFromBytes(byte[] ptxBytes, CudaException fatbinFailure)
         {
             if (ptxBytes == null)
                 throw new ArgumentNullException(nameof(ptxBytes));
@@ -145,9 +150,46 @@ namespace TensorSharp.Cuda
 
             fixed (byte* ptx = terminated)
             {
-                CudaDriverApi.cuModuleLoadData(out IntPtr module, (IntPtr)ptx).ThrowOnError();
+                int result = CudaDriverApi.cuModuleLoadData(out IntPtr module, (IntPtr)ptx);
+                if (result != 0)
+                    throw DiagnoseLoadFailure(result, ptxBytes, fatbinFailure);
                 return new CudaModule(module, ParsePtxTargetArch(ptxBytes));
             }
+        }
+
+        /// <summary>
+        /// The CudaException for a PTX image the driver rejected, its message extended with
+        /// <see cref="CudaRequirements.DescribeModuleLoadFailure"/> (read against the current
+        /// context's device) and with the fatbin error that came first, when there was one.
+        /// </summary>
+        private static CudaException DiagnoseLoadFailure(int result, byte[] ptxBytes, CudaException fatbinFailure)
+        {
+            string message = CudaErrorHelper.GetErrorString(result);
+            string diagnosis = null;
+            try
+            {
+                if (CudaDriverApi.cuDriverGetVersion(out int driverVersion) != 0)
+                    driverVersion = 0;
+                int ccMajor = 0, ccMinor = 0;
+                if (CudaDriverApi.cuCtxGetDevice(out int device) == 0)
+                {
+                    CudaDriverApi.cuDeviceGetAttribute(out ccMajor, CudaDriverApi.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+                    CudaDriverApi.cuDeviceGetAttribute(out ccMinor, CudaDriverApi.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+                }
+                var (toolkit, isa) = CudaRequirements.ParsePtxHeader(ptxBytes);
+                diagnosis = CudaRequirements.DescribeModuleLoadFailure(
+                    result, toolkit, isa, ParsePtxTargetArch(ptxBytes), driverVersion, ccMajor, ccMinor);
+            }
+            catch
+            {
+                // The diagnosis is best effort; the CUDA error itself is still reported.
+            }
+
+            if (diagnosis != null)
+                message = message.TrimEnd('.') + ". " + diagnosis;
+            if (fatbinFailure != null)
+                message += " (The fatbin built beside this PTX was rejected first: " + fatbinFailure.Message.TrimEnd('.') + ".)";
+            return new CudaException(result, message);
         }
 
         public IntPtr GetFunction(string name)

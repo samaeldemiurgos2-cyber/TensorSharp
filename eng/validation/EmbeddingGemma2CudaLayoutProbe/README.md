@@ -32,7 +32,7 @@ Build locally without touching shared model/backend binaries:
 dotnet build eng/validation/EmbeddingGemma2CudaLayoutProbe -c Release -o artifacts/embeddinggemma2/cuda-layout-probe
 ```
 
-Execute only in a coordinated quiet Linux CUDA12 window, preserving reports:
+Execute only in a coordinated quiet Linux CUDA 13 window, preserving reports:
 
 ```sh
 dotnet artifacts/embeddinggemma2/cuda-layout-probe/EmbeddingGemma2CudaLayoutProbe.dll \
