@@ -32,7 +32,8 @@ public sealed class MiniMaxM3DsparkTests : IDisposable
     {
         Directory.CreateDirectory(_dir);
         Environment.SetEnvironmentVariable(MiniMaxM3Architecture.MsaModeVariable, null);
-        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F16, false);
+        // No choice made: the request a fresh process has (no model writes its own default back).
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, false);
     }
 
     public void Dispose()

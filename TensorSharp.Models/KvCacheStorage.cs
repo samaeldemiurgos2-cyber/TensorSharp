@@ -15,7 +15,8 @@ namespace TensorSharp.Models
 {
     /// <summary>
     /// Storage element type for the per-layer K/V cache tensors. Selected once per
-    /// model load (env var <c>KV_CACHE_DTYPE</c> or per-CLI flag) and threaded into
+    /// model load (env var <c>KV_CACHE_DTYPE</c>, the CLI / server flag, or the
+    /// model-aligned default <see cref="KvCacheDtypeConfig.ModelAlignedDefault"/>) and threaded into
     /// every model's <c>InitKVCache</c>, <c>CopyToCache*</c>, and attention helpers.
     ///
     /// <c>F32</c> is the historical default: each cache element occupies four bytes
@@ -134,16 +135,24 @@ namespace TensorSharp.Models
     }
 
     /// <summary>
-    /// Process-wide configuration for the KV-cache storage type. The CLI / server
-    /// front-end calls <see cref="ConfigureFromEnvironment"/> once at start-up;
-    /// each model picks the value up via <see cref="Current"/> when it allocates
-    /// its per-layer K/V tensors.
+    /// Process-wide K/V cache dtype REQUEST. The CLI / server front-end calls
+    /// <see cref="ConfigureFromEnvironment"/> (and <see cref="Set"/> for
+    /// <c>--kv-cache-dtype</c>) once at start-up; each model captures
+    /// <see cref="Current"/> at construction. What a model actually allocates is its
+    /// own <c>ModelBase.KvCacheDtype</c>: with no explicit choice, the model picks
+    /// <see cref="ModelAlignedDefault"/> from its own weights, and a family that cannot
+    /// read a block-quantized cache substitutes f16. Neither decision is written back
+    /// here, so every model a long-lived process loads (a server switching models,
+    /// Studio, a test run) gets the cache it would get as the first load of a fresh
+    /// process.
     /// </summary>
     public static class KvCacheDtypeConfig
     {
         private static KvCacheDtype _current = KvCacheDtype.F32;
         private static bool _explicitlySet;
 
+        /// <summary>The user's explicit choice, or F32 when there is none. Not the dtype
+        /// any particular model allocated (see <c>ModelBase.KvCacheDtype</c>).</summary>
         public static KvCacheDtype Current => _current;
         public static bool IsExplicitlySet => _explicitlySet;
 
@@ -166,24 +175,25 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Apply a model-aligned default cache dtype if the user hasn't explicitly
-        /// chosen one. Models whose dominant weight tier is below F32 (Q8_0,
-        /// Q4_K, IQ4_XS, F16, etc.) get an F16 cache: K/V values fit losslessly
-        /// inside F16's ~10-bit mantissa for the [-10, 10] post-RoPE range, so
-        /// outputs are byte-identical to the F32 baseline while halving cache
-        /// memory and bandwidth. Pure F32 native models keep the F32 cache.
-        /// Callers can opt in to the more aggressive Q8_0 cache via
-        /// <c>--kv-cache-dtype q8_0</c>.
+        /// The model-aligned cache dtype for a model whose dominant weight type is
+        /// <paramref name="dominantGgmlType"/>, used when the user has not chosen one.
+        /// Models whose dominant weight tier is below F32 (Q8_0, Q4_K, IQ4_XS, F16,
+        /// etc.) get an F16 cache: K/V values fit losslessly inside F16's ~10-bit
+        /// mantissa for the [-10, 10] post-RoPE range, so outputs are byte-identical
+        /// to the F32 baseline while halving cache memory and bandwidth. Pure F32
+        /// native models keep the F32 cache. Callers can opt in to the more
+        /// aggressive Q8_0 cache via <c>--kv-cache-dtype q8_0</c>.
+        ///
+        /// <para>A pure function of the one model: it used to raise a process-wide
+        /// default that nothing ever lowered, so once any model with sub-F32 weights had
+        /// loaded, every later model in the process, all-F32 ones included, got an F16
+        /// cache.</para>
         /// </summary>
-        public static void ApplyModelDtypeDefault(int dominantGgmlType)
-        {
-            if (_explicitlySet) return;
+        public static KvCacheDtype ModelAlignedDefault(int dominantGgmlType)
             // 0 = GGML_TYPE_F32. Anything else (F16, BF16, Q8_0, Q4_K, ...) is
             // already operating below F32 precision so an F16 cache adds no
             // measurable error.
-            if (dominantGgmlType != 0)
-                _current = KvCacheDtype.F16;
-        }
+            => dominantGgmlType != 0 ? KvCacheDtype.F16 : KvCacheDtype.F32;
 
         public static bool TryParse(string value, out KvCacheDtype dtype)
         {

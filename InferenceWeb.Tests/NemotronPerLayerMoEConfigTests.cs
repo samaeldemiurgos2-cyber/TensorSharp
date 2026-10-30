@@ -217,11 +217,27 @@ public sealed class NemotronPerLayerMoEConfigTests : IDisposable
             Scaled = true,
         }.Write(Path.Combine(_directory, "per-layer-tp.gguf"));
 
-        using var single = new NemotronModel(path, BackendType.Cpu);
-        var group = new MuseSparkTensorParallelTests.CpuGroup(2);
-        using var tp = new NemotronModel(path, BackendType.Cpu, 2, group);
-        NemotronExpertScaleTests.AssertSameTrajectory(single, tp, 2e-3f);
-        Assert.True(group.Reductions > 0);
+        // Both models run one K/V cache dtype, F32 as in NemotronExpertScaleTests, whose
+        // trajectory check this is. Left to the default, the two differ: the single-device
+        // constructor takes the model-aligned default (F16 for these Q8_0 projections), the
+        // tensor-parallel one keeps the request (F32 when none; Mistral 3's does the same).
+        // Both used to get F16 only because the single-device model, built first, raised the
+        // old process-wide default before the TP model was constructed.
+        KvCacheDtype restoreDtype = KvCacheDtypeConfig.Current;
+        bool restoreExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+        KvCacheDtypeConfig.Set(KvCacheDtype.F32);
+        try
+        {
+            using var single = new NemotronModel(path, BackendType.Cpu);
+            var group = new MuseSparkTensorParallelTests.CpuGroup(2);
+            using var tp = new NemotronModel(path, BackendType.Cpu, 2, group);
+            NemotronExpertScaleTests.AssertSameTrajectory(single, tp, 2e-3f);
+            Assert.True(group.Reductions > 0);
+        }
+        finally
+        {
+            KvCacheDtypeConfig.RestoreForTests(restoreDtype, restoreExplicit);
+        }
     }
 
     private static T Field<T>(object model, string name)

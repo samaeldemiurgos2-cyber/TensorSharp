@@ -77,7 +77,7 @@ public partial class Qwen4ExpModel
             Console.WriteLine($"  Qwen distributed layer split: node {_q4eStage.NodeId}/{_q4eStage.NodeCount}, stage {_q4eStage.StageIndex}, layers [{_q4eStage.FirstLayer},{_q4eStage.EndLayer}), {LayerSplitDegree} local devices.");
         }
         _q4eDistributed.ValidateConfiguration(
-            $"qwen4exp|{NativeDistributedExecution.HeaderIdentity(path)}|{NativeDistributedExecution.MetadataIdentity(_gguf)}|{ResolveConfiguredContextLength()}|{KvCacheDtypeConfig.Current}|{group.Degree}|{group.GlobalDegree}|{LayerSplitGroup != null}|{_q4eStage?.DriverRunsLastStage}|{MoeCpuOffloadConfig.IsExplicitlySet}|{MoeCpuOffloadConfig.CpuMoeLayers}|{MoeCpuOffloadConfig.AllLayers}|" +
+            $"qwen4exp|{NativeDistributedExecution.HeaderIdentity(path)}|{NativeDistributedExecution.MetadataIdentity(_gguf)}|{ResolveConfiguredContextLength()}|{_kvCacheDtype}|{group.Degree}|{group.GlobalDegree}|{LayerSplitGroup != null}|{_q4eStage?.DriverRunsLastStage}|{MoeCpuOffloadConfig.IsExplicitlySet}|{MoeCpuOffloadConfig.CpuMoeLayers}|{MoeCpuOffloadConfig.AllLayers}|" +
             NativeDistributedExecution.EnvironmentIdentity(new[] { "TS_N_CPU_MOE", "TS_CPU_MOE", "TS_Q4E_GDN_VERIFY", "TS_Q4E_DEBUG_SPAN_LAYERS", "TS_Q4E_PREFILL_COMBINE", "TS_Q4E_TEST_MMVQ_CHANNELS", "TS_Q4E_TEST_BATCHED_VERIFY" }));
     }
 

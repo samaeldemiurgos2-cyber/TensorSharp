@@ -118,7 +118,7 @@ namespace TensorSharp.Models
                 if (LayerSplitGroup != null || LayerSplitDegree > 1)
                     ApplyModelAlignedKvCacheDefaultFromMetadata();
                 ConfigureLayerPlacement(FormattableString.Invariant(
-                    $"mistral3|{Config.NumHeads}|{Config.NumKVHeads}|{_attnKeyLen}|{_attnValLen}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeType}|{_ropeDim}|{_ropeOrigCtx}|{_ropeScalingBeta:R}|{_ropeExtFactor:R}|{_ropeBetaFast:R}|{_ropeBetaSlow:R}|{_ropeMscale:R}|{_ropeMscaleAllDim:R}|{KvCacheDtypeConfig.Current}"), balanceWeightBytes: true);
+                    $"mistral3|{Config.NumHeads}|{Config.NumKVHeads}|{_attnKeyLen}|{_attnValLen}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeType}|{_ropeDim}|{_ropeOrigCtx}|{_ropeScalingBeta:R}|{_ropeExtFactor:R}|{_ropeBetaFast:R}|{_ropeBetaSlow:R}|{_ropeMscale:R}|{_ropeMscaleAllDim:R}|{_kvCacheDtype}"), balanceWeightBytes: true);
             }
             catch { base.Dispose(); throw; }
             LoadWeights();
