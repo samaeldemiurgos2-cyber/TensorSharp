@@ -829,15 +829,21 @@ namespace TensorSharp.Models.Direct
             }
 
             if (trace) Console.WriteLine($"  [wan-attn] GENERIC path sq={sq} sk={sk} cuda={ctx.IsCuda}");
-            GenericAttention(ctx, outT, q, k, v, bias, heads, sq, sk, headDim, scale);
+            GenericAttention(ctx, outT, q, k, v, bias, heads, sq, sk, headDim, scale, halfOperands: preferGemm);
             return outT;
         }
 
         // Chunked per-head GEMM+softmax path (cuBLAS on CUDA, the parallel SIMD
         // kernels on CPU). Bigger chunks on CUDA: fewer launches, and the pool
-        // absorbs the score scratch.
+        // absorbs the score scratch. halfOperands (the long-sequence route, chosen
+        // for speed over the exact streaming kernel) runs both GEMMs on IEEE-half
+        // operands by name (HalfOperandGemm), as they ran under the old cuBLAS
+        // handle; scores, softmax and output stay F32, like ggml's F16 flash
+        // attention. Exact F32 costs 1.8-2.0x on these GEMMs (Wan2.1-1.3B at
+        // 832x480x33f: +2.2 s per forward) and TF32 still 2x.
         private static void GenericAttention(DirectContext ctx, Tensor outT, Tensor q, Tensor k, Tensor v,
-                                             Tensor bias, int heads, int sq, int sk, int headDim, float scale)
+                                             Tensor bias, int heads, int sq, int sk, int headDim, float scale,
+                                             bool halfOperands = false)
         {
             if (!ctx.IsCuda && TryCpuBlockedAttention(outT, q, k, v, bias, heads, sq, sk, headDim, scale))
                 return;
@@ -859,7 +865,8 @@ namespace TensorSharp.Models.Direct
                     using var qNv = qRows.Narrow(1, (long)h * headDim, headDim);
                     using var qh = Ops.NewContiguous(qNv);             // [qn, hd]
                     using var scores = ctx.NewF32(qn, sk);
-                    if (ctx.IsCuda) Ops.Addmm(scores, 0f, scores, scale, qh, khT);
+                    if (ctx.IsCuda && halfOperands) HalfOperandGemm.Addmm(scores, 0f, scores, scale, qh, khT);
+                    else if (ctx.IsCuda) Ops.Addmm(scores, 0f, scores, scale, qh, khT);
                     else CpuGemmABt(qh, kh, scores, scale, 0f);
                     if (bias != null)
                     {
@@ -869,7 +876,8 @@ namespace TensorSharp.Models.Direct
                     }
                     Ops.Softmax(scores, scores);
                     using var oh = ctx.NewF32(qn, headDim);
-                    if (ctx.IsCuda) Ops.Addmm(oh, 0f, oh, 1f, scores, vh);
+                    if (ctx.IsCuda && halfOperands) HalfOperandGemm.Addmm(oh, 0f, oh, 1f, scores, vh);
+                    else if (ctx.IsCuda) Ops.Addmm(oh, 0f, oh, 1f, scores, vh);
                     else CpuGemmAB(scores, vh, oh, 1f, 0f);
                     using var oRows = outT.Narrow(0, q0, qn);
                     using var dst = oRows.Narrow(1, (long)h * headDim, headDim);

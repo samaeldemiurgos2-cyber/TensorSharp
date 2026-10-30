@@ -3489,7 +3489,10 @@ namespace TensorSharp.Models
                             Ops.Copy(qChunkT, qView);
                         }
                         var scores = new Tensor(_allocator, DType.Float32, numHeads, qc, totalSeqLen);
-                        Ops.AddmmBatch(scores, 0, scores, attentionScale, qChunkT, kT);
+                        // Half operands by name on direct CUDA, as in Mistral3Model's prefill attention
+                        // (HalfOperandGemm): the M-RoPE (image) prompts that skip the fused kernel land here,
+                        // where exact F32 is 2.7x.
+                        HalfOperandGemm.AddmmBatch(scores, 0, scores, attentionScale, qChunkT, kT);
                         if (chunked)
                             qChunkT.Dispose();
 
@@ -3512,14 +3515,14 @@ namespace TensorSharp.Models
                         if (chunked)
                         {
                             var outChunk = new Tensor(_allocator, DType.Float32, numHeads, qc, headDim);
-                            Ops.AddmmBatch(outChunk, 0, outChunk, 1.0f, scores, vExpanded);
+                            HalfOperandGemm.AddmmBatch(outChunk, 0, outChunk, 1.0f, scores, vExpanded);
                             using (Tensor outView = attnOut.Narrow(1, q0, qc))
                                 Ops.Copy(outView, outChunk);
                             outChunk.Dispose();
                         }
                         else
                         {
-                            Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
+                            HalfOperandGemm.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
                         }
                         scores.Dispose();
                     }

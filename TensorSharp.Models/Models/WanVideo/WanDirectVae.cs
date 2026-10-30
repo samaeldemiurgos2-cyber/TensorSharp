@@ -183,14 +183,15 @@ namespace TensorSharp.Models.WanVideo
                         {
                             using var col = src.View(h * w, c.Ic);
                             using var band = col.Narrow(0, y0 * ow, rows * ow);
-                            if (_ctx.IsCuda) Ops.Addmm(dst, j == 0 ? 0f : 1f, dst, 1f, band, c.TapsT[j]);
+                            // Half operands by name (HalfOperandGemm): exact F32 is 2.3-2.5x on these convs.
+                            if (_ctx.IsCuda) HalfOperandGemm.Addmm(dst, j == 0 ? 0f : 1f, dst, 1f, band, c.TapsT[j]);
                             else DirectOps.CpuGemmABt(band, c.Taps[j], dst, 1f, j == 0 ? 0f : 1f);
                         }
                         else
                         {
                             using var col = _ctx.NewF32(rows * ow, k);
                             Im2Col(col, src, c.Ic, h, w, c.K, oh, ow, pad, stride, y0, rows);
-                            if (_ctx.IsCuda) Ops.Addmm(dst, j == 0 ? 0f : 1f, dst, 1f, col, c.TapsT[j]);
+                            if (_ctx.IsCuda) HalfOperandGemm.Addmm(dst, j == 0 ? 0f : 1f, dst, 1f, col, c.TapsT[j]);
                             else DirectOps.CpuGemmABt(col, c.Taps[j], dst, 1f, j == 0 ? 0f : 1f);
                         }
                         src.Dispose();

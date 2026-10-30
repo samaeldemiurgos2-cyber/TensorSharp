@@ -775,7 +775,10 @@ namespace TensorSharp.Models
 
             using var kT = kExpanded.Transpose(1, 2);
             var scores = new Tensor(_allocator, DType.Float32, numHeads, seqLen, totalSeqLen);
-            Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
+            // Both attention GEMMs on half operands by name on direct CUDA (HalfOperandGemm): K/V come from
+            // the F16 cache of a quantized model, Q and P are rounded as ggml's flash attention rounds them,
+            // and exact F32 is 2.0-2.1x here (4096 tokens: +0.9 s per prefill on an RTX 3080 Laptop).
+            HalfOperandGemm.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
             qHeads.Dispose();
             kExpanded.Dispose();
 
@@ -795,7 +798,7 @@ namespace TensorSharp.Models
             }
 
             var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, _attnValLen);
-            Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
+            HalfOperandGemm.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
             scores.Dispose();
             vExpanded.Dispose();
 
