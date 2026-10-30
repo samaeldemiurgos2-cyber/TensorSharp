@@ -38,7 +38,8 @@ def main():
                              "libraries can be compared byte for byte on the same fixture and settings")
     parser.add_argument("--long-sparse-tokens", type=int, default=0,
                         help="Also prefill a synthetic prompt of this many tokens, long enough that the owned F32 "
-                             "attention sees >= 8,192 keys, once with the default sparse prefill and once with "
+                             "attention's widest micro-batch sees >= 2,048 keys (the sparse gate), once with the "
+                             "default sparse prefill and once with "
                              "TS_DSV41_SPARSE_FA=0 (tiled), and compare the logits and a greedy continuation. "
                              "GPU backends only: the CPU backend has no owned sparse kernel. 0 skips the case")
     parser.add_argument("--long-sparse-context", type=int, default=16384)
@@ -291,14 +292,18 @@ def main():
 
 
 def long_sparse_case(args, config, api, checks, dumped):
-    """Default sparse prefill against its TS_DSV41_SPARSE_FA=0 escape hatch at >= 8,192 keys.
+    """Default sparse prefill against its TS_DSV41_SPARSE_FA=0 escape hatch.
 
     The owned CUDA attention compacts each prefill query's mask to its sliding window plus
-    the indexer's selection once a launch has more than 8 queries and at least 8,192 keys;
-    below that, and with =0, it runs the tiled dense kernel. Both are F32 and must agree to
-    the fixture tolerance, and a greedy continuation (decode stays dense in both) must pick
-    the same tokens. Each arm is a fresh load, so no graph built under one setting is reused
-    by the other; the native loader reads the variable when it builds a graph.
+    the indexer's selection once a launch has more than 8 queries and at least 2,048 keys
+    (TSG_DSV41_SPARSE_MIN_KEYS); below that, and with =0, it runs the tiled dense kernel.
+    A micro-batch's key count is the raw ring plus the bucket of its OWN visible compressed
+    rows (dsv4_comp_bucket.h), so only the micro-batches late enough to reach 2,048 keys run
+    sparse in the default arm; earlier ones run tiled in both arms and contribute nothing to
+    the comparison. Both are F32 and must agree to the fixture tolerance, and a greedy
+    continuation (decode stays dense in both) must pick the same tokens. Each arm is a fresh
+    load, so no graph built under one setting is reused by the other; the native loader
+    reads the variable when it builds a graph.
     """
     text = config["config"]["text_config"]
     vocabulary, window = text["vocab_size"], text["sliding_window"]
@@ -306,17 +311,18 @@ def long_sparse_case(args, config, api, checks, dumped):
     ubatch = 32
     ring = (window + ubatch + 255) // 256 * 256
     ratios = sorted({r for r in text["compress_ratios"] if r > 0})
-    # build_comp_plan: a power-of-two bucket (min 256) of the call's final row count, capped
-    # at 8,192 positions of hint; K is the raw ring plus that bucket.
+    # build_comp_plan: each micro-batch's own power-of-two bucket (min 256) of its visible
+    # rows (V4.1 takes no call-end floor; dsv4_comp_bucket.h), so the last micro-batch is the
+    # widest; K is the raw ring plus that bucket.
     def keys_at(ratio):
-        needed = max(min(count, 8192) // ratio, (count + 1) // ratio, 1)
+        needed = max(count // ratio, 1)
         bucket = 256
         while bucket < needed:
             bucket <<= 1
         return ring + min(bucket, (context // ratio + 1 + 255) // 256 * 256)
     widest = max(keys_at(r) for r in ratios)
-    if widest < 8192:
-        raise ValueError(f"--long-sparse-tokens {count} reaches only {widest} attention keys; the sparse gate needs 8,192")
+    if widest < 2048:
+        raise ValueError(f"--long-sparse-tokens {count} reaches only {widest} attention keys; the sparse gate needs 2,048")
     prompt = np.array([(7 * i * i + 13 * i + 5) % vocabulary for i in range(count)], dtype=np.int32)
 
     def run(setting):

@@ -46,8 +46,11 @@
 // prefix replay, while prompt prefill retains its configured micro-batch.
 constexpr int64_t TSG_PRECISION_DECODE_COLUMNS = 8;
 
-// Smallest attention key extent (raw ring plus visible compressed rows) at
-// which DeepSeek V4.1 prefill hands the owned F32 attention a sparse capacity.
+// Smallest attention key extent (raw ring plus the micro-batch's bucket of
+// compressed rows) at which DeepSeek V4.1 prefill hands the owned F32
+// attention a sparse capacity. The bucket must come from the micro-batch's own
+// positions (dsv4_comp_bucket.h): this gate turns any other input into a
+// kernel choice, and the sparse and tiled kernels round differently.
 constexpr int64_t TSG_DSV41_SPARSE_MIN_KEYS = 2048;
 
 // Sparse capacity DeepSeek V4.1's owned F32 attention (the default CUDA path,

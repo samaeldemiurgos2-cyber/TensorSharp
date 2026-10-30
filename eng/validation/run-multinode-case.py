@@ -6,7 +6,8 @@ the first --node, is the driver. Other nodes run TensorSharp.Cli, or the
 numeric probe, as workers with the same model, placement and flags. Each node
 gets a fresh <remote-out>/<label>-node<K> directory and a generated launch.sh.
 The script records the hostname, GPUs, runtime/native hashes before and after
-the run, and a git-free source fingerprint. It runs the command with output in
+the run (native-loaded.sha256 names the libGgmlOps.so the process loads), and a
+git-free source fingerprint. It runs the command with output in
 process.log and writes exit.json. Workers start first, detached with setsid and
 nohup. The driver starts once each worker logs mesh progress or listens on its
 peer port. Every run directory is copied back to OUTPUT/node<K>/.
@@ -410,15 +411,28 @@ def launcher_text(a, node, run, argv, dll, public_env):
               "finish() { printf '{\"exit_code\": %s, \"phase\": \"%s\", \"launcher_started_unix\": %s, "
               "\"command_started_unix\": %s, \"ended_unix\": %s}\\n' \"$1\" \"$2\" \"$t0\" \"$t1\" \"$(now)\" "
               "> exit.json.tmp && mv exit.json.tmp exit.json; }",
-              "runtime() { { for f in \"$bin/$main\" \"$bin\"/TensorSharp*.dll \"$bin/libGgmlOps.so\"; do "
-              "[ -f \"$f\" ] && sha256sum \"$f\"; done; IFS=:; for d in ${LD_LIBRARY_PATH:-}; do "
-              "[ -f \"$d/libGgmlOps.so\" ] && sha256sum \"$d/libGgmlOps.so\"; done; } | LC_ALL=C sort -u -k2; }",
+              # Every path GgmlNative.ImportResolver tries for libGgmlOps.so, in its order (GetCandidatePaths in
+              # TensorSharp.Backends.GGML/GgmlNative.cs): the app directory (the host resolves symlinks), then
+              # TensorSharp.GGML.Native/{build,build/Release,build-windows,build-windows/Release} under each repo
+              # root from the app directory upwards (a directory holding TensorSharp.slnx, TensorSharp.sln,
+              # Seq2SeqSharp.sln or a .git directory), then the runtime's default probing via LD_LIBRARY_PATH.
+              "ggml_candidates() ( d=$(cd \"$bin\" 2>/dev/null && pwd -P) || d=$bin; echo \"${d%/}/libGgmlOps.so\"; "
+              "while :; do if [ -f \"$d/TensorSharp.slnx\" ] || [ -f \"$d/TensorSharp.sln\" ] || "
+              "[ -f \"$d/Seq2SeqSharp.sln\" ] || [ -d \"$d/.git\" ]; then for s in build build/Release build-windows "
+              "build-windows/Release; do echo \"${d%/}/TensorSharp.GGML.Native/$s/libGgmlOps.so\"; done; fi; "
+              "p=$(dirname \"$d\"); [ \"$p\" = \"$d\" ] && break; d=$p; done; "
+              "IFS=:; for d in ${LD_LIBRARY_PATH:-}; do [ -n \"$d\" ] && echo \"$d/libGgmlOps.so\"; done; exit 0 )",
+              "runtime() { { for f in \"$bin/$main\" \"$bin\"/TensorSharp*.dll; do [ -f \"$f\" ] && sha256sum \"$f\"; done; "
+              "ggml_candidates | while IFS= read -r f; do [ -f \"$f\" ] && sha256sum \"$f\"; done; } | LC_ALL=C sort -u -k2; }",
+              # The library the process loads: the first candidate that exists. The resolver also skips a
+              # candidate that dlopen rejects; this check cannot see that case.
+              "loaded_native() { ggml_candidates | while IFS= read -r f; do [ -f \"$f\" ] && { sha256sum \"$f\"; break; }; done; return 0; }",
               "hostname > hostname.txt 2>&1; nvidia-smi -L > nvidia-smi-L.txt 2>&1",
               "nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,driver_version --format=csv > gpus.csv 2>&1",
               "\"$dotnet\" --version > dotnet-version.txt 2>&1",
               "env | grep -E '^(CUDA_|MAX_CONTEXT|KV_CACHE|LD_LIBRARY_PATH|DOTNET_|NCCL_|GGML_|TS_|TENSORSHARP_)' "
               "| grep -v -i -E '^[^=]*(TOKEN|SECRET|PASSW|CREDENTIAL|KEY)' | LC_ALL=C sort > effective-env.txt",
-              "runtime > runtime-before.sha256"]
+              "runtime > runtime-before.sha256", "loaded_native > native-loaded.sha256"]
     shard = re.search(r"-\d{5}-of-(\d{5})\.gguf$", a.model)
     model_files = q(a.model[:shard.start()]) + f"-*-of-{shard.group(1)}.gguf" if shard else q(a.model)
     lines.append(f"stat -L -c '%s %Y %n' {model_files} > model-files.txt 2>&1")
@@ -514,6 +528,13 @@ def hash_lines(path):
         if name:
             result[name.strip()] = digest
     return result
+
+
+def loaded_native(directory):
+    """The libGgmlOps.so a node's process loads, from native-loaded.sha256: {"path", "sha256"} or None."""
+    for name, digest in (hash_lines(Path(directory) / "native-loaded.sha256") or {}).items():
+        return {"path": name, "sha256": digest}
+    return None
 
 
 def load_summarizer():
@@ -908,9 +929,14 @@ class Case:
                 self.fail(f"node{k}: command exited with {code}; see node{k}/process.log")
             before, after = hash_lines(directory / "runtime-before.sha256"), hash_lines(directory / "runtime-after.sha256")
             identity = "passed" if before and before == after and any(n.endswith("/" + posixpath.basename(p["dll"])) for n in before) else "failed"
+            loaded = loaded_native(directory)
             evidence["runtime_identity"] = {"status": identity, "files": before,
-                                            "native_hashed": bool(before) and any(n.endswith("libGgmlOps.so") for n in before),
-                                            "scope": "sha256 of the main DLL, TensorSharp*.dll and libGgmlOps.so before and after the command"}
+                                            "native_hashed": bool(before and loaded) and before.get(loaded["path"]) == loaded["sha256"],
+                                            "native_loaded": loaded,
+                                            "scope": "sha256 of the main DLL, TensorSharp*.dll and every libGgmlOps.so the GGML "
+                                                     "import resolver can load (app directory, repo-root native builds, "
+                                                     "LD_LIBRARY_PATH) before and after the command; native_loaded is the "
+                                                     "first of them that exists, the one the process loads"}
             if identity != "passed" and code is not None:
                 self.fail(f"node{k}: runtime files missing or changed during the run")
             log_path = directory / "process.log"
@@ -925,13 +951,17 @@ class Case:
         fingerprints = {e.get("source_fingerprint") for e in nodes.values()}
         if len(fingerprints) > 1:
             self.warnings.append("Source fingerprints differ across nodes: " + json.dumps(sorted(map(str, fingerprints))))
-        natives = {name.rsplit("/", 1)[-1]: set() for e in nodes.values() for name in (e["runtime_identity"]["files"] or {})}
+        # Keyed by full path: every node shares --remote-root, and one node may hold several libGgmlOps.so copies.
+        natives = {}
         for e in nodes.values():
             for name, digest in (e["runtime_identity"]["files"] or {}).items():
-                natives[name.rsplit("/", 1)[-1]].add(digest)
+                natives.setdefault(name, set()).add(digest)
         differing = sorted(name for name, digests in natives.items() if len(digests) > 1)
         if differing:
             self.warnings.append("Runtime files differ across nodes: " + ", ".join(differing))
+        loaded = {k: (e["runtime_identity"]["native_loaded"] or {}).get("sha256") for k, e in nodes.items()}
+        if len(set(loaded.values())) > 1:
+            self.warnings.append("The libGgmlOps.so each node loads differs across nodes: " + json.dumps(loaded, sort_keys=True))
         self.summary["exit_codes"], self.summary["node_evidence"] = exit_codes, nodes
         if self.state[0]["started"] and exit_codes.get("node0") is not None:
             try:
