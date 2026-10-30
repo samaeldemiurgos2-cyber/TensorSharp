@@ -305,8 +305,8 @@ costs; it was enabled only for diagnostic oracle verification, not the final
 generation timings.
 
 Build the Release CLI and tests first. On the A40 worker, expose the installed
-CUDA toolkit and compile compatible PTX rather than using the committed sm120
-baseline:
+CUDA 13 toolkit and compile PTX for the A40 rather than using the committed
+compute_75 baseline, whose sm_80 tensor-core kernels stay disabled:
 
 ```sh
 TENSORSHARP_GGML_NO_UPDATE=1 PATH=/usr/local/cuda/bin:$PATH dotnet build InferenceWeb.Tests/InferenceWeb.Tests.csproj \

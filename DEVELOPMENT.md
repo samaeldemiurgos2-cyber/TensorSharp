@@ -147,8 +147,8 @@ dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -c Relea
   -p:TensorSharpUpdateCommittedPtx=true -p:CudaNvcc=/opt/cuda-13.0.3/bin/nvcc
 ```
 
-A refresh must target `compute_75`, the oldest architecture CUDA 13 compiles, and
-must be built by `nvcc` 13.0, whose PTX (ISA 9.0) every CUDA 13 driver (R580 or
+The committed baseline targets `compute_75`, the oldest architecture CUDA 13 compiles,
+and is built by `nvcc` 13.0 on Linux, whose PTX (ISA 9.0) every CUDA 13 driver (R580 or
 newer) can JIT; a driver rejects PTX newer than itself. The refresh resolves
 `CudaArch=auto` and `native` to that target and rejects any other explicit
 target; it fails before compiling unless the `nvcc` it runs (`-p:CudaNvcc`,

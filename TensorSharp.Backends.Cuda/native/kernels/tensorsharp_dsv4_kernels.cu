@@ -74,15 +74,10 @@ struct ts_dsv4_block_iq3_xxs
 // small helpers
 // ---------------------------------------------------------------------------
 
+// dp4a is native on every target CUDA 13 compiles (compute_75 and newer).
 __device__ __forceinline__ int ts_dsv4_dp4a(int a, int b, int c)
 {
-#if __CUDA_ARCH__ >= 610
     return __dp4a(a, b, c);
-#else
-    const int8_t* a8 = (const int8_t*)&a;
-    const int8_t* b8 = (const int8_t*)&b;
-    return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
-#endif
 }
 
 __device__ __forceinline__ float ts_dsv4_warp_sum(float v)

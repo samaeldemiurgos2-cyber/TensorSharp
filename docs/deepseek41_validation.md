@@ -497,9 +497,11 @@ python -m unittest discover -s benchmarks/engine_comparison -p 'test_*.py' -v
 ```
 
 On the A40 VM, build the direct CUDA kernels for `compute_86` before running
-the managed synthetic GPU lane. The committed PTX targets `sm_120` and cannot
-run on an A40. A build without `nvcc` on `PATH` copies that baseline, so a
-managed build succeeding alone does not establish GPU readiness. Keep the
+the managed synthetic GPU lane. A build without `nvcc` on `PATH` copies the
+committed `compute_75` baseline instead: the A40 loads it, but its sm_80
+tensor-core kernels (the DeepSeek expert MMA among them) compile to nothing
+there and stay disabled, so a managed build succeeding alone does not establish
+that the lane runs the kernels an A40 uses. Keep the
 already configured GGML native build intact with `TensorSharpSkipGgmlNative`:
 
 ```bash

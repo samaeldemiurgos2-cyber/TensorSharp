@@ -628,8 +628,8 @@ dispatches to `Mamba2Block` / `AttentionBlock` / `FFNBlock` based on
   - **Kernel choice.** Nemotron 3.x attention (32 query heads over 2 KV
     heads, head_dim 128, full attention) uses the group-16 flash kernel
     `ts_gqa_prefill_flash_g16d128_{f16,f32}`. A build that compiles the
-    kernels locally with nvcc has it, and so does the committed compute_61
-    baseline PTX used when nvcc is absent (refreshed with CUDA 12.8). The
+    kernels locally with nvcc has it, and so does the committed compute_75
+    baseline PTX used when nvcc is absent (refreshed with CUDA 13.0). The
     generic GQA prefill kernel runs only when the loaded module lacks it, such
     as a stale or custom PTX. `benchmarks/FlashAttnBench` prints the kernel it
     ran.

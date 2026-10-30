@@ -585,10 +585,12 @@ establish its current latency parity.
 Remote testing found that the committed PTX targeted SM120 and could not load
 on the A40 without nvcc. The five portable modules are now regenerated from
 TensorSharp sources with CUDA 12.8 and `compute_61`. Committed-baseline refreshes
-force that target, recompile despite stale architecture stamps, and reject
+force the portable target, recompile despite stale architecture stamps, and reject
 newer explicit targets. No-nvcc builds select the portable modules and replace
 newer stale output/publish files. Ordinary GPU-specific builds still select
-their detected architecture. See [Development](../DEVELOPMENT.md). The optional
+their detected architecture. (That compute_61 / CUDA 12.8 baseline was later
+retired: the committed modules now target compute_75 and are refreshed with
+CUDA 13.0; see [Development](../DEVELOPMENT.md).) The optional
 normalized CUDA projection plan also now uploads Half weights through an owned
 host mirror and preserves surrounding storage when writing partial views.
 

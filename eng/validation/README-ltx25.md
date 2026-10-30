@@ -1313,6 +1313,8 @@ benchmark without changing files. The smaller LTX module targets `sm_61` and the
 main module targets `sm_86`; both were executed on the A40. This receipt covers
 deployment bytes, while source manifests and numerical tests cover correctness.
 Do not rebuild between that receipt and `--no-build` execution.
+Pre-retirement sm_61 / CUDA 12.8 baseline; a rerun needs the refreshed module's
+hash and `:sm_75`.
 
 `ltx25-run-cuda-validation.py --config <explicit.json> --output <ignored-dir>`
 combines the required build/deployment order with strict tests and a serial case

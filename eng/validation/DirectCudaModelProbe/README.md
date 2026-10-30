@@ -44,7 +44,8 @@ separate scratch and generic Qwen3.5/3.6 scratch are unchanged. The direct CUDA
 MMA prefill path retains its existing float activation operation.
 
 The committed PTX includes the fused entry point, regenerated with CUDA 12.8.93
-while preserving PTX 8.7 and the existing `sm_120` target. A build without `nvcc`
+while preserving PTX 8.7 and the existing `sm_120` target. (The baseline has
+since moved to compute_75 built by CUDA 13.0.) A build without `nvcc`
 can use this bundled fusion on compatible hardware and drivers. SM120 was
 cross-compiled only; it was not executed on the RTX 3080 Laptop GPU (SM86).
 Compile with `nvcc` on PATH to produce PTX for the local architecture and deploy
