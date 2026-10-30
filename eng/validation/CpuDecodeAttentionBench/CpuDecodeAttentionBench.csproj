@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Times ModelBase's pure-C# GQA decode attention (AttentionDecodePureCS / AttentionDecodePureCSF16).
+       It reaches the protected entry points through a stub subclass, so the same source builds against
+       any tree: -p:TensorSharpRoot=<other tree>/ builds it against a baseline for an A/B. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <TensorSharpRoot Condition="'$(TensorSharpRoot)' == ''">$(MSBuildThisFileDirectory)../../../</TensorSharpRoot>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(TensorSharpRoot)TensorSharp.Models/TensorSharp.Models.csproj" />
+  </ItemGroup>
+</Project>

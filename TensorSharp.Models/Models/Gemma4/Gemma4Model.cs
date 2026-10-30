@@ -7245,7 +7245,7 @@ namespace TensorSharp.Models
             return contiguous.View(seqLen, numHeads * headDim);
         }
 
-        private unsafe void AttentionDecodeWithWindow(Tensor q, Tensor kCache, Tensor vCache,
+        internal static unsafe void AttentionDecodeWithWindow(Tensor q, Tensor kCache, Tensor vCache,
             Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
             int attendStart, int totalSeqLen, float scale)
         {
@@ -7267,15 +7267,34 @@ namespace TensorSharp.Models
             // Each query head is independent; at long context this serial loop is
             // the single biggest decode cost on the managed CPU backend, so fan it
             // out across cores. Pointers are passed as nint (lambdas can't capture
-            // pointer locals) and each head stackallocs its own score scratch.
+            // pointer locals) and each head has its own score scratch: stackalloc'd
+            // up to CpuScratch.StackFloatLimit keys, rented past it, since a full
+            // attention layer's row grows with the whole context.
+            int stackLimit = CpuScratch.StackFloatLimit;
             nint qN = (nint)qPtr, kN = (nint)kPtr, vN = (nint)vPtr, rN = (nint)rPtr;
             void Head(int h)
+            {
+                float[] rented = null;
+                Span<float> scratch = attendLen <= stackLimit
+                    ? stackalloc float[attendLen]
+                    : (rented = CpuScratch.RentFloats(attendLen)).AsSpan(0, attendLen);
+                try
+                {
+                    fixed (float* scores = scratch)
+                        HeadInto(h, scores);
+                }
+                finally
+                {
+                    CpuScratch.Return(rented);
+                }
+            }
+
+            void HeadInto(int h, float* scores)
             {
                 float* qHead = (float*)qN + h * keyDim;
                 int kvHead = h / groupSize;
                 float* kHead = (float*)kN + kvHead * maxSeqLen * keyDim;
                 float* vHead = (float*)vN + kvHead * maxSeqLen * valDim;
-                float* scores = stackalloc float[attendLen];
 
                 float maxScore = float.NegativeInfinity;
                 for (int t = 0; t < attendLen; t++)
@@ -7314,7 +7333,7 @@ namespace TensorSharp.Models
         private static bool ShouldParallelizeHeads(int numHeads, int attendLen) =>
             numHeads > 1 && attendLen >= 128 && Environment.ProcessorCount > 1;
 
-        private unsafe void AttentionDecodeWithWindowF16(Tensor q, Tensor kCache, Tensor vCache,
+        internal static unsafe void AttentionDecodeWithWindowF16(Tensor q, Tensor kCache, Tensor vCache,
             Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
             int attendStart, int totalSeqLen, float scale)
         {
@@ -7326,14 +7345,31 @@ namespace TensorSharp.Models
             int groupSize = numHeads / numKVHeads;
             int attendLen = totalSeqLen - attendStart;
 
+            int stackLimit = CpuScratch.StackFloatLimit;   // see AttentionDecodeWithWindow
             nint qN = (nint)qPtr, kN = (nint)kPtr, vN = (nint)vPtr, rN = (nint)rPtr;
             void Head(int h)
+            {
+                float[] rented = null;
+                Span<float> scratch = attendLen <= stackLimit
+                    ? stackalloc float[attendLen]
+                    : (rented = CpuScratch.RentFloats(attendLen)).AsSpan(0, attendLen);
+                try
+                {
+                    fixed (float* scores = scratch)
+                        HeadInto(h, scores);
+                }
+                finally
+                {
+                    CpuScratch.Return(rented);
+                }
+            }
+
+            void HeadInto(int h, float* scores)
             {
                 float* qHead = (float*)qN + h * keyDim;
                 int kvHead = h / groupSize;
                 ushort* kHead = (ushort*)kN + kvHead * maxSeqLen * keyDim;
                 ushort* vHead = (ushort*)vN + kvHead * maxSeqLen * valDim;
-                float* scores = stackalloc float[attendLen];
 
                 float maxScore = float.NegativeInfinity;
                 for (int t = 0; t < attendLen; t++)
