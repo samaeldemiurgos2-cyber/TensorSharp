@@ -69,6 +69,16 @@ int main() {
     gguf_set_val_u32(file.get(), "deepseek41.attention.indexer.candidate_block_size", UINT32_MAX); bad();
     gguf_set_val_u32(file.get(), "deepseek41.attention.indexer.candidate_block_size", 2);
     assert(load().candidate_topk_blocks == 2 && load().candidate_block_size == 2);
+    // Unsloth's 1017 GGUFs name the budget candidate_top_k_blocks. Either name is
+    // read, as the managed loader reads them, and a file with both must agree.
+    gguf_set_val_u32(file.get(), "deepseek41.attention.indexer.candidate_top_k_blocks", 2);
+    assert(load().candidate_topk_blocks == 2);
+    gguf_set_val_u32(file.get(), "deepseek41.attention.indexer.candidate_top_k_blocks", 3); bad();
+    gguf_remove_key(file.get(), "deepseek41.attention.indexer.candidate_top_k");
+    assert(load().candidate_topk_blocks == 3);
+    gguf_set_val_u32(file.get(), "deepseek41.attention.indexer.candidate_top_k_blocks", 0); bad();
+    gguf_remove_key(file.get(), "deepseek41.attention.indexer.candidate_top_k_blocks");
+    gguf_set_val_u32(file.get(), "deepseek41.attention.indexer.candidate_top_k", 2);
     set("deepseek41.engram.offsets", {0, 3, 8, 15, 0, 13, 31, 49}); bad();
     set("deepseek41.engram.offsets", {0, 3, 8, 15, 0, 13, 30, 49});
     set("deepseek41.engram.multipliers", {7, 11, 13, 17, 19}); bad();

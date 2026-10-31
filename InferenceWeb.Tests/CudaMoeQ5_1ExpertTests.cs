@@ -315,7 +315,8 @@ public sealed class CudaMoeQ5_1ExpertTests
                     }
                 }
                 double rel = Math.Sqrt(num / den);
-                string route = nt <= perSlotMaxRows ? "per-slot" : ff % Dsv4Kernels.MoeMmaK == 0 ? "tensor-core" : "grouped warp";
+                // The route the module took (on one without the tensor-core body, the staged or warp kernels).
+                var route = CudaMoe.SelectRoute(nt, perSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, guType, downType, e, ff);
                 _output.WriteLine($"{(GgmlTensorType)downType} down, ff {ff}, {nt} tokens ({route}): relative error {rel:E2}");
                 Assert.All(got, v => Assert.True(float.IsFinite(v)));
                 Assert.True(rel <= 1e-2, $"{route}: the expert block strayed {rel:E2} from the float block");
@@ -476,9 +477,9 @@ public sealed class CudaMoeQ5_1ExpertTests
         Assert.StartsWith("[glm-cuda] blk.1.ffn_down_exps.weight is Q4_0", ex.Message);
     }
 
-    /// <summary>DeepSeek V4 keeps its own (narrower) expert list; its resident layers are now refused
-    /// by name before the upload instead of at the first forward, and offloaded layers are left to the
-    /// host matmul.</summary>
+    /// <summary>DeepSeek V4 takes the expert list GLM and Qwen3.8 share, Q5_1 included: its resident layers
+    /// are refused by name before the upload when no kernel decodes them (IQ1_M here) or when the loaded
+    /// module predates the Q5_1 decoder, and offloaded layers are left to the host matmul.</summary>
     [Fact]
     public void Dsv4_RefusesResidentExpertsByName_AndLeavesOffloadedOnesToTheHost()
     {
@@ -490,16 +491,27 @@ public sealed class CudaMoeQ5_1ExpertTests
             {
                 GateExps = Desc((int)GgmlTensorType.IQ3_S, $"blk.{il}.ffn_gate_exps.weight"),
                 UpExps = Desc((int)GgmlTensorType.IQ3_S, $"blk.{il}.ffn_up_exps.weight"),
-                DownExps = Desc(il == 0 ? (int)GgmlTensorType.Q4_0 : (int)GgmlTensorType.Q6_K, $"blk.{il}.ffn_down_exps.weight"),
+                DownExps = Desc(il == 0 ? (int)GgmlTensorType.IQ1_M : (int)GgmlTensorType.Q5_1, $"blk.{il}.ffn_down_exps.weight"),
             }).ToArray(),
         };
-        var ex = Assert.Throws<NotSupportedException>(() => Dsv4CudaEngine.ValidateRoutedExpertTypes(m, 0));
-        Assert.Contains("blk.0.ffn_down_exps.weight is Q4_0 (GPU-resident)", ex.Message);
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            Dsv4CudaEngine.ValidateRoutedExpertTypes(m, 0, decodesQ5_1: true, decodesLowBitIq: true));
+        Assert.Contains("blk.0.ffn_down_exps.weight is IQ1_M (GPU-resident)", ex.Message);
+        Assert.Contains($"The GPU expert kernels implement {CudaMoe.SupportedExpertTypes};", ex.Message);
         Assert.True(ModelLoadRefusal.TryDescribe(ex, out _));
-        Dsv4CudaEngine.ValidateRoutedExpertTypes(m, 1);   // layer 0's experts stay on the host
+        // Layer 0's experts stay on the host (with no host matmul here, the engine refuses that offload itself).
+        Dsv4CudaEngine.ValidateRoutedExpertTypes(m, 1, decodesQ5_1: true, decodesLowBitIq: true);
+
+        // On a module built before the Q5_1 decoder, the first resident Q5_1 layer is refused by name.
+        ex = Assert.Throws<NotSupportedException>(() =>
+            Dsv4CudaEngine.ValidateRoutedExpertTypes(m, 1, decodesQ5_1: false, decodesLowBitIq: true));
+        Assert.StartsWith("[dsv4-cuda] blk.1.ffn_down_exps.weight is Q5_1, and the loaded tensorsharp_dsv4_kernels module",
+            ex.Message);
+        Assert.True(ModelLoadRefusal.TryDescribe(ex, out _));
 
         m.Layers[2].UpExps = Desc((int)GgmlTensorType.Q6_K, "blk.2.ffn_up_exps.weight");
-        ex = Assert.Throws<NotSupportedException>(() => Dsv4CudaEngine.ValidateRoutedExpertTypes(m, 1));
+        ex = Assert.Throws<NotSupportedException>(() =>
+            Dsv4CudaEngine.ValidateRoutedExpertTypes(m, 1, decodesQ5_1: true, decodesLowBitIq: true));
         Assert.Contains("blk.2.ffn_gate_exps.weight (IQ3_S) and blk.2.ffn_up_exps.weight (Q6_K) differ", ex.Message);
     }
 

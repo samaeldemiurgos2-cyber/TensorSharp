@@ -142,6 +142,9 @@ namespace TensorSharp.Cuda
             // A module built from source older than the Q5_1 expert decoder lacks the marker.
             try { module.GetFunction("ts_dsv4_caps_q5_1_experts"); DecodesQ5_1Experts = true; }
             catch (CudaException ex) when (ex.ErrorCode == 500) { } // CUDA_ERROR_NOT_FOUND
+            // Likewise for the IQ1_S / IQ2_S decoders and IQ2_XXS's grouped one.
+            try { module.GetFunction("ts_dsv4_caps_lowbit_iq_experts"); DecodesLowBitIqExperts = true; }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
         }
 
         /// <summary>Whether this module's expert kernels decode Q5_1 rows. False on a module built
@@ -149,6 +152,14 @@ namespace TensorSharp.Cuda
         /// would read a Q5_1 row as Q8_0; <see cref="CudaMoe.RequireExpertDecoders"/> refuses those
         /// experts there.</summary>
         public bool DecodesQ5_1Experts { get; }
+
+        /// <summary>Whether this module's expert kernels decode IQ1_S and IQ2_S rows on every route,
+        /// and IQ2_XXS rows on the grouped (register-staged and tensor-core) routes as well as the
+        /// warp-per-row ones. False on a module built from older kernel source, which reads the first
+        /// two as Q8_0 everywhere and IQ2_XXS as Q8_0 in a grouped kernel:
+        /// <see cref="CudaMoe.RequireExpertDecoders"/> refuses IQ1_S and IQ2_S experts there, and
+        /// <see cref="CudaMoe.GroupedSupportsType"/> keeps IQ2_XXS on the warp-per-row kernels.</summary>
+        public bool DecodesLowBitIqExperts { get; }
 
         public static Dsv4Kernels Create()
         {
@@ -159,12 +170,16 @@ namespace TensorSharp.Cuda
                     "tensorsharp_dsv4_kernels.ptx could not be located next to the application or under " +
                     "a 'cuda_kernels' folder. Build TensorSharp.Backends.Cuda with a CUDA 13 nvcc on the PATH.");
             }
-            return new Dsv4Kernels(CudaModule.LoadFromFile(path));
+            return new Dsv4Kernels(CudaModule.LoadFromFile(path, identify: true));
         }
 
         /// <summary>Kernels over an already loaded module (tests that load a specific image).
         /// Requires the module's context to be current.</summary>
         internal static Dsv4Kernels FromModule(CudaModule module) => new Dsv4Kernels(module);
+
+        /// <summary>The SHA-256 of the module image the driver loaded (<see cref="CudaModule.ImageSha256"/>);
+        /// null for a module loaded without identifying it.</summary>
+        public string ModuleImageSha256 => module.ImageSha256;
 
         private static void Launch(IntPtr fn, uint gx, uint gy, uint gz, int block, uint sharedBytes, IntPtr stream, void** args)
         {

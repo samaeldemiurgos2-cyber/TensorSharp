@@ -102,6 +102,25 @@ class EmbeddedEngramTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 metadata.load_engram(weights)
 
+    def test_candidate_budget_is_read_under_either_name(self):
+        # Unsloth's 1017 GGUFs name the budget candidate_top_k_blocks; the native and
+        # managed loaders read either name, and a file with both must agree.
+        weights = self.weights()
+        fields = weights.readers[0].fields
+
+        def budget(**values):
+            for name in ("candidate_top_k", "candidate_top_k_blocks"):
+                fields.pop("deepseek41.attention.indexer." + name, None)
+            for name, value in values.items():
+                fields["deepseek41.attention.indexer." + name] = SimpleNamespace(
+                    types=[GGUFValueType.UINT32], contents=lambda value=value: value)
+            return metadata.load_engram(weights)["candidate_topk"]
+        self.assertEqual(budget(candidate_top_k_blocks=5), 5)
+        self.assertEqual(budget(candidate_top_k=6), 6)
+        self.assertEqual(budget(candidate_top_k_blocks=5, candidate_top_k=5), 5)
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            budget(candidate_top_k_blocks=5, candidate_top_k=6)
+
     def test_block_count_and_compression_metadata_match_runtime_contract(self):
         for changed in ({"block_count": 3.0}, {"block_count": 3.5}, {"block_count": -1},
                         {"attention.compress_ratios": [0.0, 1.0, 1.0]},
@@ -118,6 +137,7 @@ class EmbeddedEngramTests(unittest.TestCase):
                 "attention.compress_ratios": [0, 1, 1] + [0] * (count - 3)}))
             self.assertEqual((result["candidate"], result["candidate_topk"], result["candidate_block"]), (1, 2048, 8))
 
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is not installed (eng/dsv41-reference.py imports it)")
     def test_padding_and_media_barrier_use_already_compressed_id(self):
         reference = module("dsv41_reference", "dsv41-reference.py")
         layout = metadata.load_engram(self.weights())

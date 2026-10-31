@@ -82,6 +82,33 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName, EntryPoint = "cuMemcpyDtoDAsync_v2")]
         public static partial int cuMemcpyDtoDAsync(IntPtr dstDevice, IntPtr srcDevice, UIntPtr byteCount, IntPtr stream);
 
+        /// <summary>CUDA_MEMCPY2D: a pitched copy of <see cref="Height"/> rows of <see cref="WidthInBytes"/>
+        /// bytes, field for field the driver's struct (natural alignment, so the enum fields are padded).</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct CudaMemcpy2D
+        {
+            public UIntPtr SrcXInBytes, SrcY;
+            public int SrcMemoryType;
+            public IntPtr SrcHost, SrcDevice, SrcArray;
+            public UIntPtr SrcPitch;
+            public UIntPtr DstXInBytes, DstY;
+            public int DstMemoryType;
+            public IntPtr DstHost, DstDevice, DstArray;
+            public UIntPtr DstPitch;
+            public UIntPtr WidthInBytes, Height;
+        }
+
+        /// <summary>CUmemorytype values for <see cref="CudaMemcpy2D"/>.</summary>
+        public const int CU_MEMORYTYPE_HOST = 1, CU_MEMORYTYPE_DEVICE = 2;
+
+        [LibraryImport(LibName, EntryPoint = "cuMemcpy2DAsync_v2")]
+        public static partial int cuMemcpy2DAsync(in CudaMemcpy2D copy, IntPtr stream);
+
+        /// <summary>Queues a host function on a stream (<c>void CUDA_CB fn(void* userData)</c>): it runs once the
+        /// work queued before it has completed, and the work queued after it waits for it to return.</summary>
+        [LibraryImport(LibName, EntryPoint = "cuLaunchHostFunc")]
+        public static partial int cuLaunchHostFunc(IntPtr stream, IntPtr fn, IntPtr userData);
+
         [LibraryImport(LibName, EntryPoint = "cuMemsetD8_v2")]
         public static partial int cuMemsetD8(IntPtr dstDevice, byte value, UIntPtr count);
 

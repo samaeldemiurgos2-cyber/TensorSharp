@@ -16,7 +16,7 @@ namespace InferenceWeb.Tests;
 /// </summary>
 internal static class SyntheticGguf
 {
-    public enum GgmlType { F32 = 0, F16 = 1, Q4_0 = 2, Q5_1 = 7, Q8_0 = 8, Q4_K = 12, Q6_K = 14, IQ2_XS = 17, IQ3_XXS = 18, IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23, BF16 = 30 }
+    public enum GgmlType { F32 = 0, F16 = 1, Q4_0 = 2, Q5_1 = 7, Q8_0 = 8, Q4_K = 12, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, BF16 = 30 }
 
     private const int Q8Block = 32;
     private const int Q8BlockBytes = 2 + Q8Block;   // f16 scale + 32 int8
@@ -35,6 +35,9 @@ internal static class SyntheticGguf
         GgmlType.IQ4_XS => (256, 136),   // f16 d, u16 scales_h, scales_l[4], qs[128]
         GgmlType.IQ2_XS => (256, 74),    // f16 d, qs[32] u16 (9-bit grid + 7-bit signs), scales[8]
         GgmlType.IQ3_XXS => (256, 98),   // f16 d, qs[64] grid bytes, 8 u32 of signs + scale
+        GgmlType.IQ2_XXS => (256, 66),   // f16 d, qs[32] u16 (grid bytes, then signs + scale)
+        GgmlType.IQ2_S => (256, 82),     // f16 d, qs[64] (32 grid bytes + 32 sign bytes), qh[8], scales[8]
+        GgmlType.IQ1_S => (256, 50),     // f16 d, qs[32] grid bytes, u16 qh[8] (grid high bits, scale, delta sign)
         _ => (1, 0),
     };
 
@@ -150,6 +153,8 @@ internal static class SyntheticGguf
             GgmlType.Q6_K => 64f * 16f,      // int8 scale times a 6-bit code minus 32
             GgmlType.IQ2_XS => 25f * 2f,     // grid values 8/25/43 times (0.5 + 4-bit scale) / 4
             GgmlType.IQ3_XXS => 28f * 4f,    // grid values 4..62 times (0.5 + 4-bit scale) / 2
+            GgmlType.IQ2_XXS or GgmlType.IQ2_S => 25f * 2f, // grid values 8/25/43 times (0.5 + 4-bit scale) / 4
+            GgmlType.IQ1_S => 8f,          // (2 * 3-bit scale + 1) times grid values -1..1 +/- 1/8
             _ => 1f,
         };
         for (long b = 0; b < blocks; b++)

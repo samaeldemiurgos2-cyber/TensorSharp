@@ -267,7 +267,8 @@ namespace TensorSharp.Cuda
             for (int il = 0; il < m.NLayer; il++)
             {
                 var L = m.Layers[il];
-                CudaMoe.RequireExpertDecoders("q4e-cuda", _devs[0].DK.DecodesQ5_1Experts, il, L.GateExps, L.UpExps, L.DownExps);
+                CudaMoe.RequireExpertDecoders("q4e-cuda", _devs[0].DK.DecodesQ5_1Experts, il, L.GateExps, L.UpExps, L.DownExps,
+                    decodesLowBitIq: _devs[0].DK.DecodesLowBitIqExperts);
             }
 
             // ---- placement: contiguous runs of layers, each device filled to the same share of

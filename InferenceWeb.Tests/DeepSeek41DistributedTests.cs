@@ -167,10 +167,53 @@ public sealed class DeepSeek41DistributedTests : IDisposable
             BackendType.GgmlCuda, 1, ref group, out int split, local));
         Assert.Equal(local, split);
         Assert.Same(layers, group);
-        Assert.Throws<NotSupportedException>(() =>
-            DeepSeek41Architecture.ValidateTensorParallelGroup(BackendType.Cuda, 1, layers));
+        // The direct-CUDA engine runs whole-layer stages too (Dsv4CudaEngine.Distributed.cs).
+        DeepSeek41Architecture.ValidateTensorParallelGroup(BackendType.Cuda, 1, layers);
+        DeepSeek41Architecture.ValidateLoad("not-opened.gguf", BackendType.Cuda, null, layers, 1);
+        group = layers;
+        Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(DeepSeek41Architecture.Descriptor,
+            BackendType.Cuda, 1, ref group, out split, local));
+        Assert.Equal(local, split);
+        foreach (BackendType other in new[] { BackendType.GgmlVulkan, BackendType.GgmlCpu, BackendType.Cpu })
+            Assert.Throws<NotSupportedException>(() => DeepSeek41Architecture.ValidateTensorParallelGroup(other, 1, layers));
         Assert.Throws<NotSupportedException>(() =>
             DeepSeek41Architecture.ValidateTensorParallelGroup(BackendType.GgmlCuda, 2, layers));
+        Assert.Throws<NotSupportedException>(() =>
+            DeepSeek41Architecture.ValidateTensorParallelGroup(BackendType.Cuda, 2, layers));
+    }
+
+    /// <summary>
+    /// --backend cuda runs a distributed layer split of V4.1 but not distributed (or local) tensor parallelism:
+    /// that would need 80 cross-node collectives per token and both Engram tables on every node.
+    /// </summary>
+    [Fact]
+    public void CudaRunsDistributedLayerSplitButNotTensorParallelism()
+    {
+        Assert.Equal(new[] { BackendType.GgmlCuda, BackendType.Cuda }, DeepSeek41Architecture.Descriptor.DistributedLayerSplitBackends);
+        ModelBase.ValidateDistributedLayerSplit(DeepSeek41Architecture.Descriptor, BackendType.Cuda);
+        var distributedTp = Assert.Throws<NotSupportedException>(() =>
+            ModelBase.ValidateDistributedTensorParallelism(DeepSeek41Architecture.Descriptor, BackendType.Cuda));
+        Assert.Contains("--backend ggml_cuda", distributedTp.Message);
+        var group = Assert.Throws<NotSupportedException>(() =>
+            DeepSeek41Architecture.ValidateTensorParallelGroup(BackendType.Cuda, 2, new Group(2, 4, 0, 2)));
+        Assert.Contains("requires --backend ggml_cuda", group.Message);
+        var local = Assert.Throws<NotSupportedException>(() =>
+            DeepSeek41Architecture.ValidateLoad("not-opened.gguf", BackendType.Cuda, null, null, 2));
+        Assert.Contains("ggml_cuda", local.Message);
+    }
+
+    /// <summary>The distributed stages do not mirror DSpark's drafting and rewinds: a drafter with a cuda (or
+    /// ggml_cuda) layer split is refused before anything is opened.</summary>
+    [Theory]
+    [InlineData(BackendType.Cuda)]
+    [InlineData(BackendType.GgmlCuda)]
+    public void DsparkIsRefusedUnderADistributedLayerSplit(BackendType backend)
+    {
+        var layers = new LayerGroup(1, 2, 0);
+        var error = Assert.Throws<NotSupportedException>(() => DeepSeek41Architecture.ValidateLoad(
+            "not-opened.gguf", backend, "not-opened-draft.gguf", layers, 1));
+        Assert.Contains("DSpark", error.Message);
+        Assert.Contains("layer split", error.Message);
     }
 
     [Fact]

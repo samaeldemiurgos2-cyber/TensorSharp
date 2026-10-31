@@ -1,5 +1,6 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
+using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.Cuda;
 using TensorSharp.Models;
@@ -11,12 +12,15 @@ namespace InferenceWeb.Tests;
 /// and batched decode that let <c>--backend cuda</c> serve parallel conversations and keep each
 /// one's KV between turns, as the native ggml executor does.
 ///
-/// <para>The GPU tests run the V4.1 fixture generated for this engine
+/// <para>The GPU tests run twice: on the 1017-shaped checkpoint <see cref="Dsv41SyntheticModelBuilder"/>
+/// writes (llama.cpp's combined Engram layout, the 1017's IQ1_S / IQ2_S / IQ2_XXS experts, Q5_K shared
+/// experts and BF16 compressor and indexer, whose dense projections are what batched decode has to keep
+/// row-invariant), and on the V4.1 fixture generated for this engine
 /// (<c>python eng/dsv41-fixture.py DIR --cuda-attn --q8</c>, then
-/// <c>TS_TEST_DSV41_CUDA_FIXTURE_DIR=DIR</c>) and compare the engine with itself on a fresh
-/// slot, so the reference does not depend on the fixture's quantization. "Exactly" is held
-/// to 1e-5 of the largest logit rather than to the last bit, which no kernel promises; a wrong
-/// cache row moves logits by orders of magnitude more.</para>
+/// <c>TS_TEST_DSV41_CUDA_FIXTURE_DIR=DIR</c>; that row skips without it). They compare the engine
+/// with itself on a fresh slot, so the reference does not depend on the fixture's quantization.
+/// "Exactly" is held to 1e-5 of the largest logit rather than to the last bit, which no kernel
+/// promises; a wrong cache row moves logits by orders of magnitude more.</para>
 /// </summary>
 public sealed class Dsv41CudaSlotTests
 {
@@ -108,9 +112,15 @@ public sealed class Dsv41CudaSlotTests
 
     // ---------------------------------------------------------------- the engine (GPU)
 
-    private static DeepSeek4CudaExecutor Open(int ubatch = 32) =>
-        new(TestGates.FindGguf(Environment.GetEnvironmentVariable(FixtureVar), Fixture),
-            maxContext: 1024, nUbatch: ubatch, nGpu: 1);
+    /// <summary>The theory rows: the synthetic 1017-shaped fixture, and the one the environment names.</summary>
+    private const string Synthetic = "synthetic", FromEnvironment = "environment";
+
+    private static string FixturePath(string fixture) => fixture == Synthetic
+        ? Dsv41SyntheticModelBuilder.Fixture()
+        : TestGates.FindGguf(Environment.GetEnvironmentVariable(FixtureVar), Fixture);
+
+    private static DeepSeek4CudaExecutor Open(string fixture, int ubatch = 32) =>
+        new(FixturePath(fixture), maxContext: 1024, nUbatch: ubatch, nGpu: 1);
 
     /// <summary>A reproducible token stream over the fixture's ordinary ids.</summary>
     private static int[] Stream(int seed, int count)
@@ -136,10 +146,12 @@ public sealed class Dsv41CudaSlotTests
 
     /// <summary>Two sequences whose forwards alternate on their own slots answer exactly as
     /// each does alone: no cache, position, Engram history or checkpoint leaks across slots.</summary>
-    [CudaFact(FixtureVar, Fixture)]
-    public void InterleavedSlots_AnswerExactlyAsEachSequenceAlone()
+    [CudaTheory]
+    [InlineData(Synthetic)]
+    [ModelInlineData(FixtureVar, Fixture, FromEnvironment)]
+    public void InterleavedSlots_AnswerExactlyAsEachSequenceAlone(string fixture)
     {
-        using var ex = Open();
+        using var ex = Open(fixture);
         int[][] a = { Stream(1, 23), Stream(2, 1), Stream(3, 9), Stream(4, 1), Stream(5, 1) };
         int[][] b = { Stream(6, 5), Stream(7, 31), Stream(8, 1), Stream(9, 4), Stream(10, 1) };
 
@@ -179,10 +191,12 @@ public sealed class Dsv41CudaSlotTests
     /// multi-row kernels, so this holds to rounding; it is what catches a row reading another row's
     /// slot, cache rows or position.
     /// </summary>
-    [CudaFact(FixtureVar, Fixture)]
-    public void BatchedDecode_EveryRowIsIndependentOfItsBatchmates()
+    [CudaTheory]
+    [InlineData(Synthetic)]
+    [ModelInlineData(FixtureVar, Fixture, FromEnvironment)]
+    public void BatchedDecode_EveryRowIsIndependentOfItsBatchmates(string fixture)
     {
-        using var ex = Open();
+        using var ex = Open(fixture);
         int[] prompts = { 20, 13, 31, 2 };
         int n = prompts.Length, steps = 12;
         var together = new int[n];
@@ -219,19 +233,24 @@ public sealed class Dsv41CudaSlotTests
     }
 
     /// <summary>
-    /// A batched decode step computes what each sequence's own one-token forward computes. Compared at
-    /// the first step, while both sets of slots hold the same caches: the rows can take other kernels
-    /// than a one-row forward (Q8_0's int8 MMA against its dp4a matvec accumulate the block scales in
-    /// another order), and V4.1's FP8 cache rounding and discrete top-k selection turn a difference that
-    /// size into a different cache, so over later steps the two decodes part for reasons that are not
-    /// a batching error. A row answering from the wrong slot, position or cache is wrong at once.
+    /// A batched decode step computes exactly what each sequence's own one-token forward computes, to the
+    /// bit, step after step. Every dense projection of a decode-size step takes a row-invariant route (each
+    /// row of a 2..16-row call is the one-row call's arithmetic: Q8_0 and Q6_K on their q8_1 row kernels,
+    /// Q5_K and the low-bit layouts on DenseQ81Rows, BF16 one row at a time; see DenseMatMul), the experts
+    /// run per (token, expert) slot, and attention, the caches and Engram go row by row. So a batched row
+    /// equals its own forward exactly, its cache writes do too, and the next step compares like with like.
+    /// Measured: identical on both fixtures, whose dense layouts span Q8_0, Q6_K, Q5_K and BF16; before the
+    /// row-invariant routes a Q5_K / BF16 fixture's batched rows strayed 0.65 of the largest logit. A row
+    /// answering from the wrong slot, position or cache is wrong at once.
     /// </summary>
-    [CudaFact(FixtureVar, Fixture)]
-    public void BatchedDecode_ComputesEverySequencesOwnForward()
+    [CudaTheory]
+    [InlineData(Synthetic)]
+    [ModelInlineData(FixtureVar, Fixture, FromEnvironment)]
+    public void BatchedDecode_ComputesEverySequencesOwnForward(string fixture)
     {
-        using var ex = Open();
+        using var ex = Open(fixture);
         int[] prompts = { 20, 13, 31, 2 };
-        int n = prompts.Length;
+        int n = prompts.Length, steps = 4;
         var batched = new int[n];
         var serial = new int[n];
         for (int i = 0; i < n; i++)
@@ -242,18 +261,24 @@ public sealed class Dsv41CudaSlotTests
             Forward(ex, Stream(100 + i, prompts[i]));
         }
 
-        int[] tokens = Enumerable.Range(0, n).Select(i => Stream(200 + i, 1)[0]).ToArray();
-        var rows = new float[n * ex.VocabSize];
-        Assert.True(ex.ForwardBatchedDecode(batched, tokens, prompts, rows));
         double worst = 0;
-        for (int i = 0; i < n; i++)
+        for (int step = 0; step < steps; step++)
         {
-            Assert.True(ex.SetActiveSlot(serial[i]));
-            float[] want = Forward(ex, new[] { tokens[i] });
-            worst = Math.Max(worst, RelativeError(rows.AsSpan(i * ex.VocabSize, ex.VocabSize).ToArray(), want));
+            int[] tokens = Enumerable.Range(0, n).Select(i => Stream(200 + i, steps)[step]).ToArray();
+            int[] positions = prompts.Select(p => p + step).ToArray();
+            var rows = new float[n * ex.VocabSize];
+            Assert.True(ex.ForwardBatchedDecode(batched, tokens, positions, rows));
+            for (int i = 0; i < n; i++)
+            {
+                Assert.True(ex.SetActiveSlot(serial[i]));
+                float[] want = Forward(ex, new[] { tokens[i] });
+                float[] got = rows.AsSpan(i * ex.VocabSize, ex.VocabSize).ToArray();
+                worst = Math.Max(worst, RelativeError(got, want));
+                Assert.True(MemoryMarshal.AsBytes(got.AsSpan()).SequenceEqual(MemoryMarshal.AsBytes(want.AsSpan())),
+                    $"step {step} sequence {i}: the batched row is {RelativeError(got, want):E3} from its own forward");
+            }
         }
-        Console.WriteLine($"[dsv41-cuda] batched decode vs one-row forwards: worst relative error {worst:E3}");
-        Assert.True(worst <= 1e-2, $"a batched row strayed {worst:E3} from its sequence's own forward");
+        Console.WriteLine($"[dsv41-cuda] batched decode vs one-row forwards over {steps} steps: worst relative error {worst:E3}");
     }
 
     private static double RelativeError(float[] actual, float[] expected)
@@ -275,15 +300,15 @@ public sealed class Dsv41CudaSlotTests
     /// prefill ubatches, single-token steps and a batched step all cross them. A host with fewer
     /// devices runs the splits it can hold, so two GPUs still check a boundary.
     /// </summary>
-    [MultiCudaFact(2, FixtureVar, Fixture)]
-    public void ALayerSplit_AnswersAsOneDevice()
+    [MultiCudaTheory(2)]
+    [InlineData(Synthetic)]
+    [ModelInlineData(FixtureVar, Fixture, FromEnvironment)]
+    public void ALayerSplit_AnswersAsOneDevice(string fixture)
     {
         int[] prompt = Stream(31, 45), steps = Stream(32, 6), other = Stream(33, 17);
         List<float[]> Run(int gpus)
         {
-            using var ex = new DeepSeek4CudaExecutor(
-                TestGates.FindGguf(Environment.GetEnvironmentVariable(FixtureVar), Fixture),
-                maxContext: 1024, nUbatch: 32, nGpu: gpus);
+            using var ex = new DeepSeek4CudaExecutor(FixturePath(fixture), maxContext: 1024, nUbatch: 32, nGpu: gpus);
             var rows = new List<float[]> { Forward(ex, prompt) };
             foreach (int t in steps)
                 rows.Add(Forward(ex, new[] { t }));
@@ -310,10 +335,12 @@ public sealed class Dsv41CudaSlotTests
     }
 
     /// <summary>A step the engine cannot batch is declined before anything is written.</summary>
-    [CudaFact(FixtureVar, Fixture)]
-    public void BatchedDecode_DeclinesAStepItCannotServe_WithoutWriting()
+    [CudaTheory]
+    [InlineData(Synthetic)]
+    [ModelInlineData(FixtureVar, Fixture, FromEnvironment)]
+    public void BatchedDecode_DeclinesAStepItCannotServe_WithoutWriting(string fixture)
     {
-        using var ex = Open();
+        using var ex = Open(fixture);
         int s1 = NewActiveSlot(ex);
         Forward(ex, Stream(1, 6));
         int s2 = NewActiveSlot(ex);
@@ -329,16 +356,19 @@ public sealed class Dsv41CudaSlotTests
 
     /// <summary>
     /// A conversational rewind is exact. The answer runs the head far past the raw ring's reach
-    /// (<paramref name="answer"/> 260 on this fixture's 249-position span), so the rewind to the
-    /// prompt boundary is served by the checkpoint the prompt's forward took; a short answer is
-    /// served by the live ring. Either way the next turn answers exactly as a fresh prefill.
+    /// (<paramref name="answer"/> 260 against a span of 249 positions on the generated fixture's
+    /// 8-token window, 241 on the synthetic one's 16), so the rewind to the prompt boundary is
+    /// served by the checkpoint the prompt's forward took; a short answer is served by the live
+    /// ring. Either way the next turn answers exactly as a fresh prefill.
     /// </summary>
-    [CudaTheory(FixtureVar, Fixture)]
-    [InlineData(30)]
-    [InlineData(260)]
-    public void Truncate_ToThePromptBoundary_ContinuesExactlyAsAFreshPrefill(int answer)
+    [CudaTheory]
+    [InlineData(Synthetic, 30)]
+    [InlineData(Synthetic, 260)]
+    [ModelInlineData(FixtureVar, Fixture, FromEnvironment, 30)]
+    [ModelInlineData(FixtureVar, Fixture, FromEnvironment, 260)]
+    public void Truncate_ToThePromptBoundary_ContinuesExactlyAsAFreshPrefill(string fixture, int answer)
     {
-        using var ex = Open();
+        using var ex = Open(fixture);
         int[] prompt = Stream(11, 24), reply = Stream(12, answer), next = Stream(13, 9);
         Assert.Equal(2, ex.TruncateAlign);
 
@@ -362,10 +392,12 @@ public sealed class Dsv41CudaSlotTests
 
     /// <summary>A rewind neither the live ring nor the checkpoint can serve is refused, and
     /// refusing it leaves the slot exactly where it was.</summary>
-    [CudaFact(FixtureVar, Fixture)]
-    public void Truncate_RefusesAReachNothingHolds_AndLeavesTheSlotUntouched()
+    [CudaTheory]
+    [InlineData(Synthetic)]
+    [ModelInlineData(FixtureVar, Fixture, FromEnvironment)]
+    public void Truncate_RefusesAReachNothingHolds_AndLeavesTheSlotUntouched(string fixture)
     {
-        using var ex = Open();
+        using var ex = Open(fixture);
         int[] prompt = Stream(21, 300), reply = Stream(22, 3);
         Forward(ex, prompt);
         foreach (int t in reply)
@@ -385,10 +417,12 @@ public sealed class Dsv41CudaSlotTests
 
     /// <summary>The model's retained-conversation contract on the direct-CUDA executor, the
     /// same script DeepSeekNativeRetentionFixtureTests runs on the native one.</summary>
-    [CudaFact(FixtureVar, Fixture)]
-    public void RetainedSlot_ContinuesTheConversationExactly_AndOutlivesANewPrimary()
+    [CudaTheory]
+    [InlineData(Synthetic)]
+    [ModelInlineData(FixtureVar, Fixture, FromEnvironment)]
+    public void RetainedSlot_ContinuesTheConversationExactly_AndOutlivesANewPrimary(string fixture)
     {
-        string path = TestGates.FindGguf(Environment.GetEnvironmentVariable(FixtureVar), Fixture);
+        string path = FixturePath(fixture);
         string[] keys = { "TS_DSV41_RETAINED_CACHE_MB", "MAX_CONTEXT", "TS_DSV4_UBATCH" };
         string[] values = { "2048", "512", "8" };
         var old = keys.Select(Environment.GetEnvironmentVariable).ToArray();
@@ -442,6 +476,9 @@ public sealed class Dsv41CudaSlotTests
         int at = 0;
         for (int i = 0; i < expected.Length; i++)
         {
+            // Both sides: a NaN makes the error NaN, which no comparison with the tolerance catches.
+            Assert.True(float.IsFinite(actual[i]) && float.IsFinite(expected[i]),
+                $"{what}: logit {i} was {actual[i]}, reference {expected[i]}");
             double error = Math.Abs(actual[i] - expected[i]) / scale;
             if (error > worst) { worst = error; at = i; }
         }

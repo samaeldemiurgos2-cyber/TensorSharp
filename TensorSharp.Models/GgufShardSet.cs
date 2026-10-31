@@ -94,6 +94,70 @@ namespace TensorSharp.Models
         /// <summary>The tensor's header, or null when no shard has it.</summary>
         public GgufTensorInfo InfoOf(string name) => _tensors.TryGetValue(name, out var e) ? e.Info : null;
 
+        /// <summary>Every tensor of the table (row views by their own names) and its byte count, from the
+        /// headers alone: what a placement computed before any data is read prices.</summary>
+        public IEnumerable<(string Name, GgufTensorInfo Info, long Bytes)> TensorBytes()
+        {
+            foreach (var kv in _tensors)
+                yield return (kv.Key, kv.Value.Info, kv.Value.File.GetTensorByteCount(kv.Value.Info));
+        }
+
+        /// <summary>
+        /// Replaces the 2-D tensor <paramref name="source"/> in the table with row views of it (the
+        /// static overload below). Call it before <see cref="BeginStreaming"/>.
+        /// </summary>
+        public void ReplaceWithRowViews(string source, IReadOnlyList<(string Name, long FirstRow, long Rows)> views)
+            => ReplaceWithRowViews(_tensors, source, views, _tag);
+
+        /// <summary>
+        /// Replaces the 2-D tensor <paramref name="source"/> in a per-shard tensor table with row
+        /// views: each view is a header for rows [FirstRow, FirstRow + Rows) of the same bytes in
+        /// the same shard, so every reader of the table (weight descriptors, mappings, staged
+        /// copies) sees that row range as a tensor of its own and no byte is copied. The source
+        /// entry is removed, so nothing can also stream, stage or buffer the whole tensor beside
+        /// its views. This is how llama.cpp's combined DeepSeek V4.1 Engram table becomes the
+        /// per-layer tables the executors read, as the native loader does it
+        /// (ggml_ops_deepseek4.cpp).
+        /// </summary>
+        /// <remarks>
+        /// The table's files must each be ONE shard (<see cref="GgufFile.OpenWithoutSiblingShards"/>):
+        /// a view's offset is relative to the shard that holds the source. Each view also keeps
+        /// the source's <see cref="GgufTensorInfo.Name"/>, because a GgufFile that aggregates its
+        /// siblings resolves a tensor's owning shard by that name and would look a view named
+        /// after its layer up in the wrong file.
+        /// </remarks>
+        internal static void ReplaceWithRowViews(Dictionary<string, (GgufFile File, GgufTensorInfo Info)> tensors,
+            string source, IReadOnlyList<(string Name, long FirstRow, long Rows)> views, string tag)
+        {
+            if (!tensors.TryGetValue(source, out var entry))
+                throw new InvalidOperationException($"[{tag}] missing tensor: {source}");
+            GgufTensorInfo info = entry.Info;
+            if (info.Shape.Length < 2 || Array.Exists(info.Shape, d => d == 0) ||
+                Array.FindIndex(info.Shape, 2, d => d != 1) >= 0)
+                throw new InvalidDataException($"[{tag}] {source} must be a two-dimensional tensor to be viewed by rows");
+            ulong tableRows = info.Shape[1];
+            long rowBytes = entry.File.GetTensorByteCount(new GgufTensorInfo { Shape = new[] { info.Shape[0] }, Type = info.Type });
+            var built = new Dictionary<string, GgufTensorInfo>(StringComparer.Ordinal);
+            foreach (var (name, firstRow, rows) in views)
+            {
+                if (firstRow < 0 || rows <= 0 || (ulong)firstRow > tableRows || (ulong)rows > tableRows - (ulong)firstRow)
+                    throw new InvalidDataException(
+                        $"[{tag}] {name}: rows [{firstRow}, {firstRow + rows}) lie outside {source}'s {tableRows} rows");
+                if (name == source || tensors.ContainsKey(name) || built.ContainsKey(name))
+                    throw new InvalidDataException($"[{tag}] {name} already exists; cannot view {source} under that name");
+                built[name] = new GgufTensorInfo
+                {
+                    Name = info.Name,
+                    Shape = new[] { info.Shape[0], (ulong)rows },
+                    Type = info.Type,
+                    Offset = info.Offset + (ulong)firstRow * (ulong)rowBytes,
+                };
+            }
+            foreach (var kv in built)
+                tensors[kv.Key] = (entry.File, kv.Value);
+            tensors.Remove(source);
+        }
+
         /// <summary>
         /// Switch to streaming: large weights are read exactly once, on their way to VRAM, so the
         /// engine streams them from the shards through pinned chunks instead of staging the whole
@@ -101,7 +165,9 @@ namespace TensorSharp.Models
         /// parallel: individually tiny, but there are hundreds of them and a serial read of each
         /// costs a full round trip on a network filesystem.
         /// </summary>
-        public void BeginStreaming()
+        /// <param name="prefetch">Which small tensors to read ahead (null: all of them). A stage of a
+        /// distributed layer split reads only its own layers'; a tensor left out is still read on demand.</param>
+        public void BeginStreaming(Func<string, bool> prefetch = null)
         {
             _sources = new ShardSource[_paths.Count];
             for (int s = 0; s < _paths.Count; s++)
@@ -111,9 +177,10 @@ namespace TensorSharp.Models
             foreach (var kv in _tensors)
             {
                 var type = kv.Value.Info.Type;
-                if (type == GgmlTensorType.F32 || type == GgmlTensorType.I32)
+                if ((type == GgmlTensorType.F32 || type == GgmlTensorType.I32) && (prefetch == null || prefetch(kv.Key)))
                     names.Add(kv.Key);
             }
+            PrefetchedNames = names.ToArray();
             if (names.Count == 0)
                 return;
             var slots = new IntPtr[names.Count];
@@ -132,6 +199,10 @@ namespace TensorSharp.Models
                 _owned.Add(slots[i]);
             }
         }
+
+        /// <summary>The tensors <see cref="BeginStreaming"/> read ahead (kept after <see cref="EndLoad"/>, names
+        /// only); empty before streaming.</summary>
+        public IReadOnlyList<string> PrefetchedNames { get; private set; } = Array.Empty<string>();
 
         /// <summary>The tensor's bytes in host memory (prefetched, read, or mapped), or
         /// (zero, null) when it is absent and not required.</summary>

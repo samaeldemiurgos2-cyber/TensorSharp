@@ -136,6 +136,15 @@ namespace TensorSharp.Cuda
         private SlotLayer AllocSlotLayer(Slot s, int il)
         {
             DevLayer l = _layers[il];
+            if (l.Device < 0)
+            {
+                // Another stage's layer: no caches here, except the replicas of a group source whose
+                // readers run on this node (its committed rows arrive with the boundary payload).
+                var remote = new SlotLayer();
+                if (_m.V41 && l.Ratio != 0 && l.KvSource == il)
+                    AllocReplicas(s, remote, il);
+                return remote;
+            }
             Dev dev = _devs[l.Device];
             int hd = _m.HeadDim;
             var c = new SlotLayer { RingK = SlotTensor(s, dev, DType.Float16, _ringRaw, hd) };
@@ -256,6 +265,9 @@ namespace TensorSharp.Cuda
         /// Returns its id, or -1 when the devices have no room for another set of caches.</summary>
         public int SlotAlloc()
         {
+            // A distributed stage serves the one mirrored sequence; the other nodes could not follow.
+            if (_stage != null)
+                return -1;
             try
             {
                 return CreateSlot().Id;
@@ -299,7 +311,7 @@ namespace TensorSharp.Cuda
             head = 0;
             checkpoint = -1;
             healthy = false;
-            if (!_m.V41 || _ds != null || !_slots.TryGetValue(slotId, out Slot s))
+            if (!_m.V41 || _ds != null || _stage != null || !_slots.TryGetValue(slotId, out Slot s))
                 return false;
             head = s.NPast;
             checkpoint = _rewindCheckpoint ? s.CpNPast : -1;
@@ -447,6 +459,8 @@ namespace TensorSharp.Cuda
         {
             for (int il = 0; il < _m.NLayer; il++)
             {
+                if (_layers[il].Device < 0)
+                    continue;   // another stage's layer
                 SlotLayer c = s.Layers[il];
                 Dev dev = _devs[_layers[il].Device];
                 dev.MakeCurrent();
@@ -499,7 +513,7 @@ namespace TensorSharp.Cuda
         {
             int n = slotIds?.Length ?? 0;
             // The drafter's rings are fed by the per-sequence path only.
-            if (n < 2 || n > MaxBatchedDecodeRows || n > _m.NUbatch || _ds != null
+            if (n < 2 || n > MaxBatchedDecodeRows || n > _m.NUbatch || _ds != null || _stage != null
                 || tokens == null || tokens.Length != n || positions == null || positions.Length != n
                 || logitsOut == null || logitsOut.LongLength < (long)n * _m.NVocab)
                 return false;

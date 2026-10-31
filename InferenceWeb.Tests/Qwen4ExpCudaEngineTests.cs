@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using TensorSharp.Models;
@@ -37,11 +38,14 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     }
 
     private string Fixture(int indexerTopK = 16, bool q2kxlExperts = false, bool q4kxlExperts = false,
-        SyntheticGguf.GgmlType? expertDownType = null, float expertDownGain = 0.25f) => Qwen4ExpSyntheticModelBuilder.Write(
+        SyntheticGguf.GgmlType? expertDownType = null, float expertDownGain = 0.25f,
+        SyntheticGguf.GgmlType? expertGateUpType = null, int expertFf = Qwen4ExpSyntheticModelBuilder.ExpertFf)
+        => Qwen4ExpSyntheticModelBuilder.Write(
         Path.Combine(_dir, $"qwen4exp-{indexerTopK}{(q2kxlExperts ? "-q2kxl" : "")}{(q4kxlExperts ? "-q4kxl" : "")}" +
-            $"{(expertDownType is { } down ? "-down" + down : "")}-g{expertDownGain}.gguf"), indexerTopK,
+            $"{(expertGateUpType is { } gateUp ? "-gateup" + gateUp : "")}" +
+            $"{(expertDownType is { } down ? "-down" + down : "")}-ff{expertFf}-g{expertDownGain}.gguf"), indexerTopK,
         q2kxlExperts: q2kxlExperts, q4kxlExperts: q4kxlExperts, expertDownType: expertDownType,
-        expertDownGain: expertDownGain);
+        expertDownGain: expertDownGain, expertGateUpType: expertGateUpType, expertFf: expertFf);
 
     private static readonly int[] Prompt = Enumerable.Range(0, 40).Select(i => (i * 37 + 11) % 250).ToArray();
     private static readonly int[] Steps = { 17, 203, 99, 4, 150, 61 };
@@ -164,6 +168,251 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             _output.WriteLine($"{(i == 0 ? "prefill" : $"decode {i}")}: relative error {err:E3}, argmax {ArgMax(cuda[i])} vs {ArgMax(native[i])}");
         }
         Assert.True(worst <= 2e-2, $"the direct-CUDA engine strayed {worst:E3} from the native token span");
+    }
+
+    /// <summary>
+    /// Low-bit IQ routed experts - IQ2_XXS gate/up and down, as unsloth's UD-IQ2_XXS and UD-IQ1_S files keep
+    /// many, and the DeepSeek V4.1 1017's IQ1_S gate/up over IQ2_S down - on the direct engine against
+    /// ggml-cuda's own kernels for those formats in the native span, at an expert width of 256 so the down
+    /// projection holds whole 256-value blocks. The 40-token prompt is past the per-slot bound, so it takes the
+    /// grouped route <see cref="TensorSharp.Cuda.CudaMoe.SelectRoute"/> picks for the loaded module: with the
+    /// low-bit IQ decoders, the tensor-core kernel (the register-staged ones on a module without its body) for
+    /// IQ2_XXS too, which used to run on the warp-per-row kernels alone; the six decode steps run the per-slot
+    /// ones.
+    /// <para>
+    /// The decode steps compared with ggml-cuda are the captured ones, as served. The routers are read back on a
+    /// second run, whose decode steps the probe keeps uncaptured; that run must answer as the captured one to
+    /// the bit, so what the probe reads is the computation under test.
+    /// </para>
+    /// <para>
+    /// Every step is held to <see cref="LogitBound"/>, with one exception on a module without the int8 Q8_0
+    /// tensor-core GEMM (<c>ts_quant_matmul_q8_0_mmq*</c>: the committed compute_75 PTX, or a GPU below sm_80).
+    /// There the prompt's dense Q8_0 projections take the dequantize-to-F16 cuBLAS route. Against a float64
+    /// oracle on the engine's own inputs that route is the more exact one: median relative error 2.9e-4
+    /// (2.8e-4 to 3.0e-4) against 5.5e-3 (1.0e-3 to 8.6e-3) for the int8 GEMM's q8_1 activations, and lower on
+    /// each of the prompt's 84 projections. But ggml-cuda rounds the activations to q8_1 as the int8 GEMM does,
+    /// and the choice of route alone moves the direct engine's router logits by up to 4.0e-3, so a layer whose
+    /// fourth and fifth experts stand closer than that can go either way. On the IQ1_S/IQ2_S fixture, decode
+    /// step 2's layer 4 (margin 7.5e-4 on an RTX 3080 Laptop, 4.9e-4 with every kernel module from its committed
+    /// PTX, 2.31e-4 on an A40 with the same PTX) picks expert 7 on the F16 route and expert 12 on the int8 route:
+    /// the only one of 368 router rows that differs. That step strays 2.1e-2 from ggml-cuda on the F16 route
+    /// (2.115e-2 and 2.140e-2 there, 2.143e-2 on an A40; 7.3e-3 on the int8 route), and every other step stays at
+    /// 6e-3 to 8e-3 on both. The prompt itself never flipped.
+    /// </para>
+    /// <para>
+    /// So on such a module one decode step may pass the bound as a routing flip, and only one that is measured:
+    /// the direct engine is run once more with the prompt in chunks below
+    /// <see cref="TensorSharp.Cuda.CudaQuantizedOps.F16GemmMinRows"/> rows, where the dense projections round
+    /// their activations to q8_1 as ggml-cuda's do. That run must answer the step within
+    /// <see cref="LogitBound"/>, and the lowest layer where its router chose differently must be a swap of the
+    /// direct engine's fourth expert for its fifth at a margin of at most <see cref="RouterTieMargin"/>. The
+    /// step must also keep its argmax and stay within <see cref="FlipLogitCap"/>. Every layer's chosen experts
+    /// must be the top of its own logits on both runs.
+    /// </para>
+    /// </summary>
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData((int)SyntheticGguf.GgmlType.IQ2_XXS, (int)SyntheticGguf.GgmlType.IQ2_XXS)]
+    [InlineData((int)SyntheticGguf.GgmlType.IQ1_S, (int)SyntheticGguf.GgmlType.IQ2_S)]
+    public void TheDirectCudaEngine_AnswersAsTheNativeSpan_LowBitIqExperts(int gateUpType, int downType)
+    {
+        var gateUp = (SyntheticGguf.GgmlType)gateUpType;
+        var down = (SyntheticGguf.GgmlType)downType;
+        // The routed down projection at full gain, as for the Q5_1 layout above.
+        const int ff = 256;
+        string path = Fixture(indexerTopK: 2048, expertGateUpType: gateUp, expertDownType: down, expertDownGain: 1f,
+            expertFf: ff);
+        // Decode steps captured into CUDA graphs, as served (the default), for the run held to ggml-cuda.
+        _env.Set("TS_Q4E_GRAPHS", null);
+        float[][] native, cuda, probed;
+        var routers = new List<TensorSharp.Cuda.Q4eCudaEngine.RouterLayerProbe>();
+        using (ModelBase model = ModelBase.Create(path, BackendType.GgmlCuda))
+            native = Run(model);
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda))
+        {
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            cuda = Run(model);
+            Assert.True(engine.CapturedDecodeGraphs > 0, "the decode steps were not captured");
+        }
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda))
+        {
+            // The probe reads the device mid-step, so this run's decode steps are not captured.
+            Assert.IsType<Qwen4ExpCudaModel>(model).Engine.RouterProbe = routers.Add;
+            probed = Run(model);
+        }
+        for (int i = 0; i < cuda.Length; i++)
+            Assert.True(System.Runtime.InteropServices.MemoryMarshal.AsBytes(cuda[i].AsSpan())
+                    .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.AsBytes(probed[i].AsSpan())),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: the uncaptured run the routers were read from differs from the captured one");
+        TensorSharp.Cuda.CudaMoe.ExpertRoute route;
+        bool int8Gemm;
+        using (var allocator = new TensorSharp.Cuda.CudaAllocator(0))
+        {
+            allocator.Context.MakeCurrent();
+            int8Gemm = allocator.Kernels.HasQ80Mmq;
+            using var dk = TensorSharp.Cuda.Dsv4Kernels.Create();
+            Assert.True(dk.DecodesLowBitIqExperts, "the loaded kernel module predates the low-bit IQ decoders");
+            route = TensorSharp.Cuda.CudaMoe.SelectRoute(Prompt.Length, TensorSharp.Cuda.Q4eCudaEngine.PerSlotMaxRows,
+                dk.HasMoeMma, dk.DecodesLowBitIqExperts, gateUpType, downType,
+                Qwen4ExpSyntheticModelBuilder.Hidden, ff);
+            Assert.Equal(dk.HasMoeMma ? TensorSharp.Cuda.CudaMoe.ExpertRoute.TensorCore : TensorSharp.Cuda.CudaMoe.ExpertRoute.Staged,
+                route);
+        }
+        var failures = new List<string>();
+        // Only on a module without the int8 GEMM: the direct engine with the prompt's dense projections on
+        // q8_1 activations, as ggml-cuda's, for the routing flips the F16 route can leave.
+        float[][] q81 = null;
+        var q81Routers = new List<TensorSharp.Cuda.Q4eCudaEngine.RouterLayerProbe>();
+        int q81Chunk = 0;
+        if (!int8Gemm)
+        {
+            q81Chunk = Q81PromptChunk();
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            Assert.IsType<Qwen4ExpCudaModel>(model).Engine.RouterProbe = q81Routers.Add;
+            q81 = Run(model, q81Chunk);
+        }
+        int flips = 0;
+        for (int i = 0; i < native.Length; i++)
+        {
+            string step = i == 0 ? "prefill" : $"decode {i}";
+            int p0 = i == 0 ? 0 : Prompt.Length + i - 1;
+            double err = RelativeError(cuda[i], native[i]);
+            int argmax = ArgMax(cuda[i]), nativeArgmax = ArgMax(native[i]);
+            double margin = SmallestRouterMargin(routers, p0, step, failures);
+            _output.WriteLine($"{gateUp} gate/up, {down} down, {(i == 0 ? $"prefill ({route})" : step)}: " +
+                $"relative error {err:E3}, argmax {argmax} vs {nativeArgmax}, smallest router margin {margin:E2}");
+            List<RouterSwap> swaps = null;
+            double q81Err = double.NaN;
+            if (q81 != null)
+            {
+                q81Err = RelativeError(q81[i], native[i]);
+                string where = $"{step} with the prompt in {q81Chunk}-row chunks";
+                if (i == 0)
+                {
+                    for (int c = 0; c < Prompt.Length; c += q81Chunk)
+                        SmallestRouterMargin(q81Routers, c, where, failures);
+                }
+                else
+                {
+                    SmallestRouterMargin(q81Routers, p0, where, failures);
+                    swaps = SelectionDifferences(routers, q81Routers, p0);
+                }
+                _output.WriteLine($"  prompt in {q81Chunk}-row chunks (q8_1 activations): relative error {q81Err:E3}" +
+                    (swaps == null ? "" : swaps.Count == 0 ? ", same experts" : ", experts differ at " + string.Join(", ", swaps)));
+            }
+            if (err <= LogitBound)
+                continue;
+            // A measured routing flip: a decode step on a module without the int8 GEMM, whose q8_1 twin answers within
+            // the bound and first chose differently where the direct engine's fourth and fifth experts nearly tie.
+            if (swaps is { Count: > 0 } && swaps[0].FourthForFifth && swaps[0].Margin <= RouterTieMargin
+                && q81Err <= LogitBound && argmax == nativeArgmax && err <= FlipLogitCap)
+            {
+                flips++;
+                _output.WriteLine($"  {step}: a routing flip at a near tie of the direct engine's router ({swaps[0]})");
+                continue;
+            }
+            failures.Add($"{step}: the direct-CUDA engine strayed {err:E3} from the native token span " +
+                $"(argmax {argmax} vs {nativeArgmax}, smallest router margin {margin:E2}" +
+                (q81 == null ? ")" : $"; with q8_1 prompt activations {q81Err:E3}, experts differ at " +
+                    (swaps is { Count: > 0 } ? string.Join(", ", swaps) : "no layer") + ")"));
+        }
+        if (flips > 1)
+            failures.Add($"{flips} steps past {LogitBound:E0}: more than the one routing flip a near tie explains");
+        Assert.True(failures.Count == 0, string.Join("; ", failures));
+    }
+
+    /// <summary>The logits' relative L2 bound for every step.</summary>
+    private const double LogitBound = 2e-2;
+
+    /// <summary>The largest fourth-minus-fifth router margin a measured flip may stand at: the flips measured stood at
+    /// 4.9e-4 and 7.5e-4 on an RTX 3080 Laptop and 2.31e-4 on an A40, under the 4.0e-3 by which the dense prefill
+    /// route moves the router logits.</summary>
+    private const double RouterTieMargin = 2e-3;
+
+    /// <summary>What one measured routing flip may leave in the step's logits: it moved them 2.115e-2 to 2.143e-2.</summary>
+    private const double FlipLogitCap = 2.5e-2;
+
+    /// <summary>The prompt's logits, then each decode step's, with the prompt run as forwards of at most
+    /// <paramref name="promptChunk"/> tokens.</summary>
+    private static float[][] Run(ModelBase model, int promptChunk)
+    {
+        var rows = new float[Steps.Length + 1][];
+        for (int c = 0; c < Prompt.Length; c += promptChunk)
+            rows[0] = (float[])model.Forward(Prompt[c..Math.Min(Prompt.Length, c + promptChunk)]).Clone();
+        for (int i = 0; i < Steps.Length; i++)
+            rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+        return rows;
+    }
+
+    /// <summary>Equal prompt chunks below <see cref="TensorSharp.Cuda.CudaQuantizedOps.F16GemmMinRows"/> rows: the dense
+    /// Q8_0 projections then quantize their activations to q8_1 (dp4a), as ggml-cuda's do, instead of taking the
+    /// dequantize-to-F16 cuBLAS route.</summary>
+    private static int Q81PromptChunk()
+    {
+        int below = TensorSharp.Cuda.CudaQuantizedOps.F16GemmMinRows - 1;
+        Assert.True(below >= 2, $"TS_CUDA_QMM_F16GEMM_MIN_ROWS={below + 1} leaves no multi-row q8_1 prompt chunk");
+        int chunks = (Prompt.Length + below - 1) / below;
+        return (Prompt.Length + chunks - 1) / chunks;
+    }
+
+    /// <summary>A row where two runs' routers chose different experts: this run's choice and the other's, this run's
+    /// fourth-minus-fifth margin, and whether the other took exactly this run's fifth expert instead of its fourth.</summary>
+    private readonly record struct RouterSwap(int Layer, int Row, int[] Chosen, int[] Other, double Margin, bool FourthForFifth)
+    {
+        public override string ToString() =>
+            $"layer {Layer} row {Row} [{string.Join(",", Chosen.Order())}] vs [{string.Join(",", Other.Order())}] " +
+            $"margin {Margin:E2}{(FourthForFifth ? "" : ", not a fourth-for-fifth swap")}";
+    }
+
+    /// <summary>Every layer and row of the forward at <paramref name="p0"/> where <paramref name="other"/> chose other
+    /// experts than <paramref name="run"/>, lowest layer first.</summary>
+    private static List<RouterSwap> SelectionDifferences(List<TensorSharp.Cuda.Q4eCudaEngine.RouterLayerProbe> run,
+        List<TensorSharp.Cuda.Q4eCudaEngine.RouterLayerProbe> other, int p0)
+    {
+        var theirs = other.Where(p => p.P0 == p0).ToDictionary(p => p.Layer);
+        var swaps = new List<RouterSwap>();
+        foreach (var p in run.Where(p => p.P0 == p0).OrderBy(p => p.Layer))
+        {
+            Assert.True(theirs.TryGetValue(p.Layer, out var q) && q.Nt == p.Nt, $"layer {p.Layer} at {p0}: no router to compare");
+            for (int t = 0; t < p.Nt; t++)
+            {
+                int[] chosen = p.Selected.AsSpan(t * p.Used, p.Used).ToArray();
+                int[] otherChosen = q.Selected.AsSpan(t * q.Used, q.Used).ToArray();
+                if (chosen.ToHashSet().SetEquals(otherChosen))
+                    continue;
+                float[] logits = p.Logits.AsSpan(t * p.Experts, p.Experts).ToArray();
+                int[] ranked = Enumerable.Range(0, p.Experts).OrderByDescending(e => logits[e]).ThenBy(e => e).ToArray();
+                double margin = (double)logits[ranked[p.Used - 1]] - logits[ranked[p.Used]];
+                bool fourthForFifth = otherChosen.ToHashSet().SetEquals(ranked.Take(p.Used - 1).Append(ranked[p.Used]));
+                swaps.Add(new RouterSwap(p.Layer, t, chosen, otherChosen, margin, fourthForFifth));
+            }
+        }
+        return swaps;
+    }
+
+    /// <summary>The smallest fourth-to-fifth margin of the direct engine's router logits over every layer and row of
+    /// the forward at <paramref name="p0"/>. Each layer's chosen experts must be the top of its own logits (the
+    /// kernel ranks in float, this in double: only a tie within float rounding may differ).</summary>
+    private static double SmallestRouterMargin(List<TensorSharp.Cuda.Q4eCudaEngine.RouterLayerProbe> probes, int p0,
+        string step, List<string> failures)
+    {
+        var forward = probes.Where(p => p.P0 == p0).ToList();
+        Assert.True(forward.Count == Qwen4ExpSyntheticModelBuilder.Layers, $"{step}: {forward.Count} router probes");
+        double smallest = double.MaxValue;
+        foreach (var p in forward)
+        {
+            for (int t = 0; t < p.Nt; t++)
+            {
+                float[] logits = p.Logits.AsSpan(t * p.Experts, p.Experts).ToArray();
+                int[] ranked = Enumerable.Range(0, p.Experts).OrderByDescending(e => logits[e]).ThenBy(e => e).ToArray();
+                double margin = (double)logits[ranked[p.Used - 1]] - logits[ranked[p.Used]];
+                smallest = Math.Min(smallest, margin);
+                int[] chosen = p.Selected.AsSpan(t * p.Used, p.Used).ToArray();
+                if (!ranked.Take(p.Used).ToHashSet().SetEquals(chosen) && margin > 1e-5)
+                    failures.Add($"{step}, layer {p.Layer} row {t}: the router chose [{string.Join(",", chosen)}], " +
+                        $"not the top {p.Used} of its own logits [{string.Join(",", ranked.Take(p.Used))}]");
+            }
+        }
+        return smallest;
     }
 
     /// <summary>An expert layout no direct-CUDA kernel decodes (Q4_0 down) is refused at load as one

@@ -24,12 +24,17 @@ public sealed class DistributedNativeArchitectureGateTests
             BackendType.GgmlCpu, BackendType.GgmlVulkan, BackendType.GgmlMetal, BackendType.Mlx })
         {
             Assert.Throws<NotSupportedException>(() => ModelBase.ValidateDistributedTensorParallelism(architecture, backend));
-            Assert.Throws<NotSupportedException>(() => ModelBase.ValidateDistributedLayerSplit(architecture, backend));
+            // DeepSeek V4.1 alone also runs its distributed layer-split stages on the direct-CUDA engine.
+            if (id == "deepseek41" && backend == BackendType.Cuda)
+                ModelBase.ValidateDistributedLayerSplit(architecture, backend);
+            else
+                Assert.Throws<NotSupportedException>(() => ModelBase.ValidateDistributedLayerSplit(architecture, backend));
         }
     }
 
     /// <summary>
-    /// The direct-CUDA engines have no cross-node stage executor or collectives. The refusal has to
+    /// The direct-CUDA engines have no cross-node collectives, and only DeepSeek V4.1's has cross-node
+    /// layer-split stages (Dsv4CudaEngine.Distributed.cs). The refusal has to
     /// name the backend that has them in the spelling --backend accepts (it used to print the enum
     /// name GgmlCuda, and the layer-split one named no backend at all).
     /// </summary>
@@ -44,6 +49,12 @@ public sealed class DistributedNativeArchitectureGateTests
             ModelBase.ValidateDistributedTensorParallelism(architecture, BackendType.Cuda));
         Assert.Contains($"Architecture '{id}' does not implement distributed tensor parallelism on --backend cuda", tp.Message);
         Assert.Contains("Use one of its distributed backends: --backend ggml_cuda.", tp.Message);
+        if (id == "deepseek41")
+        {
+            // Its direct-CUDA engine runs the stages of a distributed layer split (Dsv4CudaEngine.Distributed.cs).
+            ModelBase.ValidateDistributedLayerSplit(architecture, BackendType.Cuda);
+            return;
+        }
         var layers = Assert.Throws<NotSupportedException>(() =>
             ModelBase.ValidateDistributedLayerSplit(architecture, BackendType.Cuda));
         Assert.Contains($"Architecture '{id}' does not implement distributed --layer-split on --backend cuda", layers.Message);

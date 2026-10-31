@@ -514,6 +514,18 @@ namespace TensorSharp.Models
             return new GgmlTensorParallelGroup(CreateGgmlContext(ggmlType, Math.Max(1, localDegree)));
         }
 
+        /// <summary>
+        /// The on-node group a distributed <c>--layer-split</c> wraps, for <paramref name="backend"/>: per-rank ggml
+        /// backends on ggml_cuda / ggml_vulkan, and on <c>--backend cuda</c> a group that carries only the GPU count
+        /// (<see cref="DirectCudaLayerSplitDevices"/>): the direct-CUDA engine creates its own device contexts.
+        /// Which architectures run distributed stages on which backend is the descriptor's decision
+        /// (<see cref="ValidateDistributedLayerSplit(string, BackendType)"/>), checked before this is called.
+        /// </summary>
+        public static ITensorParallelGroup CreateLocalLayerSplitGroup(BackendType backend, int localDegree)
+            => backend == BackendType.Cuda
+                ? new DirectCudaLayerSplitDevices(Math.Max(1, localDegree))
+                : CreateGgmlLocalLayerSplitGroup(backend, localDegree);
+
         public static GgmlLayerSplitDevices CreateGgmlLocalLayerSplitGroup(BackendType backend, int localDegree)
         {
             var type = backend switch

@@ -387,6 +387,21 @@ namespace InferenceWeb.Tests
         private BackendType _ggmlBackend;
     }
 
+    /// <summary>[Theory] variant of <see cref="MultiCudaFactAttribute"/>.</summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class MultiCudaTheoryAttribute : TheoryAttribute, ITraitAttribute
+    {
+        public string RequiresValue { get; }
+
+        public MultiCudaTheoryAttribute(int devices, string modelEnvVar = null, string ggufContains = null)
+        {
+            RequiresValue = modelEnvVar == null ? "Cuda" : "Cuda,Models";
+            Skip = TestGates.CudaDevicesSkip(devices)
+                ?? (modelEnvVar == null ? null : TestGates.ModelSkip(modelEnvVar, ggufContains));
+        }
+    }
+
     /// <summary>[Theory] variant of <see cref="CudaFactAttribute"/>.</summary>
     [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
     [AttributeUsage(AttributeTargets.Method)]
@@ -408,6 +423,14 @@ namespace InferenceWeb.Tests
             set { _tensorCoreModule = value; Skip ??= TestGates.TensorCoreKernelsSkip(value); }
         }
         private string _tensorCoreModule;
+
+        /// <summary>See <see cref="CudaFactAttribute.GgmlBackend"/>.</summary>
+        public BackendType GgmlBackend
+        {
+            get => _ggmlBackend;
+            set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
+        }
+        private BackendType _ggmlBackend;
     }
 
     /// <summary>
@@ -422,6 +445,46 @@ namespace InferenceWeb.Tests
         {
             Skip = TestGates.NvccOutputSkip(fileName);
         }
+    }
+
+    /// <summary>
+    /// One row of theory data that needs real GGUF weights: skips visibly, naming the variable, when
+    /// <c>envVar</c> is unset or holds no matching GGUF (<see cref="TestGates.ModelSkip"/>), while the
+    /// theory's other rows run. For a theory that runs both a fixture it builds itself and one the
+    /// environment supplies.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Method, AllowMultiple = true)]
+    public sealed class ModelInlineDataAttribute : DataAttribute
+    {
+        private readonly object[] _data;
+
+        public ModelInlineDataAttribute(string envVar, string ggufContains, params object[] data)
+        {
+            _data = data;
+            Skip = TestGates.ModelSkip(envVar, ggufContains);
+        }
+
+        public override IEnumerable<object[]> GetData(System.Reflection.MethodInfo testMethod) => new[] { _data };
+    }
+
+    /// <summary>
+    /// One row of theory data that launches a kernel module's sm_80+ tensor-core kernels: skips visibly
+    /// where the loaded <c>module</c> has no body for them (<see cref="TestGates.TensorCoreKernelsSkip"/>),
+    /// while the theory's other rows run. The row form of <see cref="CudaFactAttribute.TensorCoreModule"/>,
+    /// for a theory whose other rows take routes every module carries.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Method, AllowMultiple = true)]
+    public sealed class TensorCoreInlineDataAttribute : DataAttribute
+    {
+        private readonly object[] _data;
+
+        public TensorCoreInlineDataAttribute(string module, params object[] data)
+        {
+            _data = data;
+            Skip = TestGates.TensorCoreKernelsSkip(module);
+        }
+
+        public override IEnumerable<object[]> GetData(System.Reflection.MethodInfo testMethod) => new[] { _data };
     }
 
     /// <summary>

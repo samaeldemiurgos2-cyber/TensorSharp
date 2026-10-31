@@ -22,7 +22,9 @@ namespace TensorSharp.Models
             DistributedTensorParallelBackends = new[] { BackendType.GgmlCuda },
             SupportsLayerSplit = true,
             SupportsDistributedLayerSplit = true,
-            DistributedLayerSplitBackends = new[] { BackendType.GgmlCuda },
+            // ggml_cuda's stage graph, and the direct-CUDA engine's stages
+            // (Dsv4CudaEngine.Distributed.cs). Tensor parallelism stays ggml_cuda only.
+            DistributedLayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.Cuda },
             MultiGpuLimitation = "DeepSeek V4.1 uses native routed-MoE tensor parallelism; attention and shared experts retain local layer placement.",
             SupportsNativeTensorParallel = (degree, backend) => backend == BackendType.GgmlCuda &&
                 degree is >= 2 and <= 8,
@@ -71,7 +73,9 @@ namespace TensorSharp.Models
             DeepSeek4Architecture.RefuseBlockQuantizedKvCache("DeepSeek V4.1 Flash", v41: true);
             ValidateTensorParallelGroup(backend, tpDegree, tpGroup);
             if (tpGroup?.NodeCount > 1 && !string.IsNullOrWhiteSpace(draftModelPath))
-                throw new NotSupportedException("Distributed DeepSeek V4.1 tensor parallelism does not mirror DSpark operations; omit --draft-model.");
+                throw new NotSupportedException(tpGroup is ILayerSplitGroup
+                    ? "Distributed DeepSeek V4.1 layer split does not mirror DSpark operations; omit --draft-model."
+                    : "Distributed DeepSeek V4.1 tensor parallelism does not mirror DSpark operations; omit --draft-model.");
             if (!string.IsNullOrWhiteSpace(draftModelPath) &&
                 backend != BackendType.GgmlCuda && backend != BackendType.GgmlCpu)
                 throw new NotSupportedException(
@@ -129,11 +133,11 @@ namespace TensorSharp.Models
             if (backend == BackendType.Cuda || backend == BackendType.Cpu)
             {
                 if (header != null)
-                    RefuseCombinedEngramLayout(backend, header);
+                    RefuseUnreadableEngramLayout(backend, header);
                 else if (File.Exists(ggufPath))
                 {
                     using var file = GgufFile.OpenWithoutSiblingShards(ggufPath);
-                    RefuseCombinedEngramLayout(backend, file);
+                    RefuseUnreadableEngramLayout(backend, file);
                 }
             }
         }
@@ -142,38 +146,56 @@ namespace TensorSharp.Models
         /// llama.cpp's Engram layout, which unsloth's DeepSeek-V4.1-Flash-1017 GGUFs use: one
         /// combined <c>per_layer_token_embd.weight</c> table described by <c>deepseek41.ple.*</c>
         /// metadata, with <c>blk.N.engram_kv</c> and the fused <c>blk.N.engram_gate</c> (q*k) in
-        /// place of TensorSharp's <c>engram_wkv</c>/<c>engram_q</c>/<c>engram_k</c>. The native
-        /// loader reads both layouts and prefers TensorSharp's when its
-        /// <c>deepseek41.engram.layer_ids</c> is present (has_combined_engram_metadata in
-        /// dsv41_engram_gguf.h); the combined table is also accepted as evidence, for a header
-        /// whose <c>ple</c> keys are missing.
+        /// place of TensorSharp's <c>engram_wkv</c>/<c>engram_q</c>/<c>engram_k</c>. Decided as the
+        /// native loader decides (has_combined_engram_metadata in dsv41_engram_gguf.h): the
+        /// <c>ple</c> layer list is present and TensorSharp's <c>deepseek41.engram.layer_ids</c>,
+        /// which wins when a header carries both key sets, is not.
         /// </summary>
-        internal static bool UsesCombinedEngramLayout(GgufFile header)
-            => !header.Metadata.ContainsKey("deepseek41.engram.layer_ids") &&
-               (header.Metadata.Keys.Any(key => key.StartsWith("deepseek41.ple.", StringComparison.Ordinal)) ||
-                header.Tensors.ContainsKey("per_layer_token_embd.weight"));
+        internal static bool UsesCombinedEngramLayout(GgufFile header) => Dsv41EngramData.HasCombinedMetadata(header);
 
         /// <summary>
-        /// The two managed executors -- the direct-CUDA engine and the pure C# one -- read
-        /// Engram through Dsv41EngramData, which knows only TensorSharp's per-layer layout.
-        /// Handed a combined-layout checkpoint they used to fail deep in the executor with
-        /// "Missing or invalid DeepSeek V4.1 GGUF metadata: deepseek41.engram.pad_id", naming
-        /// neither the layout nor the backend that loads it. Refuse from the header instead,
-        /// before a 300 GB checkpoint is mapped.
+        /// Every V4.1 executor reads both Engram layouts: the managed ones -- the direct-CUDA engine
+        /// and the pure C# one -- through Dsv41EngramData, which exposes the combined table's
+        /// per-layer slices as views the way the native loader does. What none of them can read is
+        /// a header that commits to neither layout or mixes them: llama.cpp's combined table or
+        /// <c>ple</c> keys without the <c>deepseek41.ple.layers</c> list that addresses the table,
+        /// or a combined table beside a per-layer one. The managed executors used to fail inside
+        /// the executor on those with a bare metadata key name; refuse them from the header
+        /// instead, before a 300 GB checkpoint is mapped. Only the opened file's own tensors are
+        /// visible here (shard 1 of a split checkpoint usually has none); Dsv41EngramData.Load
+        /// repeats the table checks against every shard.
         /// </summary>
-        internal static void RefuseCombinedEngramLayout(BackendType backend, GgufFile header)
+        internal static void RefuseUnreadableEngramLayout(BackendType backend, GgufFile header)
         {
-            if ((backend != BackendType.Cuda && backend != BackendType.Cpu) || !UsesCombinedEngramLayout(header))
+            if (backend != BackendType.Cuda && backend != BackendType.Cpu)
+                return;
+            bool tensorSharp = header.Metadata.ContainsKey("deepseek41.engram.layer_ids");
+            bool combined = UsesCombinedEngramLayout(header);
+            bool table = header.Tensors.ContainsKey(Dsv41EngramData.CombinedTableName);
+            bool perLayerTable = header.Tensors.Keys.Any(name =>
+                name.StartsWith("blk.", StringComparison.Ordinal) &&
+                name.EndsWith(".engram_embd.weight", StringComparison.Ordinal));
+            bool pleKeys = header.Metadata.Keys.Any(key => key.StartsWith("deepseek41.ple.", StringComparison.Ordinal));
+            string problem =
+                !tensorSharp && !combined && (table || pleKeys)
+                    ? "llama.cpp's combined Engram layout (deepseek41.ple.* metadata or a per_layer_token_embd.weight " +
+                      "table) without the deepseek41.ple.layers list that addresses the table, and no TensorSharp " +
+                      "deepseek41.engram.layer_ids either"
+                : tensorSharp && table
+                    ? "both Engram layouts: TensorSharp's per-layer metadata (deepseek41.engram.layer_ids) and " +
+                      "llama.cpp's combined per_layer_token_embd.weight table"
+                : combined && perLayerTable
+                    ? "both Engram layouts: llama.cpp's combined metadata (deepseek41.ple.*) and a TensorSharp " +
+                      "per-layer blk.N.engram_embd.weight table"
+                : null;
+            if (problem == null)
                 return;
             string name = backend == BackendType.Cuda ? "cuda" : "cpu";
             string executor = backend == BackendType.Cuda ? "the direct-CUDA engine" : "the pure C# executor";
             throw new NotSupportedException(
-                "This DeepSeek V4.1 GGUF stores its Engram tables in llama.cpp's combined layout " +
-                "(deepseek41.ple.* metadata and one per_layer_token_embd.weight table, as in unsloth's " +
-                $"DeepSeek-V4.1-Flash-1017 GGUFs). --backend {name} ({executor}) reads only TensorSharp's " +
-                "per-layer layout (deepseek41.engram.* metadata with blk.N.engram_embd/engram_wkv/engram_q/" +
-                "engram_k), so it cannot load this checkpoint. Use --backend ggml_cuda, which loads both " +
-                "layouts" + (backend == BackendType.Cpu ? " (--backend ggml_cpu for a CPU-only run)." : "."));
+                $"This DeepSeek V4.1 GGUF has {problem}. --backend {name} ({executor}) reads either TensorSharp's " +
+                "per-layer Engram layout or llama.cpp's combined one (unsloth's DeepSeek-V4.1-Flash-1017 GGUFs), " +
+                "never a mix or a part of one, so it cannot tell which rows belong to which Engram layer.");
         }
 
         /// <summary>
@@ -240,9 +262,10 @@ namespace TensorSharp.Models
             if (group == null) return;
             if (group is ILayerSplitGroup layer)
             {
-                if (backend != BackendType.GgmlCuda || tpDegree != 1 || layer.NodeCount < 2 ||
+                // Whole-layer stages run on ggml_cuda's stage graph or on the direct-CUDA engine's.
+                if (backend is not (BackendType.GgmlCuda or BackendType.Cuda) || tpDegree != 1 || layer.NodeCount < 2 ||
                     layer.Degree is < 1 or > 8 || layer.NodeId < 0 || layer.NodeId >= layer.NodeCount)
-                    throw new NotSupportedException("DeepSeek distributed layer split requires ggml_cuda, --tp 1 and 1..8 GPUs per node.");
+                    throw new NotSupportedException("DeepSeek distributed layer split requires --backend ggml_cuda or cuda, --tp 1 and 1..8 GPUs per node.");
                 return;
             }
             if (backend != BackendType.GgmlCuda)
@@ -273,6 +296,26 @@ namespace TensorSharp.Models
             for (int bit = 0; bit < votes.Length; ++bit)
                 if (votes[bit] != (((digest[bit / 8] >> (bit % 8)) & 1) * group.NodeCount))
                     throw new InvalidOperationException("DeepSeek V4.1 distributed nodes have different model metadata or execution settings. Use the same checkpoint, context, prefill width, CPU-MoE count and YOCO policy on every node.");
+        }
+
+        /// <summary>
+        /// The settings that change what the direct-CUDA engine computes, for a distributed run's startup
+        /// digest: the prefill width (which also decides each projection's kernel), the dense matmul routing
+        /// thresholds of the shared CUDA ops, the expert fusion switch, the decode attention partitioning and
+        /// where the Engram tables live. <paramref name="read"/> reads one variable (the process environment
+        /// unless a test stands in for one node's).
+        /// </summary>
+        internal static string DirectCudaNumericalOptions(Func<string, string> read)
+        {
+            var options = new StringBuilder();
+            foreach (string name in new[]
+            {
+                "TS_DSV4_UBATCH", "TS_CUDA_QMM_F16GEMM_MAX_MB", "TS_CUDA_QMM_F16GEMM_MIN_ROWS", "TS_CUDA_Q80_VEC_MIN_OUT",
+                "TS_CUDA_Q80_MMQ_MAX_ROWS", "TENSORSHARP_CUDA_MOE_FUSION", "TS_CUDA_DECODE_ATTN_PARTITION_THRESHOLD",
+                "TS_DSV41_ENGRAM_DEVICE", YocoKeepVariable,
+            })
+                options.Append('|').Append(name).Append('=').Append(read(name) ?? "<default>");
+            return options.ToString();
         }
 
         internal static string DistributedNumericalOptions()

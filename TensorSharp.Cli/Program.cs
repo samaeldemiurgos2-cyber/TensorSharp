@@ -974,7 +974,7 @@ namespace TensorSharp.Cli
                     // CudaAllocators, the ggml backends drive per-rank ggml backends.
                     tpGroup = parallelism.IsLayerSplit
                         ? new TensorSharp.Distributed.DistributedLayerSplitGroup(
-                            ModelBase.CreateGgmlLocalLayerSplitGroup(backend, localDegree), tpNodeId, peerEndpoints)
+                            ModelBase.CreateLocalLayerSplitGroup(backend, localDegree), tpNodeId, peerEndpoints)
                         : backend is BackendType.GgmlCuda or BackendType.GgmlVulkan
                         ? new TensorSharp.Distributed.DistributedTensorParallelGroup(
                             ModelBase.CreateGgmlLocalTpGroup(backend, localDegree), tpNodeId, peerEndpoints)

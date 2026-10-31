@@ -4,6 +4,7 @@ using System.Text.Json;
 using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Models;
+using Xunit.Sdk;
 
 namespace InferenceWeb.Tests;
 
@@ -15,7 +16,8 @@ namespace InferenceWeb.Tests;
 /// Engram table and the delayed hyper-connection gates. Generate it with
 /// <c>python eng/dsv41-fixture.py DIR --f32</c>, write the reference logits
 /// beside it, and point <c>TS_DSV41_FIXTURE_DIR</c> at DIR. Without that the
-/// tests skip: the fixture needs numpy, torch, gguf and tokenizers.</para>
+/// tests skip, saying what is missing (<see cref="Dsv41OracleFactAttribute"/>):
+/// the fixture needs numpy, torch, gguf and tokenizers.</para>
 ///
 /// <para>The oracle is <c>eng/dsv41-reference.py</c>, not the native executor,
 /// so a shared misreading of the architecture cannot pass.</para>
@@ -31,21 +33,39 @@ public class Dsv41CpuExecutorTests
     /// tie order in the sparse selection is observable -- so the pure C#
     /// executor is still pinned to something rather than left unchecked there.
     /// </summary>
-    private static Fixture Load()
+    private static (string Gguf, string Logits) Paths()
     {
-        string dir = Environment.GetEnvironmentVariable("TS_DSV41_FIXTURE_DIR");
-        if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
-            return null;
+        string dir = Environment.GetEnvironmentVariable("TS_DSV41_FIXTURE_DIR") ?? string.Empty;
         string oracle = Environment.GetEnvironmentVariable("TS_DSV41_FIXTURE_ORACLE") ?? "torch";
-        string gguf = Path.Combine(dir, "deepseek41-fixture.gguf");
-        string logits = Path.Combine(dir, oracle.ToLowerInvariant() switch
+        return (Path.Combine(dir, "deepseek41-fixture.gguf"), Path.Combine(dir, oracle.ToLowerInvariant() switch
         {
             "native" => "native-logits.json",
             "csharp" => "csharp-logits.json",
             _ => "expected-logits.json",
-        });
-        if (!File.Exists(gguf) || !File.Exists(logits))
-            return null;
+        }));
+    }
+
+    /// <summary>Why the oracle tests cannot run here, or null: the fixture directory, its GGUF and the
+    /// chosen oracle's logits must all be there. Decided when the tests are discovered, so a missing
+    /// fixture is a visible skip and never a test that returns early and counts as a pass.</summary>
+    internal static string OracleSkip()
+    {
+        string dir = Environment.GetEnvironmentVariable("TS_DSV41_FIXTURE_DIR");
+        if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
+            return "Requires the V4.1 oracle fixture: TS_DSV41_FIXTURE_DIR is unset or missing " +
+                   "(python eng/dsv41-fixture.py DIR --f32, then the reference logits beside it).";
+        var (gguf, logits) = Paths();
+        if (!File.Exists(gguf))
+            return $"Requires the V4.1 oracle fixture: no {Path.GetFileName(gguf)} in TS_DSV41_FIXTURE_DIR.";
+        return File.Exists(logits) ? null
+            : $"Requires the oracle's logits: no {Path.GetFileName(logits)} in TS_DSV41_FIXTURE_DIR " +
+              "(TS_DSV41_FIXTURE_ORACLE picks torch, native or csharp).";
+    }
+
+    private static Fixture Load()
+    {
+        var (gguf, logits) = Paths();
+        Assert.True(OracleSkip() == null, OracleSkip());
 
         using var doc = JsonDocument.Parse(File.ReadAllBytes(logits));
         JsonElement root = doc.RootElement;
@@ -81,10 +101,11 @@ public class Dsv41CpuExecutorTests
 
     /// <summary>
     /// The same fixture through the DIRECT-CUDA engine, which owns its own
-    /// kernels and shares nothing with ggml. Gated on TS_DSV41_FIXTURE_CUDA=1
-    /// because it needs a GPU; the fixture is small enough for one.
+    /// kernels and shares nothing with ggml. Opt-in with TS_DSV41_FIXTURE_CUDA=1:
+    /// it needs a GPU and a fixture written with <c>--cuda-attn</c> (the engine
+    /// takes only 512-wide heads); without either it skips, saying which.
     /// </summary>
-    [Theory]
+    [Dsv41OracleTheory(Cuda = true)]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(3)]
@@ -92,8 +113,6 @@ public class Dsv41CpuExecutorTests
     public void TheDirectCudaEngineMatchesTheSameOracle(int chunk)
     {
         Fixture fixture = Load();
-        if (fixture == null || Environment.GetEnvironmentVariable("TS_DSV41_FIXTURE_CUDA") != "1")
-            return;
 
         using var executor = new DeepSeek4CudaExecutor(fixture.Gguf, maxContext: 256, nUbatch: 32, nGpu: 1);
         var logits = new float[executor.VocabSize];
@@ -125,13 +144,11 @@ public class Dsv41CpuExecutorTests
     /// term: it is the same arithmetic, and it is pinned to the reference by the
     /// F32 fixture.</para>
     /// </summary>
-    [Fact]
+    [Dsv41OracleFact(DumpVariable = "TS_DSV41_DUMP_CSHARP_LOGITS")]
     public void DumpsTheManagedExecutorsLogitsWhenAsked()
     {
         Fixture fixture = Load();
         string outPath = Environment.GetEnvironmentVariable("TS_DSV41_DUMP_CSHARP_LOGITS");
-        if (fixture == null || string.IsNullOrWhiteSpace(outPath))
-            return;
 
         using var executor = Open(fixture);
         var rows = new List<float[]>();
@@ -158,11 +175,10 @@ public class Dsv41CpuExecutorTests
         }));
     }
 
-    [Fact]
+    [Dsv41OracleFact]
     public void PrefillMatchesTheReferenceOracle()
     {
         Fixture fixture = Load();
-        if (fixture == null) return;
 
         using var executor = Open(fixture);
         var logits = new float[executor.VocabSize];
@@ -176,7 +192,7 @@ public class Dsv41CpuExecutorTests
     /// boundary, the Engram history is indexed by absolute position, and the
     /// delayed hyper-connection gates carry across the layer loop.
     /// </summary>
-    [Theory]
+    [Dsv41OracleTheory]
     [InlineData(1)]
     [InlineData(3)]
     [InlineData(5)]
@@ -184,7 +200,6 @@ public class Dsv41CpuExecutorTests
     public void ChunkedPrefillMatchesTheReferenceOracleAtEveryPosition(int chunk)
     {
         Fixture fixture = Load();
-        if (fixture == null) return;
 
         using var executor = Open(fixture);
         var logits = new float[executor.VocabSize];
@@ -199,11 +214,10 @@ public class Dsv41CpuExecutorTests
 
     /// <summary>Reset has to clear the Engram token history and the compressor
     /// state ring, not only the KV rows.</summary>
-    [Fact]
+    [Dsv41OracleFact]
     public void ResetClearsEveryPieceOfSequenceState()
     {
         Fixture fixture = Load();
-        if (fixture == null) return;
 
         using var executor = Open(fixture);
         var logits = new float[executor.VocabSize];
@@ -213,4 +227,55 @@ public class Dsv41CpuExecutorTests
         executor.Forward(fixture.Other, logits);
         AssertClose("after reset", logits, fixture.ExpectedOther[^1]);
     }
+}
+
+/// <summary>[Fact] over the V4.1 oracle fixture: skips, saying what is missing, unless
+/// <c>TS_DSV41_FIXTURE_DIR</c> holds the fixture and the chosen oracle's logits
+/// (<see cref="Dsv41CpuExecutorTests.OracleSkip"/>). With <see cref="DumpVariable"/>, a tool rather than
+/// a check: it also skips unless that variable names a file to write.</summary>
+[TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class Dsv41OracleFactAttribute : FactAttribute, ITraitAttribute
+{
+    public string RequiresValue => "Models";
+
+    public Dsv41OracleFactAttribute() => Skip = Dsv41CpuExecutorTests.OracleSkip();
+
+    public string DumpVariable
+    {
+        get => _dumpVariable;
+        set
+        {
+            _dumpVariable = value;
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(value)))
+                Skip ??= $"Writes the managed executor's logits only when {value} names the file to write.";
+        }
+    }
+    private string _dumpVariable;
+}
+
+/// <summary>[Theory] variant of <see cref="Dsv41OracleFactAttribute"/>. With <see cref="Cuda"/>, the
+/// rows run the direct-CUDA engine, which also needs a GPU and the opt-in TS_DSV41_FIXTURE_CUDA=1.</summary>
+[TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class Dsv41OracleTheoryAttribute : TheoryAttribute, ITraitAttribute
+{
+    public string RequiresValue => _cuda ? "Cuda,Models" : "Models";
+
+    public Dsv41OracleTheoryAttribute() => Skip = Dsv41CpuExecutorTests.OracleSkip();
+
+    public bool Cuda
+    {
+        get => _cuda;
+        set
+        {
+            _cuda = value;
+            if (!value) return;
+            Skip ??= TestGates.CudaSkip;
+            if (Environment.GetEnvironmentVariable("TS_DSV41_FIXTURE_CUDA") != "1")
+                Skip ??= "Runs the direct-CUDA engine only with TS_DSV41_FIXTURE_CUDA=1 and a fixture written with " +
+                         "--cuda-attn (the engine takes only 512-wide heads).";
+        }
+    }
+    private bool _cuda;
 }

@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash (`deepseek41`)
 
-> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Add `--tp-node-id` and `--tp-peers` to span nodes on `ggml_cuda`; N is the local GPU count. See [multi-node setup and limitations](../multi-node-inference.md). Older measurements below retain their original topology and do not validate the new distributed layer path.
+> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Add `--tp-node-id` and `--tp-peers` to span nodes on `ggml_cuda` (layer split or TP), or with `--layer-split N` on `cuda` (the direct-CUDA engine's stages; see [Backends](#backends)); N is the local GPU count. See [multi-node setup and limitations](../multi-node-inference.md). Older measurements below retain their original topology and do not validate the new distributed layer path.
 
 [← back to model index](README.md) | [中文](deepseek41_zh-cn.md)
 
@@ -137,10 +137,18 @@ layout differs from the one above in four ways, handled by the native loader:
   (`clip`, projector `deepseek41v`), which `--mmproj` loads directly; the image
   tokens' routing biases come from the text shards (`blk.N.exp_probs_b_vl.bias`).
 
-The managed executors, `--backend cuda` and `--backend cpu`, do not read this
-layout and refuse these files from the header, before any weight is mapped; see
+The managed executors, `--backend cuda` and `--backend cpu`, read the Engram
+part of this layout the same way: each layer's slice of the combined table
+becomes a view of the shard that holds it (nothing is copied), and
+`engram_gate` scales the query while the key keeps its plain RMS norm. The
+1017's routed experts still keep these files off `cpu`. `cuda` decodes all of
+them while they stay in VRAM: a 10-layer truncation of the `UD-IQ2_XXS` file
+has run on it under the
+[per-stage oracle](#per-stage-oracle-against-ggml_cuda), and the whole file has
+run on two nodes of two A40s each against `ggml_cuda`
+([Full 1017 on `cuda`](#full-1017-on-cuda-2-nodes-x-2-a40)); see
 [Backends](#backends). The completed loading and distributed controls cover
-`UD-IQ2_XXS` on `ggml_cuda`; other quantizations need separate validation. At revision `60ad3651…`, `UD-Q4_K_XL` contains Engram type 43,
+`UD-IQ2_XXS` on `ggml_cuda` and `cuda`; other quantizations need separate validation. At revision `60ad3651…`, `UD-Q4_K_XL` contains Engram type 43,
 which the tested unchanged ggml `3612c0af…` rejects. Its load failed; see the
 [validation report](../deepseek41_validation.md).
 
@@ -858,9 +866,66 @@ MXFP4 indexer, NVFP4 compressed). It is held to the independent PyTorch oracle
 `eng/dsv41-reference.py` at atol=rtol=2e-5, plus exact greedy-argmax agreement,
 across one-shot prefill, chunk sizes 1/3/5/8 and reset — at fixture scale
 rather than on the released weights. `--backend cuda`, the direct-CUDA engine,
-also runs V4.1 through its own kernels with no ggml, and has no numerical gate
-yet. Like `ggml_cpu`, both are correctness and portability paths, not serving
-ones; the end of
+also runs V4.1 through its own kernels with no ggml. It is held to `ggml_cuda`
+and to `ggml_cpu`, both with exact prefill (`TS_DSV41_YOCO_KEEP=0`), on a
+C#-built checkpoint shaped like the 1017 (`InferenceWeb.Tests`
+`Dsv41SyntheticModelBuilder`): llama.cpp's combined Engram layout, the 1017's
+IQ1_S/IQ2_S/IQ2_XXS gate+up and IQ2_S/IQ3_XXS/IQ2_XS/IQ2_XXS/Q2_K down experts
+at a 768-wide expert (rows only 2-byte aligned), Q6_K/Q8_0 attention, Q5_K/Q8_0
+shared experts and BF16 compressor and indexer, and a prompt long enough for the
+sparse selection and the candidate mask to engage. The script is a 150-token
+prefill (three 64-token ubatches), 15 decode steps, a 21-token append at the odd
+position 165 (a multi-row call that completes the compressed block a decode step
+began), 2 more decode steps, then a reset, the prompt and the first 3 decode steps
+again, which must reproduce the first answers to the bit. With each routed-expert
+route forced in turn (tensor cores, register-staged, warp-per-row, per-slot),
+every logit vector is within 2e-2 relative L2 of the native one with the same
+argmax: measured at most 8.2e-3 against `ggml_cuda` and 9.7e-3 against
+`ggml_cpu`. That checkpoint is conditioned so two correct engines can meet such a
+bound: on random weights with full-size updates the two ggml backends themselves
+differed by 9e-2, because the routing, the sparse selection and the
+FP8/NVFP4/MXFP4 cache rounding turn rounding differences into large ones. It
+writes small attention and shared-expert updates, so its logits see the attention
+path, and every row but a call's last, only coarsely: removing the sparse
+selection altogether moves them by 1.6e-2. The stages are therefore also held to
+the native executor's own trace (`TS_DSV41_TRACE_DIR` against
+`TS_DSV4_CUDA_TRACE_DIR`), row by row:
+
+- Every routed-expert block's output, on every row of every call and layer, on
+  each forced route: within 0.1 relative L2 beyond twice the error of the stream
+  it was given (measured at most 4.5e-2 against `ggml_cuda`). A row past that has
+  to be a routing flip, where the direct engine's own fourth and fifth expert
+  choices stood within 2e-2 (one row in 1128 against either backend, at a margin
+  of 3e-3 to 5e-3). The experts it chose must be the top four of its own router
+  scores plus the selection bias, which decides 183 of those rows.
+- The sparse attention. The indexer's queries and keys are rounded to the trained
+  4-bit cache format on both sides, so the two engines' scores differ by about 6%
+  per token and their selections by a row or two on about half of the tokens;
+  what each engine must do exactly is the arithmetic on its own scores. The rows
+  every index source scores (all visible rows; after the candidate layer, its
+  four best 8-row blocks with the query's own block first) and the 16 it selects
+  are checked on both engines against those rules, which ggml's trace shows are
+  its arithmetic. The scores are held to ggml's per token and on average, the
+  compressor's latents per row (at most 4.3e-3), and the attention output on
+  every row whose selection is ggml's (at most 3.4e-2).
+- The Engram stage: the projected rows per token (2e-7 at decode, 5.4e-3 where the
+  direct engine's prefill GEMM reads F16 activations) and the gated update each
+  engine applied, relative to the stream (2.2e-5 at decode, 4.8e-4 at a
+  multi-row call).
+
+Each stage check catches a seeded bug that leaves every logit vector within
+2e-2: a grouped expert route that drops a busy expert's members past the
+sixteenth in layers 3-5, a consumer layer that attends over another source's
+compressed cache, a candidate layer that keeps one block too many, an Engram gate
+that scores the next token's key in a multi-row call, and a compressor that drops
+the block an odd-position call completes. An IQ1_S decoder with its delta sign
+inverted fails the logits themselves (3.9e-2 to 7.7e-2 on every vector, measured
+on the script's earlier 16-step form). `eng/validation/compare-dsv4-traces.py`
+diffs a `TS_DSV4_CUDA_TRACE_DIR` trace against a `TS_DSV41_TRACE_DIR` one stage
+by stage (it maps the native `v41.NN.<stage>` names, the compressor's latents
+included, and derives the Engram gate the direct engine folds into its kernel)
+to find where a model first departs. Like `ggml_cpu`, both are
+correctness and portability paths, not serving ones; the end of
 [Running on the ggml CPU backend](#running-on-the-ggml-cpu-backend) has the
 detail. `--backend mlx` remains refused.
 
@@ -868,46 +933,329 @@ detail. `--backend mlx` remains refused.
 |---|---|---|---|---|
 | `ggml_cuda` | TensorSharp's and llama.cpp's (unsloth 1017) | `--layer-split N`, routed-MoE `--tp 2..8` | layer split (1-8 GPUs per node) and routed-MoE TP (2-16 global ranks) | serving |
 | `ggml_cpu` | both | n/a (one CPU device) | refused | correctness, portability |
-| `cuda` | TensorSharp's only | `--layer-split N`; `--tp` refused | refused | correctness, portability |
-| `cpu` | TensorSharp's only | n/a | refused | correctness, portability |
+| `cuda` | both | `--layer-split N`; `--tp` refused | layer split (1-8 GPUs per node, the driver runs the last stage); TP refused | correctness, portability |
+| `cpu` | both | n/a | refused | correctness, portability |
 | `ggml_vulkan`, `ggml_metal` (`TS_DSV41_ALLOW_NON_CUDA_GPU=1`) | both | one GPU | refused | portability |
 
-The two managed executors, `cuda` and `cpu`, read Engram only in TensorSharp's
-per-layer layout: `deepseek41.engram.*` metadata (layer ids, multipliers,
-primes, offsets, the compressed pad id) with `blk.N.engram_embd`,
-`engram_wkv`, `engram_q` and `engram_k` tensors, which is what
-`eng/dsv41-fixture.py` writes. llama.cpp's combined layout, which unsloth's
-DeepSeek-V4.1-Flash-1017 GGUFs use (`deepseek41.ple.*` metadata, one
-`per_layer_token_embd.weight` table, `engram_kv` and the fused `engram_gate`),
-is read only by the native loader behind `ggml_cuda` and `ggml_cpu`. `cuda` and
-`cpu` refuse it from the header, before any weight is mapped, with
-`This DeepSeek V4.1 GGUF stores its Engram tables in llama.cpp's combined
-layout ... Use --backend ggml_cuda, which loads both layouts`. They used to fail
-inside the executor with `Missing or invalid DeepSeek V4.1 GGUF metadata:
-deepseek41.engram.pad_id` instead.
+The two managed executors, `cuda` and `cpu`, read Engram in either layout and
+pick it exactly as the native loader does (`deepseek41.ple.layers` present and
+`deepseek41.engram.layer_ids` absent means combined). TensorSharp's per-layer
+layout is `deepseek41.engram.*` metadata (layer ids, multipliers, primes,
+offsets, the compressed pad id) with `blk.N.engram_embd`, `engram_wkv`,
+`engram_q` and `engram_k` tensors, which is what `eng/dsv41-fixture.py` writes.
+llama.cpp's combined layout, which unsloth's DeepSeek-V4.1-Flash-1017 GGUFs use,
+is `deepseek41.ple.*` metadata, one `per_layer_token_embd.weight` table,
+`engram_kv` and the fused `engram_gate` (q*k). For it the per-layer offsets are
+rebased onto each layer's slice of the table and the raw `engram.pad_token_id`
+is compressed through the token map, as `engram.py` does. Each slice is then
+exposed as that layer's `blk.N.engram_embd.weight`: a row range of the shard
+that holds the table, mapped or streamed in place. The combined entry itself is
+dropped, so `TS_DSV4_MMAP=0` never buffers 126 GiB twice (on the 1017-shaped
+fixture the pure C# executor buffers the table once, as its two row views, and
+answers exactly as from the mapping). `--backend cuda` places the tables as
+`ggml_cuda` does: in VRAM when the layer split holds them without offloading more
+experts, host mappings otherwise; `TS_DSV41_ENGRAM_DEVICE=0` forces the host
+mappings, which is what the 1017's 62.9 GiB slices take on 46 GB GPUs, and `=1`
+requires VRAM. The direct engine used to ignore the variable. Forced to the host
+mappings, the fixture's logits are those of the VRAM tables to the bit.
+`engram_gate` scales
+the normalized query and the key gets a gain of ones, which is the native
+graph's arithmetic. On a fixture rewritten into the combined layout, both
+executors give logits identical to the bit to a per-layer copy carrying the
+same folded product. The 1017's `deepseek41.attention.indexer.candidate_top_k_blocks`
+is read as the candidate budget by these executors and the native loader alike,
+so ggml and the managed executors prune to the same budget (a file that also
+has `candidate_top_k` must agree with it).
+
+What the managed executors still refuse, from the header and before any weight
+is mapped, is a file that mixes the layouts or carries only part of the
+combined one: a `per_layer_token_embd.weight` table or `deepseek41.ple.*` keys
+without `deepseek41.ple.layers`, a combined table beside TensorSharp's
+`deepseek41.engram.layer_ids`, or `ple` metadata beside a per-layer table. The
+message is `This DeepSeek V4.1 GGUF has ... never a mix or a part of one, so it
+cannot tell which rows belong to which Engram layer.` Before, the partial case
+failed inside the executor with `Missing or invalid DeepSeek V4.1 GGUF metadata:
+deepseek41.engram.pad_id`.
 
 The direct-CUDA engine also checks every routed-expert tensor before it uploads
-anything, against the code that will run it. Its GPU expert kernels implement
-Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q2_K, IQ3_S, IQ2_XXS and MXFP4 (IQ2_XXS only through
-the per-token kernels, not the tensor-core or register-staged prefill ones); layers offloaded with
-`--n-cpu-moe` run on the managed host matmul, which implements a different set
-(IQ2_XS and IQ3_XXS, but not IQ2_XXS or Q3_K). A tensor that cannot run where
-the layer split puts it is refused by name, for example `blk.0.ffn_gate_exps.weight
-is IQ1_S (GPU-resident)`. Before, the whole checkpoint streamed into VRAM and
-the first token through that layer failed with a bare type number. The 1017
-`UD-IQ2_XXS` experts would be refused on `cuda` even in TensorSharp's layout:
-their gate/up tensors are IQ1_S (10 layers), IQ2_S (15) and IQ2_XXS (15), and
-their down tensors IQ2_S (15), IQ3_XXS (15), IQ2_XS (6), IQ2_XXS (3) and Q2_K (1).
-IQ1_S and IQ2_S run in neither place, so no `--n-cpu-moe` value makes that file
-loadable on `cuda`.
+anything, against the code that will run it. Its GPU expert kernels are the ones
+the GLM-5.3-Flash and Qwen3.8 direct engines run, and implement Q8_0, Q6_K, Q5_K,
+Q5_1, Q4_K, Q3_K, Q2_K, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS,
+IQ1_S and MXFP4 on every route: the per-token decode kernels, and for prefill the
+tensor-core, register-staged and warp-per-row ones. That covers every routed-expert
+type of the 1017 `UD-IQ2_XXS` file: gate/up IQ1_S (10 layers), IQ2_S (15) and
+IQ2_XXS (15); down IQ2_S (15), IQ3_XXS (15), IQ2_XS (6), IQ2_XXS (3) and Q2_K (1).
+Layers offloaded with `--n-cpu-moe` run on the managed host matmul, which
+implements a different set (IQ2_XS, IQ3_XXS and Q2_K, but not IQ1_S, IQ2_S,
+IQ2_XXS or Q3_K), so that file's experts have to stay in VRAM on `cuda`. A tensor
+that cannot run where the layer split puts it is refused by name, for example
+`blk.0.ffn_gate_exps.weight is IQ1_S (offloaded by --n-cpu-moe)`. Before, the
+whole checkpoint streamed into VRAM and the first token through that layer failed
+with a bare type number. When the GPUs cannot hold such a file, the VRAM refusal
+says that no offload can help and names the first tensor in the way (`... and
+blk.0.ffn_gate_exps.weight is IQ1_S, which the host matmul behind --n-cpu-moe does
+not implement`); it used to suggest an `--n-cpu-moe` value that the engine then
+refused. The IQ1_S and IQ2_S decoders, and IQ2_XXS's tensor-core and
+register-staged ones, are recent kernel code. On a kernel module built from older
+source (a committed PTX baseline not yet regenerated, which a machine without nvcc
+loads) the engine refuses IQ1_S and IQ2_S experts by name, `blk.N.ffn_gate_exps.weight
+is IQ1_S, and the loaded tensorsharp_dsv4_kernels module was built from kernel source
+older than its IQ1_S expert decoder`, rather than reading them as Q8_0, and runs
+IQ2_XXS experts on the per-token and warp-per-row kernels such a module already has.
+It checks the module its devices loaded, before uploading anything. Until this change the engine
+kept a narrower list of its own and refused IQ1_S, IQ2_S, IQ2_XS and IQ3_XXS. The
+kernels are checked against ggml's dequantization of the same bytes, the engine
+against `ggml_cuda` on the 1017-shaped fixture above, and the 1017's own weights
+stage by stage on a 10-layer truncation
+([Per-stage oracle](#per-stage-oracle-against-ggml_cuda)) and as a whole model on
+2 nodes x 2 A40, where the final logits pass a gate against `ggml_cuda`
+([Full 1017 on `cuda`](#full-1017-on-cuda-2-nodes-x-2-a40)). Every expert stayed in
+VRAM there; no other quantization of these experts has run.
 
-Multi-node DeepSeek V4.1 is `ggml_cuda` only, for both distributed layer split
-and distributed routed-MoE TP. The direct-CUDA engine has no cross-node stage
-executor or collectives, so `--backend cuda` with `--tp-node-id`/`--tp-peers`
-is refused before any peer is contacted: `Architecture 'deepseek41' does not
-implement distributed --layer-split on --backend cuda. Its distributed stage
-executor runs on --backend ggml_cuda; ...` (and the matching tensor-parallel
-message).
+Distributed routed-MoE TP is `ggml_cuda` only (on `cuda` it is refused before
+any peer is contacted). Distributed layer split also runs on the direct-CUDA
+engine: `--backend cuda --layer-split N --tp-node-id K --tp-peers ...`, the same
+flags on the CLI, the server (driver) and
+`eng/validation/DeepSeek41DistributedProbe`. Each node is one pipeline stage:
+
+- The cut comes from the shards' header bytes, never from free VRAM, so every
+  node computes the same one: `LayerSplitPlan.CreateWeighted` over each layer's
+  weights, its caches and the cache replicas the cut needs, the embedding on the
+  first GPU and the head on the last. For the 1017 on 2 nodes x 2 GPUs at 64K
+  context it is (12, 22, 31), as for `ggml_cuda`. A node then checks that its
+  part fits (weights, caches, the cache replicas it holds, the embedding or head);
+  when one does not, it refuses naming the GPU and the bytes, and every other node
+  refuses with it before any weight is uploaded. It never moves layers.
+- A node describes, maps, reads ahead and uploads only its own layers (the
+  embedding when it owns layer 0, the head when it owns the last).
+- A node of several GPUs receives the boundary state on its first GPU and hands
+  on, through its own in-node boundaries, whatever its later GPUs read: on the
+  1017 at 2 x 2, node 0 receives group 20's cache rows and the candidate mask on
+  its first GPU, and layers 31-39 on its second read them. Every in-process
+  boundary checks that it hands over exactly the blocks the ubatch closed in
+  each group read past it (whether committed locally or received), and an active
+  candidate mask when the layers past it prune with it, as the network receiver
+  checks a payload.
+- Per ubatch the stage boundary carries the hidden streams, the delayed
+  hyper-connection gates, the compressed and indexer cache rows the stage
+  committed for every group read past the boundary, the published sparse
+  selection and the candidate mask (its visible columns): what the in-process
+  split moves between two GPUs. The payload is self-describing: a header with a
+  layout hash (dimensions, ratios, sources, the placement, ubatch, context), the
+  position and a sequence number, which the receiver checks, and the committed
+  ranges, which it recomputes from the position, before anything reaches its GPU.
+  On the 1017's 21|22 boundary that is about 87 KB per decoded token at depth 2K
+  (151 KB at 64K) and 21-37 MB per 256-token prefill ubatch. A payload must fit
+  one transport frame (2 GiB): a prefill width and context that would exceed it
+  (2048 rows at 1M context: the candidate mask alone is 2 GiB) is refused on
+  every node at startup.
+- Every node digests the checkpoint header and each setting that changes the
+  engine's numbers (`TS_DSV4_UBATCH`, `MAX_CONTEXT`, `TS_CUDA_QMM_F16GEMM_*`,
+  `TS_CUDA_Q80_*`, `TENSORSHARP_CUDA_MOE_FUSION`, `TS_DSV41_ENGRAM_DEVICE`, ...),
+  then the placement and the kernel module (the SHA-256 of the image the GPUs
+  loaded, the build's release and source revision, the boundary wire version and
+  the decoders), and all refuse to load on any difference.
+- The driver (node 0) runs the last stage, so logits never cross the network;
+  `TENSORSHARP_LAYER_SPLIT_DRIVER_STAGE=first` is refused on `cuda`. So are
+  `--n-cpu-moe`/`--cpu-moe` and a DSpark drafter. As on `ggml_cuda`, the run
+  serves one mirrored sequence: no slots, truncation or prefix reuse. Engram
+  tables stay host mappings unless `TS_DSV41_ENGRAM_DEVICE=1`.
+- A node that fails mid-forward aborts the mesh: its peers fail the request at
+  once instead of waiting out the transport deadline, and every node must then be
+  restarted.
+
+Coverage: a two-node loopback on one GPU (each node a process-local stage over
+real TCP) on the 1017-shaped synthetic fixture, with the cut forced past a KV
+source, past the candidate source and past an Engram layer, is bit-identical to
+the single-process engine at every logit of a multi-ubatch prefill, 18 decode
+steps, an append and a reset plus re-prefill; so is `DeepSeek41DistributedProbe`
+run as two processes, and so is the server's startup path driving a worker.
+Nodes of several GPUs run in the tests as several logical devices (each its
+own allocator, stream, events and kernel module; logical device d runs on
+physical GPU d mod the visible count): on a synthetic topology whose ratio-1
+group is read by four layers, two nodes of two GPUs each (the received rows and
+mask handed on through node 0's in-node boundary) and three nodes of one GPU
+(the middle node receiving and sending them on) are bit-identical as well, and
+so is the single-process split over two to four GPUs. On one GPU every logical
+device shares it. On a host with two A40s the two-nodes-of-two-GPUs run put
+each node's two devices on the two physical GPUs (both nodes, in one process,
+sharing them). All of these runs use the synthetic fixture. The one real
+checkpoint run distributed on `cuda` so far is the whole 1017 on two pods of two
+A40s each, compared with `ggml_cuda` rather than with a single-process `cuda` run
+(no single host here holds it); see
+[Full 1017 on `cuda`](#full-1017-on-cuda-2-nodes-x-2-a40).
+
+### Per-stage oracle against `ggml_cuda`
+
+`eng/validation/dsv41-stage-oracle.py` checks `--backend cuda` on real weights
+one stage at a time. It reads two traces of the same tokens: one from the direct
+engine (`TS_DSV4_CUDA_TRACE_DIR`) and one from `ggml_cuda`
+(`TS_DSV41_TRACE_DIR`, with `TS_DSV41_YOCO_KEEP=0`). It recomputes every stage
+in float64 from the GGUF weights and from each engine's own traced inputs to
+that stage, so each engine is judged on the rounding it adds there, not on what
+it inherited.
+
+Its gate requires:
+
+- the direct engine's error at each stage to be at most 1.25 times ggml's, per
+  call and in aggregate (F32 stages at most 1e-6);
+- committed cache rows to equal the trained-format replay, up to ties;
+- every sparse selection and routing pick to be an exact top-k of the engine's
+  own scores, within derived F32 bounds;
+- ggml's own error to match a precision model of ggml-cuda's arithmetic, and
+  both engines to fit the oracle's attention and MoE semantics better than
+  perturbed variants. These two-sided checks are there so that an error the
+  oracle shares with the direct engine fails too.
+
+[README-dsv41-stage-oracle.md](../../eng/validation/README-dsv41-stage-oracle.md)
+has the rules, the limits, and how to capture and judge a trace pair. Long
+prompts are captured in layer windows through `dsv41-trace-sink.py`.
+
+On October 30, 2026 it was run on 2x A40 against a 10-layer truncation of the
+1017 `UD-IQ2_XXS` file. The truncation keeps blocks 0-3, 20-24 and 36, with the
+candidate budget cut to 65 blocks so that pruning engages. The prompts were 68,
+773, 2,003 and 4,204 tokens long, each including 4 decode steps.
+
+- Every check on the direct engine passed at every length.
+- The gate passed at the first three lengths.
+- At 4,204 tokens the gate failed one check of ggml's own arithmetic. At layer 4
+  the precision model replays ggml's `attn_out` at 0.405 of its error, against a
+  limit of 0.40. The cause is that ggml rotates the compressed rows it commits
+  with float32 angles, while the oracle rebuilds those rows with exact angles.
+
+The run covers ten layers in one process with `--layer-split 2`. It is not a
+full-model gate; the next section is.
+
+### Full 1017 on `cuda`, 2 nodes x 2 A40
+
+On October 30, 2026 the whole 1017 `UD-IQ2_XXS` file (unsloth revision
+`60ad3651…`, 300.5 GB) ran on the direct engine across two pods with two 46 GB
+A40s each: `--backend cuda --layer-split 2 --tp-node-id {0|1} --tp-peers ...`,
+the driver running the last stage, `--n-cpu-moe 0`. The build was TensorSharp
+`501add66` (the same tree as `main` at `9e0d9926`) plus the change that adds this
+section, measured before it was committed. Apart from documentation and the
+validation harness `eng/validation/run-multinode-case.py` and its test, that
+commit's code is identical to the measured build. ggml was unmodified
+`facdc44a`; CUDA 13.2, driver 595.91. The pods compiled the direct engine's
+kernels with nvcc 13.2 for sm_86, so the committed PTX that a machine without
+nvcc loads was not used. Both nodes ran the same native library. Both engines
+used F16 KV, `TS_DSV4_UBATCH=256` (the direct engine's default for V4.1),
+`MAX_CONTEXT=65536`, `TS_DSV41_ENGRAM_DEVICE=0` (both Engram slices host-mapped
+on node 1), `TS_DSV41_ENGRAM_WARM=0` and `TS_DSV41_YOCO_KEEP=0`, so `ggml_cuda`
+ran exact prefill, the only prefill the direct engine has. Every run logged the
+cut (12, 22, 31) on both nodes: node 1 holds layers 0-21 and the embedding,
+node 0 layers 22-39 and the head. The nodes talk over an SSH tunnel, as in the
+`ggml_cuda` measurements under [Current limits](#current-limits-and-tensor-parallel-work).
+
+**Numerics.** `DeepSeek41DistributedProbe` ran three texts teacher-forced
+(chunk 256, 128 decode steps): two excerpts of this repository's English
+documentation and one of its C# sources. It saved every logit vector: whole-prompt
+prefill, decode, chunked prefill, refill after the chunks, and reset. Each
+vector was compared with the same step of a `ggml_cuda` reference recorded on
+the same pods with the per-micro-batch sparse-attention fix. The limits are three
+times ggml's own floor, ggml at ubatch 128 against ggml at 256 on the 2K text:
+
+| Text (prompt tokens) | Vectors | Mean KL | p95 KL | Top-1 agreement | Decode PPL ratio (127 targets) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Limit | | <= 0.02626 | <= 0.1020 | >= 0.8422 | 0.9623-1.0377 |
+| ggml's floor (2K prose) | 266 | 0.00876 | 0.0340 | 0.9474 | 0.9874 |
+| 2K prose (1,875) | 266 | 0.00935 | 0.0346 | 0.9774 | 0.9939 |
+| 8K prose (8,534) | 292 | 0.01957 | 0.0670 | 0.9418 | 1.0136 |
+| C# code (1,507) | 264 | 0.00918 | 0.0429 | 0.9545 | 0.9868 |
+
+All three texts pass. The 8K text uses 74.5% of the mean-KL allowance, and
+there is no 8K floor to compare it with. A repeat of the 2K probe is bit-identical
+(266 of 266 vectors). Within every probe the last chunk equals the whole-prompt
+prefill, each refill step equals its decode step and the reset equals the first
+prefill, bit for bit.
+
+**HTTP suites.** The server ran on `cuda` and then on `ggml_cuda`, from the same
+build with the same settings. Each ran the suite of the 2 x 2 `ggml_cuda` runs
+below (`eng/validation/run-http-quality-suite.sh`: answers, JSON, multi-turn and
+tool calls), a Paris/42 smoke on `/v1/chat/completions` with and without
+streaming, and the ten V4.1 tool-policy scenarios of
+`benchmarks/engine_comparison/validate_deepseek41_tools.py` (DSML tool calls,
+one request at a time). Both passed the same 25 of 26 checks. On both, the
+failure was `tool_round_trip`: the right JSON inside a code fence, which the
+strict check rejects.
+
+**Throughput.** Both engines ran the same benchmarks (random tokens, 128
+decoded tokens, four runs per process) in one session, interleaved per workload
+as `cuda`, `ggml_cuda`, `ggml_cuda`, `cuda`. Before every process except the
+warm ones, the Engram page cache was evicted on both nodes. A warm process
+repeats the token sets of the cold process before it. The table gives medians of
+runs 2-4 over both processes of each engine (six runs), in tok/s:
+
+| Workload | `cuda` prefill / decode | `ggml_cuda` prefill / decode | `cuda` / `ggml_cuda` |
+| --- | ---: | ---: | ---: |
+| 512 tokens, cold | 98.7 / 8.0 | 152.9 / 27.1 | 0.65 / 0.30 |
+| 2,048 tokens, cold | 137.6 / 9.7 | 207.9 / 27.8 | 0.66 / 0.35 |
+| 2,048 tokens, warm | 547.5 / 28.6 | 445.2 / 33.2 | 1.23 / 0.86 |
+| 8,192 tokens, cold | 306.1 / 17.7 | 218.5 / 27.7 | 1.40 / 0.64 |
+| 20,480 tokens, cold | 335.8 / 16.6 | 206.0 / 27.2 | 1.63 / 0.61 |
+
+With the Engram rows in the page cache, the direct engine prefills 23% faster
+than `ggml_cuda`'s exact prefill and decodes at 86% of its speed. With them on
+storage it decodes at 8-18 tok/s.
+
+**Throughput floor.** This first full-model run had one throughput target, a
+floor: in the same Engram state, prefill of 2,048 tokens at least 0.6x
+`ggml_cuda`, and decode at 2K and 8K tokens of context at least 0.8x. Prefill
+meets it (0.66x cold, 1.23x warm). Decode misses it whenever the Engram rows
+start cold: 0.35x at 2,048 tokens and 0.64x at 8,192. Warm, it meets it at 2,048
+tokens (0.86x); there is no warm 8K row.
+
+Profiling points to the Engram row gather as the most likely cause. On the node
+that owns the Engram layers, the direct engine gathers rows from the mapped table
+in parallel only across tokens (`DeepSeek4CudaExecutor.GatherEngramRows`). At
+decode there is one token, so it reads 24 rows per table, from two tables, on one
+thread, and every uncached row is a storage round trip in series. `ggml_cuda`
+reads them with 16 I/O threads. With `TS_DSV4_PERF=2` at 2,048 tokens, node 1
+took 84-95 ms per decoded token cold and 20 ms warm on the direct engine; on
+`ggml_cuda` its input preparation took 5-7 ms per token cold and its compute
+15 ms. The direct engine does not time node 1's work stage by stage, so the cause
+is inferred from the code and these timings, not measured directly. The planned
+fix, and the next performance change, gathers the rows in parallel across rows as
+well as tokens.
+
+The cold medians also favour the direct engine at 8K and 20K tokens, for a reason
+other than speed. The direct engine leaves the rows it read mapped and cached:
+node 1's process grew to 89 GB resident at 20,480 tokens, with the 100 GB
+container at its limit. Later runs on fresh tokens then find more rows already
+cached, and its 8K prefill climbs from about 140 tok/s in run 1 to up to 405 in
+run 4. `ggml_cuda` stayed under 19 GB in the container, and its later runs gain
+less (8K: 148-181 tok/s in run 1, 188-228 in runs 2-4). Run 1 of every process
+uses the same tokens. On run 1 alone,
+`cuda` / `ggml_cuda` is 0.61, 0.63, 0.86 and 0.95 for prefill at 512, 2,048,
+8,192 and 20,480 tokens, and 0.29-0.53 for decode.
+
+These figures need the same Engram state on both engines, and they are not a
+serving claim: every row is one sequence through an SSH tunnel. The
+`TS_DSV41_YOCO_KEEP=0` rows on `ggml_cuda` are exact prefill. Its default YOCO
+replay (approximate prefill) was not run here.
+
+**Memory.** The direct engine allocates its working set at load and holds it,
+at a 65,536-token context. On node 0's two GPUs and node 1's two GPUs it used
+40,539 / 41,111 / 40,433 / 39,791 MiB in every probe and benchmark, from 512 to
+20,480 tokens, and at most 31 MiB more in the server. The highest is node 0's
+second GPU, which holds layers 31-39 and the head. In the same session
+`ggml_cuda` peaked there at 41,611 (512 tokens) to 43,149 MiB (20,480 tokens).
+A 267 MiB allocation from outside TensorSharp appears on every GPU at each
+quarter hour. With it, the measured worst case is 41,384 MiB for the direct
+engine (in the server) and 43,416 MiB for `ggml_cuda`: 3,672 and 1,640 MiB under
+44 GiB.
+
+**Not covered:** YOCO replay (the direct engine has none), and `ggml_cuda`'s
+throughput with its default YOCO replay as a baseline in the same session;
+routed-expert TP; more than one sequence (distributed runs serve one mirrored
+sequence, so no slots, batched decode, prefix reuse or rewind); other KV types,
+contexts, ubatch widths or chunk sizes; Engram on the GPU or warmed;
+`TS_DSV4_UBATCH` left unset (the runs set the default, 256, explicitly); numerics
+on prompts longer than 8,534 tokens (the benchmarks reach 20,480 but check no
+logits); warm throughput at 8,192 and 20,480 tokens; server requests with
+real-text prompts of about 1.8K and 7.3K tokens (the throughput rows use random
+tokens); the committed PTX on the full model (only the fixture and kernel tests
+have run on it, on A40); `--n-cpu-moe`; and any other quantization of the 1017.
 
 ### One backend per GPU
 
@@ -1512,13 +1860,13 @@ delayed hyper-connection gates and the trained cache quantization. It is held to
 1/3/5/8 and reset. That gate is fixture-scale — a five-layer, 256-hidden,
 16-token F32 synthetic model — so it establishes architectural agreement with
 the oracle rather than parity on the released 246 GiB Q2_K weights, and the
-tests return silently unless `TS_DSV41_FIXTURE_DIR` names the fixture
+tests skip, naming the variable, unless `TS_DSV41_FIXTURE_DIR` names the fixture
 directory. Unlike `--backend ggml_cpu` it takes no vision companion: that
 encoder is a native ggml component, and `LoadVisionEncoder` throws here, so
 image and video input are not available. The native loader's Engram and
 attention knobs — `TS_DSV41_ENGRAM_WARM`, `_THREADS`, `_RANDOM`,
 `TS_DSV41_SPARSE_FA`, `TS_DSV41_COMPACT_RAW_GATHER` — are inert on it.
-Engram configuration comes directly from the GGUF, in TensorSharp's layout only
+Engram configuration comes directly from the GGUF, in either Engram layout
 (see [Backends](#backends));
 `TS_DSV4_THREADS` defaults to `ProcessorCount` here rather than
 min(cores, 32); and `TS_DSV4_CPU_TRACE_DIR` writes the same per-tensor files
@@ -1528,16 +1876,34 @@ path, not a serving one: no throughput, load time or resident footprint has been
 measured for a full checkpoint on it.
 
 `--backend cuda`, the direct-CUDA engine, also runs V4.1 with its own kernels and
-no ggml, on TensorSharp-layout GGUFs only (see [Backends](#backends)). It has per-sequence slots, batched decode, retained conversation state and
-local whole-layer placement through `--layer-split N`; routed-expert `--tp N`
-remains a `ggml_cuda` mode. The source includes targeted numerical contracts:
+no ggml, on both Engram layouts (see [Backends](#backends)). It has per-sequence
+slots, batched decode, retained conversation state and whole-layer placement
+through `--layer-split N`, on one node or across nodes; routed-expert `--tp N`
+remains a `ggml_cuda` mode. Its numerical checks:
+[`Dsv41CudaEngineParityTests`](../../InferenceWeb.Tests/Dsv41CudaEngineParityTests.cs)
+holds the whole engine to `ggml_cuda` and `ggml_cpu` on the 1017-shaped fixture
+(see [Backends](#backends)), `eng/validation/dsv41-stage-oracle.py` holds each
+stage to a float64 oracle on real weights
+([Per-stage oracle](#per-stage-oracle-against-ggml_cuda)),
 [`Dsv4ExpertKernelTests`](../../InferenceWeb.Tests/Dsv4ExpertKernelTests.cs)
 checks synthetic quantized expert projections against upstream dequantization,
 while [`Dsv41CudaSlotTests`](../../InferenceWeb.Tests/Dsv41CudaSlotTests.cs)
 checks slot isolation, batched decode, ring rewind and retained state against a
-fresh run of the same direct engine, at 1e-5 of the largest logit. These are
-kernel and state-consistency checks, not an independent full-model numerical
-oracle or full-checkpoint quality validation. Model/device-gated tests require
+fresh run of the same direct engine, at 1e-5 of the largest logit. A batched
+decode step computes each sequence's dense projections bit for bit as that
+sequence's own step does: up to 16 rows, Q2_K to Q6_K, Q8_0, IQ2_XXS, IQ3_XXS,
+IQ3_S, IQ4_NL, IQ4_XS, MXFP4 and BF16 weights take kernels that compute every row
+as one row, which covers all of the 1017's dense layouts: Q5_K (its shared experts
+in 13 layers), Q6_K, Q8_0 and BF16 (its compressor and indexer)
+([`Dsv4DenseRowInvarianceTests`](../../InferenceWeb.Tests/Dsv4DenseRowInvarianceTests.cs)).
+F16 and F32 weights (cuBLAS picks its kernel by row count), the legacy Q4_0 to
+Q5_1 layouts, IQ2_S and NVFP4 are not held to that. A BF16 projection runs such a
+step one row at a time, reading its weight once per row: at 16 rows that is 6 to
+14 times the time of one cuBLAS call on an RTX 3080 Laptop GPU.
+These are fixture-scale, per-stage, kernel and state-consistency checks. The
+full-checkpoint gate is separate: the whole 1017 on 2 nodes x 2 A40 against
+`ggml_cuda`, with its HTTP suites
+([Full 1017 on `cuda`](#full-1017-on-cuda-2-nodes-x-2-a40)). Model/device-gated tests require
 their fixture and CUDA hardware; unavailable cases are skips. The CUDA backend notes,
 `docs/validation/deepseek41-cuda-backend/README.md` (local validation evidence, not committed),
 record what has been verified and what blocks the rest. `--backend mlx` remains refused.
@@ -1673,20 +2039,32 @@ original output limit retain precedence.
   [Running on the ggml CPU backend](#running-on-the-ggml-cpu-backend). `cpu`
   runs a pure-C# V4.1 executor checked against the PyTorch reference at
   2e-5, and `cuda` runs V4.1 through the direct-CUDA engine's own kernels,
-  which has targeted kernel/slot contracts but no independent full-checkpoint numerical gate; both are correctness and portability paths
-  rather than serving ones. `mlx` fails before the weights are read, rather
+  which is held to `ggml_cuda` on a 1017-shaped fixture, stage by stage on
+  a 10-layer truncation of the 1017
+  ([Per-stage oracle](#per-stage-oracle-against-ggml_cuda)) and on the whole
+  1017 across 2 nodes x 2 A40
+  ([Full 1017 on `cuda`](#full-1017-on-cuda-2-nodes-x-2-a40)); both are
+  correctness and portability paths rather than serving ones. `mlx` fails before the weights are read, rather
   than loading V4.1 weights into a graph that does not implement it.
-- `cuda` and `cpu` need a GGUF in TensorSharp's Engram layout. They refuse
-  llama.cpp's combined layout, which includes unsloth's
-  DeepSeek-V4.1-Flash-1017 GGUFs, from the header; run those on `ggml_cuda`.
-  On `cuda`, the 1017 `UD-IQ2_XXS` routed experts are also refused at load:
-  IQ1_S, IQ2_S, IQ2_XS and IQ3_XXS have no GPU expert kernel, and the host
-  matmul behind `--n-cpu-moe` runs neither IQ1_S, IQ2_S nor IQ2_XXS. Porting
-  the combined layout to the managed executors would therefore not make that
-  file run on `cuda`. The `cuda` backend is uncovered for the 1017 checkpoint.
-- Distributed layer split and distributed routed-MoE TP run only on
-  `ggml_cuda`. `cuda`, `cpu`, `ggml_cpu` and the opt-in non-CUDA ggml backends
-  refuse `--tp-node-id`/`--tp-peers` before contacting a peer.
+- `cuda` and `cpu` read both Engram layouts, including llama.cpp's combined
+  one in unsloth's DeepSeek-V4.1-Flash-1017 GGUFs. That is checked against the
+  real 1017 header and, end to end, on a fixture rewritten into the combined
+  layout. No 1017 weights have run on `cpu`. On `cuda`, a 10-layer truncation of
+  the `UD-IQ2_XXS` file has run on 2x A40 with `--layer-split 2`, under the
+  [per-stage oracle](#per-stage-oracle-against-ggml_cuda). The 1017 `UD-IQ2_XXS`
+  routed experts pass the load-time check when they stay in VRAM (the GPU expert
+  kernels decode all of them; a kernel module older than the IQ1_S and IQ2_S
+  decoders refuses them by name), while the host matmul behind `--n-cpu-moe` runs
+  neither IQ1_S, IQ2_S nor IQ2_XXS. A `cuda` run of the whole file therefore needs
+  GPUs that hold all of its experts, on one host or across nodes with the
+  distributed layer split. One such run has been made, on 2 nodes x 2 A40 with
+  one sequence and the settings in the table below; see
+  [Full 1017 on `cuda`](#full-1017-on-cuda-2-nodes-x-2-a40) for what it covers
+  and what it does not.
+- Distributed routed-MoE TP runs only on `ggml_cuda`; distributed layer split on
+  `ggml_cuda` and `cuda`. `cpu`, `ggml_cpu` and the opt-in non-CUDA ggml backends
+  refuse `--tp-node-id`/`--tp-peers` before contacting a peer, and so does `cuda`
+  with `--tp`.
 - Distributed routed-MoE TP uses the host-driven exchange, not local TP's
   device-resident one. Per GPU-resident MoE layer and per token, each node
   enters two blocking F32 AllReduce collectives over the cross-node transport:
@@ -1735,6 +2113,25 @@ original output limit retain precedence.
   each placement is also bit-identical from run to run. The HTTP suites
   (answers, JSON, multi-turn, tool calls) passed in both placements except
   one strict check that rejects a correct JSON answer inside a code fence.
+- On October 30, 2026 the same two pods, now with CUDA 13.2, ran the direct
+  engine (`--backend cuda --layer-split 2`, distributed) against `ggml_cuda`
+  with exact prefill, one build, one session, Engram evicted before each cold
+  process. Medians of runs 2-4, tok/s, prefill / decode:
+
+  | 2 nodes x 2 A40, layer split, exact prefill | `cuda` | `ggml_cuda` |
+  | --- | ---: | ---: |
+  | 2,048 tokens, Engram cold | 137.6 / 9.7 | 207.9 / 27.8 |
+  | 2,048 tokens, Engram warm | 547.5 / 28.6 | 445.2 / 33.2 |
+  | 20,480 tokens, Engram cold at the start | 335.8 / 16.6 | 206.0 / 27.2 |
+
+  Decode on `cuda` misses this run's floor of 0.8x `ggml_cuda` whenever the
+  Engram rows start cold: 0.35x at 2,048 tokens and 0.64x at 8,192 (0.86x warm at
+  2,048). It is most likely bound by those rows, which the node that owns them
+  reads one after another on one thread at decode; that node took 84-95 ms per
+  decoded token cold against 20 ms warm. A parallel row gather is the planned
+  fix. The long-prompt figures benefit from the rows the direct engine keeps
+  cached. The numerics gate, the HTTP suites, the full matrix and the coverage
+  are in [Full 1017 on `cuda`](#full-1017-on-cuda-2-nodes-x-2-a40).
 - Index and candidate selections use `ggml_argsort_top_k`. ggml-cuda's radix
   top-k (`ggml_top_k` on wide rows) resolves ties and orders its output by
   atomic arrival, so above 4,096 index rows gathered decode summed its keys

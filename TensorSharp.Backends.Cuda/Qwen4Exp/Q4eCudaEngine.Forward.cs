@@ -368,7 +368,7 @@ namespace TensorSharp.Cuda
 
             HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt);
             StageEnd(dev, StHc);
-            Moe(dev, L, nt);
+            Moe(dev, L, il, nt, pos == IntPtr.Zero && rows == null ? p0 : -1);
             dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, m.Hc, dev.Stream);
             StageEnd(dev, StHc);
         }
@@ -585,13 +585,17 @@ namespace TensorSharp.Cuda
             StageEnd(dev, StPle);
         }
 
-        private void Moe(Dev dev, DevLayer L, int nt)
+        /// <param name="probeP0">The position of the ubatch's first row on the single-sequence uncaptured
+        /// path, where <see cref="RouterProbe"/> may read the router back; -1 elsewhere.</param>
+        private void Moe(Dev dev, DevLayer L, int il, int nt, int probeP0)
         {
             var m = _m;
             int e = m.NEmbd;
             MatMulF32(dev, L.Router, dev.Cur, dev.RouterLogits, e, m.NExpert, nt);
             dev.DK.MoeSelect(dev.RouterLogits, IntPtr.Zero, IntPtr.Zero, null, dev.Moe.Sel, dev.Moe.SelW,
                 m.NExpert, m.NExpertUsed, 1, 1.0f, nt, dev.Stream, Dsv4Kernels.RouterSoftmax);
+            if (probeP0 >= 0)
+                RouterProbe?.Invoke(CaptureRouter(dev, il, probeP0, nt));
             StageEnd(dev, StRouter);
 
             IntPtr cur = QuantizeShared(dev, dev.Cur, e, nt);
@@ -697,6 +701,30 @@ namespace TensorSharp.Cuda
                 Scores = Download<float>(At(dev.Scores, (long)row0 * ScoreStride), (long)nt * ScoreStride),
                 Cells = Download<int>((IntPtr)((long)Ptr(dev.Cells) + (long)row0 * CellStride * 4), (long)nt * CellStride),
                 CellCnt = Download<int>((IntPtr)((long)Ptr(dev.CellCnt) + (long)row0 * 4), nt),
+            };
+        }
+
+        /// <summary>Test hook: each layer's router logits and chosen experts on the single-sequence path, read
+        /// back once the experts were chosen. Decode steps are not captured while it is set.</summary>
+        internal Action<RouterLayerProbe> RouterProbe { get; set; }
+
+        /// <summary>One layer's router for a ubatch: the logits [Nt, Experts] and the experts chosen [Nt, Used].</summary>
+        internal sealed class RouterLayerProbe
+        {
+            public int Layer, P0, Nt, Experts, Used;
+            public float[] Logits;
+            public int[] Selected;
+        }
+
+        private RouterLayerProbe CaptureRouter(Dev dev, int il, int p0, int nt)
+        {
+            var m = _m;
+            CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+            return new RouterLayerProbe
+            {
+                Layer = il, P0 = p0, Nt = nt, Experts = m.NExpert, Used = m.NExpertUsed,
+                Logits = Download<float>(Ptr(dev.RouterLogits), (long)nt * m.NExpert),
+                Selected = Download<int>(Ptr(dev.Moe.Sel), (long)nt * m.NExpertUsed),
             };
         }
 
