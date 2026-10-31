@@ -20,6 +20,18 @@ the probe uses that model's tokenizer and saves the exact IDs and text SHA256.
 Do not reuse a synthetic fixture's small token IDs for another vocabulary: they
 can denote unused special tokens and yield an uninformative zero-vector case.
 
+`--backend cuda` selects the direct-CUDA engine: single-process, or, with
+`--layer-split N --tp-node-id K --tp-peers ...`, one pipeline stage per node
+(DeepSeek V4.1 only; distributed `--tp` stays `ggml_cuda`). The driver (node 0)
+must run the last stage, the default `TENSORSHARP_LAYER_SPLIT_DRIVER_STAGE`.
+Both stages run the same kernels as the single-process engine and exchange
+their boundary state losslessly, so the driver's vectors are expected to be
+**bit-identical** to a single-process `--backend cuda` control with the same
+settings (set `TS_DSV41_ENGRAM_DEVICE=0` on the control: distributed stages
+keep the Engram tables host-mapped unless it is 1). Every node must use the
+same `MAX_CONTEXT`, `TS_DSV4_UBATCH` and CUDA routing variables; a node whose
+settings differ refuses at load.
+
 Retain native per-device ownership diagnostics: seeing two visible devices
 alone does not establish that both execute model layers. When local controls
 need CPU expert offload while distributed stages fit on GPUs, report the

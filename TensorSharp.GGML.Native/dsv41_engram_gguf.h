@@ -240,7 +240,15 @@ engram_data load_engram_gguf(gguf_context * file, TensorShape tensor_shape) {
     if (source < -1 || source >= n_layer) fail("deepseek41.attention.indexer.candidate_source_layer");
     result.candidate_source_layer_id = int32_t(source);
     if (source >= 0) {
-        result.candidate_topk_blocks = u32("deepseek41.attention.indexer.candidate_top_k", 2048);
+        // Unsloth's 1017 GGUFs spell the budget candidate_top_k_blocks; TensorSharp's own
+        // files and fixtures candidate_top_k. A file with both must not let them disagree.
+        // Dsv41EngramData.Load (the managed executors) reads it the same way.
+        const char * blocks_key = "deepseek41.attention.indexer.candidate_top_k_blocks";
+        const char * topk_key = "deepseek41.attention.indexer.candidate_top_k";
+        const bool has_blocks = gguf_find_key(file, blocks_key) >= 0;
+        result.candidate_topk_blocks = u32(has_blocks ? blocks_key : topk_key, 2048);
+        if (has_blocks && gguf_find_key(file, topk_key) >= 0 && u32(topk_key) != result.candidate_topk_blocks)
+            fail(std::string(blocks_key) + " disagrees with " + topk_key);
         result.candidate_block_size = u32("deepseek41.attention.indexer.candidate_block_size", 8);
         if (std::find(result.index_source_layer_ids.begin(), result.index_source_layer_ids.end(), source) ==
             result.index_source_layer_ids.end()) fail("candidate source must own an indexer");

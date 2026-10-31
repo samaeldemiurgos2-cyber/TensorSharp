@@ -216,6 +216,20 @@ namespace TensorSharp.Models
         public int ContextSize => _nCtx;
         public int NPast => _nPast;
 
+        /// <summary>
+        /// Tests only: every tensor TS_DSV4_MMAP=0 (or TS_DSV4_BUFFER_SHARDS) copied into RAM, by name,
+        /// with its byte count; empty on the mapped path. What shows that llama.cpp's combined Engram
+        /// table is buffered once, as its per-layer row views, and never whole beside them.
+        /// </summary>
+        internal IReadOnlyDictionary<string, long> BufferedTensorBytes()
+        {
+            var bytes = new Dictionary<string, long>(StringComparer.Ordinal);
+            if (_bufferedTensors != null)
+                foreach (string name in _bufferedTensors.Keys)
+                    bytes[name] = _tensorMap[name].File.GetTensorByteCount(_tensorMap[name].Info);
+            return bytes;
+        }
+
         public DeepSeek4CpuExecutor(string ggufPath, int maxContext, int nUbatch, int nThreads, IAllocator allocator)
         {
             _alloc = allocator ?? throw new ArgumentNullException(nameof(allocator));
@@ -424,6 +438,13 @@ namespace TensorSharp.Models
         {
             _engram = Dsv41EngramData.Load(_shards[0],
                 name => _tensorMap.TryGetValue(name, out var entry) ? entry.Info : null);
+            // llama.cpp's layout: each Engram layer's table is a row range of one combined
+            // tensor. Name those ranges as TensorSharp's layout names its tables, as views of
+            // the same shard bytes, and drop the combined entry, which TS_DSV4_MMAP=0 would
+            // otherwise buffer whole. From here on both layouts read alike.
+            if (_engram.Slices != null)
+                GgufShardSet.ReplaceWithRowViews(_tensorMap, Dsv41EngramData.CombinedTableName,
+                    _engram.TableViews(), "dsv4-cpu");
             _v41KvSource = new int[_nLayer];
             _v41IndexSource = new int[_nLayer];
 
@@ -643,9 +664,31 @@ namespace TensorSharp.Models
                         if (_engram.Layers[e].Id != il) continue;
                         L.EngramIndex = e;
                         L.EngramEmbd = GetW(p + "engram_embd.weight");
-                        L.EngramWkv = GetW(p + "engram_wkv.weight");
-                        L.EngramQ = GetF32(p + "engram_q.weight");
-                        L.EngramK = GetF32(p + "engram_k.weight");
+                        // llama.cpp's layout: engram.py only ever uses q_weight * k_weight, so
+                        // the file stores that product once, as engram_gate, beside engram_kv
+                        // (engram_wkv by another name). The product scales the query and the
+                        // key keeps its plain RMS norm (a gain of ones), as in the native graph.
+                        bool fused = _tensorMap.ContainsKey(p + "engram_gate.weight");
+                        string q = p + (fused ? "engram_gate.weight" : "engram_q.weight");
+                        L.EngramWkv = GetW(p + (fused ? "engram_kv.weight" : "engram_wkv.weight"));
+                        L.EngramQ = GetF32(q);
+                        if (fused)
+                        {
+                            L.EngramK = new float[HC * _nEmbd];
+                            Array.Fill(L.EngramK, 1f);
+                        }
+                        else
+                        {
+                            L.EngramK = GetF32(p + "engram_k.weight");
+                        }
+                        ulong[] qShape = _tensorMap[q].Info.Shape;
+                        int lookup = (int)(_engram.HashColumns * _engram.HeadDim);
+                        if (L.EngramWkv.Ne0 != lookup || L.EngramWkv.Ne1 != (HC + 1) * _nEmbd ||
+                            qShape.Length < 2 || qShape[0] != (ulong)_nEmbd || qShape[1] != HC ||
+                            L.EngramK.Length != HC * _nEmbd)
+                            throw new InvalidOperationException(
+                                $"[dsv4-cpu] DeepSeek V4.1 Engram weights at layer {il} do not match {lookup} lookup " +
+                                $"values, {HC} streams and n_embd {_nEmbd}");
                         break;
                     }
                 }

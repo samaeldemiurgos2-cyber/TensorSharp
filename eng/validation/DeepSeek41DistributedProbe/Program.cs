@@ -32,7 +32,7 @@ catch (ArgumentException error)
     Console.Error.WriteLine(error.Message);
     Console.Error.WriteLine("Usage: DeepSeek41DistributedProbe --model MODEL.gguf (--tokens TOKENS.json | --text UTF8_TEXT_FILE) " +
         "--weights-id IMMUTABLE_ID --output FRESH_DIRECTORY [--tp 2 --tp-node-id 0 --tp-peers HOST:PORT,HOST:PORT] " +
-        "[--chunk 3 --decode-count 4 --backend ggml_cuda]");
+        "[--chunk 3 --decode-count 4 --backend ggml_cuda|ggml_cpu|cuda]");
     return 2;
 }
 
@@ -91,7 +91,9 @@ try
     {
         "ggml_cuda" => BackendType.GgmlCuda,
         "ggml_cpu" => BackendType.GgmlCpu,
-        _ => throw new ArgumentException("Probe backend must be ggml_cuda or ggml_cpu.")
+        // The direct-CUDA engine: single-process, or one stage of a distributed --layer-split.
+        "cuda" => BackendType.Cuda,
+        _ => throw new ArgumentException("Probe backend must be ggml_cuda, ggml_cpu or cuda.")
     };
     // Match the CLI/server initialization contract: these are managed settings,
     // so exporting the variables alone does not configure a standalone host.
@@ -117,7 +119,7 @@ try
         {
             ModelBase.ValidateDistributedLayerSplit(options["--model"], backend);
             unownedGroup = new DistributedLayerSplitGroup(
-                ModelBase.CreateGgmlLocalLayerSplitGroup(backend, distributed.LocalDegree),
+                ModelBase.CreateLocalLayerSplitGroup(backend, distributed.LocalDegree),
                 distributed.NodeId, distributed.PeerEndpoints);
         }
         else

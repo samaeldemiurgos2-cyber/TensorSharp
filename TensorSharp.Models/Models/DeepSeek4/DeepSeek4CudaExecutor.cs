@@ -36,6 +36,8 @@ namespace TensorSharp.Models
     {
         private const int CsaRatio = 4;
         private const int HcaRatio = 128;
+        // Hyper-connection residual streams; ParseHparams refuses any other count.
+        private const int HcStreams = 4;
 
         // The checkpoint's shards (and a DSpark drafter's GGUF beside them).
         private GgufShardSet _gguf;
@@ -62,6 +64,9 @@ namespace TensorSharp.Models
 
         public int VocabSize => _nVocab;
         public int NPast => _engine.NPast;
+
+        /// <summary>The engine this executor drives (tests read its route counts).</summary>
+        internal Dsv4CudaEngine Engine => _engine;
 
 
         /// <summary>
@@ -111,35 +116,240 @@ namespace TensorSharp.Models
             }
 
             _gguf = new GgufShardSet(ggufPath, "dsv4-cuda", dsparkPath);
-            ParseHparams();
-            if (_isV41)
-                LoadEngramMetadata();
-            Mark("shards opened / hparams parsed");
-
-            // Large weights are read exactly once, on their way to VRAM, so the
-            // engine streams them straight from the shards through pinned
-            // chunks instead of staging the whole (hundreds of GB) model in
-            // host RAM first. TS_DSV4_MMAP=1 opts back into the mmap path.
-            bool stream = ParseEnvInt("TS_DSV4_MMAP", 0) == 0;
-            if (stream)
+            try
             {
-                _gguf.BeginStreaming();
-                Mark("small tensors prefetched");
+                ParseHparams();
+                if (_isV41)
+                    LoadEngramMetadata();
+                Mark("shards opened / hparams parsed");
+
+                // Large weights are read exactly once, on their way to VRAM, so the
+                // engine streams them straight from the shards through pinned
+                // chunks instead of staging the whole (hundreds of GB) model in
+                // host RAM first. TS_DSV4_MMAP=1 opts back into the mmap path.
+                bool stream = ParseEnvInt("TS_DSV4_MMAP", 0) == 0;
+                if (stream)
+                {
+                    _gguf.BeginStreaming();
+                    PrefetchedTensorNames = _gguf.PrefetchedNames;
+                    Mark("small tensors prefetched");
+                }
+
+                int nCtx = maxContext > 0 ? maxContext : 16384;
+                int ubatch = nUbatch > 0 ? nUbatch : 1024;
+
+                var desc = BuildModelDesc(nCtx, ubatch);
+                Mark("model desc built");
+                _engine = new Dsv4CudaEngine(desc, nGpu, nCpuMoe);
+                Mark("engine ready");
+
+                // Everything lives in VRAM now; drop the host-side scraps.
+                _gguf.EndLoad();
+
+                Console.Error.WriteLine($"[dsv4-cuda] model ready in {sw.Elapsed.TotalSeconds:F1}s");
+                StartEngramWarm();
             }
+            catch
+            {
+                ReleaseRefusedLoad();
+                throw;
+            }
+        }
 
-            int nCtx = maxContext > 0 ? maxContext : 16384;
-            int ubatch = nUbatch > 0 ? nUbatch : 1024;
+        /// <summary>
+        /// A constructor that throws is never disposed by its caller, and a refused load (a peer that does not fit, a
+        /// module or placement the nodes disagree on, too little VRAM, an upload fault) would otherwise keep the
+        /// shards open (locking the files on Windows), the prefetched small tensors (about 474 MB on the 1017) and
+        /// any Engram mapping for the life of the process.
+        /// </summary>
+        private void ReleaseRefusedLoad()
+        {
+            try { Dispose(); }
+            catch { /* the load's own error is the one to report */ }
+        }
 
-            var desc = BuildModelDesc(nCtx, ubatch);
-            Mark("model desc built");
-            _engine = new Dsv4CudaEngine(desc, nGpu, nCpuMoe);
-            Mark("engine ready");
+        /// <summary>The small tensors this load read ahead (names only), for tests.</summary>
+        internal IReadOnlyList<string> PrefetchedTensorNames { get; private set; } = Array.Empty<string>();
 
-            // Everything lives in VRAM now; drop the host-side scraps.
-            _gguf.EndLoad();
+        /// <summary>A node's part of a cross-node layer split, built by the model layer from its
+        /// <see cref="ILayerSplitGroup"/>.</summary>
+        internal sealed class DistributedStage
+        {
+            public int Nodes, NodeId, LocalDevices;
+            public bool DriverRunsLastStage;
+            public IDsv4StageLink Link;
+            /// <summary>Cross-node agreement on an identity string (the model's
+            /// ValidateDistributedExecutionConfig): the placement before any weight is read, and the
+            /// engine's kernel module before any is uploaded.</summary>
+            public Action<string> Agree;
+            /// <summary>The build this node runs, which the stages agree on with the kernel module
+            /// (<see cref="Dsv4StagePlan.Build"/>).</summary>
+            public string Build;
+        }
 
-            Console.Error.WriteLine($"[dsv4-cuda] model ready in {sw.Elapsed.TotalSeconds:F1}s");
-            StartEngramWarm();
+        /// <summary>
+        /// Tests only: the global device boundaries a distributed load uses instead of the byte-balanced cut
+        /// (entry g is the first layer of global device g, the last entry the layer count), so a test can put
+        /// the cut where it wants the state to cross. Every node of the test sees the same value.
+        /// </summary>
+        internal static int[] ForceStageBoundaries { get; set; }
+
+        /// <summary>The global device of every layer this load placed, null on a single-process load.</summary>
+        internal int[] GlobalDeviceOfLayer { get; private set; }
+
+        /// <summary>
+        /// One node of a cross-node layer split (DeepSeek V4.1 only): the placement is computed from the
+        /// shards' headers (<see cref="Dsv4StagePlacement.Plan"/>), so every node derives the same one; this
+        /// node then describes, maps and uploads only its own layers. Routed experts stay in VRAM and Engram
+        /// tables are host mappings unless TS_DSV41_ENGRAM_DEVICE=1.
+        /// </summary>
+        public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, DistributedStage distributed)
+        {
+            ArgumentNullException.ThrowIfNull(distributed);
+            var sw = Stopwatch.StartNew();
+            _gguf = new GgufShardSet(ggufPath, "dsv4-cuda");
+            try
+            {
+                ParseHparams();
+                if (!_isV41)
+                    throw new NotSupportedException("[dsv4-cuda] cross-node layer split is implemented for DeepSeek V4.1 only.");
+                LoadEngramMetadata();
+
+                int nCtx = maxContext > 0 ? maxContext : 16384;
+                int ubatch = nUbatch > 0 ? nUbatch : 1024;
+                bool engramOnDevice = EngramPlacement() == true;
+                Dsv4Topology topology = BuildTopology(nCtx, ubatch);
+                var (layerBytes, embeddingBytes, headBytes) = HeaderBytes(engramOnDevice);
+                int devices = checked(distributed.Nodes * distributed.LocalDevices);
+                int[] globalDevice = ForceStageBoundaries is { } forced
+                    ? Dsv4StagePlacement.FromBoundaries(forced, _nLayer)
+                    : Dsv4StagePlacement.Plan(topology, layerBytes, embeddingBytes, headBytes,
+                        distributed.Nodes, distributed.LocalDevices, distributed.DriverRunsLastStage);
+                if (globalDevice[^1] != devices - 1)
+                    throw new InvalidOperationException($"[dsv4-cuda] the layer split names {globalDevice[^1] + 1} devices; the run has {devices}.");
+                GlobalDeviceOfLayer = globalDevice;
+                int stage = LayerSplitPlan.StageOf(distributed.NodeId, distributed.Nodes, distributed.DriverRunsLastStage);
+                int[] boundaries = Dsv4StagePlacement.Boundaries(globalDevice, devices);
+
+                // Before any weight is read: every node must have computed the same placement from the same bytes.
+                ulong bytesHash = Fnv1a(layerBytes, embeddingBytes, headBytes);
+                distributed.Agree?.Invoke($"dsv4-cuda-placement|devices={string.Join(",", boundaries)}" +
+                    $"|assignment={Dsv4StagePlacement.AssignmentHash(globalDevice):X16}|bytes={bytesHash:X16}" +
+                    $"|ctx={nCtx}|ubatch={ubatch}|engram_device={engramOnDevice}");
+                Console.Error.WriteLine($"[dsv4-cuda] cross-node layer split: global device boundaries {string.Join(",", boundaries)}; " +
+                    $"node {distributed.NodeId} runs stage {stage} of {distributed.Nodes}");
+                // Every node computes the same verdict from the same topology, so all refuse here together, before
+                // anything is read or allocated, when a payload would not fit one transport frame.
+                Dsv4StagePlacement.ValidateWireLimits(topology, globalDevice, distributed.LocalDevices);
+
+                int first = stage * distributed.LocalDevices, end = first + distributed.LocalDevices;
+                bool Owns(int il) => il < _nLayer && globalDevice[il] >= first && globalDevice[il] < end;
+                if (ParseEnvInt("TS_DSV4_MMAP", 0) == 0)
+                {
+                    // Only this stage's layers' small tensors (and the non-layer ones): another stage's norms,
+                    // gates and routers are never read here.
+                    _gguf.BeginStreaming(name => !LayerSplitPlan.TryGetLayer(name, out int il) || Owns(il));
+                    PrefetchedTensorNames = _gguf.PrefetchedNames;
+                }
+                var desc = BuildModelDesc(nCtx, ubatch, Owns, engramOnDevice);
+                _engine = new Dsv4CudaEngine(desc, new Dsv4StagePlan
+                {
+                    GlobalDeviceOfLayer = globalDevice,
+                    Stage = stage,
+                    StageCount = distributed.Nodes,
+                    LocalDevices = distributed.LocalDevices,
+                    Link = distributed.Link,
+                    Agree = distributed.Agree,
+                    Build = distributed.Build,
+                });
+                _gguf.EndLoad();
+                Console.Error.WriteLine($"[dsv4-cuda] stage {stage} ready in {sw.Elapsed.TotalSeconds:F1}s");
+                StartEngramWarm();
+            }
+            catch
+            {
+                ReleaseRefusedLoad();
+                throw;
+            }
+        }
+
+        /// <summary>The topology the cross-node placement is computed from: the engine derives the same one
+        /// from the descriptors this executor hands it.</summary>
+        private Dsv4Topology BuildTopology(int nCtx, int nUbatch)
+        {
+            var t = new Dsv4Topology
+            {
+                NLayer = _nLayer, NEmbd = _nEmbd, HeadDim = _headDim, IdxHeadSize = _idxHeadSize, IdxTopK = _idxTopK,
+                NUbatch = nUbatch, NCtx = nCtx, NSwa = _nSwa, V41 = _isV41,
+                NVocab = (int)(_gguf.InfoOf("token_embd.weight")?.Shape[1] ?? 0),
+                CandidateSource = _isV41 ? _engram.CandidateSourceLayerId : -1,
+                Ratio = new int[_nLayer], KvSource = new int[_nLayer], IndexSource = new int[_nLayer], EngramIndex = new int[_nLayer],
+            };
+            for (int il = 0; il < _nLayer; il++)
+            {
+                t.Ratio[il] = _compressRatios[il];
+                t.KvSource[il] = _isV41 ? _v41KvSource[il] : -1;
+                t.IndexSource[il] = _isV41 ? _v41IndexSource[il] : -1;
+                t.EngramIndex[il] = EngramIndexOf(il);
+            }
+            return t;
+        }
+
+        /// <summary>The Engram table of layer <paramref name="il"/>, -1 for none.</summary>
+        private int EngramIndexOf(int il)
+        {
+            if (!_isV41)
+                return -1;
+            for (int t = 0; t < _engram.Layers.Length; t++)
+            {
+                if (_engram.Layers[t].Id == il)
+                    return t;
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// What each layer, the embedding and the head occupy on a GPU, from the shards' headers alone: every
+        /// tensor of the layer as the engine places it (256-byte aligned), the Engram table only when it goes
+        /// to VRAM. The same on every node, which free VRAM is not.
+        /// </summary>
+        private (long[] Layers, long Embedding, long Head) HeaderBytes(bool engramOnDevice)
+        {
+            var layers = new long[_nLayer];
+            long embedding = 0, head = 0;
+            static long Align(long v) => (v + 255) & ~255L;
+            foreach (var (name, _, bytes) in _gguf.TensorBytes())
+            {
+                if (LayerSplitPlan.TryGetLayer(name, out int il))
+                {
+                    if (il >= _nLayer || (!engramOnDevice && name.EndsWith(".engram_embd.weight", StringComparison.Ordinal)))
+                        continue;
+                    layers[il] = checked(layers[il] + Align(bytes));
+                }
+                else if (name == "token_embd.weight")
+                    embedding = checked(embedding + Align(bytes));
+                else if (name is "output.weight" or "output_norm.weight")
+                    head = checked(head + Align(bytes));
+            }
+            return (layers, embedding, head);
+        }
+
+        private static ulong Fnv1a(long[] values, params long[] more)
+        {
+            ulong h = 1469598103934665603UL;
+            void Mix(long v)
+            {
+                for (int i = 0; i < 8; i++)
+                {
+                    h ^= (ulong)(v >> (8 * i)) & 0xff;
+                    h *= 1099511628211UL;
+                }
+            }
+            foreach (long v in values)
+                Mix(v);
+            foreach (long v in more)
+                Mix(v);
+            return h;
         }
 
         private static int ParseEnvInt(string name, int fallback)
@@ -281,6 +491,13 @@ namespace TensorSharp.Models
         private void LoadEngramMetadata()
         {
             _engram = Dsv41EngramData.Load(_gguf.First, _gguf.InfoOf);
+            // llama.cpp's layout: each Engram layer's table is a row range of one combined
+            // tensor. Name those ranges as TensorSharp's layout names its tables, as views of
+            // the same shard bytes, and drop the combined entry so nothing streams or stages it
+            // whole. From here on (placement, mapping, warming) both layouts read alike, which
+            // is what the native loader does too.
+            if (_engram.Slices != null)
+                _gguf.ReplaceWithRowViews(Dsv41EngramData.CombinedTableName, _engram.TableViews());
 
             if (_engram.Layers[^1].Id >= _nLayer ||
                 _engram.KvSourceLayerIds[^1] >= _nLayer || _engram.IndexSourceLayerIds[^1] >= _nLayer)
@@ -332,12 +549,34 @@ namespace TensorSharp.Models
         /// cached is a storage round trip: about a millisecond on a network filesystem, so a cold table
         /// halves decode. Read the tables once on a background thread after the model is ready, as the
         /// native loader does (dsv4_warm_engram), when the host has room to keep them cached.
+        /// TS_DSV41_ENGRAM_WARM is read as the native loader reads it (atoi): unset warms in the background,
+        /// <c>0</c> never warms, and a positive value warms before the model is handed out. Ignoring it read
+        /// the whole 63 GiB table of the 1017 behind every request of a run that asked for no warm, and filled
+        /// a 100 GB cgroup that MemAvailable (host-wide) said had room.
         /// </summary>
         private void StartEngramWarm()
         {
             if (_engramRanges.Count == 0 || _engine.EngramResident)
                 return;
+            int mode = EngramWarmMode();
+            if (mode == 0)
+            {
+                Console.Error.WriteLine("[dsv4-cuda] Engram tables are not warmed (TS_DSV41_ENGRAM_WARM=0)");
+                return;
+            }
             _engramWarm = MappedTableWarm.Start(_engramRanges, "dsv4-cuda", "Engram tables", _engramWarmCancel.Token);
+            if (mode > 0)
+                _engramWarm?.Wait();
+        }
+
+        /// <summary>TS_DSV41_ENGRAM_WARM as the native loader's atoi reads it: -1 when unset (background),
+        /// 0 for off (and for anything that is not a number, as atoi), the value otherwise (synchronous).</summary>
+        internal static int EngramWarmMode()
+        {
+            string option = Environment.GetEnvironmentVariable("TS_DSV41_ENGRAM_WARM");
+            if (option == null)
+                return -1;
+            return int.TryParse(option.Trim(), out int v) ? v : 0;
         }
 
         public int HashColumns => (int)_engram.HashColumns;
@@ -425,6 +664,24 @@ namespace TensorSharp.Models
             };
         }
 
+        /// <summary>
+        /// TS_DSV41_ENGRAM_DEVICE, read as the native loader reads it: unset places the Engram tables in
+        /// VRAM when the split holds them without offloading more experts, <c>0</c> keeps them host
+        /// mappings (the path a host that cannot hold them takes, and the one a bit-exact comparison with
+        /// a host oracle needs), <c>1</c> requires VRAM. Anything else is refused rather than ignored.
+        /// </summary>
+        internal static bool? EngramPlacement()
+        {
+            string option = Environment.GetEnvironmentVariable("TS_DSV41_ENGRAM_DEVICE");
+            return option switch
+            {
+                null => null,
+                "0" => false,
+                "1" => true,
+                _ => throw new NotSupportedException("TS_DSV41_ENGRAM_DEVICE must be 0 or 1 (unset selects automatically)."),
+            };
+        }
+
         private static float YarnCorrDim(int nDims, int nCtxOrig, float nRot, float freqBase)
         {
             return nDims * MathF.Log(nCtxOrig / (nRot * 2f * MathF.PI)) / (2f * MathF.Log(freqBase));
@@ -448,7 +705,13 @@ namespace TensorSharp.Models
         // Descriptor construction
         // -------------------------------------------------------------------
 
-        private Dsv4CudaEngine.ModelDesc BuildModelDesc(int nCtx, int nUbatch)
+        /// <param name="owns">The layers this node describes in full (null: every layer). Another node's layer
+        /// keeps its topology only (ratio, sources, Engram table), which is what the boundaries are planned from;
+        /// none of its tensors is described, read or mapped.</param>
+        /// <param name="engramOnDevice">Overrides TS_DSV41_ENGRAM_DEVICE's automatic choice (a distributed
+        /// load decides it the same way on every node).</param>
+        private Dsv4CudaEngine.ModelDesc BuildModelDesc(int nCtx, int nUbatch, Func<int, bool> owns = null,
+            bool? engramOnDevice = null)
         {
             var tokEmbd = GetQW("token_embd.weight");
             _nVocab = tokEmbd.Ne1;
@@ -496,6 +759,7 @@ namespace TensorSharp.Models
                 CandidateTopk = _isV41 ? (int)_engram.CandidateTopkBlocks : 0,
                 CandidateBlock = _isV41 ? (int)_engram.CandidateBlockSize : 0,
                 Engram = _isV41 ? this : null,
+                EngramOnDevice = _isV41 ? engramOnDevice ?? EngramPlacement() : null,
                 RopeRawTable = BuildRopeTable(nCtx, comp: false),
                 RopeCompTable = BuildRopeTable(nCtx, comp: true),
                 Layers = new Dsv4CudaEngine.LayerDesc[_nLayer],
@@ -505,6 +769,17 @@ namespace TensorSharp.Models
 
             for (int il = 0; il < _nLayer; il++)
             {
+                if (owns != null && !owns(il))
+                {
+                    m.Layers[il] = new Dsv4CudaEngine.LayerDesc
+                    {
+                        Ratio = _compressRatios[il],
+                        KvSource = _isV41 ? _v41KvSource[il] : -1,
+                        IndexSource = _isV41 ? _v41IndexSource[il] : -1,
+                        EngramIndex = EngramIndexOf(il),
+                    };
+                    continue;
+                }
                 string p = $"blk.{il}.";
                 var L = new Dsv4CudaEngine.LayerDesc
                 {
@@ -562,10 +837,35 @@ namespace TensorSharp.Models
                         if (_engram.Layers[t].Id != il)
                             continue;
                         L.EngramIndex = t;
-                        L.EngramWkv = GetQW(p + "engram_wkv.weight");
                         L.EngramTable = GetQW(p + "engram_embd.weight");
-                        L.EngramQ = GetF32(p + "engram_q.weight");
-                        L.EngramK = GetF32(p + "engram_k.weight");
+                        // llama.cpp's layout: engram.py only ever uses q_weight * k_weight, so
+                        // the file stores that product once, as engram_gate, beside engram_kv
+                        // (engram_wkv by another name). The gate kernel scales the normalized
+                        // query by EngramQ and the normalized key by EngramK, and reads both;
+                        // the product goes on the query and the key gets a gain of exactly one,
+                        // which is the native graph's arithmetic (rms(x) * gate against a plain
+                        // rms(key)) with no second kernel.
+                        bool fused = _gguf.Has(p + "engram_gate.weight");
+                        string q = p + (fused ? "engram_gate.weight" : "engram_q.weight");
+                        L.EngramWkv = GetQW(p + (fused ? "engram_kv.weight" : "engram_wkv.weight"));
+                        L.EngramQ = GetF32(q);
+                        if (fused)
+                        {
+                            L.EngramK = new float[HcStreams * _nEmbd];
+                            Array.Fill(L.EngramK, 1f);
+                        }
+                        else
+                        {
+                            L.EngramK = GetF32(p + "engram_k.weight");
+                        }
+                        ulong[] qShape = _gguf.InfoOf(q).Shape;
+                        int lookup = HashColumns * HeadDim;
+                        if (L.EngramWkv.Ne0 != lookup || L.EngramWkv.Ne1 != (HcStreams + 1) * _nEmbd ||
+                            qShape.Length < 2 || qShape[0] != (ulong)_nEmbd || qShape[1] != HcStreams ||
+                            L.EngramK.Length != HcStreams * _nEmbd)
+                            throw new InvalidOperationException(
+                                $"[dsv4-cuda] DeepSeek V4.1 Engram weights at layer {il} do not match {lookup} lookup " +
+                                $"values, {HcStreams} streams and n_embd {_nEmbd}");
                         _engramTables ??= new EngramTable[_engram.Layers.Length];
                         _engramTables[t] = MapEngramTable(p + "engram_embd.weight");
                         break;

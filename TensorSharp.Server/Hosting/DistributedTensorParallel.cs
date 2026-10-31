@@ -42,7 +42,7 @@ public static class DistributedTensorParallel
 
         if (options.IsLayerSplit)
             return new DistributedLayerSplitGroup(
-                ModelBase.CreateGgmlLocalLayerSplitGroup(backend, distConfig.LocalDegree),
+                ModelBase.CreateLocalLayerSplitGroup(backend, distConfig.LocalDegree),
                 distConfig.NodeId, distConfig.PeerEndpoints);
 
         // The on-node group has to match the backend: direct CUDA

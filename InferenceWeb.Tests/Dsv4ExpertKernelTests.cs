@@ -12,6 +12,9 @@ namespace InferenceWeb.Tests;
 /// The direct-CUDA engine's tensor-core expert projection (ts_dsv4_moe_mma_f32), held to ggml's
 /// own dequantization of the same bytes. The routing is built so that one expert has no member
 /// tokens, one has more members than a single pass holds, and gate and up share a launch.
+/// The low-bit IQ layouts also run at DeepSeek V4.1 1017's expert widths: 2304 (the down
+/// projection's input), whose odd rows start two bytes off a 4-byte boundary, and 5120 (gate/up's),
+/// there with the whole matrix moved two bytes off one.
 /// </summary>
 public sealed class Dsv4ExpertKernelTests
 {
@@ -35,15 +38,31 @@ public sealed class Dsv4ExpertKernelTests
     [InlineData((int)GgmlTensorType.IQ4_NL)]
     [InlineData((int)GgmlTensorType.IQ4_XS)]
     [InlineData((int)GgmlTensorType.Q5_1)]
-    public void TheTensorCoreExpertProjection_MatchesTheDequantizedWeights(int ggmlType)
+    [InlineData((int)GgmlTensorType.Q2_K, 2304)]
+    [InlineData((int)GgmlTensorType.IQ1_S)]
+    [InlineData((int)GgmlTensorType.IQ1_S, 2304)]
+    [InlineData((int)GgmlTensorType.IQ1_S, 5120, 2)]
+    [InlineData((int)GgmlTensorType.IQ2_S)]
+    [InlineData((int)GgmlTensorType.IQ2_S, 2304)]
+    [InlineData((int)GgmlTensorType.IQ2_S, 5120, 2)]
+    [InlineData((int)GgmlTensorType.IQ2_XXS)]
+    [InlineData((int)GgmlTensorType.IQ2_XXS, 2304)]
+    [InlineData((int)GgmlTensorType.IQ2_XXS, 5120, 2)]
+    [InlineData((int)GgmlTensorType.IQ2_XS)]
+    [InlineData((int)GgmlTensorType.IQ2_XS, 2304)]
+    [InlineData((int)GgmlTensorType.IQ2_XS, 5120, 2)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 2304)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 5120, 2)]
+    public void TheTensorCoreExpertProjection_MatchesTheDequantizedWeights(int ggmlType, int inDim = InDim, int weightOffset = 0)
     {
-        long rowBytes = NativeDequant.RowSize(ggmlType, InDim);
+        long rowBytes = NativeDequant.RowSize(ggmlType, inDim);
         byte[] gate = QuantRows(ggmlType, Experts * Rows, rowBytes, seed: 1);
         byte[] up = QuantRows(ggmlType, Experts * Rows, rowBytes, seed: 2);
 
-        var act = new float[Tokens, InDim];
+        var act = new float[Tokens, inDim];
         for (int t = 0; t < Tokens; t++)
-            for (int k = 0; k < InDim; k++)
+            for (int k = 0; k < inDim; k++)
                 act[t, k] = MathF.Sin(0.013f * (k + 1) * (t + 3)) + 0.25f * MathF.Cos(0.071f * k - t);
 
         // Every token takes expert 1 (40 members: two passes of 32) and one of 0, 2, 4; expert 3
@@ -71,8 +90,8 @@ public sealed class Dsv4ExpertKernelTests
         allocator.Context.MakeCurrent();
         using var kernels = Dsv4Kernels.Create();
         Assert.True(kernels.HasMoeMma, "The gate read an sm_80+ module, but the loaded one disables its tensor-core expert kernel.");
-        using var gateW = Up(allocator, gate);
-        using var upW = Up(allocator, up);
+        using var gateW = Up(allocator, Shifted(gate, weightOffset));
+        using var upW = Up(allocator, Shifted(up, weightOffset));
         using var actT = Up(allocator, act);
         using var countsT = Up(allocator, counts);
         using var offsetsT = Up(allocator, offsets);
@@ -80,25 +99,25 @@ public sealed class Dsv4ExpertKernelTests
         using var gateOut = new Tensor(allocator, DType.Float32, sel.Length, Rows);
         using var upOut = new Tensor(allocator, DType.Float32, sel.Length, Rows);
 
-        kernels.MoeMma(Dsv4CudaEngine.Ptr(gateW), Dsv4CudaEngine.Ptr(upW), actT, countsT, offsetsT, slotTokenT,
-            gateOut, upOut, ggmlType, Rows, InDim, rowBytes, Experts, allocator.Stream.Handle);
+        kernels.MoeMma(Dsv4CudaEngine.Ptr(gateW) + weightOffset, Dsv4CudaEngine.Ptr(upW) + weightOffset, actT, countsT,
+            offsetsT, slotTokenT, gateOut, upOut, ggmlType, Rows, inDim, rowBytes, Experts, allocator.Stream.Handle);
         allocator.Stream.Synchronize();
 
         float[] tokenRow(int s) => Row(act, slotToken[s]);
-        AssertMatches("gate", gate, ggmlType, rowBytes, counts, offsets, tokenRow, Down(gateOut, sel.Length * Rows));
-        AssertMatches("up", up, ggmlType, rowBytes, counts, offsets, tokenRow, Down(upOut, sel.Length * Rows));
+        AssertMatches("gate", gate, ggmlType, rowBytes, inDim, counts, offsets, tokenRow, Down(gateOut, sel.Length * Rows));
+        AssertMatches("up", up, ggmlType, rowBytes, inDim, counts, offsets, tokenRow, Down(upOut, sel.Length * Rows));
 
         // The down projection's shape: activations already in slot order, one weight set.
-        var slotAct = new float[sel.Length, InDim];
+        var slotAct = new float[sel.Length, inDim];
         for (int s = 0; s < sel.Length; s++)
-            for (int k = 0; k < InDim; k++)
+            for (int k = 0; k < inDim; k++)
                 slotAct[s, k] = 0.5f * MathF.Cos(0.021f * (k + 7) * (s + 1));
         using var slotActT = Up(allocator, slotAct);
         using var downOut = new Tensor(allocator, DType.Float32, sel.Length, Rows);
-        kernels.MoeMma(Dsv4CudaEngine.Ptr(gateW), IntPtr.Zero, slotActT, countsT, offsetsT, null,
-            downOut, null, ggmlType, Rows, InDim, rowBytes, Experts, allocator.Stream.Handle);
+        kernels.MoeMma(Dsv4CudaEngine.Ptr(gateW) + weightOffset, IntPtr.Zero, slotActT, countsT, offsetsT, null,
+            downOut, null, ggmlType, Rows, inDim, rowBytes, Experts, allocator.Stream.Handle);
         allocator.Stream.Synchronize();
-        AssertMatches("slot-ordered", gate, ggmlType, rowBytes, counts, offsets, s => Row(slotAct, s),
+        AssertMatches("slot-ordered", gate, ggmlType, rowBytes, inDim, counts, offsets, s => Row(slotAct, s),
             Down(downOut, sel.Length * Rows));
     }
 
@@ -118,38 +137,54 @@ public sealed class Dsv4ExpertKernelTests
     [InlineData((int)GgmlTensorType.IQ4_NL)]
     [InlineData((int)GgmlTensorType.IQ4_XS)]
     [InlineData((int)GgmlTensorType.Q5_1)]
-    public void TheDecodeExpertProjection_ServesEveryTokenOfAStep(int ggmlType)
+    [InlineData((int)GgmlTensorType.Q2_K, 2304)]
+    [InlineData((int)GgmlTensorType.IQ1_S)]
+    [InlineData((int)GgmlTensorType.IQ1_S, 2304)]
+    [InlineData((int)GgmlTensorType.IQ1_S, 5120, 2)]
+    [InlineData((int)GgmlTensorType.IQ2_S)]
+    [InlineData((int)GgmlTensorType.IQ2_S, 2304)]
+    [InlineData((int)GgmlTensorType.IQ2_S, 5120, 2)]
+    [InlineData((int)GgmlTensorType.IQ2_XXS)]
+    [InlineData((int)GgmlTensorType.IQ2_XXS, 2304)]
+    [InlineData((int)GgmlTensorType.IQ2_XXS, 5120, 2)]
+    [InlineData((int)GgmlTensorType.IQ2_XS)]
+    [InlineData((int)GgmlTensorType.IQ2_XS, 2304)]
+    [InlineData((int)GgmlTensorType.IQ2_XS, 5120, 2)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 2304)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 5120, 2)]
+    public void TheDecodeExpertProjection_ServesEveryTokenOfAStep(int ggmlType, int inDim = InDim, int weightOffset = 0)
     {
         const int nt = 3;
-        long rowBytes = NativeDequant.RowSize(ggmlType, InDim);
+        long rowBytes = NativeDequant.RowSize(ggmlType, inDim);
         byte[] gate = QuantRows(ggmlType, Experts * Rows, rowBytes, seed: 3);
         byte[] up = QuantRows(ggmlType, Experts * Rows, rowBytes, seed: 4);
-        var act = new float[nt, InDim];
+        var act = new float[nt, inDim];
         for (int t = 0; t < nt; t++)
-            for (int k = 0; k < InDim; k++)
+            for (int k = 0; k < inDim; k++)
                 act[t, k] = MathF.Sin(0.017f * (k + 5) * (t + 1)) - 0.3f * MathF.Cos(0.043f * k + t);
         int[] sel = { 4, 0, 2, 4, 1, 3 };   // [nt, Used]; expert 4 serves two tokens
 
         using var allocator = new CudaAllocator(0);
         allocator.Context.MakeCurrent();
         using var kernels = Dsv4Kernels.Create();
-        using var gateW = Up(allocator, gate);
-        using var upW = Up(allocator, up);
+        using var gateW = Up(allocator, Shifted(gate, weightOffset));
+        using var upW = Up(allocator, Shifted(up, weightOffset));
         using var actT = Up(allocator, act);
-        using var actQ = new Tensor(allocator, DType.UInt8, nt * (InDim / 32) * 36L);
+        using var actQ = new Tensor(allocator, DType.UInt8, nt * (inDim / 32) * 36L);
         using var selT = Up(allocator, sel);
         using var gateOut = new Tensor(allocator, DType.Float32, sel.Length, Rows);
         using var upOut = new Tensor(allocator, DType.Float32, sel.Length, Rows);
-        allocator.Kernels.LaunchQuantizeQ81Rows(Dsv4CudaEngine.Ptr(actT), Dsv4CudaEngine.Ptr(actQ), InDim, nt,
+        allocator.Kernels.LaunchQuantizeQ81Rows(Dsv4CudaEngine.Ptr(actT), Dsv4CudaEngine.Ptr(actQ), inDim, nt,
             allocator.Stream.Handle, warpCooperative: true);
-        kernels.MoeGateUpDecode(Dsv4CudaEngine.Ptr(gateW), Dsv4CudaEngine.Ptr(upW), actQ, selT, gateOut, upOut,
-            ggmlType, Rows, InDim, rowBytes, nt, Used, allocator.Stream.Handle);
+        kernels.MoeGateUpDecode(Dsv4CudaEngine.Ptr(gateW) + weightOffset, Dsv4CudaEngine.Ptr(upW) + weightOffset, actQ, selT,
+            gateOut, upOut, ggmlType, Rows, inDim, rowBytes, nt, Used, allocator.Stream.Handle);
         allocator.Stream.Synchronize();
 
         float[,] rounded = QuantizeDequantizeQ8_1(act);
         float[] gotGate = Down(gateOut, sel.Length * Rows);
         float[] gotUp = Down(upOut, sel.Length * Rows);
-        var w = new float[InDim];
+        var w = new float[inDim];
         for (int s = 0; s < sel.Length; s++)
         {
             float[] a = Row(rounded, s / Used);
@@ -157,9 +192,9 @@ public sealed class Dsv4ExpertKernelTests
             {
                 for (int r = 0; r < Rows; r++)
                 {
-                    NativeDequant.DequantizeToFloat32(ggmlType, weights, (int)(((long)sel[s] * Rows + r) * rowBytes), w, 0, InDim);
+                    NativeDequant.DequantizeToFloat32(ggmlType, weights, (int)(((long)sel[s] * Rows + r) * rowBytes), w, 0, inDim);
                     double sum = 0, mag = 0;
-                    for (int k = 0; k < InDim; k++)
+                    for (int k = 0; k < inDim; k++)
                     {
                         sum += (double)w[k] * a[k];
                         mag += Math.Abs((double)w[k] * a[k]);
@@ -200,23 +235,30 @@ public sealed class Dsv4ExpertKernelTests
 
     /// <summary>Each member slot's output against the dequantized expert weights, with both operands
     /// rounded to F16 as the kernel stages them, so what remains is accumulation order.</summary>
-    private static void AssertMatches(string what, byte[] weights, int ggmlType, long rowBytes,
+    private static void AssertMatches(string what, byte[] weights, int ggmlType, long rowBytes, int inDim,
         int[] counts, int[] offsets, Func<int, float[]> activation, float[] got)
     {
-        var w = new float[InDim];
+        var w = new float[inDim];
+        var wh = new double[inDim];
         for (int e = 0; e < Experts; e++)
         {
+            // The members' activations, rounded to F16 once per expert rather than once per row.
+            var acts = new double[counts[e]][];
+            for (int i = 0; i < counts[e]; i++)
+                acts[i] = Array.ConvertAll(activation(offsets[e] + i), v => (double)(float)(System.Half)v);
             for (int r = 0; r < Rows; r++)
             {
-                NativeDequant.DequantizeToFloat32(ggmlType, weights, (int)(((long)e * Rows + r) * rowBytes), w, 0, InDim);
+                NativeDequant.DequantizeToFloat32(ggmlType, weights, (int)(((long)e * Rows + r) * rowBytes), w, 0, inDim);
+                for (int k = 0; k < inDim; k++)
+                    wh[k] = (float)(System.Half)w[k];
                 for (int i = 0; i < counts[e]; i++)
                 {
                     int s = offsets[e] + i;
-                    float[] a = activation(s);
+                    double[] a = acts[i];
                     double sum = 0, mag = 0;
-                    for (int k = 0; k < InDim; k++)
+                    for (int k = 0; k < inDim; k++)
                     {
-                        double p = (double)(float)(System.Half)w[k] * (float)(System.Half)a[k];
+                        double p = wh[k] * a[k];
                         sum += p;
                         mag += Math.Abs(p);
                     }
@@ -237,6 +279,18 @@ public sealed class Dsv4ExpertKernelTests
         return t;
     }
 
+    /// <summary><paramref name="bytes"/> behind <paramref name="offset"/> zero bytes: uploaded and read
+    /// from the device pointer plus the offset, a matrix whose rows sit off the allocation's alignment
+    /// (a weight inside a GGUF mapping is placed by the file).</summary>
+    internal static byte[] Shifted(byte[] bytes, int offset)
+    {
+        if (offset == 0)
+            return bytes;
+        var shifted = new byte[offset + bytes.Length];
+        Buffer.BlockCopy(bytes, 0, shifted, offset, bytes.Length);
+        return shifted;
+    }
+
     /// <summary>Read back what a kernel wrote through a raw pointer.</summary>
     internal static float[] Down(Tensor t, int count)
     {
@@ -253,7 +307,7 @@ public sealed class Dsv4ExpertKernelTests
     }
 
     /// <summary>Deterministic bytes for <paramref name="rows"/> quantized rows: every bit pattern is a
-    /// valid encoding except the F16 block scales, which are set to small finite values.</summary>
+    /// valid encoding except the block scales (F16, or MXFP4's E8M0), which are set to small finite values.</summary>
     internal static byte[] QuantRows(int ggmlType, int rows, long rowBytes, int seed)
     {
         var bytes = new byte[rows * rowBytes];
@@ -275,6 +329,12 @@ public sealed class Dsv4ExpertKernelTests
             (int)GgmlTensorType.IQ4_NL => (18, new[] { 0 }),
             (int)GgmlTensorType.IQ4_XS => (136, new[] { 0 }),
             (int)GgmlTensorType.Q5_1 => (24, new[] { 0 }),
+            (int)GgmlTensorType.IQ1_S => (50, new[] { 0 }),
+            (int)GgmlTensorType.IQ2_S => (82, new[] { 0 }),
+            (int)GgmlTensorType.IQ2_XXS => (66, new[] { 0 }),
+            (int)GgmlTensorType.IQ2_XS => (74, new[] { 0 }),
+            (int)GgmlTensorType.IQ3_XXS => (98, new[] { 0 }),
+            (int)GgmlTensorType.MXFP4 => (17, Array.Empty<int>()),
             _ => throw new ArgumentOutOfRangeException(nameof(ggmlType)),
         };
         for (int b = 0; b * blockBytes < bytes.Length; b++)
@@ -295,6 +355,9 @@ public sealed class Dsv4ExpertKernelTests
                 bytes[b * blockBytes + 2] = (byte)mBits;
                 bytes[b * blockBytes + 3] = (byte)(mBits >> 8);
             }
+            // MXFP4's block scale is one E8M0 byte, 2^(e-127): small powers of two, not random exponents.
+            if (ggmlType == (int)GgmlTensorType.MXFP4)
+                bytes[b * blockBytes] = (byte)(119 + b % 5);
         }
         return bytes;
     }

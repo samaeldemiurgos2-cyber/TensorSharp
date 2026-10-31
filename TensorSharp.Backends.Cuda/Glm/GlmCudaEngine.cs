@@ -229,7 +229,8 @@ namespace TensorSharp.Cuda
             {
                 var L = m.Layers[il];
                 if (L.Moe)
-                    CudaMoe.RequireExpertDecoders("glm-cuda", _devs[0].DK.DecodesQ5_1Experts, il, L.GateExps, L.UpExps, L.DownExps);
+                    CudaMoe.RequireExpertDecoders("glm-cuda", _devs[0].DK.DecodesQ5_1Experts, il, L.GateExps, L.UpExps, L.DownExps,
+                        decodesLowBitIq: _devs[0].DK.DecodesLowBitIqExperts);
             }
             // ---- placement: contiguous runs of layers, each device filled to the same share of
             // what it has free after its fixed scratch ----

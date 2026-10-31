@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash（`deepseek41`）
 
-> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。在 `ggml_cuda` 上再加 `--tp-node-id` 与 `--tp-peers` 可跨节点运行，N 为每个节点的本地 GPU 数。配置及限制见[多节点推理](../multi-node-inference.md)（英文）。下面的历史测量保留原有拓扑，不构成新增分布式按层切分路径的验证。
+> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。在 `ggml_cuda` 上（按层切分或 TP）、或在 `cuda` 上配合 `--layer-split N`（Direct CUDA 引擎的 stage，见[后端](#后端)）再加 `--tp-node-id` 与 `--tp-peers` 可跨节点运行，N 为每个节点的本地 GPU 数。配置及限制见[多节点推理](../multi-node-inference.md)（英文）。下面的历史测量保留原有拓扑，不构成新增分布式按层切分路径的验证。
 
 [← 返回模型索引](README_zh-cn.md) | [English](deepseek41.md)
 
@@ -118,8 +118,10 @@ Q2_K-Q5。每次新验证都须记录 revision 与全部分片哈希。
   `deepseek41v`）发布，`--mmproj` 可直接加载；图像 token 的路由偏置取自文本分片
   （`blk.N.exp_probs_b_vl.bias`）。
 
-托管执行器 `--backend cuda` 与 `--backend cpu` 不读取这种布局，会在映射任何权重之前根据文件头拒绝这些文件，
-见[后端](#后端)。本轮已完成的加载与分布式对照覆盖 `ggml_cuda` 上的 `UD-IQ2_XXS`，其他量化版本需要单独验证。修订 `60ad3651…` 的
+托管执行器 `--backend cuda` 与 `--backend cpu` 以同样方式读取这种布局的 Engram 部分：合并表中每层的切片
+成为所在分片的视图（不复制任何数据），`engram_gate` 缩放 query，key 保持纯 RMS 归一化。1017 的路由
+专家仍使这些文件无法在 `cpu` 上运行。`cuda` 在专家留在显存中时能解码全部类型：`UD-IQ2_XXS` 文件的 10 层
+截断版本已在它上面按[逐阶段 oracle](#对照-ggml_cuda-的逐阶段-oracle) 运行过，完整文件也已在两个各有两张 A40 的节点上对照 `ggml_cuda` 运行过（[完整 1017 在 `cuda` 上的 2 节点 x 2 A40 运行](#完整-1017-在-cuda-上的-2-节点-x-2-a40-运行)）；见[后端](#后端)。本轮已完成的加载与分布式对照覆盖 `ggml_cuda` 与 `cuda` 上的 `UD-IQ2_XXS`，其他量化版本需要单独验证。修订 `60ad3651…` 的
 `UD-Q4_K_XL` 含 Engram 类型 43，测试所用未修改的 ggml `3612c0af…` 不支持该类型，
 实际加载失败；详见[验证报告](../deepseek41_validation.md)。
 
@@ -639,8 +641,41 @@ Engram 表、延迟 hyper-connection 门控、共享专家，以及检查点里�
 （原始行 FP8 E4M3、索引器 MXFP4、压缩 cache NVFP4）。它以 atol=rtol=2e-5 对齐独立的
 PyTorch 参考实现 `eng/dsv41-reference.py`，并要求贪心 argmax 完全一致，覆盖一次性
 prefill、分块大小 1/3/5/8 与 reset——不过那是 fixture 规模的对齐，而不是在已发布权重上
-的等价。Direct CUDA 引擎 `--backend cuda` 同样用自己的内核、不经 ggml 运行 V4.1，但还
-没有数值门禁。和 `ggml_cpu` 一样，这两条都是正确性与可移植性通道，而不是服务通道；
+的等价。Direct CUDA 引擎 `--backend cuda` 同样用自己的内核、不经 ggml 运行 V4.1。它在一个
+用 C# 生成、形状仿照 1017 的检查点（`InferenceWeb.Tests` 的 `Dsv41SyntheticModelBuilder`）上对齐
+`ggml_cuda` 与 `ggml_cpu`（两者都使用精确 prefill，`TS_DSV41_YOCO_KEEP=0`）：llama.cpp 的合并
+Engram 布局、1017 的 IQ1_S/IQ2_S/IQ2_XXS gate+up 与 IQ2_S/IQ3_XXS/IQ2_XS/IQ2_XXS/Q2_K down 专家
+（专家宽度 768，行只按 2 字节对齐）、Q6_K/Q8_0 注意力、Q5_K/Q8_0 共享专家、BF16 压缩器与索引器，
+提示长度足以让稀疏选择和候选掩码生效。脚本是 150 个 token 的 prefill（三个 64 token 的 ubatch）、
+15 步解码、在奇数位置 165 追加 21 个 token（一次多行调用补完某个解码步开始的压缩块）、再解码 2 步，
+然后 reset，重新运行提示与前 3 步解码，结果必须与第一次逐位相同。依次强制每条路由专家路径
+（tensor core、寄存器暂存、warp-per-row、per-slot），每个 logit 向量与原生结果的相对 L2 都在 2e-2
+以内且 argmax 相同：实测对 `ggml_cuda` 最大 8.2e-3，对 `ggml_cpu` 最大 9.7e-3。这个检查点经过调理，
+使两个正确的引擎能满足这样的界限：在全尺寸更新的随机权重上，两个 ggml 后端彼此就相差 9e-2，因为路由、
+稀疏选择以及 FP8/NVFP4/MXFP4 cache 舍入会把舍入差异放大。它只写入很小的注意力与共享专家更新，所以
+logits 对注意力路径、以及每次调用最后一行以外的所有行都只是粗略可见：完全去掉稀疏选择只让 logits 变化
+1.6e-2。因此各阶段还逐行对齐原生执行器自己的转储（`TS_DSV41_TRACE_DIR` 对 `TS_DSV4_CUDA_TRACE_DIR`）：
+
+- 每个路由专家块的输出：在每条强制路径上、每次调用的每一行、每一层，相对 L2 不超过 0.1 加上它所接收
+  的残差流误差的两倍（实测对 `ggml_cuda` 最大 4.5e-2）。超出的行必须是路由翻转，即 Direct 引擎自己
+  第四与第五个专家选择相差不超过 2e-2（对任一后端，1128 行中各有一行，余量 3e-3 到 5e-3）。它选中的
+  专家必须是它自己的路由得分加选择偏置后的前四名；偏置决定了其中 183 行的选择。
+- 稀疏注意力。两边都把索引器的 query 与 key 舍入到训练时的 4 bit cache 格式，所以两个引擎的得分每个
+  token 平均相差约 6%，约一半 token 的选择相差一两行；每个引擎必须精确完成的是基于自己得分的算术。
+  每个索引源打分的行（全部可见行；候选层之后，是它最好的四个 8 行块，且查询自己所在的块排第一）以及
+  它选出的 16 行，在两个引擎上都按这些规则检查，而 ggml 的转储表明这些规则正是它的算术。得分按 token
+  并按平均值对齐 ggml，压缩器的 latent 逐行对齐（最大 4.3e-3），注意力输出在所有选择与 ggml 相同的
+  行上对齐（最大 3.4e-2）。
+- Engram 阶段：逐 token 的投影行（解码时 2e-7；Direct 引擎 prefill GEMM 读取 F16 激活时 5.4e-3），
+  以及每个引擎实际施加的门控更新，相对于残差流（解码时 2.2e-5，多行调用时 4.8e-4）。
+
+每项阶段检查都能抓到一个让所有 logit 向量仍在 2e-2 以内的人为注入错误：分组专家路径在第 3-5 层丢掉
+繁忙专家第 16 个之后的成员；消费层在另一个源的压缩 cache 上做注意力；候选层多保留一个块；Engram 门控
+在多行调用中使用下一个 token 的 key；压缩器丢掉奇数位置调用补完的块。把 IQ1_S 解码器的 delta 符号取反，
+logits 本身就会失败（每个向量偏离 3.9e-2 到 7.7e-2，在脚本较早的 16 步形式上测得）。
+`eng/validation/compare-dsv4-traces.py` 可逐阶段比对 `TS_DSV4_CUDA_TRACE_DIR` 与
+`TS_DSV41_TRACE_DIR` 的转储（它映射原生的 `v41.NN.<stage>` 命名，包括压缩器的 latent，并推导出 Direct
+引擎折叠进内核的 Engram 门控），定位模型第一次偏离的位置。和 `ggml_cpu` 一样，这两条都是正确性与可移植性通道，而不是服务通道；
 细节见[在 ggml CPU 后端上运行](#在-ggml-cpu-后端上运行)的末尾。`--backend mlx` 仍然被
 拒绝。
 
@@ -648,36 +683,103 @@ prefill、分块大小 1/3/5/8 与 reset——不过那是 fixture 规模的对�
 |---|---|---|---|---|
 | `ggml_cuda` | TensorSharp 布局与 llama.cpp 布局（unsloth 1017） | `--layer-split N`、路由专家 `--tp 2..8` | 按层切分（每节点 1–8 张 GPU）与路由专家 TP（全局 2–16 个 rank） | 服务 |
 | `ggml_cpu` | 两种 | 不适用（一个 CPU 设备） | 拒绝 | 正确性、可移植性 |
-| `cuda` | 仅 TensorSharp 布局 | `--layer-split N`；拒绝 `--tp` | 拒绝 | 正确性、可移植性 |
-| `cpu` | 仅 TensorSharp 布局 | 不适用 | 拒绝 | 正确性、可移植性 |
+| `cuda` | 两种 | `--layer-split N`；拒绝 `--tp` | 按层切分（每节点 1–8 张 GPU，driver 运行最后一个 stage）；拒绝 TP | 正确性、可移植性 |
+| `cpu` | 两种 | 不适用 | 拒绝 | 正确性、可移植性 |
 | `ggml_vulkan`、`ggml_metal`（`TS_DSV41_ALLOW_NON_CUDA_GPU=1`） | 两种 | 一张 GPU | 拒绝 | 可移植性 |
 
-两个托管执行器 `cuda` 与 `cpu` 只读取 TensorSharp 的逐层 Engram 布局：`deepseek41.engram.*`
-元数据（层号、乘数、素数、偏移、已压缩的 pad id），以及 `blk.N.engram_embd`、`engram_wkv`、
-`engram_q`、`engram_k` 张量，也就是 `eng/dsv41-fixture.py` 写出的布局。unsloth 的
-DeepSeek-V4.1-Flash-1017 GGUF 使用 llama.cpp 的合并布局（`deepseek41.ple.*` 元数据、单个
-`per_layer_token_embd.weight` 表、`engram_kv` 与融合的 `engram_gate`），只有 `ggml_cuda` 与
-`ggml_cpu` 背后的原生加载器读取它。`cuda` 与 `cpu` 会在映射任何权重之前根据文件头拒绝它，
-报错为 `This DeepSeek V4.1 GGUF stores its Engram tables in llama.cpp's combined layout ...
-Use --backend ggml_cuda, which loads both layouts`；此前它们会在执行器内部以
-`Missing or invalid DeepSeek V4.1 GGUF metadata: deepseek41.engram.pad_id` 失败。
+两个托管执行器 `cuda` 与 `cpu` 读取任一种 Engram 布局，并与原生加载器完全一样地判定布局（存在
+`deepseek41.ple.layers` 且不存在 `deepseek41.engram.layer_ids` 即为合并布局）。TensorSharp 的逐层布局是
+`deepseek41.engram.*` 元数据（层号、乘数、素数、偏移、已压缩的 pad id），以及 `blk.N.engram_embd`、
+`engram_wkv`、`engram_q`、`engram_k` 张量，也就是 `eng/dsv41-fixture.py` 写出的布局。unsloth 的
+DeepSeek-V4.1-Flash-1017 GGUF 使用的 llama.cpp 合并布局是 `deepseek41.ple.*` 元数据、单个
+`per_layer_token_embd.weight` 表、`engram_kv` 与融合的 `engram_gate`（q*k）。对这种布局，逐层偏移
+被重定位到该层在表中的切片上，原始的 `engram.pad_token_id` 像 `engram.py` 一样经 token 映射压缩。每个
+切片随后作为该层的 `blk.N.engram_embd.weight` 暴露：它是存放该表的分片中的一段行区间，原地映射或流式
+读取。合并表条目本身被移除，因此 `TS_DSV4_MMAP=0` 不会把 126 GiB 缓冲两次（在仿 1017 的 fixture 上，纯 C#
+执行器只以两个行视图的形式缓冲一次该表，结果与映射读取完全相同）。`--backend cuda` 与 `ggml_cuda` 一样放置
+这些表：层切分在不额外卸载专家的前提下放得下就放进显存，否则使用主机映射；`TS_DSV41_ENGRAM_DEVICE=0` 强制
+主机映射（1017 的 62.9 GiB 切片在 46 GB GPU 上就走这条路径），`=1` 要求驻留显存。Direct 引擎以前忽略这个
+变量。强制主机映射时，fixture 的 logits 与显存中的表逐位相同。`engram_gate` 缩放归一化后的
+query，key 的增益为全 1，这正是原生计算图的算术。在改写为合并布局的 fixture 上，两个执行器的 logits
+与携带同一融合乘积的逐层副本逐位相同。1017 的 `deepseek41.attention.indexer.candidate_top_k_blocks`
+被这两个执行器与原生加载器一样读作候选预算，因此 ggml 与托管执行器按同一预算剪枝（同时含有
+`candidate_top_k` 的文件两者必须一致）。
+
+托管执行器仍会在映射任何权重之前根据文件头拒绝混用两种布局或只带合并布局一部分的文件：没有
+`deepseek41.ple.layers` 的 `per_layer_token_embd.weight` 表或 `deepseek41.ple.*` 键、与 TensorSharp 的
+`deepseek41.engram.layer_ids` 并存的合并表，或与逐层表并存的 `ple` 元数据。报错为
+`This DeepSeek V4.1 GGUF has ... never a mix or a part of one, so it cannot tell which rows belong to which
+Engram layer.`；此前不完整的情况会在执行器内部以 `Missing or invalid DeepSeek V4.1 GGUF metadata:
+deepseek41.engram.pad_id` 失败。
 
 Direct CUDA 引擎还会在上传任何数据之前，按实际执行位置检查每个路由专家张量。它的 GPU 专家
-内核实现了 Q8_0、Q6_K、Q5_K、Q4_K、Q3_K、Q2_K、IQ3_S、IQ2_XXS 与 MXFP4（IQ2_XXS 只走逐 token
-内核，不走 tensor core 或寄存器暂存的 prefill 内核）；用 `--n-cpu-moe` 卸载的层在托管主机
-matmul 上运行，它支持的类型集合不同（支持 IQ2_XS 与 IQ3_XXS，不支持 IQ2_XXS 与 Q3_K）。无法在
-层切分所放位置运行的张量会按名称被拒绝，例如 `blk.0.ffn_gate_exps.weight is IQ1_S (GPU-resident)`；
-此前整个检查点会先流式上传到显存，直到第一个经过该层的 token 才以一个裸类型编号失败。即使改成
-TensorSharp 布局，1017 `UD-IQ2_XXS` 的专家在 `cuda` 上也会被拒绝：其 gate/up 张量为
-IQ1_S（10 层）、IQ2_S（15 层）与 IQ2_XXS（15 层），down 张量为 IQ2_S（15）、IQ3_XXS（15）、
-IQ2_XS（6）、IQ2_XXS（3）与 Q2_K（1）。IQ1_S 与 IQ2_S 在两处都无法运行，因此任何 `--n-cpu-moe`
-取值都不能让该文件在 `cuda` 上加载。
+内核与 GLM-5.3-Flash、Qwen3.8 的 Direct 引擎共用，在所有路径上（逐 token 解码内核，以及 prefill
+的 tensor core、寄存器暂存与逐行 warp 内核）实现了 Q8_0、Q6_K、Q5_K、Q5_1、Q4_K、Q3_K、Q2_K、
+IQ4_XS、IQ4_NL、IQ3_S、IQ3_XXS、IQ2_S、IQ2_XS、IQ2_XXS、IQ1_S 与 MXFP4。这覆盖了 1017
+`UD-IQ2_XXS` 文件的全部路由专家类型：gate/up 为 IQ1_S（10 层）、IQ2_S（15 层）与 IQ2_XXS（15 层），
+down 为 IQ2_S（15）、IQ3_XXS（15）、IQ2_XS（6）、IQ2_XXS（3）与 Q2_K（1）。用 `--n-cpu-moe`
+卸载的层在托管主机 matmul 上运行，它支持的类型集合不同（支持 IQ2_XS、IQ3_XXS 与 Q2_K，不支持
+IQ1_S、IQ2_S、IQ2_XXS 与 Q3_K），因此该文件的专家在 `cuda` 上必须留在显存中。无法在层切分所放
+位置运行的张量会按名称被拒绝，例如 `blk.0.ffn_gate_exps.weight is IQ1_S (offloaded by --n-cpu-moe)`；
+此前整个检查点会先流式上传到显存，直到第一个经过该层的 token 才以一个裸类型编号失败。显卡放不下这样的
+文件时，显存不足的拒绝信息会说明任何卸载都无济于事，并给出第一个挡路的张量（`... and
+blk.0.ffn_gate_exps.weight is IQ1_S, which the host matmul behind --n-cpu-moe does not implement`）；
+此前它会建议一个 `--n-cpu-moe` 值，而引擎随后又会拒绝该值。IQ1_S 与 IQ2_S 解码器，以及 IQ2_XXS 的
+tensor core 与寄存器暂存解码器，是较新的内核代码。在由更旧源码构建的内核模块（尚未重新生成的已提交
+PTX 基线，没有 nvcc 的机器会加载它）上，引擎会按名称拒绝 IQ1_S 与 IQ2_S 专家，
+`blk.N.ffn_gate_exps.weight is IQ1_S, and the loaded tensorsharp_dsv4_kernels module was built from
+kernel source older than its IQ1_S expert decoder`，而不是把它们当作 Q8_0 读取；IQ2_XXS 专家则在这种
+模块已有的逐 token 与逐行 warp 内核上运行。检查针对的是设备实际加载的模块，并在上传任何数据之前完成。在此之前，该引擎
+自带一份更窄的类型列表，会拒绝 IQ1_S、IQ2_S、IQ2_XS 与 IQ3_XXS。这些内核已对同一字节的 ggml
+反量化结果做过检查，引擎在上面仿 1017 的 fixture 上对照过 `ggml_cuda`；1017 自身的权重在 10 层截断版本上
+逐阶段检查过（[逐阶段 oracle](#对照-ggml_cuda-的逐阶段-oracle)），并以完整模型在 2 节点 x 2 A40 上运行，最终 logits
+通过了对照 `ggml_cuda` 的门禁（[完整 1017 在 `cuda` 上的 2 节点 x 2 A40 运行](#完整-1017-在-cuda-上的-2-节点-x-2-a40-运行)）。
+那次运行中所有专家都留在显存里；这些专家的其他量化版本尚未运行过。
 
-多节点 DeepSeek V4.1 只支持 `ggml_cuda`，分布式按层切分与分布式路由专家 TP 都是如此。Direct CUDA
-引擎没有跨节点的 stage 执行器或集合通信，因此 `--backend cuda` 配合 `--tp-node-id`/`--tp-peers`
-会在联系任何对端之前被拒绝：`Architecture 'deepseek41' does not implement distributed
---layer-split on --backend cuda. Its distributed stage executor runs on --backend ggml_cuda; ...`
-（张量并行的报错与之对应）。
+分布式路由专家 TP 只支持 `ggml_cuda`（在 `cuda` 上会在联系任何对端之前被拒绝）。分布式按层切分也能在
+Direct CUDA 引擎上运行：`--backend cuda --layer-split N --tp-node-id K --tp-peers ...`，CLI、服务端（driver）
+与 `eng/validation/DeepSeek41DistributedProbe` 使用同样的参数。每个节点是流水线的一个 stage：
+
+- 切分点由各分片文件头中的字节数决定，从不取决于空闲显存，因此每个节点算出的结果相同：对每层的权重、
+  缓存以及切分所需的缓存副本做 `LayerSplitPlan.CreateWeighted`，embedding 计在第一张 GPU，head 计在最后
+  一张。1017 在 2 节点 x 2 GPU、64K 上下文下为 (12, 22, 31)，与 `ggml_cuda` 相同。随后每个节点只检查自己的
+  部分（权重、缓存、它持有的缓存副本、embedding 或 head）能否放下；某个节点放不下时，它拒绝加载并指明 GPU
+  与字节数，其他节点也在上传任何权重之前随之拒绝。不会挪动任何层。
+- 每个节点只描述、映射、预读和上传自己的层（拥有第 0 层时还有 embedding，拥有最后一层时还有 head）。
+- 有多张 GPU 的节点在第一张 GPU 上接收边界状态，并经自己的节点内边界把后面的 GPU 要读取的内容继续传下去：
+  1017 在 2 x 2 下，节点 0 在第一张 GPU 上收到第 20 组的缓存行与候选掩码，第二张 GPU 上的第 31–39 层读取它们。
+  每个进程内边界都会检查：对边界之后仍要读取的每个组，所传递的恰好是本 ubatch 封闭的块（无论是本地提交的
+  还是接收到的）；边界之后的层用候选掩码剪枝时，掩码必须处于激活状态。这与网络接收端校验载荷的方式相同。
+- 每个 ubatch 的 stage 边界携带隐藏流、延迟的超连接门控、该 stage 为边界之后仍要读取的每个组所提交的
+  压缩与索引器缓存行、已发布的稀疏选择以及候选掩码（可见的列），与进程内切分在两张 GPU 之间传递的内容
+  一致。载荷是自描述的：头部含布局哈希（维度、压缩比、来源层、放置、ubatch、上下文）、位置与序号，
+  接收端先校验它们，并按位置重新计算已提交的行区间，之后才把任何数据送到 GPU。1017 的 21|22 边界上，
+  深度 2K 时每个解码 token 约 87 KB（64K 时 151 KB），每个 256 token 的预填充 ubatch 为 21–37 MB。载荷必须
+  能装进一个传输帧（2 GiB）：会超出的预填充宽度与上下文（例如 1M 上下文下 2048 行：仅候选掩码就有 2 GiB）
+  会在启动时被所有节点拒绝。
+- 每个节点对检查点文件头以及每个会改变引擎数值的设置（`TS_DSV4_UBATCH`、`MAX_CONTEXT`、
+  `TS_CUDA_QMM_F16GEMM_*`、`TS_CUDA_Q80_*`、`TENSORSHARP_CUDA_MOE_FUSION`、`TS_DSV41_ENGRAM_DEVICE` 等）
+  求摘要，再对放置与内核模块（GPU 加载的镜像的 SHA-256、构建的版本与源码修订、边界线格式版本以及解码器）
+  求摘要，任何不一致都会让所有节点拒绝加载。
+- driver（节点 0）运行最后一个 stage，因此 logits 从不经过网络；`cuda` 上拒绝
+  `TENSORSHARP_LAYER_SPLIT_DRIVER_STAGE=first`，也拒绝 `--n-cpu-moe`/`--cpu-moe` 与 DSpark 草稿器。与
+  `ggml_cuda` 一样只服务一个镜像序列：没有槽位、截断或前缀复用。除非设置 `TS_DSV41_ENGRAM_DEVICE=1`，
+  Engram 表保持为主机映射。
+- 某个节点在 forward 中途失败时会中止整个网络：其他节点立即让请求失败，而不是等到传输超时；之后所有节点
+  都必须重启。
+
+覆盖范围：在一张 GPU 上的两节点回环（每个节点是进程内的一个 stage，经真实 TCP 通信），使用 1017 形状的
+合成 fixture，把切分点分别强制放在 KV 来源层之后、候选来源层之后和 Engram 层之后，多 ubatch 预填充、18 次
+解码、一次追加以及 reset 后重新预填充的每个 logit 都与单进程引擎逐位相同；以两个进程运行
+`DeepSeek41DistributedProbe` 也是如此，服务端的启动路径驱动一个 worker 时同样如此。测试中，有多张 GPU 的节点
+以多个逻辑设备运行（每个逻辑设备有自己的分配器、流、事件与内核模块；逻辑设备 d 运行在编号为 d mod 可见 GPU 数的
+物理 GPU 上）：在一个压缩比为 1 的组被四层读取的合成拓扑上，2 个各有 2 张 GPU 的节点（接收到的行与掩码经
+节点 0 的节点内边界继续传递）以及 3 个各有 1 张 GPU 的节点（中间节点接收并继续发送它们）也逐位相同，单进程在
+2 到 4 张 GPU 上的切分同样如此。只有一张 GPU 时，所有逻辑设备共用它；在有两张 A40 的主机上，2 个各有 2 张 GPU
+的节点那次运行把每个节点的两个设备分别放在两张物理 GPU 上（两个节点在同一进程内共用它们）。这些运行都使用合成
+fixture。目前在 `cuda` 上分布式运行过的唯一真实检查点是两个各有两张 A40 的 pod 上的完整 1017，它对照的是 `ggml_cuda`，
+而不是单进程 `cuda` 运行（这里没有能单独放下它的主机）；见
+[完整 1017 在 `cuda` 上的 2 节点 x 2 A40 运行](#完整-1017-在-cuda-上的-2-节点-x-2-a40-运行)。
 
 在 `ggml_cuda` 上，V4.1 的 attention 运行 TensorSharp 自有的 F32 内核（ggml 的 CUDA flash
 attention 会把 Q 与 softmax 权重收窄到 F16，而 cache 量化可能放大丢失的这些位）。**prefill
@@ -747,6 +849,128 @@ token 的检查点默认至少保留窗口 + 8。只有 ggml 执行器实现了�
 [为图保留的设备内存](#为图保留的设备内存)）。CPU 执行器与 direct CUDA 引擎保持 256。任何
 显式值都原样使用；`TS_DSV4_UBATCH=256` 恢复此前固定的默认值。模型声明的窗口更大，并不意味着
 某个具体的 GPU 配置能分配或高效服务那么长的上下文。
+
+### 对照 `ggml_cuda` 的逐阶段 oracle
+
+`eng/validation/dsv41-stage-oracle.py` 在真实权重上逐阶段检查 `--backend cuda`。它读取同一组 token
+的两份 trace：一份来自 direct 引擎（`TS_DSV4_CUDA_TRACE_DIR`），一份来自 `ggml_cuda`
+（`TS_DSV41_TRACE_DIR`，配合 `TS_DSV41_YOCO_KEEP=0`）。它以 float64 从 GGUF 权重和各引擎自己在该阶段的
+trace 输入重新计算每个阶段，因此评判的是每个引擎在该阶段新增的舍入，而不是它从前面继承的误差。
+
+它的 gate 要求：
+
+- direct 引擎在每个阶段的误差不超过 ggml 的 1.25 倍，逐次调用与整体都如此（F32 阶段不超过 1e-6）；
+- 提交的 cache 行与训练格式的重放相同，只允许平局；
+- 每个稀疏选择与路由选择都是引擎自身分数的精确 top-k，误差在推导出的 F32 界之内；
+- ggml 自身的误差须符合 ggml-cuda 运算的精度模型，两个引擎都须比扰动变体更符合 oracle 的 attention
+  与 MoE 语义。设置这些双向检查，是为了让 oracle 与 direct 引擎共有的错误同样失败。
+
+规则、局限，以及如何采集和评判一对 trace，见
+[README-dsv41-stage-oracle.md](../../eng/validation/README-dsv41-stage-oracle.md)（英文）。长提示通过
+`dsv41-trace-sink.py` 按层窗口采集。
+
+2026 年 10 月 30 日，它在两张 A40 上针对 1017 `UD-IQ2_XXS` 文件的 10 层截断版本运行。该截断版本保留第
+0–3、20–24 与 36 块，候选预算降到 65 个块，以使剪枝生效。提示长度为 68、773、2,003 与 4,204 个 token，
+各含 4 步 decode。
+
+- direct 引擎的每项检查在每个长度上都通过。
+- gate 在前三个长度上通过。
+- 在 4,204 个 token 时，gate 有一项针对 ggml 自身运算的检查失败：第 4 层上，精度模型对 ggml `attn_out`
+  的重放距离为其误差的 0.405，限值为 0.40。原因是 ggml 用 float32 角度旋转它提交的压缩行，而 oracle
+  用精确角度重建这些行。
+
+这次运行覆盖单进程 `--layer-split 2` 下的十层，并非完整模型的 gate；完整模型的 gate 见下一节。
+
+### 完整 1017 在 `cuda` 上的 2 节点 x 2 A40 运行
+
+2026 年 10 月 30 日，完整的 1017 `UD-IQ2_XXS` 文件（unsloth 修订 `60ad3651…`，300.5 GB）在两个 pod 上用
+direct 引擎运行，每个 pod 有两张 46 GB A40：`--backend cuda --layer-split 2 --tp-node-id {0|1} --tp-peers ...`，
+driver 运行最后一个 stage，`--n-cpu-moe 0`。构建为 TensorSharp `501add66`（与 `main` 在 `9e0d9926` 的源码树
+相同）加上添加本节的改动，测量时该改动尚未提交。除文档以及验证脚本 `eng/validation/run-multinode-case.py` 与其
+测试外，该提交的代码与所测构建完全相同。ggml 为未修改的 `facdc44a`；CUDA 13.2，驱动 595.91。direct 引擎的内核
+由 pod 上的 nvcc 13.2 针对 sm_86 编译，因此没有使用已提交的 PTX（没有 nvcc 的机器会加载它）。两个节点使用同一个
+原生库。
+两个引擎都使用 F16 KV、`TS_DSV4_UBATCH=256`（direct 引擎对 V4.1 的默认值）、`MAX_CONTEXT=65536`、
+`TS_DSV41_ENGRAM_DEVICE=0`（两个 Engram 切片都以主机映射放在节点 1 上）、`TS_DSV41_ENGRAM_WARM=0` 与
+`TS_DSV41_YOCO_KEEP=0`，因此 `ggml_cuda` 运行的是精确 prefill，也是 direct 引擎唯一的 prefill 方式。每次运行
+两个节点都记录了切分点 (12, 22, 31)：节点 1 持有 0–21 层与 embedding，节点 0 持有 22–39 层与 head。节点之间
+经 SSH 隧道通信，与[当前限制](#当前限制与张量并行工作)中 `ggml_cuda` 的测量相同。
+
+**数值。** `DeepSeek41DistributedProbe` 以 teacher-forced 方式运行三段文本（分块 256，128 步 decode）：取自本仓库的
+两段英文文档和一段 C# 源码。它保存每个 logit 向量：整段 prefill、decode、分块 prefill、分块之后的 refill 以及 reset。每个向量与同一 pod 上用逐
+micro-batch 稀疏注意力修复记录的 `ggml_cuda` 参考的同一步比较。限值是 ggml 自身下限的三倍，该下限为 2K
+文本上 ggml 的 ubatch 128 对比 ubatch 256：
+
+| 文本（提示 token 数） | 向量数 | 平均 KL | p95 KL | Top-1 一致率 | Decode PPL 比值（127 个目标） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 限值 | | <= 0.02626 | <= 0.1020 | >= 0.8422 | 0.9623–1.0377 |
+| ggml 自身下限（2K 英文） | 266 | 0.00876 | 0.0340 | 0.9474 | 0.9874 |
+| 2K 英文（1,875） | 266 | 0.00935 | 0.0346 | 0.9774 | 0.9939 |
+| 8K 英文（8,534） | 292 | 0.01957 | 0.0670 | 0.9418 | 1.0136 |
+| C# 代码（1,507） | 264 | 0.00918 | 0.0429 | 0.9545 | 0.9868 |
+
+三段文本都通过。8K 文本用掉平均 KL 允许值的 74.5%，且没有 8K 自己的下限可供对比。2K 探针重跑一次逐位
+相同（266 个向量中 266 个）。每个探针内部，最后一个分块与整段 prefill、每步 refill 与对应的 decode、reset 与
+第一次 prefill 都逐位相同。
+
+**HTTP 套件。** 服务端先在 `cuda` 上、再在 `ggml_cuda` 上运行，构建与设置相同。两者都运行了下文 2 x 2
+`ggml_cuda` 测量所用的套件（`eng/validation/run-http-quality-suite.sh`：问答、JSON、多轮与工具调用），
+`/v1/chat/completions` 上流式与非流式的 Paris/42 冒烟测试，以及
+`benchmarks/engine_comparison/validate_deepseek41_tools.py` 中的十个 V4.1 工具策略场景（DSML 工具调用，
+逐个请求）。两者通过的是相同的 26 项中的 25 项。两者失败的都是 `tool_round_trip`：答案是正确的 JSON，但包在
+代码块里，严格检查会拒绝。
+
+**吞吐。** 两个引擎在同一会话中运行相同的基准（随机 token，decode 128 个 token，每个进程运行四次），
+每种负载按 `cuda`、`ggml_cuda`、`ggml_cuda`、`cuda` 的顺序交错。除热态进程外，每个进程之前都在两个节点上
+逐出 Engram 的页缓存；热态进程重复前一个冷态进程的 token 集合。下表为每个引擎两个进程第 2–4 次运行的中位数
+（六次运行），单位 tok/s：
+
+| 负载 | `cuda` prefill / decode | `ggml_cuda` prefill / decode | `cuda` / `ggml_cuda` |
+| --- | ---: | ---: | ---: |
+| 512 token，冷态 | 98.7 / 8.0 | 152.9 / 27.1 | 0.65 / 0.30 |
+| 2,048 token，冷态 | 137.6 / 9.7 | 207.9 / 27.8 | 0.66 / 0.35 |
+| 2,048 token，热态 | 547.5 / 28.6 | 445.2 / 33.2 | 1.23 / 0.86 |
+| 8,192 token，冷态 | 306.1 / 17.7 | 218.5 / 27.7 | 1.40 / 0.64 |
+| 20,480 token，冷态 | 335.8 / 16.6 | 206.0 / 27.2 | 1.63 / 0.61 |
+
+Engram 行在页缓存中时，direct 引擎的 prefill 比 `ggml_cuda` 的精确 prefill 快 23%，decode 为其 86%。行在存储上
+时，它的 decode 只有 8–18 tok/s。
+
+**吞吐下限。** 这次首个完整模型运行只有一个吞吐目标，即一个下限：在相同的 Engram 状态下，2,048 token 的 prefill
+至少为 `ggml_cuda` 的 0.6 倍，2K 与 8K 上下文处的 decode 至少为 0.8 倍。prefill 达到了下限（冷态 0.66 倍，热态
+1.23 倍）。只要 Engram 行起始为冷态，decode 就达不到：2,048 token 时为 0.35 倍，8,192 token 时为 0.64 倍。热态下
+2,048 token 时达到下限（0.86 倍）；没有 8K 的热态数据。
+
+剖析结果指向 Engram 行的收集，这是最可能的原因。在拥有 Engram 层的节点上，direct 引擎从映射的表中收集行时只在
+token 之间并行（`DeepSeek4CudaExecutor.GatherEngramRows`）。decode 时只有一个 token，因此它在一个线程上从两张表
+各读 24 行，每个未缓存的行都是一次串行的存储往返；`ggml_cuda` 用 16 个 I/O 线程读取它们。在 2,048 token 上使用
+`TS_DSV4_PERF=2` 测得：direct 引擎的节点 1 每个 decode token 冷态耗时 84–95 ms、热态 20 ms；`ggml_cuda` 在该节点
+上的输入准备冷态每个 token 5–7 ms，计算 15 ms。direct 引擎不会逐阶段计时节点 1 的工作，因此这个原因是由代码与
+这些计时推断的，并非直接测量。计划中的修复，也是下一项性能改动，是在行之间（而不仅在 token 之间）并行收集。
+
+8K 与 20K 的冷态中位数也偏向 direct 引擎，但原因并非速度。direct 引擎把读过的行留在映射和缓存中：在 20,480 token
+时，节点 1 的进程常驻内存增长到 89 GB，100 GB 的容器达到上限。之后在新 token 上的运行会找到更多已缓存的行，
+它的 8K prefill 从第 1 次运行的约 140 tok/s 升到第 4 次运行的最高 405 tok/s。`ggml_cuda` 在容器中保持在 19 GB
+以下，后续运行的提升较小（8K：第 1 次 148–181 tok/s，第 2–4 次 188–228）。每个进程的第 1 次运行使用相同的
+token；只看第 1 次运行，`cuda` / `ggml_cuda` 在 512、2,048、8,192 与 20,480 token 上的 prefill 比值为 0.61、
+0.63、0.86 与 0.95，decode 比值为 0.29–0.53。
+
+这些数字需要两个引擎处于相同的 Engram 状态，也不是服务能力的结论：每一行都是经 SSH 隧道的单个序列。`ggml_cuda`
+的 `TS_DSV41_YOCO_KEEP=0` 行是精确 prefill；它默认的 YOCO 重放（近似 prefill）这里没有运行。
+
+**显存。** direct 引擎在加载时分配工作集并一直保持，上下文为 65,536 token。在节点 0 的两张 GPU 与节点 1 的两张
+GPU 上，它在每次探针与基准中（512 到 20,480 token）分别使用 40,539 / 41,111 / 40,433 / 39,791 MiB，在服务端中
+最多再多 31 MiB。最高的是节点 0 的第二张 GPU，它持有第 31–39 层与 head。同一会话中 `ggml_cuda` 在那里的峰值为
+41,611（512 token）到 43,149 MiB（20,480 token）。每张 GPU 在每个整刻钟会出现一次来自 TensorSharp 之外的
+267 MiB 分配；算上它，实测最坏情况为 direct 引擎 41,384 MiB（在服务端中）、`ggml_cuda` 43,416 MiB，分别比
+44 GiB 低 3,672 与 1,640 MiB。
+
+**未覆盖：** YOCO 重放（direct 引擎没有），以及同一会话中以默认 YOCO 重放运行的 `ggml_cuda` 吞吐基线；路由专家
+TP；多于一个序列（分布式运行只服务一个镜像序列，因此没有槽位、批量解码、前缀复用或回退）；其他 KV 类型、上下文、
+ubatch 宽度或分块大小；放在 GPU 上或预热的 Engram；不设置 `TS_DSV4_UBATCH`（这些运行显式设置了默认值 256）；
+长于 8,534 token 的提示上的数值（基准到 20,480 token，但不检查 logits）；8,192 与 20,480 token 的热态吞吐；
+约 1.8K 与 7.3K token 真实文本提示的服务端请求（吞吐行使用随机 token）；完整模型上的已提交 PTX（只有 fixture 与
+内核测试在 A40 上用它运行过）；`--n-cpu-moe`；以及 1017 的其他量化版本。
 
 ### 每张 GPU 一个后端
 
@@ -1119,27 +1343,38 @@ Engram 表、延迟 hyper-connection 门控，以及训练好的 cache 量化。
 `eng/dsv41-reference.py`，覆盖一次性 prefill、分块大小 1/3/5/8 与 reset。那道门禁是
 fixture 规模的——一个五层、hidden 256、16 token 的 F32 合成模型——因此它确立的是与参考
 实现在架构层面的一致，而不是在已发布的 246 GiB Q2_K 权重上的等价；而且不设置
-`TS_DSV41_FIXTURE_DIR` 指向 fixture 目录时，这些测试会静默返回，什么都不检查。与
+`TS_DSV41_FIXTURE_DIR` 指向 fixture 目录时，这些测试会显式跳过并说明缺少该变量。与
 `--backend ggml_cpu` 不同，它不接受视觉伴随文件：那个编码器是原生 ggml 组件，在这里
 `LoadVisionEncoder` 会抛异常，所以图像与视频输入不可用。原生加载器的 Engram 与注意力
 开关——`TS_DSV41_ENGRAM_WARM`、`_THREADS`、`_RANDOM`、
 `TS_DSV41_SPARSE_FA`、`TS_DSV41_COMPACT_RAW_GATHER`——在这里全部无效。Engram 配置直接来自 GGUF，
-且只支持 TensorSharp 布局（见[后端](#后端)）；
+两种 Engram 布局都支持（见[后端](#后端)）；
 `TS_DSV4_THREADS` 在这个后端上默认取
 `ProcessorCount`，而不是 min(核数, 32)；`TS_DSV4_CPU_TRACE_DIR` 写出的逐张量文件与
 `eng/dsv41-reference.py --output` 写出的同名，于是两个目录可以逐张量对拍。和
 `--backend ggml_cpu` 一样，它是正确性与可移植性通道，而不是服务通道：完整检查点在它
 上面的吞吐、加载时间与常驻内存占用都没有测过。
 
-Direct CUDA 引擎 `--backend cuda` 也用自己的内核、不经 ggml 运行 V4.1，且只接受 TensorSharp 布局的
-GGUF（见[后端](#后端)）。它具有逐序列槽位、
-批量解码、会话状态保留，并通过 `--layer-split N` 在本地按整层放置；路由专家 `--tp N` 仍是
-`ggml_cuda` 模式。源码包含针对性的数值约束：
+Direct CUDA 引擎 `--backend cuda` 也用自己的内核、不经 ggml 运行 V4.1，读取两种 Engram 布局
+（见[后端](#后端)）。它具有逐序列槽位、批量解码、会话状态保留，并通过 `--layer-split N` 在单个节点或跨节点
+按整层放置；路由专家 `--tp N` 仍是 `ggml_cuda` 模式。它的数值检查：
+[`Dsv41CudaEngineParityTests`](../../InferenceWeb.Tests/Dsv41CudaEngineParityTests.cs)
+在仿 1017 的 fixture 上把整个引擎与 `ggml_cuda` 和 `ggml_cpu` 对照（见[后端](#后端)）；
+`eng/validation/dsv41-stage-oracle.py` 在真实权重上把每个阶段与 float64 oracle 对照
+（[逐阶段 oracle](#对照-ggml_cuda-的逐阶段-oracle)）；
 [`Dsv4ExpertKernelTests`](../../InferenceWeb.Tests/Dsv4ExpertKernelTests.cs)
 把合成量化专家投影与上游反量化结果对比；
 [`Dsv41CudaSlotTests`](../../InferenceWeb.Tests/Dsv41CudaSlotTests.cs)
 把槽位隔离、批量解码、环形缓存回退与保留状态，和同一 Direct 引擎的全新运行对比，容差为最大
-logit 的 1e-5。这些是内核与状态一致性检查，不是独立的完整模型数值参考或完整检查点质量验证。
+logit 的 1e-5。批量解码步对每个序列稠密投影的计算与该序列自己的单步逐位相同：最多 16 行时，Q2_K 到
+Q6_K、Q8_0、IQ2_XXS、IQ3_XXS、IQ3_S、IQ4_NL、IQ4_XS、MXFP4 与 BF16 权重使用逐行计算与单行一致的内核，
+覆盖 1017 的全部稠密类型：Q5_K（13 层的共享专家）、Q6_K、Q8_0 与 BF16（其压缩器与索引器）
+（[`Dsv4DenseRowInvarianceTests`](../../InferenceWeb.Tests/Dsv4DenseRowInvarianceTests.cs)）。
+F16 与 F32 权重（cuBLAS 按行数选择内核）、旧的 Q4_0 到 Q5_1 类型、IQ2_S 与 NVFP4 不在此保证之内。BF16
+投影在这样的批量步中逐行计算，每行读取一次权重：在 RTX 3080 Laptop GPU 上，16 行时耗时是一次 cuBLAS
+调用的 6 到 14 倍。
+这些是 fixture 规模、逐阶段、内核与状态一致性的检查。完整检查点的门禁另行进行：完整 1017 在 2 节点 x 2 A40 上
+对照 `ggml_cuda` 运行，并跑了 HTTP 套件（[完整 1017 在 `cuda` 上的 2 节点 x 2 A40 运行](#完整-1017-在-cuda-上的-2-节点-x-2-a40-运行)）。
 模型/设备门控测试需要对应夹具与 CUDA 硬件，不可用的场景会跳过。已经验证了什么、还有什么挡着，见 CUDA 后端说明
 `docs/validation/deepseek41-cuda-backend/README.md`（本地验证记录，未提交到 Git）。`--backend mlx`
 仍然被拒绝。
@@ -1240,16 +1475,22 @@ V4.1 没有发布任何委派相关的实测结果。
   作为正确性与可移植性通道，没有实测吞吐；见
   [在 ggml CPU 后端上运行](#在-ggml-cpu-后端上运行)。`cpu` 运行纯 C# 的 V4.1 执行器，
   已按 2e-5 对齐 PyTorch 参考实现；`cuda` 用 Direct CUDA 引擎自己的内核运行 V4.1，
-  它具有针对内核/槽位的约束，但没有独立的完整检查点数值门禁——两者都是正确性与可移植性通道，而不是服务通道。`mlx` 会在读取权重
+  它在仿 1017 的 fixture 上对照 `ggml_cuda`，并在 1017 的 10 层截断版本上逐阶段检查
+  （[逐阶段 oracle](#对照-ggml_cuda-的逐阶段-oracle)），并在 2 节点 x 2 A40 上以完整 1017 对照
+  （[完整 1017 在 `cuda` 上的 2 节点 x 2 A40 运行](#完整-1017-在-cuda-上的-2-节点-x-2-a40-运行)）——两者都是正确性与可移植性通道，而不是服务通道。`mlx` 会在读取权重
   之前失败，而不会把 V4.1 的权重塞进并未实现它的计算图。
-- `cuda` 与 `cpu` 需要 TensorSharp Engram 布局的 GGUF。它们会根据文件头拒绝 llama.cpp 的合并
-  布局（包括 unsloth 的 DeepSeek-V4.1-Flash-1017 GGUF）；这些文件请在 `ggml_cuda` 上运行。在
-  `cuda` 上，1017 `UD-IQ2_XXS` 的路由专家也会在加载时被拒绝：IQ1_S、IQ2_S、IQ2_XS 与 IQ3_XXS
-  没有 GPU 专家内核，而 `--n-cpu-moe` 背后的主机 matmul 不支持 IQ1_S、IQ2_S 与 IQ2_XXS。因此
-  即使把合并布局移植到托管执行器，该文件也无法在 `cuda` 上运行。`cuda` 后端对 1017 检查点
-  没有覆盖。
-- 分布式按层切分与分布式路由专家 TP 只在 `ggml_cuda` 上运行。`cuda`、`cpu`、`ggml_cpu` 以及
-  需显式开启的非 CUDA ggml 后端会在联系对端之前拒绝 `--tp-node-id`/`--tp-peers`。
+- `cuda` 与 `cpu` 读取两种 Engram 布局，包括 unsloth 的 DeepSeek-V4.1-Flash-1017 GGUF 所用的
+  llama.cpp 合并布局。这一点已对真实的 1017 文件头、以及端到端地对改写为合并布局的 fixture 做过
+  检查。尚无 1017 权重在 `cpu` 上运行过；在 `cuda` 上，`UD-IQ2_XXS` 文件的 10 层截断版本已在两张 A40 上以
+  `--layer-split 2` 按[逐阶段 oracle](#对照-ggml_cuda-的逐阶段-oracle) 运行过。1017 `UD-IQ2_XXS` 的路由专家留在
+  显存中时可以通过加载时检查（GPU 专家内核能解码全部类型；早于 IQ1_S 与 IQ2_S 解码器的内核模块会
+  按名称拒绝它们），而 `--n-cpu-moe` 背后的主机 matmul 不支持 IQ1_S、IQ2_S 与 IQ2_XXS。因此在
+  `cuda` 上运行完整文件需要能放下全部专家的 GPU（单台主机，或借助分布式按层切分跨节点）。目前有一次这样的
+  运行，在 2 节点 x 2 A40 上、单序列、使用下表的设置；它覆盖了什么、没有覆盖什么，见
+  [完整 1017 在 `cuda` 上的 2 节点 x 2 A40 运行](#完整-1017-在-cuda-上的-2-节点-x-2-a40-运行)。
+- 分布式路由专家 TP 只在 `ggml_cuda` 上运行；分布式按层切分在 `ggml_cuda` 与 `cuda` 上运行。`cpu`、
+  `ggml_cpu` 以及需显式开启的非 CUDA ggml 后端会在联系对端之前拒绝 `--tp-node-id`/`--tp-peers`，
+  `cuda` 配合 `--tp` 时也是如此。
 - 分布式路由专家 TP 使用主机驱动的交换，而不是本地 TP 的设备侧交换。每个 GPU 驻留的 MoE 层、
   每个 token，每个节点都要经跨节点传输进入两次阻塞的 F32 AllReduce：拼接后的专家激活
   2304 x 6 个值（54 KiB），以及互不重叠的输出行 5120 个值（20 KiB）。所有层的专家都在 GPU 上时，
@@ -1283,6 +1524,20 @@ V4.1 没有发布任何委派相关的实测结果。
   探针上（82 个向量）logits 逐位一致；加上下面的选择修复后，在 23,357 token 的探针上（126 个向量）
   也逐位一致，且每种放置多次运行之间逐位一致。HTTP 套件（问答、JSON、多轮、工具调用）在两种放置下
   均通过，唯一例外是一项严格检查拒绝了包在代码块中的正确 JSON 答案。
+- 2026 年 10 月 30 日，同样的两个 pod（此时为 CUDA 13.2）用同一构建、同一会话运行 direct 引擎
+  （`--backend cuda --layer-split 2`，分布式）并对照精确 prefill 的 `ggml_cuda`，每个冷态进程之前逐出 Engram。
+  第 2–4 次运行的中位数，tok/s，prefill / decode：
+
+  | 2 节点 x 2 A40，按层切分，精确 prefill | `cuda` | `ggml_cuda` |
+  | --- | ---: | ---: |
+  | 2,048 token，Engram 冷态 | 137.6 / 9.7 | 207.9 / 27.8 |
+  | 2,048 token，Engram 热态 | 547.5 / 28.6 | 445.2 / 33.2 |
+  | 20,480 token，开始时 Engram 冷态 | 335.8 / 16.6 | 206.0 / 27.2 |
+
+  只要 Engram 行起始为冷态，`cuda` 的 decode 就达不到这次运行 0.8 倍 `ggml_cuda` 的下限：2,048 token 时为 0.35 倍，
+  8,192 token 时为 0.64 倍（2,048 token 热态为 0.86 倍）。最可能的原因是这些行：拥有它们的节点在 decode 时在一个线程
+  上逐个读取，该节点每个 decode token 冷态耗时 84–95 ms，热态 20 ms。计划中的修复是并行收集这些行。长提示的数字
+  得益于 direct 引擎保留在缓存中的行。数值门禁、HTTP 套件、完整矩阵与覆盖范围见[完整 1017 在 `cuda` 上的 2 节点 x 2 A40 运行](#完整-1017-在-cuda-上的-2-节点-x-2-a40-运行)。
 - 索引与候选选择使用 `ggml_argsort_top_k`。ggml-cuda 的 radix top-k（宽行上的 `ggml_top_k`）按原子
   操作到达顺序处理并列值与输出顺序，因此索引行超过 4,096 时 gather 解码每个 token 的 key 求和顺序都不同，
   超过 16,384 行时候选选择可能保留不同的并列块：长上下文的结果每次运行都不同，分布式 TP 下两个节点

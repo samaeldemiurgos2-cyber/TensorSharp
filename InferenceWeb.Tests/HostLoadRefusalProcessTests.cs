@@ -146,6 +146,20 @@ public class HostLoadRefusalProcessTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// <c>--backend cuda</c> runs the stages of a distributed <c>--layer-split</c> for DeepSeek V4.1 only (the
+    /// direct-CUDA engine's, Dsv4CudaEngine.Distributed.cs). Both hosts still refuse it for another architecture,
+    /// from the checkpoint's header, before a GPU is initialized or a peer contacted (these peers do not exist).
+    /// </summary>
+    [Fact]
+    public void BothHosts_CudaDistributedLayerSplit_IsRefusedForArchitecturesWithoutDirectCudaStages()
+    {
+        string model = new NemotronSyntheticModelBuilder().Write(Path.Combine(_dir, "nemotron-tiny.gguf"));
+        string[] args = { "--backend", "cuda", "--layer-split", "1", "--tp-node-id", "0", "--tp-peers", "127.0.0.1:9,127.0.0.1:10" };
+        foreach (HostRun run in new[] { RunCliWith(model, args), RunServerWith(model, args) })
+            AssertRefused(run, "does not implement distributed --layer-split on --backend cuda");
+    }
+
     // ---- malformed values and removed variables ---------------------------------------
     // The server applies most option families after Build, and those appliers ran outside
     // its configuration-error handler: a malformed --kv-cache-dtype, --spec-draft,

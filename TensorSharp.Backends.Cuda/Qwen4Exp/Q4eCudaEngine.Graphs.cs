@@ -41,9 +41,10 @@ namespace TensorSharp.Cuda
         /// <summary>The step's position, read by every device's graph (PORTABLE pinned memory).</summary>
         private IntPtr _posPinned;
 
-        /// <summary>Decode steps may be captured: not while stages are timed or the sparse selection
-        /// is probed (both read the device mid-step).</summary>
-        private bool CanCaptureDecode => _graphsEnabled && !_graphsFailed && _perf < 2 && SparseProbe == null;
+        /// <summary>Decode steps may be captured: not while stages are timed or the sparse selection or
+        /// the router is probed (they read the device mid-step).</summary>
+        private bool CanCaptureDecode => _graphsEnabled && !_graphsFailed && _perf < 2 && SparseProbe == null
+            && RouterProbe == null;
 
         /// <summary>Captured decode steps this engine holds (tests, diagnostics).</summary>
         internal int CapturedDecodeGraphs => _graphs.Count;

@@ -32,6 +32,7 @@
 #include <stdint.h>
 
 #include "tensorsharp_dsv4_tables.cuh"
+#include "tensorsharp_iq1s_tables.cuh"
 #include "tensorsharp_iq2xxs_tables.cuh"
 
 #define TS_DSV4_QK8_1 32
@@ -69,6 +70,28 @@ struct ts_dsv4_block_iq3_xxs
     half d;
     uint8_t qs[96];
 };
+
+// block_iq2_s: 82 bytes / 256 values (half d, 32 low grid-index bytes then 32 sign
+// bytes, one byte of high grid-index bits and one of two 4-bit scales per 32 values).
+struct ts_dsv4_block_iq2_s
+{
+    half d;
+    uint8_t qs[64];
+    uint8_t qh[8];
+    uint8_t scales[8];
+};
+
+// block_iq1_s: 50 bytes / 256 values (half d, 32 low grid-index bytes, then one uint16
+// per 32 values: four 3-bit grid-index highs, a 3-bit scale and the delta's sign).
+struct ts_dsv4_block_iq1_s
+{
+    half d;
+    uint8_t qs[32];
+    uint16_t qh[8];
+};
+
+static_assert(sizeof(ts_dsv4_block_iq2_s) == 82, "block_iq2_s is 82 bytes");
+static_assert(sizeof(ts_dsv4_block_iq1_s) == 50, "block_iq1_s is 50 bytes");
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -366,6 +389,13 @@ __device__ __forceinline__ float ts_dsv4_dot_q5_1_block(
 // Q5_1 experts on a module that lacks it. Never launched.
 extern "C" __global__ void ts_dsv4_caps_q5_1_experts() {}
 
+// Present only in a module whose expert decoders read IQ1_S and IQ2_S on every route, and IQ2_XXS on
+// the grouped (register-staged and tensor-core) routes as well as the warp-per-row ones. A module
+// built from older source decodes the first two as Q8_0, and IQ2_XXS too once it reaches a grouped
+// kernel: Dsv4Kernels looks this name up, and CudaMoe keeps those layouts off a module that lacks it.
+// Never launched.
+extern "C" __global__ void ts_dsv4_caps_lowbit_iq_experts() {}
+
 #define TS_DSV4_WTYPE_Q5_1 7
 #define TS_DSV4_WTYPE_Q8_0 8
 #define TS_DSV4_WTYPE_Q6_K 14
@@ -378,7 +408,9 @@ extern "C" __global__ void ts_dsv4_caps_q5_1_experts() {}
 #define TS_DSV4_WTYPE_IQ2XXS 16
 #define TS_DSV4_WTYPE_IQ2XS 17
 #define TS_DSV4_WTYPE_IQ3XXS 18
+#define TS_DSV4_WTYPE_IQ1S 19
 #define TS_DSV4_WTYPE_IQ4NL 20
+#define TS_DSV4_WTYPE_IQ2S 22
 #define TS_DSV4_WTYPE_IQ4XS 23
 #define TS_DSV4_IQ4NL_BLOCK_BYTES 18  // half d + qs[16], 32 values
 #define TS_DSV4_IQ4XS_BLOCK_BYTES 136 // half d, u16 scales_h, scales_l[4], qs[128], 256 values
@@ -389,6 +421,8 @@ extern "C" __global__ void ts_dsv4_caps_q5_1_experts() {}
 #define TS_DSV4_IQ2XXS_BLOCK_BYTES 66
 #define TS_DSV4_IQ2XS_BLOCK_BYTES 74
 #define TS_DSV4_IQ3XXS_BLOCK_BYTES 98
+#define TS_DSV4_IQ2S_BLOCK_BYTES 82
+#define TS_DSV4_IQ1S_BLOCK_BYTES 50
 #define TS_DSV4_Q6_K_BLOCK_BYTES 210
 
 // Full-row dot: one warp computes dot(weight row, activation row).
@@ -508,6 +542,91 @@ __device__ __forceinline__ float ts_dsv4_dot_iq3xxs_group(
     const int ls = aux32 >> 28;
     sumi = (ls * sumi + sumi / 2) / 2;
     return __half2float(bq3->d) * __half2float(q8[group].d) * (float)sumi;
+}
+
+// One IQ2_S 32-value group as 8 packed signed ints (ggml's dequantize_row_iq2_s before the scale):
+// four 8-value lookups into the 1024-entry grid, each index's low 8 bits from qs and its high 2 from
+// the group's qh byte, with an explicit sign byte per 8 values. The low-bit IQ decoders read their
+// blocks two bytes at a time: a 2304-wide expert row (V4.1 1017's down projection) is 738 bytes of
+// IQ2_S, 594 of IQ2_XXS and 450 of IQ1_S, so every other row starts off a 4-byte boundary.
+__device__ __forceinline__ void ts_dsv4_iq2s_group_ints(
+    const ts_dsv4_block_iq2_s* b, int group, int* __restrict__ w8)
+{
+    const int qsPacked = ts_dsv4_get_int_b2(b->qs, group);
+    const uint8_t* qs = (const uint8_t*)&qsPacked;
+    const int signsPacked = ts_dsv4_get_int_b2(b->qs, 8 + group);
+    const uint8_t* signs = (const uint8_t*)&signsPacked;
+    const int qh = b->qh[group];
+#pragma unroll
+    for (int l = 0; l < 4; ++l)
+    {
+        const uint2 gridPos = ((const uint2*)iq2s_grid)[qs[l] | ((qh << (8 - 2 * l)) & 0x300)];
+        const int s0 = __vcmpne4(((signs[l] & 0x03) << 7) | ((signs[l] & 0x0C) << 21), 0x00000000);
+        const int s1 = __vcmpne4(((signs[l] & 0x30) << 3) | ((signs[l] & 0xC0) << 17), 0x00000000);
+        w8[2 * l + 0] = __vsub4((int)gridPos.x ^ s0, s0);
+        w8[2 * l + 1] = __vsub4((int)gridPos.y ^ s1, s1);
+    }
+}
+
+// One IQ2_S 32-value group dotted against one q8_1 activation block. Ported from ggml-cuda's
+// vec_dot_iq2_s_q8_1 (as the generic backend's dot_iq2_s_q8_1 is), keeping its integer rounding of
+// the two 4-bit scales, d * (0.5 + scale) / 4 per 16 values.
+__device__ __forceinline__ float ts_dsv4_dot_iq2s_group(
+    const uint8_t* iq_block, const ts_dsv4_block_q8_1* q8, int group)
+{
+    const ts_dsv4_block_iq2_s* bq2 = (const ts_dsv4_block_iq2_s*)iq_block;
+    int w8[8];
+    ts_dsv4_iq2s_group_ints(bq2, group, w8);
+    int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        sumi0 = ts_dsv4_dp4a(w8[k], ts_dsv4_get_int_b4(q8[group].qs, k), sumi0);
+        sumi1 = ts_dsv4_dp4a(w8[k + 4], ts_dsv4_get_int_b4(q8[group].qs, k + 4), sumi1);
+    }
+    const int ls0 = bq2->scales[group] & 0x0F;
+    const int ls1 = bq2->scales[group] >> 4;
+    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    return __half2float(bq2->d) * __half2float(q8[group].d) * (float)sumi;
+}
+
+// One IQ1_S 32-value group as 8 packed signed ints, returning their scale. ggml's
+// dequantize_row_iq1_s makes value j d * (2s + 1) * (g_j + delta), g_j in {-1, 0, 1} from the
+// 2048-entry grid (whose GPU form stores g_j + 1) and delta = +/-1/8 by the top qh bit. Times 8 that
+// is the integer 8 g_j +/- 1 (|.| <= 9), so the group decodes exactly into int8 under the scale
+// d * (2s + 1) / 8 with no offset: no route needs the activation sum, which the register-staged
+// kernels' split q8_1 layout does not carry (ggml-cuda's vec_dot_iq1_s_q8_1 takes the delta term
+// from the q8_1 block's F16 sum instead).
+__device__ __forceinline__ float ts_dsv4_iq1s_group_ints(
+    const ts_dsv4_block_iq1_s* b, int group, int* __restrict__ w8)
+{
+    const int qsPacked = ts_dsv4_get_int_b2(b->qs, group);
+    const uint8_t* qs = (const uint8_t*)&qsPacked;
+    const int qh = b->qh[group];
+    // 8 (g + 1) - 7 = 8 g + 1 for delta +1/8, 8 (g + 1) - 9 = 8 g - 1 for -1/8.
+    const int bias = (qh & 0x8000) ? 0x09090909 : 0x07070707;
+#pragma unroll
+    for (int l = 0; l < 4; ++l)
+    {
+        const int grid = (int)iq1s_grid_gpu[qs[l] | (((qh >> (3 * l)) & 0x07) << 8)];
+        w8[2 * l + 0] = __vsub4((grid & 0x0F0F0F0F) << 3, bias);
+        w8[2 * l + 1] = __vsub4(((grid >> 4) & 0x0F0F0F0F) << 3, bias);
+    }
+    return __half2float(b->d) * (float)(2 * ((qh >> 12) & 0x07) + 1) * 0.125f;
+}
+
+// One IQ1_S 32-value group dotted against one q8_1 activation block (ggml-cuda's
+// vec_dot_iq1_s_q8_1 over the exact integer form above).
+__device__ __forceinline__ float ts_dsv4_dot_iq1s_group(
+    const uint8_t* iq_block, const ts_dsv4_block_q8_1* q8, int group)
+{
+    int w8[8];
+    const float sc = ts_dsv4_iq1s_group_ints((const ts_dsv4_block_iq1_s*)iq_block, group, w8);
+    int sumi = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+        sumi = ts_dsv4_dp4a(w8[k], ts_dsv4_get_int_b4(q8[group].qs, k), sumi);
+    return sc * __half2float(q8[group].d) * (float)sumi;
 }
 
 // One Q2_K 32-value group dotted against one q8_1 activation block.
@@ -811,11 +930,33 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
         for (int b = lane; b < nBlk; b += 32)
             sum += ts_dsv4_dot_q5_1_block(wRow + (size_t)b * TS_DSV4_Q5_1_BLOCK_BYTES, act + b);
     }
-    else // TS_DSV4_WTYPE_Q8_0
+    else if (wtype == TS_DSV4_WTYPE_IQ2S)
+    {
+        // Unsloth's DeepSeek V4.1 1017 UD-IQ2_XXS keeps its gate/up experts in IQ1_S, IQ2_S or
+        // IQ2_XXS and most down projections in IQ2_S, IQ3_XXS or IQ2_XS.
+        const int nGroups = inDim / 32;
+        for (int g = lane; g < nGroups; g += 32)
+            sum += ts_dsv4_dot_iq2s_group(wRow + (size_t)(g >> 3) * TS_DSV4_IQ2S_BLOCK_BYTES,
+                                          act + (size_t)(g >> 3) * 8, g & 7);
+    }
+    else if (wtype == TS_DSV4_WTYPE_IQ1S)
+    {
+        const int nGroups = inDim / 32;
+        for (int g = lane; g < nGroups; g += 32)
+            sum += ts_dsv4_dot_iq1s_group(wRow + (size_t)(g >> 3) * TS_DSV4_IQ1S_BLOCK_BYTES,
+                                          act + (size_t)(g >> 3) * 8, g & 7);
+    }
+    else if (wtype == TS_DSV4_WTYPE_Q8_0)
     {
         const int nBlk = inDim / 32;
         for (int b = lane; b < nBlk; b += 32)
             sum += ts_dsv4_dot_q8_0_block(wRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES, act + b);
+    }
+    else
+    {
+        // A layout no branch decodes answers NaN: this chain once ended in a bare Q8_0 `else`, so a
+        // gate admitting a type before its decoder read the rows as Q8_0, wrong with no error.
+        sum = __int_as_float(0x7fc00000);
     }
     return ts_dsv4_warp_sum(sum);
 }
@@ -2521,7 +2662,8 @@ extern "C" __global__ void ts_dsv4_moe_scatter_i32(
 // (1 + 2*ls) factor); the activation's own q8_1 scale is applied at use.
 // Codebook values fit int8 for every supported type (IQ3_S grid |v| <= 15 after
 // sign application, MXFP4 table |v| <= 12, Q6_K raw-32 is -32..31, Q5_1's codes
-// are 0..31, Q8_0 is already int8). Q6_K's two half-group scales are kept separately.
+// are 0..31, the IQ2 grids |v| <= 43, IQ1_S's 8 g +/- 1 |v| <= 9, Q8_0 is already
+// int8). Q6_K's two half-group scales are kept separately.
 //
 // Activations come from the DENSE split q8_1 layout (ts_quantize_q8_1_split_rows_f32):
 // a contiguous int8 row plus a separate per-block float scale. The interleaved
@@ -2535,6 +2677,9 @@ extern "C" __global__ void ts_dsv4_moe_scatter_i32(
 // Decode one 32-value sub-block of a quantized weight row into 8 packed ints
 // plus the scales of its two 16-value halves, and for Q2_K the mins those
 // halves subtract (dmin * m, times the half's activation sum); 0 otherwise.
+// Callers pass only the layouts it reads (ts_dsv4_dot_row_warp's Q6_K / IQ4
+// branch, ts_dsv4_decode_sub_grouped's list), so its last branch, Q8_0, never
+// sees a layout it does not decode.
 __device__ __forceinline__ void ts_dsv4_decode_sub(
     const uint8_t* __restrict__ wRow, int wtype, int sub, int* __restrict__ w8,
     float* __restrict__ scLo, float* __restrict__ scHi,
@@ -2717,7 +2862,8 @@ __device__ __forceinline__ void ts_dsv4_decode_sub(
 
 // The grouped expert kernels' decoder (register-staged and tensor-core prefill): every layout
 // ts_dsv4_decode_sub reads, plus IQ2_XS and IQ3_XXS, Qwen3.8-Flash-Next UD-Q2_K_XL's gate/up
-// experts, and Q5_1, its UD-Q4_K_XL's down experts. Kept out of ts_dsv4_decode_sub itself because the per-token decode kernels inline that
+// experts, Q5_1, its UD-Q4_K_XL's down experts, and IQ2_XXS, IQ2_S and IQ1_S, DeepSeek V4.1 1017
+// UD-IQ2_XXS's. Kept out of ts_dsv4_decode_sub itself because the per-token decode kernels inline that
 // one for their Q6_K / IQ4 rows: with the two branches there, Qwen3.8-Flash-Next's decode on two
 // A40s fell from 56.9 to 55.0-55.6 tok/s (its down projection is IQ4_NL).
 __device__ __forceinline__ void ts_dsv4_decode_sub_grouped(
@@ -2791,10 +2937,70 @@ __device__ __forceinline__ void ts_dsv4_decode_sub_grouped(
         *mnHi = *mnLo;
         return;
     }
-    else
+    else if (wtype == TS_DSV4_WTYPE_IQ2XXS)
+    {
+        // One word of four grid indices (eight values each) per 32 values, then one word of four
+        // 7-bit sign indices into ksigns_iq2xs under a 4-bit scale, as ggml's dequantize_row_iq2_xxs:
+        // d * (0.5 + scale) / 4 for the whole group.
+        const ts_dsv4_block_iq2_xxs* b =
+            (const ts_dsv4_block_iq2_xxs*)(wRow + (size_t)(sub >> 3) * TS_DSV4_IQ2XXS_BLOCK_BYTES);
+        const int group = sub & 7;
+        const int q2 = ts_dsv4_get_int_b2(b->qs, group * 2 + 0);
+        const uint8_t* aux8 = (const uint8_t*)&q2;
+        const uint32_t aux32 = (uint32_t)ts_dsv4_get_int_b2(b->qs, group * 2 + 1);
+#pragma unroll
+        for (int l = 0; l < 4; ++l)
+        {
+            const uint2 gridPos = ((const uint2*)iq2xxs_grid)[aux8[l]];
+            const int signsPacked = ksigns_iq2xs[(aux32 >> (7 * l)) & 0x7F];
+            const int s0 = __vcmpne4(((signsPacked & 0x03) << 7) | ((signsPacked & 0x0C) << 21), 0x00000000);
+            const int s1 = __vcmpne4(((signsPacked & 0x30) << 3) | ((signsPacked & 0xC0) << 17), 0x00000000);
+            w8[2 * l + 0] = __vsub4((int)gridPos.x ^ s0, s0);
+            w8[2 * l + 1] = __vsub4((int)gridPos.y ^ s1, s1);
+        }
+        const float sc = __half2float(b->d) * (0.5f + (float)(aux32 >> 28)) * 0.25f;
+        *scLo = sc;
+        *scHi = sc;
+    }
+    else if (wtype == TS_DSV4_WTYPE_IQ2S)
+    {
+        // d * (0.5 + scale) / 4 per 16 values, as ggml's dequantize_row_iq2_s.
+        const ts_dsv4_block_iq2_s* b =
+            (const ts_dsv4_block_iq2_s*)(wRow + (size_t)(sub >> 3) * TS_DSV4_IQ2S_BLOCK_BYTES);
+        const int group = sub & 7;
+        ts_dsv4_iq2s_group_ints(b, group, w8);
+        const float d = __half2float(b->d);
+        *scLo = d * (0.5f + (float)(b->scales[group] & 0x0F)) * 0.25f;
+        *scHi = d * (0.5f + (float)(b->scales[group] >> 4)) * 0.25f;
+    }
+    else if (wtype == TS_DSV4_WTYPE_IQ1S)
+    {
+        // 8 g +/- 1 under d * (2s + 1) / 8: the tensor-core tile's F16 scale * int is then exactly
+        // ggml's value, and nothing is subtracted.
+        const float sc = ts_dsv4_iq1s_group_ints(
+            (const ts_dsv4_block_iq1_s*)(wRow + (size_t)(sub >> 3) * TS_DSV4_IQ1S_BLOCK_BYTES), sub & 7, w8);
+        *scLo = sc;
+        *scHi = sc;
+    }
+    else if (wtype == TS_DSV4_WTYPE_IQ3S || wtype == TS_DSV4_WTYPE_MXFP4 || wtype == TS_DSV4_WTYPE_IQ4NL
+             || wtype == TS_DSV4_WTYPE_IQ4XS || wtype == TS_DSV4_WTYPE_Q6_K || wtype == TS_DSV4_WTYPE_Q2_K
+             || wtype == TS_DSV4_WTYPE_Q3_K || wtype == TS_DSV4_WTYPE_Q4_K || wtype == TS_DSV4_WTYPE_Q5_K
+             || wtype == TS_DSV4_WTYPE_Q8_0)
     {
         ts_dsv4_decode_sub(wRow, wtype, sub, w8, scLo, scHi, mnLo, mnHi);
         return;
+    }
+    else
+    {
+        // A layout no decoder reads: NaN scales, as ts_dsv4_dot_row_warp answers, never a Q8_0 read.
+        // The test lives in this list and not in ts_dsv4_decode_sub's last branch: the per-token
+        // decode kernels inline that function, and touching it moved their register allocation (Q8_0
+        // decode 3% slower, IQ4_NL 2-5% faster on an RTX 3080), where this costs them nothing.
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            w8[j] = 0;
+        *scLo = __int_as_float(0x7fc00000);
+        *scHi = *scLo;
     }
     *mnLo = 0.0f;
     *mnHi = 0.0f;

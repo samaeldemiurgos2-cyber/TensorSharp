@@ -80,11 +80,14 @@ NODE = re.compile(r"(?:([A-Za-z0-9._-]+)@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(
 BINARIES = {"cli": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
             "server": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
             "probe": "eng/validation/DeepSeek41DistributedProbe/bin/Release/net10.0/DeepSeek41DistributedProbe.dll"}
+# Sources hashed into each node's source fingerprint. TensorSharp.Backends.Cuda holds the direct CUDA engine
+# that --backend cuda runs (Dsv4CudaEngine, its .cu kernels, and the committed PTX that a build without nvcc
+# loads); the rest of that engine is in TensorSharp.Models, TensorSharp.Distributed and TensorSharp.Core.
 SOURCE_DIRS = ("TensorSharp.GGML.Native", "TensorSharp.Core", "TensorSharp.Runtime", "TensorSharp.Models",
-               "TensorSharp.Backends.GGML", "TensorSharp.Distributed", "TensorSharp.Cli", "TensorSharp.Chat",
-               "TensorSharp.Server", "TensorSharp.Server.Host")
+               "TensorSharp.Backends.GGML", "TensorSharp.Backends.Cuda", "TensorSharp.Distributed",
+               "TensorSharp.Cli", "TensorSharp.Chat", "TensorSharp.Server", "TensorSharp.Server.Host")
 SOURCE_PATTERNS = ("*.cs", "*.csproj", "*.props", "*.targets", "*.cpp", "*.c", "*.h", "*.hpp",
-                   "*.cu", "*.cuh", "*.cmake", "CMakeLists.txt")
+                   "*.cu", "*.cuh", "*.ptx", "*.cmake", "CMakeLists.txt")
 PROGRESS = ("inference benchmark starting|benchmark run|benchmark summary|Loaded model|Kernel warmup|"
             "TcpCommunicator|Distributed (tensor|layer)|Now listening on|Model load refused|Unhandled exception")
 NOTABLE = re.compile(r"Distributed (tensor parallelism|layer splitting):|\[TcpCommunicator\] Rank \d+/\d+ connected|"

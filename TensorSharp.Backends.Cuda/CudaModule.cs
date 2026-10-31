@@ -80,7 +80,14 @@ namespace TensorSharp.Cuda
         /// GPU) falls back to the PTX. When the PTX fails too, the exception says why: the PTX
         /// ISA against the driver's CUDA version, or the PTX target against the GPU.
         /// </summary>
-        public static CudaModule LoadFromFile(string path)
+        public static CudaModule LoadFromFile(string path) => LoadFromFile(path, identify: false);
+
+        /// <summary>
+        /// <see cref="LoadFromFile(string)"/>; with <paramref name="identify"/> the module also records the SHA-256 of
+        /// the image the driver actually loaded (the fatbin, or the PTX it fell back to) in
+        /// <see cref="ImageSha256"/>, which a distributed run compares across nodes.
+        /// </summary>
+        public static CudaModule LoadFromFile(string path, bool identify)
         {
             if (path == null)
                 throw new ArgumentNullException(nameof(path));
@@ -92,7 +99,10 @@ namespace TensorSharp.Cuda
             {
                 try
                 {
-                    return LoadImage(fatbin, ParsePtxTargetArch(bytes));
+                    CudaModule loaded = LoadImage(fatbin, ParsePtxTargetArch(bytes));
+                    if (identify)
+                        loaded.ImageSha256 = Sha256(fatbin);
+                    return loaded;
                 }
                 catch (CudaException ex)
                 {
@@ -100,8 +110,18 @@ namespace TensorSharp.Cuda
                     fatbinFailure = ex;
                 }
             }
-            return LoadFromBytes(bytes, fatbinFailure);
+            CudaModule module = LoadFromBytes(bytes, fatbinFailure);
+            if (identify)
+                module.ImageSha256 = Sha256(bytes);
+            return module;
         }
+
+        /// <summary>The SHA-256 (hex) of the image this module was loaded from, when the loader was asked to
+        /// identify it; null otherwise.</summary>
+        public string ImageSha256 { get; private set; }
+
+        private static string Sha256(byte[] image)
+            => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(image));
 
         internal static byte[] TryReadMatchingFatbin(string ptxPath, byte[] ptxBytes)
         {
@@ -135,6 +155,15 @@ namespace TensorSharp.Cuda
         }
 
         public static CudaModule LoadFromBytes(byte[] ptxBytes) => LoadFromBytes(ptxBytes, null);
+
+        /// <summary><see cref="LoadFromBytes(byte[])"/>, recording the image's SHA-256 when <paramref name="identify"/> is set.</summary>
+        public static CudaModule LoadFromBytes(byte[] ptxBytes, bool identify)
+        {
+            CudaModule module = LoadFromBytes(ptxBytes);
+            if (identify)
+                module.ImageSha256 = Sha256(ptxBytes);
+            return module;
+        }
 
         private static unsafe CudaModule LoadFromBytes(byte[] ptxBytes, CudaException fatbinFailure)
         {

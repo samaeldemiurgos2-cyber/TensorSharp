@@ -81,7 +81,7 @@ the local arithmetic, so network costs can dominate decode.
 
 | Family | Multi-node layer backend | State and limits |
 | --- | --- | --- |
-| DeepSeek V4.1 Flash, including 1017 | `ggml_cuda` | Native whole-layer graphs transfer residual streams, delayed gates, sparse selections, candidate masks and newly written shared cache rows. Exact prefill; approximate YOCO, vision and DSpark are unavailable in this mode. |
+| DeepSeek V4.1 Flash, including 1017 | `ggml_cuda`, `cuda` (layer split only) | Native whole-layer graphs transfer residual streams, delayed gates, sparse selections, candidate masks and newly written shared cache rows. Exact prefill; approximate YOCO, vision and DSpark are unavailable in this mode. The direct-CUDA engine's stages move the same state in a layout-hashed payload, place layers from header bytes, need the driver on the last stage and keep every routed expert in VRAM ([card](models/deepseek41.md#backends)). |
 | Qwen3.8 Flash Next (`qwen4exp`) | `ggml_cuda` | Native spans transfer the complete hyper-connection residual. GDN recurrence, convolution, PLE and QSA state stay with their owning layers. Text forwards only. |
 | GLM-5.3-Flash (`glm5next` / `glm5-next`) | `ggml_cuda` | Native stages transfer the complete hyper-connection residual. KDA recurrence and pooled DSA/MLA caches stay with their owning layers. Text forwards only; older `glm-dsa` variants remain local. |
 | Mistral 3 dense text tower | `ggml_cuda`, `ggml_vulkan` | Shared dense pipeline transfers F32 hidden activations. Each node loads only its layer weights/KV state; the first stage embeds and the last stage computes logits. |

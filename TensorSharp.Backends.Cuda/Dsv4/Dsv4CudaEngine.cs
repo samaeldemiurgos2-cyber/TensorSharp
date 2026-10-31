@@ -45,9 +45,8 @@ namespace TensorSharp.Cuda
         private const int HcaRatio = 128;
         private const int Q81BlockBytes = 36;
 
-        // ggml type ids this engine dispatches on
-        private const int TF32 = 0, TF16 = 1, TQ8_0 = 8, TQ2_K = 10, TQ3_K = 11, TQ4_K = 12, TQ5_K = 13, TQ6_K = 14,
-            TIQ2_XXS = 16, TIQ3_S = 21, TBF16 = 30, TMXFP4 = 39;
+        // ggml type ids this engine dispatches on (the routed experts' are CudaMoe's)
+        private const int TF32 = 0, TF16 = 1, TQ8_0 = 8, TQ2_K = 10, TQ3_K = 11, TQ6_K = 14, TIQ2_XXS = 16, TBF16 = 30;
 
         public sealed class LayerDesc
         {
@@ -109,6 +108,11 @@ namespace TensorSharp.Cuda
             /// <summary>Host-side Engram gather; required when any layer names an
             /// Engram table.</summary>
             public IDsv41EngramSource Engram;
+            /// <summary>Where the Engram tables live (<c>TS_DSV41_ENGRAM_DEVICE</c>, as the native
+            /// executor reads it): null puts them in VRAM when the split holds them without offloading
+            /// more experts and keeps them host mappings otherwise; false keeps them host mappings; true
+            /// requires VRAM and refuses a split that cannot hold them.</summary>
+            public bool? EngramOnDevice;
             /// <summary>Optional DSpark speculative-decoding module (see
             /// Dsv4CudaEngine.Dspark.cs); null when no drafter was loaded.</summary>
             public DsparkDesc Dspark;
@@ -190,6 +194,9 @@ namespace TensorSharp.Cuda
             // dense split-q8_1 activation scratch for the register-staged expert
             // kernels (A = per-token rows into gate/up, B = packed rows into down)
             public Tensor SplitQsA, SplitDA, SplitQsB, SplitDB;
+            // q8_1 rows of a decode-size input to a dense projection on the DenseQ81Rows kernel
+            // (see DenseMatMul); null on a device that holds no such projection.
+            public Tensor DenseQ81;
             public Tensor Logits;
             // Partial sums of the split small-row GEMV (the hyper-connection mixes).
             public Tensor GemvScratch;
@@ -201,11 +208,12 @@ namespace TensorSharp.Cuda
 
         private readonly ModelDesc _m;
         private readonly Dev[] _devs;
-        private readonly DevLayer[] _layers;
+        // Set by Load, which runs inside the constructor's cleanup scope.
+        private DevLayer[] _layers;
         private readonly int _ringRaw;
         private readonly int _compRowsCsa;
         private readonly int _compRowsHca;
-        private readonly int _lastDev;
+        private int _lastDev;
         private DeviceWeight _outputQW;
         private DeviceWeight _tokEmbdQW;
         private Tensor _outputNorm, _hcHeadFn, _hcHeadScale, _hcHeadBase;
@@ -239,8 +247,27 @@ namespace TensorSharp.Cuda
         /// int.MaxValue every layer, -1 auto (the fewest leading layers that make
         /// the model fit; opt-in only). See Dsv4CudaEngine.HostMoe.cs.</param>
         public Dsv4CudaEngine(ModelDesc m, int nGpu, int nCpuMoe = 0)
+            : this(m, nGpu, nCpuMoe, null)
+        {
+        }
+
+        /// <summary>
+        /// One pipeline stage of a cross-node layer split (Dsv4CudaEngine.Distributed.cs): this node's layers
+        /// on its <see cref="Dsv4StagePlan.LocalDevices"/> GPUs, the boundary state of every ubatch through
+        /// <see cref="Dsv4StagePlan.Link"/>. <paramref name="m"/> describes the weights of the owned layers and
+        /// the topology (ratio and sources) of every layer; routed experts are never offloaded.
+        /// </summary>
+        public Dsv4CudaEngine(ModelDesc m, Dsv4StagePlan stage)
+            : this(m, (stage ?? throw new ArgumentNullException(nameof(stage))).LocalDevices, 0, stage)
+        {
+        }
+
+        private Dsv4CudaEngine(ModelDesc m, int nGpu, int nCpuMoe, Dsv4StagePlan stage)
         {
             _m = m ?? throw new ArgumentNullException(nameof(m));
+            _stage = stage;
+            if (stage != null)
+                ValidateStage(m, stage);
             if (m.HeadDim != 512)
                 throw new NotSupportedException($"DSV4 CUDA engine requires head_dim 512, got {m.HeadDim}.");
             if (m.IdxNHead > 0 && m.IdxHeadSize != 128)
@@ -248,10 +275,12 @@ namespace TensorSharp.Cuda
             if (m.NExpertUsed > 16)
                 throw new NotSupportedException($"DSV4 CUDA engine supports at most 16 experts per token, got {m.NExpertUsed}.");
             // An explicit offload puts exactly the leading min(nCpuMoe, NLayer) layers' experts on the
-            // host, so their types can be checked before any device is touched; an automatic one is
-            // checked once the split has chosen it, still before anything is uploaded.
+            // host, so their types can be checked before any device is touched (against the decoders the
+            // kernel source has; the module the devices load is checked once they have loaded it); an
+            // automatic one is checked once the split has chosen it, still before anything is uploaded.
             if (nCpuMoe >= 0)
-                ValidateRoutedExpertTypes(m, Math.Min(nCpuMoe, m.NLayer));
+                ValidateRoutedExpertTypes(m, Math.Min(nCpuMoe, m.NLayer), decodesQ5_1: true, decodesLowBitIq: true,
+                    owned: OwnedBy(stage));
 
             _perf = EnvInt("TS_DSV4_PERF", 0);
             _stages = new CudaStageTimer("dsv4-cuda", _perf, StageNames);
@@ -264,10 +293,14 @@ namespace TensorSharp.Cuda
             CudaBackend.Register();
 
             CudaDriverApi.cuInit(0);
-            CudaDriverApi.cuDeviceGetCount(out int devCount).ThrowOnError();
+            CudaDriverApi.cuDeviceGetCount(out int physicalDevices).ThrowOnError();
+            int devCount = LogicalDevicesForTests > 0 && physicalDevices > 0 ? LogicalDevicesForTests : physicalDevices;
             int useDevs = nGpu > 0 ? Math.Min(nGpu, devCount) : devCount;
             if (useDevs < 1)
                 throw new InvalidOperationException("No CUDA devices available for the DSV4 engine.");
+            if (stage != null && devCount < stage.LocalDevices)
+                throw new InvalidOperationException(
+                    $"[dsv4-cuda] this node's stage needs {stage.LocalDevices} CUDA device(s) (--layer-split), but {devCount} are visible.");
 
             // A speculative verify writes KV for tokens that may be rejected. The
             // rejected tail is never restored -- instead every ring the next pass
@@ -278,8 +311,9 @@ namespace TensorSharp.Cuda
             _ringRaw = Pad(m.NSwa + m.NUbatch, 256);
             // V4.1 compresses disjoint blocks, so a head aligned to every ratio reads nothing a
             // rewind dropped; a query at the new head reads the raw window (head - n_swa, head],
-            // which the ring still holds while the head moved back at most _rewindSpan.
-            TruncateAlign = ComputeTruncateAlign(m);
+            // which the ring still holds while the head moved back at most _rewindSpan. A stage of a
+            // distributed run serves one mirrored sequence and never truncates.
+            TruncateAlign = stage != null ? 0 : ComputeTruncateAlign(m);
             _rewindCheckpoint = m.V41;
             _rewindSpan = m.V41 ? Math.Max(0, _ringRaw - m.NSwa + 1) : 0;
             // V4.1 compresses at ratios 1 and 2 rather than 4 and 128, so the
@@ -291,17 +325,86 @@ namespace TensorSharp.Cuda
             // Created before the layer split, which needs each device's free
             // VRAM (cuMemGetInfo wants a current context) to size its share.
             _devs = new Dev[useDevs];
-            for (int d = 0; d < useDevs; d++)
+            try
             {
-                var dev = new Dev { Ordinal = d };
-                dev.Alloc = new CudaAllocator(d);
-                dev.MakeCurrent();
-                dev.DK = Dsv4Kernels.Create();
-                CudaDriverApi.cuEventCreate(out IntPtr ev, 0x02 /*CU_EVENT_DISABLE_TIMING*/).ThrowOnError();
-                dev.Event = ev;
-                _devs[d] = dev;
+                for (int d = 0; d < useDevs; d++)
+                {
+                    var dev = new Dev { Ordinal = d };
+                    _devs[d] = dev;
+                    dev.Alloc = new CudaAllocator(d % physicalDevices);
+                    dev.MakeCurrent();
+                    dev.DK = KernelModuleLoader?.Invoke() ?? Dsv4Kernels.Create();
+                    CudaDriverApi.cuEventCreate(out IntPtr ev, 0x02 /*CU_EVENT_DISABLE_TIMING*/).ThrowOnError();
+                    dev.Event = ev;
+                }
+                // Every stage must run the same kernels on the same numbers: agree on the module before a byte is
+                // uploaded -- the image the devices loaded, the build that drives it, the boundary wire version and
+                // the decoders it has (two modules that pick different expert kernels for the same widths would
+                // compute different numbers for the same layers).
+                stage?.Agree?.Invoke(ModuleIdentity(_devs[0].DK, useDevs, stage.Build));
+                Load(m, nCpuMoe, useDevs);
             }
+            catch
+            {
+                // A refusal once the devices exist (a kernel module older than an expert decoder, too
+                // little VRAM) or a fault while uploading releases them, so a host that goes on to load
+                // another model does not keep this one's contexts, modules and arenas.
+                try { Dispose(); } catch { /* the load's own error is the one to report */ }
+                throw;
+            }
+        }
 
+        /// <summary>
+        /// Tests only: loads the kernel module each device runs, with that device's context current,
+        /// instead of <see cref="Dsv4Kernels.Create"/>; null loads the module next to the application.
+        /// Lets a test hand the engine a module built from older kernel source, as a machine without
+        /// nvcc loads from the committed PTX. Not an environment variable, like <see cref="ForceMoeRoute"/>.
+        /// </summary>
+        internal static Func<Dsv4Kernels> KernelModuleLoader { get; set; }
+
+        /// <summary>
+        /// Tests only: when positive, the engine sees this many CUDA devices, logical device d running on physical
+        /// device d mod (the visible count). Each logical device keeps its own allocator, stream, events, staging and
+        /// kernel module, on the physical device's shared primary context, so a one-GPU host runs the multi-device
+        /// paths: local boundaries in a single-process split, and a distributed stage of several local devices
+        /// whose in-node boundary follows a network one. Not an environment variable, like
+        /// <see cref="KernelModuleLoader"/>.
+        /// </summary>
+        internal static int LogicalDevicesForTests { get; set; }
+
+        /// <summary>What every stage of a distributed run agrees on about its kernel module before uploading: the
+        /// SHA-256 of the image the devices loaded ("unidentified" for a module a test loaded itself), the build
+        /// that drives it (<see cref="Dsv4StagePlan.Build"/>), the boundary wire version, the decoders the module
+        /// has and the local device count.</summary>
+        internal static string ModuleIdentity(Dsv4Kernels kernels, int localDevices, string build)
+            => $"dsv4-cuda-module|image={kernels.ModuleImageSha256 ?? "unidentified"}|build={build ?? "unknown"}" +
+               $"|wire={Dsv4BoundaryLayout.Version}|mma={kernels.HasMoeMma}|q5_1={kernels.DecodesQ5_1Experts}" +
+               $"|lowbit_iq={kernels.DecodesLowBitIqExperts}|local={localDevices}";
+
+        /// <summary>The constructor past device creation: the checks against the loaded module, the
+        /// layer split, the uploads and the buffers.</summary>
+        private void Load(ModelDesc m, int nCpuMoe, int useDevs)
+        {
+            // Every device loads the same module file. One built from kernel source older than an
+            // expert decoder (a committed PTX baseline not yet regenerated) reads those rows as Q8_0, so
+            // the resident layers that need one are refused here by tensor name, before the split.
+            if (nCpuMoe >= 0)
+                ValidateRoutedExpertTypes(m, Math.Min(nCpuMoe, m.NLayer),
+                    _devs[0].DK.DecodesQ5_1Experts, _devs[0].DK.DecodesLowBitIqExperts, OwnedBy(_stage));
+
+            var assignment = new int[m.NLayer];
+            long[] layerBytes;
+            long dsparkBytes = DsparkBytes(m.Dspark);
+            if (_stage != null)
+                layerBytes = PlaceStage(m, useDevs, assignment);
+            else
+                layerBytes = PlaceLocal(m, nCpuMoe, useDevs, assignment, dsparkBytes);
+            LoadPlaced(m, nCpuMoe, useDevs, assignment, layerBytes, dsparkBytes);
+        }
+
+        /// <summary>The single-process split: every layer, over the local GPUs by their free VRAM.</summary>
+        private long[] PlaceLocal(ModelDesc m, int nCpuMoe, int useDevs, int[] assignment, long dsparkBytes)
+        {
             // ---- layer placement: contiguous ranges balanced by quantized bytes ----
             // V4.1's Engram tables (tens of GiB) go to VRAM with their layers when the split holds
             // them without offloading more experts, as ggml_cuda places them; the host gathers the
@@ -321,11 +424,22 @@ namespace TensorSharp.Cuda
                 return bytes;
             }
 
-            long dsparkBytes = DsparkBytes(m.Dspark);
-            var assignment = new int[m.NLayer];
-            EngramResident = m.V41 && Array.Exists(m.Layers, L => L.EngramTable.IsValid);
+            bool hasTables = m.V41 && Array.Exists(m.Layers, L => L.EngramTable.IsValid);
+            EngramResident = hasTables && m.EngramOnDevice != false;
             long[] layerBytes;
-            if (EngramResident)
+            if (EngramResident && m.EngramOnDevice == true)
+            {
+                // Required in VRAM: a split that cannot hold the tables is refused, not demoted.
+                try { _nCpuMoe = PlaceLayers(m, useDevs, LayerBytes(), layerExpBytes, dsparkBytes, nCpuMoe, assignment); }
+                catch (InvalidOperationException e)
+                {
+                    throw new InvalidOperationException(
+                        "[dsv4-cuda] TS_DSV41_ENGRAM_DEVICE=1 does not fit: the Engram tables cannot be placed in VRAM " +
+                        "beside the model. Unset it (automatic) or set 0 for host mappings. " + e.Message, e);
+                }
+                layerBytes = LayerBytes();
+            }
+            else if (EngramResident)
             {
                 var hostAssignment = new int[m.NLayer];
                 int hostOffload;
@@ -358,9 +472,23 @@ namespace TensorSharp.Cuda
             }
             else
             {
+                if (hasTables)
+                    Console.Error.WriteLine("[dsv4-cuda] Engram tables stay host mappings (TS_DSV41_ENGRAM_DEVICE=0)");
                 layerBytes = LayerBytes();
                 _nCpuMoe = PlaceLayers(m, useDevs, layerBytes, layerExpBytes, dsparkBytes, nCpuMoe, assignment);
             }
+            _globalDev = (int[])assignment.Clone();
+            _firstGlobal = 0;
+            _firstLayer = 0;
+            _endLayer = m.NLayer;
+            _ownsEngram = Array.Exists(m.Layers, L => L.EngramIndex >= 0);
+            return layerBytes;
+        }
+
+        /// <summary>Everything past the placement: the checks against it, the uploads and the buffers.
+        /// <paramref name="assignment"/> holds each layer's local device, -1 for a layer another stage owns.</summary>
+        private void LoadPlaced(ModelDesc m, int nCpuMoe, int useDevs, int[] assignment, long[] layerBytes, long dsparkBytes)
+        {
             long totalBytes = 0;
             foreach (long b in layerBytes)
                 totalBytes += b;
@@ -370,9 +498,16 @@ namespace TensorSharp.Cuda
                     "[dsv4-cuda] routed-expert CPU offload is required to fit this model but no host matmul was " +
                     "supplied (ModelDesc.HostMatMul).");
             if (nCpuMoe < 0)
-                ValidateRoutedExpertTypes(m, _nCpuMoe);
+                ValidateRoutedExpertTypes(m, _nCpuMoe, _devs[0].DK.DecodesQ5_1Experts, _devs[0].DK.DecodesLowBitIqExperts);
             _lastDev = useDevs - 1;
-            PlanBoundaries(m, assignment);
+            PlanBoundaries(m, _globalDev, _stage != null ? _stage.StageCount * _stage.LocalDevices : useDevs);
+            if (_stage != null)
+            {
+                CheckStageFits(m, useDevs, assignment);
+                AllocateNetworkStaging(useDevs);
+            }
+            LayerRuns = new long[m.NLayer];
+            EngramRuns = new long[Math.Max(0, EngramTableCount(m))];
 
             // per-device boundary staging (pinned + events)
             long xsBytes = (long)m.NUbatch * HC * m.NEmbd * 4;
@@ -395,11 +530,15 @@ namespace TensorSharp.Cuda
             for (int il = 0; il < m.NLayer; il++)
             {
                 int d = assignment[il];
+                if (d < 0)
+                    continue;   // another stage's layer
                 foreach (var qw in EnumerateQuantWeights(m.Layers[il], skipRoutedExperts: il < _nCpuMoe))
                     arenaNeed[d] += Align(qw.TotalBytes);
             }
-            arenaNeed[0] += Align(m.TokEmbd.TotalBytes);
-            arenaNeed[_lastDev] += Align(m.Output.TotalBytes) + dsparkBytes;
+            if (OwnsEmbedding)
+                arenaNeed[0] += Align(m.TokEmbd.TotalBytes);
+            if (OwnsHead)
+                arenaNeed[_lastDev] += Align(m.Output.TotalBytes) + dsparkBytes;
 
             for (int d = 0; d < useDevs; d++)
             {
@@ -410,14 +549,26 @@ namespace TensorSharp.Cuda
             // ---- upload weights (parallel across devices) ----
             _layers = new DevLayer[m.NLayer];
             _hostMoe = new HostMoeLayer[m.NLayer];
+            // A layer another stage owns keeps its topology (what it reads and publishes), which is what
+            // the boundaries are planned from, and Device -1, which no local device matches.
             for (int il = 0; il < m.NLayer; il++)
-                _layers[il] = new DevLayer { Device = assignment[il], Ratio = m.Layers[il].Ratio };
+            {
+                LayerDesc src = m.Layers[il];
+                _layers[il] = new DevLayer
+                {
+                    Device = assignment[il], Ratio = src.Ratio,
+                    KvSource = src.KvSource, IndexSource = src.IndexSource, EngramIndex = src.EngramIndex,
+                };
+            }
 
             var perDevLayers = new List<int>[useDevs];
             for (int d = 0; d < useDevs; d++)
                 perDevLayers[d] = new List<int>();
             for (int il = 0; il < m.NLayer; il++)
-                perDevLayers[assignment[il]].Add(il);
+            {
+                if (assignment[il] >= 0)
+                    perDevLayers[assignment[il]].Add(il);
+            }
 
             var uploadSw = Stopwatch.StartNew();
             Parallel.For(0, useDevs, d =>
@@ -426,9 +577,9 @@ namespace TensorSharp.Cuda
                 dev.MakeCurrent();
                 foreach (int il in perDevLayers[d])
                     UploadLayer(dev, il);
-                if (d == 0)
+                if (d == 0 && OwnsEmbedding)
                     _tokEmbdQW = dev.Weights.Place(m.TokEmbd);
-                if (d == _lastDev)
+                if (d == _lastDev && OwnsHead)
                 {
                     _outputQW = dev.Weights.Place(m.Output);
                     _outputNorm = UploadF32(dev, m.OutputNorm);
@@ -455,7 +606,10 @@ namespace TensorSharp.Cuda
 
             _devs[0].NeedsTokens = true;
             for (int il = 0; il < Math.Min(m.HashLayerCount, m.NLayer); il++)
-                _devs[assignment[il]].NeedsTokens = true;
+            {
+                if (assignment[il] >= 0)
+                    _devs[assignment[il]].NeedsTokens = true;
+            }
             foreach (var dev in _devs)
             {
                 if (!dev.NeedsTokens)
@@ -470,7 +624,8 @@ namespace TensorSharp.Cuda
             }
 
             var last = _devs[_lastDev];
-            last.Logits = AllocF32(last, 1, m.NVocab);
+            if (OwnsHead)
+                last.Logits = AllocF32(last, 1, m.NVocab);
             if (m.Dspark != null)
             {
                 int specRows = m.Dspark.BlockSize + 1;
@@ -492,7 +647,8 @@ namespace TensorSharp.Cuda
             Console.Error.WriteLine(
                 $"[dsv4-cuda] {gib:F1} GiB of weights resident across {useDevs} GPU(s) " +
                 $"(layer split {string.Join("/", CountPerDev(assignment, useDevs))}), uploaded in {uploadSw.Elapsed.TotalSeconds:F1}s " +
-                $"(n_ctx={m.NCtx}, ubatch={m.NUbatch})");
+                $"(n_ctx={m.NCtx}, ubatch={m.NUbatch})" +
+                (_stage != null ? $"; distributed stage: layers {DescribeOwnedLayers()}" : string.Empty));
         }
 
         /// <summary>
@@ -616,8 +772,7 @@ namespace TensorSharp.Cuda
                         $"[dsv4-cuda] not enough VRAM: {weightBytes / (double)(1L << 30):F1} GiB of weights plus " +
                         $"this context's KV caches against {freeTotal / (double)(1L << 30):F1} GiB free across " +
                         $"{nDev} device(s)" + (nCpuMoe > 0 ? " at the requested offload" : string.Empty) +
-                        $". Re-run with --n-cpu-moe {need} (moves the routed experts of the first {need} layer(s), " +
-                        $"{wouldFree / (double)(1L << 30):F1} GiB, to system RAM) or --cpu-moe to offload every layer.");
+                        OffloadAdvice(m, need, wouldFree));
                 }
             }
 
@@ -643,6 +798,47 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>
+        /// The remedy a refusal for want of VRAM names: offloading the routed experts of the leading
+        /// <paramref name="need"/> layers (<c>--n-cpu-moe</c>), or of every layer (<c>--cpu-moe</c>), only
+        /// where the host matmul runs those layers' layouts. Where it does not (the 1017's IQ1_S, IQ2_S and
+        /// IQ2_XXS gate/up experts have no host kernel) no offload loads the model, so the refusal names
+        /// the tensor that keeps the experts in VRAM rather than an offload the engine would then refuse.
+        /// </summary>
+        internal static string OffloadAdvice(ModelDesc m, int need, long wouldFreeBytes)
+        {
+            string blocker = m.HostMatMul == null
+                ? "no host matmul was supplied to run them (ModelDesc.HostMatMul)"
+                : FirstExpertTheHostCannotRun(m, need) is { } tensor
+                    ? tensor + ", which the host matmul behind --n-cpu-moe does not implement"
+                    : null;
+            if (blocker != null)
+                return $". Offloading routed experts cannot make it fit: the first {need} layer(s) would move to " +
+                    $"system RAM, and {blocker}. Free VRAM, add GPUs, shorten the context, or use --backend " +
+                    "ggml_cuda, which runs offloaded experts through ggml's CPU kernels.";
+            return $". Re-run with --n-cpu-moe {need} (moves the routed experts of the first {need} layer(s), " +
+                $"{wouldFreeBytes / (double)(1L << 30):F1} GiB, to system RAM)" +
+                (FirstExpertTheHostCannotRun(m, m.NLayer) == null ? " or --cpu-moe to offload every layer." : ".");
+        }
+
+        /// <summary>The first routed-expert tensor of the leading <paramref name="layers"/> layers that
+        /// <see cref="ModelDesc.HostMatMul"/> (not null) cannot run, as "name is TYPE"; null when it runs
+        /// them all.</summary>
+        internal static string FirstExpertTheHostCannotRun(ModelDesc m, int layers)
+        {
+            for (int il = 0; il < Math.Min(layers, m.NLayer); il++)
+            {
+                LayerDesc layer = m.Layers[il];
+                foreach ((CudaWeightDesc w, string tensor) in new[]
+                    { (layer.GateExps, "ffn_gate_exps"), (layer.UpExps, "ffn_up_exps"), (layer.DownExps, "ffn_down_exps") })
+                {
+                    if (!m.HostMatMul.SupportsType(w.GgmlType, w.Ne0))
+                        return $"{w.Name ?? $"blk.{il}.{tensor}.weight"} is {GgmlTypeName(w.GgmlType)}";
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
         /// Per-layer device memory beyond the packed weights: the raw SWA ring,
         /// the CSA/HCA compressed-K caches, the indexer cache and the compressor
         /// state rings, all allocated on the layer's own device. A split that
@@ -656,16 +852,10 @@ namespace TensorSharp.Cuda
             if (m.V41)
             {
                 // Every V4.1 slot also keeps the rewind checkpoint's shadows of the modular
-                // rings, and only a ratio group's source layer owns the group's caches.
-                b *= 2;
-                if (ratio != 0 && m.Layers[il].KvSource == il)
-                {
-                    long rows = V41Rows(ratio);
-                    b += rows * hd * 2 + rows * m.IdxHeadSize * 2;       // CompK + LidK (F16)
-                    if (ratio > 1)
-                        b += 2L * 2 * V41StateRows(ratio) * hd * 4;      // Hist kv+score and shadows (F32)
-                }
-                return b;
+                // rings, and only a ratio group's source layer owns the group's caches. The
+                // cross-node placement prices layers with the same function.
+                return Dsv4StagePlacement.V41LayerCacheBytes(ratio, ratio != 0 && m.Layers[il].KvSource == il,
+                    m.NSwa, m.NUbatch, m.NCtx, hd, m.IdxHeadSize, _maxDraft);
             }
             if (ratio == CsaRatio)
             {
@@ -702,7 +892,10 @@ namespace TensorSharp.Cuda
         {
             var counts = new int[nDev];
             foreach (int d in assignment)
-                counts[d]++;
+            {
+                if (d >= 0)
+                    counts[d]++;
+            }
             return counts;
         }
 
@@ -746,6 +939,28 @@ namespace TensorSharp.Cuda
             yield return l.GateShexp;
             yield return l.UpShexp;
             yield return l.DownShexp;
+        }
+
+        /// <summary>Every weight a <see cref="MatMul"/> on <paramref name="dev"/> reads, once placed: its
+        /// layers' and the drafter's projections and, on the last device, the output head.</summary>
+        private IEnumerable<DeviceWeight> DenseWeights(Dev dev)
+        {
+            IEnumerable<DevLayer> layers = _layers.Where(l => l.Device == dev.Ordinal);
+            if (_ds != null && _ds.Dev == dev)
+                layers = layers.Concat(_ds.Stages);
+            foreach (DevLayer l in layers)
+            {
+                foreach (DeviceWeight w in new[] { l.WqA, l.WqB, l.Wkv, l.WoA, l.WoB, l.CompWkv, l.CompWgate, l.IdxProj,
+                             l.IdxQB, l.IdxCompWkv, l.IdxCompWgate, l.IndexerK, l.EngramWkv, l.GateShexp, l.UpShexp, l.DownShexp })
+                    yield return w;
+            }
+            if (dev.Ordinal == _lastDev && OwnsHead)
+                yield return _outputQW;
+            if (_ds != null && _ds.Dev == dev)
+            {
+                yield return _ds.MainProj;
+                yield return _ds.MarkovW2;
+            }
         }
 
         /// <summary>Small dense tensor (norm/gate/table) as an allocator-owned
@@ -1001,6 +1216,13 @@ namespace TensorSharp.Cuda
             dev.ShUp = AllocF32(dev, nt, shFf);
             dev.ShDown = AllocF32(dev, nt, e);
 
+            int denseIn = 0;
+            foreach (DeviceWeight w in DenseWeights(dev))
+                if (TakesDenseQ81Rows(w.Type, w.Ne0))
+                    denseIn = Math.Max(denseIn, w.Ne0);
+            if (denseIn > 0)
+                dev.DenseQ81 = AllocU8(dev, MaxBatchedDecodeRows, (long)(denseIn / 32) * Q81BlockBytes);
+
             // The F16 weight-dequant and F16/BF16 activation panels the prefill
             // GEMMs need are NOT allocated here any more: CudaQuantizedOps owns
             // one grow-on-demand scratch per allocator and every matmul on this
@@ -1061,7 +1283,7 @@ namespace TensorSharp.Cuda
             {
                 double secs = sw.Elapsed.TotalSeconds;
                 Console.Error.WriteLine($"[dsv4-cuda] forward {tokens.Length} tokens in {secs:F3}s ({tokens.Length / secs:F1} tok/s), "
-                    + $"host issue {IssueMs(start):F1}ms");
+                    + $"host issue {IssueMs(start):F1}ms" + (_stage != null ? "; " + DescribeBoundaries() : string.Empty));
             }
         }
 
@@ -1100,24 +1322,58 @@ namespace TensorSharp.Cuda
         /// TS_DSV4_CUDA_TRACE_DIR writes whole tensors under the same names the
         /// managed executor writes with TS_DSV4_CPU_TRACE_DIR, so the two
         /// directories can be diffed tensor by tensor. That is the only tractable
-        /// way to find which layer of a forty-layer graph first disagrees.
+        /// way to find which layer of a forty-layer graph first disagrees. Read per engine, so a process
+        /// can trace one model and not the next (the native TS_DSV41_TRACE_DIR is read per graph).
         /// </summary>
-        private static readonly string TraceDir = Environment.GetEnvironmentVariable("TS_DSV4_CUDA_TRACE_DIR");
+        private readonly string _traceDir = Environment.GetEnvironmentVariable("TS_DSV4_CUDA_TRACE_DIR");
         private int _traceP0;
 
-        private void Trace(Dev dev, string name, Tensor t, long count)
+        private void Trace(Dev dev, string name, Tensor t, long count, string extension = "f32")
         {
-            if (TraceDir == null || t == null)
+            if (_traceDir == null || t == null)
                 return;
-            System.IO.Directory.CreateDirectory(TraceDir);
+            System.IO.Directory.CreateDirectory(_traceDir);
             dev.MakeCurrent();
             CudaDriverApi.cuStreamSynchronize(dev.Stream);
-            var host = new float[count];
-            fixed (float* h = host)
-                CudaDriverApi.cuMemcpyDtoH((IntPtr)h, Ptr(t), new UIntPtr((ulong)count * 4)).ThrowOnError();
             var bytes = new byte[count * 4];
-            Buffer.BlockCopy(host, 0, bytes, 0, bytes.Length);
-            System.IO.File.WriteAllBytes(System.IO.Path.Combine(TraceDir, $"p{_traceP0:D6}_{name}.f32"), bytes);
+            fixed (byte* h = bytes)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)h, Ptr(t), new UIntPtr((ulong)count * 4)).ThrowOnError();
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(_traceDir, $"p{_traceP0:D6}_{name}.{extension}"), bytes);
+        }
+
+        /// <summary>An Int32 tensor, written as .i32 like the native executor's.</summary>
+        private void TraceI32(Dev dev, string name, Tensor t, long count) => Trace(dev, name, t, count, "i32");
+
+        /// <summary>S8b oracle trace: raw bytes of a device range (committed F16 cache rows), under TS_DSV4_CUDA_TRACE_DIR only.</summary>
+        private void TraceBytes(Dev dev, string name, IntPtr ptr, long bytes, string extension)
+        {
+            if (_traceDir == null || ptr == IntPtr.Zero || bytes <= 0)
+                return;
+            System.IO.Directory.CreateDirectory(_traceDir);
+            dev.MakeCurrent();
+            CudaDriverApi.cuStreamSynchronize(dev.Stream);
+            var data = new byte[bytes];
+            fixed (byte* h = data)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)h, ptr, new UIntPtr((ulong)bytes)).ThrowOnError();
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(_traceDir, $"p{_traceP0:D6}_{name}.{extension}"), data);
+        }
+
+        /// <summary>S8b oracle trace: the first <paramref name="width"/> bytes of each of <paramref name="rows"/> rows
+        /// <paramref name="stride"/> bytes apart (the candidate mask, cut to the visible rows).</summary>
+        private void TraceRowPrefix(Dev dev, string name, IntPtr ptr, int rows, long stride, long width, string extension)
+        {
+            if (_traceDir == null || ptr == IntPtr.Zero || rows <= 0 || width <= 0 || width > stride)
+                return;
+            System.IO.Directory.CreateDirectory(_traceDir);
+            dev.MakeCurrent();
+            CudaDriverApi.cuStreamSynchronize(dev.Stream);
+            var all = new byte[rows * stride];
+            fixed (byte* h = all)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)h, ptr, new UIntPtr((ulong)all.LongLength)).ThrowOnError();
+            var data = new byte[rows * width];
+            for (int r = 0; r < rows; r++)
+                Array.Copy(all, r * stride, data, r * width, width);
+            System.IO.File.WriteAllBytes(System.IO.Path.Combine(_traceDir, $"p{_traceP0:D6}_{name}.{extension}"), data);
         }
 
         private static string TraceLayer(int il, string what) => $"blk{il:D2}_{what}";
@@ -1163,6 +1419,8 @@ namespace TensorSharp.Cuda
         {
             var m = _m;
             int e = m.NEmbd;
+            if (_stage != null && (batch != null || allLogitsRows || hAllOut != null))
+                throw new NotSupportedException("[dsv4-cuda] a distributed stage runs one mirrored sequence: no batched decode or speculation.");
 
             // tokens -> pinned buffer (parity-double-buffered) -> devices that need
             // them. Per-device parity events guard reuse of the pinned slot two
@@ -1195,7 +1453,7 @@ namespace TensorSharp.Cuda
             _traceP0 = p0;
             if (batch != null)
                 StagePositions(batch);
-            if (m.V41 && m.Engram != null)
+            if (m.V41 && m.Engram != null && _ownsEngram)
             {
                 if (batch == null)
                 {
@@ -1210,18 +1468,27 @@ namespace TensorSharp.Cuda
                 }
             }
 
-            // embedding on device 0
+            // embedding on device 0, or the previous stage's boundary state there
             var dev0 = _devs[0];
             dev0.MakeCurrent();
             StageBegin(dev0);
-            dev0.DK.Embed(_tokEmbdQW.Ptr, TokensOf(dev0), dev0.Xs, _tokEmbdQW.Type, _tokEmbdQW.RowBytes, nt, e, dev0.Stream);
-            StageEnd(dev0, 0);
-            CheckSync(dev0, "embed");
-            Dump(dev0, "embed.xs", dev0.Xs);
-            Trace(dev0, "embedding", dev0.Xs, (long)nt * HC * e);
+            if (OwnsEmbedding)
+            {
+                dev0.DK.Embed(_tokEmbdQW.Ptr, TokensOf(dev0), dev0.Xs, _tokEmbdQW.Type, _tokEmbdQW.RowBytes, nt, e, dev0.Stream);
+                StageEnd(dev0, 0);
+                CheckSync(dev0, "embed");
+                Dump(dev0, "embed.xs", dev0.Xs);
+                Trace(dev0, "embedding", dev0.Xs, (long)nt * HC * e);
+            }
+            else
+            {
+                ReceiveBoundary(dev0, p0, nt);
+                StageEnd(dev0, 11);
+                CheckSync(dev0, "boundary receive");
+            }
 
             int curDev = 0;
-            for (int il = 0; il < m.NLayer; il++)
+            for (int il = _firstLayer; il < _endLayer; il++)
             {
                 var L = _layers[il];
                 if (L.Device != curDev)
@@ -1241,7 +1508,7 @@ namespace TensorSharp.Cuda
                     // is the supported multi-GPU pattern.
                     src.MakeCurrent();
                     CudaDriverApi.cuMemcpyDtoHAsync(src.BoundaryPinned, Ptr(src.Xs), copyBytes, src.Stream).ThrowOnError();
-                    var state = StageBoundaryState(src, dst, nt);
+                    var state = StageBoundaryState(src, dst, nt, p0, batch);
                     StageEnd(src, 11);
                     CudaDriverApi.cuEventRecord(src.XsReadyEv, src.Stream).ThrowOnError();
                     dst.MakeCurrent();
@@ -1263,7 +1530,7 @@ namespace TensorSharp.Cuda
                 // Runs before the attention block and rewrites the residual in
                 // place, which is where the reference puts it.
                 if (L.EngramIndex >= 0)
-                    EngramLayer(dev, L, nt);
+                    EngramLayer(dev, L, il, nt);
 
                 // ---- attention super-block ----
                 // V4.1 delays the hyper-connection collapse by one block: each
@@ -1330,6 +1597,15 @@ namespace TensorSharp.Cuda
                     dev.DK.HcMean(dev.Xs, _ds.CapH, nt, e, DsparkFeatureSize, _ds.CaptureSlot[il] * e, dev.Stream);
                     CheckSync(dev, $"dspark capture L{il}");
                 }
+                LayerRuns[il]++;
+            }
+
+            // A stage before the last hands everything its layers published to the next one; the
+            // head (and the logits) belong to the last stage.
+            if (!OwnsHead)
+            {
+                SendBoundary(_devs[curDev], p0, nt);
+                return;
             }
 
             if (_dsSelfCatchUp)
@@ -1585,6 +1861,8 @@ namespace TensorSharp.Cuda
 
             MatMul(dev, l.WqA, dev.Cur, dev.Qr, nt);
             RmsNorm(dev, dev.Qr, l.QANorm, nt);
+            // The native executor's v41.NN.qr: the W_q_a product, RMS-normed, before W_q_b.
+            Trace(dev, TraceLayer(il, "qr"), dev.Qr, (long)nt * m.QLoraRank);
             MatMul(dev, l.WqB, dev.Qr, dev.Q, nt);
             MatMul(dev, l.Wkv, dev.Cur, dev.KvRaw, nt);
             dev.DK.V41AttnPrep(dev.Q, dev.KvRaw, Ptr(l.KvNorm), ropeTab, Ptr(c.RingK),
@@ -1614,6 +1892,8 @@ namespace TensorSharp.Cuda
             float kqScale = 1.0f / MathF.Sqrt(hd);
             dev.DK.Attention(dev.Q, Ptr(c.RingK), Ptr(comp), dev.TopkIdx, dev.TopkCnt, Ptr(l.Sinks), dev.AttnO,
                 p0, m.NSwa, _ringRaw, nh, hd, mode, ratio == 0 ? 1 : ratio, m.IdxTopK, kqScale, nt, dev.Stream);
+            // The attention core (heads still rotated), before the inverse RoPE and the grouped out-projection.
+            Trace(dev, TraceLayer(il, "attn_core"), dev.AttnO, (long)nt * nh * hd);
             StageEnd(dev, 5);
             CheckSync(dev, $"v41_attn_core L{il}");
 
@@ -1631,6 +1911,13 @@ namespace TensorSharp.Cuda
             MatMul(dev, l.CompWkv, dev.Cur, dev.StKv, nt);
             if (ratio > 1)
                 MatMul(dev, l.CompWgate, dev.Cur, dev.StScore, nt);
+            if (_traceDir != null)
+            {
+                // S8b oracle: the compressor projections this call pools (BF16 weights), one row per token.
+                Trace(dev, TraceLayer(l.KvSource, "comp_kv"), dev.StKv, (long)nt * hd);
+                if (ratio > 1)
+                    Trace(dev, TraceLayer(l.KvSource, "comp_score"), dev.StScore, (long)nt * hd);
+            }
 
             long firstBoundary = -1;
             for (long p = p0; p < (long)p0 + nt; p++)
@@ -1643,6 +1930,8 @@ namespace TensorSharp.Cuda
             {
                 dev.DK.V41Compress(dev.StKv, dev.StScore, Ptr(c.HistKv), Ptr(c.HistScore), Ptr(l.CompNorm),
                     dev.Latent, firstBoundary, nBlocks, p0, ratio, V41StateRows(ratio), hd, m.RmsEps, dev.Stream);
+                // The native executor's v41.NN.latent: one normalized, unrotated row per block this call completes.
+                Trace(dev, TraceLayer(l.KvSource, "latent"), dev.Latent, (long)nBlocks * hd);
 
                 using (Tensor latentRows = Rows(dev.Latent, nBlocks))
                 using (Tensor keyRows = Rows(dev.LatentK, nBlocks))
@@ -1650,11 +1939,20 @@ namespace TensorSharp.Cuda
                     MatMul(dev, l.IndexerK, latentRows, keyRows, nBlocks);
                     RmsNorm(dev, keyRows, l.IndexerKNorm, nBlocks);
                 }
+                // S8b oracle: the indexer K rows before the commit rotates and quantizes them.
+                Trace(dev, TraceLayer(l.KvSource, "lid_pre"), dev.LatentK, (long)nBlocks * id);
 
                 dev.DK.V41Commit(dev.LatentK, Ptr(dev.RopeComp), Ptr(c.LidK),
                     firstBoundary, nBlocks, ratio, id, m.NRot, 1, dev.Stream);
                 dev.DK.V41Commit(dev.Latent, Ptr(dev.RopeComp), Ptr(c.CompK),
                     firstBoundary, nBlocks, ratio, hd, m.NRot, 2, dev.Stream);
+                if (_traceDir != null)
+                {
+                    // S8b oracle: what the two commits stored (F16 rows firstBoundary / ratio ...).
+                    long firstRow = firstBoundary / ratio;
+                    TraceBytes(dev, TraceLayer(l.KvSource, "lid_k"), (IntPtr)((long)Ptr(c.LidK) + firstRow * id * 2), (long)nBlocks * id * 2, "f16");
+                    TraceBytes(dev, TraceLayer(l.KvSource, "comp_k"), (IntPtr)((long)Ptr(c.CompK) + firstRow * hd * 2), (long)nBlocks * hd * 2, "f16");
+                }
                 NoteCommitted(l.KvSource, _active, firstBoundary, ratio, nBlocks);
             }
 
@@ -1673,6 +1971,9 @@ namespace TensorSharp.Cuda
             float iwScale = 1.0f / MathF.Sqrt((float)m.IdxHeadSize * m.IdxNHead);
             dev.DK.V41IdxPrep(dev.Iq, dev.Iw, Ptr(dev.RopeComp), p0, m.IdxNHead, m.IdxHeadSize, m.NRot,
                 iwScale, nt, dev.Stream);
+            // S8b oracle: the rotated, MXFP4-rounded query heads and the prescaled weights the score kernel reads.
+            Trace(dev, TraceLayer(il, "index_q"), dev.Iq, (long)nt * m.IdxNHead * m.IdxHeadSize);
+            Trace(dev, TraceLayer(il, "index_w"), dev.Iw, (long)nt * m.IdxNHead);
 
             // Rows this layer may see: visibility, then whatever the candidate
             // layer left standing for the layers after it.
@@ -1685,10 +1986,19 @@ namespace TensorSharp.Cuda
             {
                 dev.DK.V41Candidate(dev.IdxScores, Ptr(dev.CandMask), p0, ratio, rows,
                     m.CandidateBlock, m.CandidateTopk, nt, dev.Stream);
+                // S8b oracle: the keep mask this layer publishes, cut to the visible rows.
+                if (_traceDir != null)
+                    TraceRowPrefix(dev, TraceLayer(il, "cand_mask"), Ptr(dev.CandMask), nt, rows, maxVis, "u8");
                 _v41CandActive = true;
             }
 
             dev.DK.TopK(dev.IdxScores, dev.TopkIdx, dev.TopkCnt, p0, ratio, m.IdxTopK, rows, nt, dev.Stream);
+            // The native executor's v41.NN.index_scores and index_top, in this engine's layout: [nt, rows]
+            // scores (visible rows only; pruned ones -inf) and [nt, IdxTopK] row ids, of which each row's
+            // index_count are the selection, in no particular order.
+            Trace(dev, TraceLayer(il, "index_scores"), dev.IdxScores, (long)nt * rows);
+            TraceI32(dev, TraceLayer(il, "index_top"), dev.TopkIdx, (long)nt * m.IdxTopK);
+            TraceI32(dev, TraceLayer(il, "index_count"), dev.TopkCnt, nt);
         }
 
         /// <summary>Inverse RoPE on the rope slice, then the grouped LoRA output
@@ -1714,7 +2024,7 @@ namespace TensorSharp.Cuda
         /// the previous fill (the last ubatch, or another Engram layer on this device) may not have
         /// run yet: refilling a shared staging handed that copy this layer's rows. Each layer
         /// fills its own staging, after the copy out of its last fill has run.</remarks>
-        private void EngramLayer(Dev dev, DevLayer l, int nt)
+        private void EngramLayer(Dev dev, DevLayer l, int il, int nt)
         {
             var m = _m;
             int columns = m.Engram.HashColumns;
@@ -1737,9 +2047,17 @@ namespace TensorSharp.Cuda
                     new UIntPtr((ulong)(nt * cols * 4)), dev.Stream).ThrowOnError();
                 CudaDriverApi.cuEventRecord(l.EngramCopied, dev.Stream).ThrowOnError();
             }
+            // The gathered table rows the projection reads: both engines gather the same rows, so a float64
+            // product of these is the exact engram_kv either one should approximate.
+            Trace(dev, TraceLayer(il, "engram_lookup"), dev.EngramLookup, nt * cols);
             MatMul(dev, l.EngramWkv, dev.EngramLookup, dev.EngramKv, nt);
+            EngramRuns[l.EngramIndex]++;
+            Trace(dev, TraceLayer(il, "engram_kv"), dev.EngramKv, (long)nt * (HC + 1) * m.NEmbd);
             dev.DK.V41EngramGate(dev.Xs, dev.EngramKv, Ptr(l.EngramQ), Ptr(l.EngramK),
                 HC, m.NEmbd, m.RmsEps, nt, dev.Stream);
+            // The native executor's v41.NN.engram_kv and v41.NN.engram_output (compare-dsv4-traces.py
+            // maps the names); its engram_gate is folded into the kernel here, and the script derives it.
+            Trace(dev, TraceLayer(il, "engram_output"), dev.Xs, (long)nt * HC * m.NEmbd);
         }
 
         /// <summary>A candidate mask belongs to one ubatch: the rows it names are
@@ -1783,6 +2101,11 @@ namespace TensorSharp.Cuda
             dev.DK.MoeSelect(dev.RouterLogits, Ptr(l.ExpProbsBias), Ptr(l.Tid2Eid), tokensDev, dev.Sel, dev.SelW,
                 nEx, nUsed, m.ExpertWeightsNorm ? 1 : 0, m.ExpertWeightsScale, nt, dev.Stream);
             StageEnd(dev, 7);
+            // The router's logits and the experts it chose: what tells a routing flip (a near tie the two
+            // engines' rounding settles differently) from an expert decoder that is wrong.
+            Trace(dev, TraceLayer(il, "router"), dev.RouterLogits, (long)nt * nEx);
+            TraceI32(dev, TraceLayer(il, "experts"), dev.Sel, (long)nt * nUsed);
+            Trace(dev, TraceLayer(il, "selw"), dev.SelW, (long)nt * nUsed);
             if (dbg)
             {
                 Dump(dev, "L0.router", dev.RouterLogits);
@@ -1796,6 +2119,7 @@ namespace TensorSharp.Cuda
             MatMul(dev, l.GateShexp, dev.Cur, dev.ShGate, nt);
             SwigluClamp(dev.ShGate, dev.ShUp, (long)nt * shFf, l.ClampShexp);
             MatMul(dev, l.DownShexp, dev.ShGate, dev.ShDown, nt);
+            Trace(dev, TraceLayer(il, "shexp_out"), dev.ShDown, (long)nt * e);
             StageEnd(dev, 9);
             CheckSync(dev, $"shexp L{il}");
 
@@ -1824,20 +2148,19 @@ namespace TensorSharp.Cuda
             int downType = l.DownExps.Type;
             if (l.UpExps.Type != guType)
                 throw new NotSupportedException("[dsv4-cuda] expert gate/up quant types differ");
-            RequireExpertType(guType);
-            RequireExpertType(downType);
 
             // Up to MaxBatchedDecodeRows tokens (a decode step, a batched decode step, a verify
             // window) run the decode kernels once per (token, selected expert) slot, so every token
             // computes exactly what it computes alone. Longer ubatches group the slots by expert and
-            // run on tensor cores when the widths allow, else through the register-staged kernels.
-            bool perSlot = nt <= MaxBatchedDecodeRows;
-            bool mma = !perSlot && dev.DK.HasMoeMma
-                && StagedSupportsType(guType) && StagedSupportsType(downType)
-                && e % Dsv4Kernels.MoeMmaK == 0 && ff % Dsv4Kernels.MoeMmaK == 0;
-            bool staged = !perSlot && !mma
-                && StagedSupportsType(guType) && StagedSupportsType(downType)
-                && Dsv4Kernels.StagedSupports(e) && Dsv4Kernels.StagedSupports(ff);
+            // run on tensor cores when the widths allow, else through the register-staged kernels,
+            // else the grouped warp-per-row ones: the routing GLM and Qwen3.8 share (CudaMoe), with
+            // this module's decoders. ValidateRoutedExpertTypes checked every layout at load.
+            CudaMoe.ExpertRoute route = SelectMoeRoute(nt, dev.DK.HasMoeMma, dev.DK.DecodesLowBitIqExperts,
+                guType, downType, e, ff);
+            MoeRouteRuns[(int)route]++;
+            bool perSlot = route == CudaMoe.ExpertRoute.PerSlot;
+            bool mma = route == CudaMoe.ExpertRoute.TensorCore;
+            bool staged = route == CudaMoe.ExpertRoute.Staged;
             if (staged)
                 QuantizeQ81Split(dev, dev.Cur, dev.SplitQsA, dev.SplitDA, e, nt);
             else if (!mma)
@@ -1914,30 +2237,63 @@ namespace TensorSharp.Cuda
             return flat.Narrow(0, 0, n);
         }
 
-        private const string ResidentExpertTypes = "Q8_0, Q6_K, Q5_K, Q4_K, Q3_K, Q2_K, IQ3_S, IQ2_XXS, MXFP4";
+        /// <summary>
+        /// Tests only: the route every routed-expert block takes, whatever its ubatch, instead of the one
+        /// <see cref="CudaMoe.SelectRoute"/> picks; null leaves the choice to the engine. It is not an
+        /// environment variable (the engine's routing is not a user option). A route the loaded module, the
+        /// layer's layouts or its widths cannot take throws instead of falling back, so a test that forced
+        /// the tensor cores cannot pass on another route.
+        /// </summary>
+        internal static CudaMoe.ExpertRoute? ForceMoeRoute { get; set; }
 
-        private static void RequireExpertType(int type)
+        /// <summary>How many GPU routed-expert blocks (trunk and drafter) this engine has run on each
+        /// route, indexed by <see cref="CudaMoe.ExpertRoute"/>: what lets a test that forced a route see
+        /// that it is the one that ran.</summary>
+        internal int[] MoeRouteRuns { get; } = new int[4];
+
+        /// <summary>The kernels a routed-expert block of <paramref name="nt"/> tokens runs on, on a module
+        /// with or without the tensor-core body and the low-bit IQ decoders: <see cref="ForceMoeRoute"/>
+        /// when set, else the shared selection (per-slot up to <see cref="MaxBatchedDecodeRows"/>).</summary>
+        internal static CudaMoe.ExpertRoute SelectMoeRoute(int nt, bool hasMoeMma, bool decodesLowBitIq,
+            int guType, int downType, int e, int ff)
         {
-            if (!SupportsResidentExpertType(type))
+            if (ForceMoeRoute is not { } forced)
+                return CudaMoe.SelectRoute(nt, MaxBatchedDecodeRows, hasMoeMma, decodesLowBitIq, guType, downType, e, ff);
+            bool grouped = CudaMoe.GroupedSupportsType(guType, decodesLowBitIq)
+                && CudaMoe.GroupedSupportsType(downType, decodesLowBitIq);
+            string why = forced switch
             {
-                throw new NotSupportedException(
-                    $"[dsv4-cuda] unsupported expert quant type {GgmlTypeName(type)} (supported: {ResidentExpertTypes})");
-            }
+                CudaMoe.ExpertRoute.TensorCore when !hasMoeMma =>
+                    "the loaded tensorsharp_dsv4_kernels module has no tensor-core body (a PTX baseline below sm_80, or a GPU below it)",
+                CudaMoe.ExpertRoute.TensorCore or CudaMoe.ExpertRoute.Staged when !grouped =>
+                    $"the grouped kernels of this module do not decode {GgmlTypeName(guType)} gate/up with {GgmlTypeName(downType)} down",
+                CudaMoe.ExpertRoute.TensorCore when e % Dsv4Kernels.MoeMmaK != 0 || ff % Dsv4Kernels.MoeMmaK != 0 =>
+                    $"widths {e} and {ff} are not multiples of its k-step {Dsv4Kernels.MoeMmaK}",
+                CudaMoe.ExpertRoute.Staged when !Dsv4Kernels.StagedSupports(e) || !Dsv4Kernels.StagedSupports(ff) =>
+                    $"the register-staged kernels do not take widths {e} and {ff}",
+                _ => null,
+            };
+            if (why != null)
+                throw new InvalidOperationException($"[dsv4-cuda] ForceMoeRoute = {forced} cannot run here: {why}.");
+            return forced;
         }
-
-        /// <summary>The routed-expert layouts the GPU MoE kernels decode.</summary>
-        internal static bool SupportsResidentExpertType(int type) => StagedSupportsType(type) || type == TIQ2_XXS;
 
         /// <summary>
         /// Checks every routed-expert tensor against the code that will run it, before a byte is
-        /// uploaded: a GPU-resident layer's against the expert kernels, an offloaded layer's (the
-        /// leading <paramref name="nCpuMoe"/>) against <see cref="ModelDesc.HostMatMul"/>, and gate
-        /// against up, which both paths dispatch as one type. The DSpark drafter's stages are never
-        /// offloaded. Without this, a checkpoint the engine cannot run -- unsloth's UD quants put
-        /// IQ1_S, IQ2_S, IQ2_XS and IQ3_XXS into the experts -- streamed every expert into VRAM
-        /// first and then failed on the first token through such a layer, with a bare type number.
+        /// uploaded: a GPU-resident layer's against the expert kernels GLM and Qwen3.8 share
+        /// (<see cref="CudaMoe.SupportsExpertType"/>) and then against the decoders of the module loaded
+        /// (<see cref="CudaMoe.RequireExpertDecoders"/>, which refuses Q5_1 unless
+        /// <paramref name="decodesQ5_1"/> and IQ1_S and IQ2_S unless <paramref name="decodesLowBitIq"/>:
+        /// a module built from older kernel source reads those rows as Q8_0), an offloaded layer's (the
+        /// leading <paramref name="nCpuMoe"/>) against <see cref="ModelDesc.HostMatMul"/>, and gate against
+        /// up, which both paths dispatch as one type. The DSpark drafter's stages are never offloaded.
+        /// Without this, a checkpoint the engine cannot run streamed every expert into VRAM first and then
+        /// failed on the first token through such a layer, with a bare type number.
         /// </summary>
-        internal static void ValidateRoutedExpertTypes(ModelDesc m, int nCpuMoe)
+        /// <param name="owned">The layers this engine runs (a stage of a distributed run checks only its own,
+        /// the other layers carry no weights here); null for every layer.</param>
+        internal static void ValidateRoutedExpertTypes(ModelDesc m, int nCpuMoe, bool decodesQ5_1, bool decodesLowBitIq,
+            Func<int, bool> owned = null)
         {
             var refused = new List<string>();
             void Check(LayerDesc layer, string prefix, bool host)
@@ -1952,27 +2308,53 @@ namespace TensorSharp.Cuda
                 {
                     // Without a host matmul an offload is refused by the constructor, with its own reason.
                     if (host ? m.HostMatMul == null || m.HostMatMul.SupportsType(w.GgmlType, w.Ne0)
-                             : SupportsResidentExpertType(w.GgmlType))
+                             : CudaMoe.SupportsExpertType(w.GgmlType))
                         continue;
                     refused.Add($"{w.Name ?? prefix + tensor + ".weight"} is {GgmlTypeName(w.GgmlType)} " +
                         (host ? "(offloaded by --n-cpu-moe)" : "(GPU-resident)"));
                 }
             }
             for (int il = 0; il < m.NLayer; il++)
-                Check(m.Layers[il], $"blk.{il}.", host: il < nCpuMoe);
+            {
+                if (owned == null || owned(il))
+                    Check(m.Layers[il], $"blk.{il}.", host: il < nCpuMoe);
+            }
             if (m.Dspark?.Stages != null)
                 for (int s = 0; s < m.Dspark.Stages.Length; s++)
                     Check(m.Dspark.Stages[s], $"dspark.{s}.", host: false);
-            if (refused.Count == 0)
-                return;
-            const int Shown = 6;
-            throw new NotSupportedException(
-                $"[dsv4-cuda] the direct-CUDA engine cannot run {refused.Count} routed-expert tensor(s) of this " +
-                "checkpoint where the layer split places them: " + string.Join("; ", refused.Take(Shown)) +
-                (refused.Count > Shown ? $"; and {refused.Count - Shown} more" : string.Empty) +
-                $". The GPU expert kernels implement {ResidentExpertTypes}; layers offloaded with --n-cpu-moe run " +
-                "on the host's quantized matmul, which implements its own set. Use --backend ggml_cuda, which runs " +
-                "the experts through ggml's kernels instead.");
+            if (refused.Count > 0)
+            {
+                const int Shown = 6;
+                throw new NotSupportedException(
+                    $"[dsv4-cuda] the direct-CUDA engine cannot run {refused.Count} routed-expert tensor(s) of this " +
+                    "checkpoint where the layer split places them: " + string.Join("; ", refused.Take(Shown)) +
+                    (refused.Count > Shown ? $"; and {refused.Count - Shown} more" : string.Empty) +
+                    $". The GPU expert kernels implement {CudaMoe.SupportedExpertTypes}; layers offloaded with --n-cpu-moe " +
+                    "run on the host's quantized matmul, which implements its own set. Use --backend ggml_cuda, which " +
+                    "runs the experts through ggml's kernels instead.");
+            }
+
+            // The resident layers against the decoders the loaded module carries.
+            void RequireDecoders(LayerDesc layer, int index, string prefix)
+                => CudaMoe.RequireExpertDecoders("dsv4-cuda", decodesQ5_1, index,
+                    Named(layer.GateExps, prefix + "ffn_gate_exps.weight"), Named(layer.UpExps, prefix + "ffn_up_exps.weight"),
+                    Named(layer.DownExps, prefix + "ffn_down_exps.weight"), decodesLowBitIq);
+            for (int il = Math.Max(nCpuMoe, 0); il < m.NLayer; il++)
+            {
+                if (owned == null || owned(il))
+                    RequireDecoders(m.Layers[il], il, $"blk.{il}.");
+            }
+            if (m.Dspark?.Stages != null)
+                for (int s = 0; s < m.Dspark.Stages.Length; s++)
+                    RequireDecoders(m.Dspark.Stages[s], s, $"dspark.{s}.");
+        }
+
+        /// <summary>The descriptor with <paramref name="name"/> when the loader gave it none.</summary>
+        private static CudaWeightDesc Named(CudaWeightDesc w, string name)
+        {
+            if (string.IsNullOrEmpty(w.Name))
+                w.Name = name;
+            return w;
         }
 
         /// <summary>ggml's name for a tensor type id, for messages.</summary>
@@ -1986,12 +2368,6 @@ namespace TensorSharp.Cuda
             41 => "Q1_0", 42 => "Q2_0",
             _ => $"type {type}",
         };
-
-        /// <summary>The layouts the grouped expert kernels (tensor-core and register-staged)
-        /// decode; IQ2_XXS, used by the DSpark drafter, only has the per-token path.</summary>
-        private static bool StagedSupportsType(int type)
-            => type == TIQ3_S || type == TMXFP4 || type == TQ8_0 || type == TQ6_K || type == TQ5_K || type == TQ4_K
-                || type == TQ3_K || type == TQ2_K;
 
         // -------------------------------------------------------------------
         // dense matmul dispatch
@@ -2013,28 +2389,76 @@ namespace TensorSharp.Cuda
 
         /// <summary>
         /// result[rows, w.Ne1] = input[rows, w.Ne0] x w^T for a weight this engine
-        /// already holds resident in its per-device arena.
-        ///
-        /// The kernel choice (dp4a matvec, MMQ int8 GEMM, dequant-to-F16 + cuBLAS,
-        /// BF16 tensor cores, ...) is NOT decided here: it is the shared routing in
-        /// CudaQuantizedOps, so DSV4 gets exactly the same tuning as every other
-        /// direct-CUDA model and there is one implementation to maintain. The engine
-        /// asks for row-invariant kernels, so a batched decode step computes each
-        /// sequence's row exactly as that sequence's own one-token forward does.
+        /// already holds resident in its per-device arena (<see cref="DenseMatMul"/>).
         /// </summary>
         private void MatMul(Dev dev, in DeviceWeight w, Tensor input, Tensor output, int rows)
+            => DenseMatMul(dev.Alloc.Kernels, dev.DK, dev.Stream, w, input, output, rows, dev.DenseQ81);
+
+        /// <summary>Whether a decode-size projection of this layout runs on <see cref="Dsv4Kernels.DenseQ81Rows"/>
+        /// rather than the shared routing: the layouts both decode, except those the shared routing already
+        /// computes alike for 1..16 rows on its q8_1 kernels (Q2_K, Q3_K, Q6_K, Q8_0, and IQ2_XXS, whose
+        /// one-row matvec there is also the faster). The others (Q4_K, Q5_K, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS,
+        /// MXFP4) it runs on a q8_1 dp4a or F32 matvec for one row and on its scalar batched F32 kernel for
+        /// 2..16, so a sequence's row would depend on how many sequences shared the step (13 of the 1017's 40
+        /// shared experts are Q5_K). A layout the shared routing cannot run at all (IQ2_XS) stays refused there
+        /// rather than running only below 17 rows.</summary>
+        internal static bool TakesDenseQ81Rows(int type, int inDim)
+            => type is not (TQ2_K or TQ3_K or TQ6_K or TQ8_0 or TIQ2_XXS) && Dsv4Kernels.DenseQ81RowsSupports(type, inDim)
+                && CudaQuantizedOps.SupportsMatmulType(type);
+
+        /// <summary>
+        /// result[rows, w.Ne1] = input[rows, w.Ne0] x w^T for a resident weight, with every row of a
+        /// decode-size call (up to <see cref="MaxBatchedDecodeRows"/>: a batched decode step, a verify
+        /// window, a short prompt) computed exactly as a one-row call computes it, so a batched step
+        /// answers each sequence as that sequence's own forward does.
+        ///
+        /// The kernel choice (dp4a matvec, MMQ int8 GEMM, dequant-to-F16 + cuBLAS,
+        /// BF16 tensor cores, ...) is otherwise NOT decided here: it is the shared routing in
+        /// CudaQuantizedOps, asked for its row-invariant kernels (Q2_K, Q3_K, Q6_K, Q8_0 and IQ2_XXS then
+        /// compute each of 1..16 rows as one row), so DSV4 gets the same tuning as every other direct-CUDA
+        /// model. The layouts that routing does not keep row-invariant and <see cref="Dsv4Kernels.DenseQ81Rows"/>
+        /// decodes (<see cref="TakesDenseQ81Rows"/>: Q4_K, Q5_K, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4) run on
+        /// that kernel (q8_1 rows in <paramref name="q81"/>), and BF16 (the V4.1 compressor and indexer) one
+        /// row at a time through the one-row call, whose F32 matvec several rows would otherwise trade for
+        /// cuBLAS over BF16-rounded activations. The rest are not held to the one-row result: F16 and F32
+        /// (cuBLAS, whose kernel choice follows the row count), the legacy Q4_0 to Q5_1 layouts, IQ2_S and
+        /// NVFP4; none is a dense layout of the 1017.
+        /// </summary>
+        internal static void DenseMatMul(CudaKernels kernels, Dsv4Kernels dk, IntPtr stream, in DeviceWeight w,
+            Tensor input, Tensor output, int rows, Tensor q81)
         {
+            if (rows <= MaxBatchedDecodeRows && TakesDenseQ81Rows(w.Type, w.Ne0))
+            {
+                long need = (long)rows * (w.Ne0 / 32) * Q81BlockBytes;
+                if (q81 == null || q81.ElementCount() < need)
+                    throw new InvalidOperationException(
+                        $"[dsv4-cuda] no q8_1 scratch for {rows} rows of a {w.Ne0}-wide {GgmlTypeName(w.Type)} projection");
+                kernels.LaunchQuantizeQ81Rows(Ptr(input), Ptr(q81), w.Ne0, rows, stream, warpCooperative: true);
+                dk.DenseQ81Rows(w.Ptr, Ptr(q81), Ptr(output), w.Type, w.Ne1, w.Ne0, w.RowBytes, rows, stream);
+                return;
+            }
             // Scratch buffers are sized for the WIDEST user on this device (the
             // shared expert's ff differs per layer, compressor widths differ
             // between CSA and HCA), so the operands are compact [rows, dim]
             // blocks at the front of the buffer, not full-width row views.
-            using Tensor a = Block(input, 0, rows, w.Ne0);
-            using Tensor r = Block(output, 0, rows, w.Ne1);
-            CudaQuantizedOps.AddmmResidentToFloat32(r, a, w.Ptr, w.Type, w.Ne0, w.Ne1, rowInvariant: true);
+            int perCall = rows > 1 && rows <= MaxBatchedDecodeRows && w.Type == TBF16 ? 1 : rows;
+            for (int first = 0; first < rows; first += perCall)
+            {
+                using Tensor a = Block(input, first, perCall, w.Ne0);
+                using Tensor r = Block(output, first, perCall, w.Ne1);
+                CudaQuantizedOps.AddmmResidentToFloat32(r, a, w.Ptr, w.Type, w.Ne0, w.Ne1, rowInvariant: true);
+            }
         }
 
         /// <summary>Dense F32 weight (MoE router, hyper-connection mixer) held in
-        /// the arena rather than as a tensor: same shared routing, type F32.</summary>
+        /// the arena rather than as a tensor: result[rows, outDim] = input[rows, inDim] x w^T in F32.
+        /// Up to <see cref="Dsv4Kernels.GemvMaxRows"/> rows on this module's gemv; more on the shared routing,
+        /// whose F32 GEMM names CUBLAS_COMPUTE_32F_PEDANTIC (CudaQuantizedOps.RunGemm): F32 operands whatever the
+        /// handle's math mode. These are the logits a top-k routes from: when that GEMM ran under the handle's old
+        /// CUBLAS_TENSOR_OP_MATH, both operands were rounded to a 10-bit mantissa, which on the 1017 put 2.6e-5 of
+        /// relative error into every prefill row's router logits and hyper-connection mixes (1e-7 on the gemv's
+        /// decode rows and on ggml_cuda). These GEMMs are a few hundred MFLOP a layer, so full F32 costs nothing
+        /// measurable.</summary>
         private void MatMulF32(Dev dev, IntPtr wF32, Tensor input, Tensor output, int inDim, int outDim, int rows)
         {
             if (rows <= Dsv4Kernels.GemvMaxRows)
@@ -2050,6 +2474,35 @@ namespace TensorSharp.Cuda
         public void Dispose()
         {
             _stages.Dispose();
+            if (_devs != null && _devs.Length > 0 && _devs[0]?.Alloc != null)
+            {
+                // The sender's copies into the network staging run on the LAST local device's stream and the
+                // receiver's out of it on the first; a forward that failed between queueing them and waiting for
+                // them leaves them in flight, so every stream drains before the pinned memory goes.
+                foreach (var dev in _devs)
+                {
+                    if (dev?.Alloc == null)
+                        continue;
+                    try
+                    {
+                        dev.MakeCurrent();
+                        CudaDriverApi.cuStreamSynchronize(dev.Stream);
+                    }
+                    catch
+                    {
+                        // teardown must not throw
+                    }
+                }
+                try
+                {
+                    _devs[0].MakeCurrent();
+                    FreeNetworkStaging();
+                }
+                catch
+                {
+                    // teardown must not throw
+                }
+            }
             FreeHostMoeBuffers();
             // Slot caches come out of the device allocators, so they go before the allocators do.
             FreeSlots();

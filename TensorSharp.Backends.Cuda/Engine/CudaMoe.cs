@@ -81,29 +81,62 @@ namespace TensorSharp.Cuda
     {
         // ggml type ids of the expert weights the kernels take.
         private const int TQ5_1 = 7, TQ8_0 = 8, TQ2_K = 10, TQ3_K = 11, TQ4_K = 12, TQ5_K = 13, TQ6_K = 14,
-            TIQ2_XXS = 16, TIQ2_XS = 17, TIQ3_XXS = 18, TIQ4_NL = 20, TIQ3_S = 21, TIQ4_XS = 23, TMXFP4 = 39;
+            TIQ2_XXS = 16, TIQ2_XS = 17, TIQ3_XXS = 18, TIQ1_S = 19, TIQ4_NL = 20, TIQ3_S = 21, TIQ2_S = 22,
+            TIQ4_XS = 23, TMXFP4 = 39;
 
         /// <summary>Every expert layout the kernels decode, as a refusal lists them.</summary>
         public const string SupportedExpertTypes =
-            "Q8_0, Q6_K, Q5_K, Q5_1, Q4_K, Q3_K, Q2_K, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_XS, IQ2_XXS, MXFP4";
+            "Q8_0, Q6_K, Q5_K, Q5_1, Q4_K, Q3_K, Q2_K, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, MXFP4";
 
-        /// <summary>Layouts only the warp-per-row kernels decode (the per-token decode kernels and
-        /// the grouped warp kernels a long ubatch falls back to): IQ2_XXS, the DSpark drafter's.</summary>
-        private static bool RowKernelOnlyType(int type) => type == TIQ2_XXS;
+        /// <summary>The layouts whose decoders came with the module's low-bit IQ marker
+        /// (<see cref="Dsv4Kernels.DecodesLowBitIqExperts"/>): IQ1_S and IQ2_S on every route, IQ2_XXS
+        /// on the grouped ones. A module without it reads those rows as Q8_0. IQ2_XXS's warp-per-row
+        /// decoder (the DSpark drafter's) is older, so there IQ2_XXS still runs on those kernels alone.
+        /// Unsloth's DeepSeek V4.1 1017 UD-IQ2_XXS keeps its gate/up experts in these three.</summary>
+        private static bool LowBitIqType(int type) => type == TIQ1_S || type == TIQ2_S || type == TIQ2_XXS;
 
-        /// <summary>The layouts the grouped expert kernels (tensor-core and register-staged)
-        /// decode; see <see cref="RowKernelOnlyType"/> for the rest. IQ2_XS and IQ3_XXS are
-        /// Qwen3.8-Flash-Next UD-Q2_K_XL's gate/up experts: on the warp-per-row fallback its
-        /// 1,823-token prefill ran at 500 tok/s on two A40s, against ggml-cuda's 1,174-1,217 and
-        /// 1,612 once these kernels took the two layouts. Q5_1 is its UD-Q4_K_XL's down projection
-        /// in 43 of 48 layers.</summary>
-        public static bool GroupedSupportsType(int type)
+        /// <summary>The layouts the grouped expert kernels (tensor-core and register-staged) decode
+        /// on a module with (<paramref name="decodesLowBitIq"/>) or without the low-bit IQ marker; the
+        /// default answers for a module without it, which keeps IQ2_XXS on the warp-per-row kernels.
+        /// IQ2_XS and IQ3_XXS are Qwen3.8-Flash-Next UD-Q2_K_XL's gate/up experts: on the warp-per-row
+        /// fallback its 1,823-token prefill ran at 500 tok/s on two A40s, against ggml-cuda's
+        /// 1,174-1,217 and 1,612 once these kernels took the two layouts. Q5_1 is its UD-Q4_K_XL's
+        /// down projection in 43 of 48 layers.</summary>
+        public static bool GroupedSupportsType(int type, bool decodesLowBitIq = false)
             => type == TIQ3_S || type == TMXFP4 || type == TQ8_0 || type == TQ6_K || type == TQ5_K || type == TQ4_K
                 || type == TQ3_K || type == TQ2_K || type == TIQ4_NL || type == TIQ4_XS
-                || type == TIQ2_XS || type == TIQ3_XXS || type == TQ5_1;
+                || type == TIQ2_XS || type == TIQ3_XXS || type == TQ5_1
+                || (decodesLowBitIq && LowBitIqType(type));
 
-        /// <summary>Whether some expert route decodes this layout (<see cref="SupportedExpertTypes"/>).</summary>
-        public static bool SupportsExpertType(int type) => GroupedSupportsType(type) || RowKernelOnlyType(type);
+        /// <summary>Whether some expert route of a module built from the current kernel source decodes
+        /// this layout (<see cref="SupportedExpertTypes"/>); <see cref="RequireExpertDecoders"/> answers
+        /// for the module actually loaded.</summary>
+        public static bool SupportsExpertType(int type) => GroupedSupportsType(type, decodesLowBitIq: true);
+
+        /// <summary>The kernels <see cref="Experts"/> runs a ubatch on.</summary>
+        internal enum ExpertRoute { PerSlot, TensorCore, Staged, Warp }
+
+        /// <summary>
+        /// Up to <paramref name="perSlotMaxRows"/> tokens run the per-(token, expert) decode kernels;
+        /// longer ubatches the tensor-core kernel where the module has its body and both widths sit on
+        /// its k-step, else the register-staged kernels where they take both widths, else the grouped
+        /// warp-per-row kernels. Both grouped routes need gate/up and down in layouts
+        /// <see cref="GroupedSupportsType"/> grants this module.
+        /// </summary>
+        internal static ExpertRoute SelectRoute(int nt, int perSlotMaxRows, bool hasMoeMma, bool decodesLowBitIq,
+            int guType, int downType, int e, int ff)
+        {
+            if (nt <= perSlotMaxRows)
+                return ExpertRoute.PerSlot;
+            bool grouped = GroupedSupportsType(guType, decodesLowBitIq) && GroupedSupportsType(downType, decodesLowBitIq);
+            // hasMoeMma: from the committed compute_75 PTX the tensor-core kernel compiles to an
+            // empty body and would leave ffnOut unwritten; the staged route serves those builds.
+            if (grouped && hasMoeMma && e % Dsv4Kernels.MoeMmaK == 0 && ff % Dsv4Kernels.MoeMmaK == 0)
+                return ExpertRoute.TensorCore;
+            if (grouped && Dsv4Kernels.StagedSupports(e) && Dsv4Kernels.StagedSupports(ff))
+                return ExpertRoute.Staged;
+            return ExpertRoute.Warp;
+        }
 
         /// <summary>
         /// Refuses a layer whose routed experts the kernels cannot run, from the loader's descriptors:
@@ -139,23 +172,33 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>
-        /// Refuses Q5_1 experts on a kernel module that predates their decoder
-        /// (<see cref="Dsv4Kernels.DecodesQ5_1Experts"/> false: built from older source, such as a
-        /// committed PTX baseline not yet regenerated), whose expert kernels would read the rows as
-        /// Q8_0 and answer with wrong output and no error. Every device loads the same module file.
+        /// Refuses experts whose decoder the loaded kernel module predates (built from older source, such
+        /// as a committed PTX baseline not yet regenerated), whose expert kernels would read the rows as
+        /// Q8_0 and answer with wrong output and no error: Q5_1 unless <paramref name="decodesQ5_1"/>
+        /// (<see cref="Dsv4Kernels.DecodesQ5_1Experts"/>), IQ1_S and IQ2_S unless
+        /// <paramref name="decodesLowBitIq"/> (<see cref="Dsv4Kernels.DecodesLowBitIqExperts"/>; the
+        /// default refuses them). IQ2_XXS passes either way: <see cref="GroupedSupportsType"/> keeps it
+        /// on such a module's warp-per-row kernels. Every device loads the same module file.
         /// </summary>
         public static void RequireExpertDecoders(string tag, bool decodesQ5_1, int layer,
-            in CudaWeightDesc gate, in CudaWeightDesc up, in CudaWeightDesc down)
+            in CudaWeightDesc gate, in CudaWeightDesc up, in CudaWeightDesc down, bool decodesLowBitIq = false)
         {
-            if (decodesQ5_1)
+            if (decodesQ5_1 && decodesLowBitIq)
                 return;
             foreach ((CudaWeightDesc w, string role) in new[] { (gate, "gate"), (up, "up"), (down, "down") })
             {
-                if (w.GgmlType == TQ5_1)
+                bool decoded = w.GgmlType switch
                 {
+                    TQ5_1 => decodesQ5_1,
+                    TIQ1_S or TIQ2_S => decodesLowBitIq,
+                    _ => true,
+                };
+                if (!decoded)
+                {
+                    string type = GgmlTypeName(w.GgmlType);
                     throw new NotSupportedException(
-                        $"[{tag}] {ExpertName(layer, role, w)} is Q5_1, and the loaded tensorsharp_dsv4_kernels module " +
-                        "was built from kernel source older than its Q5_1 expert decoder (a committed PTX baseline not " +
+                        $"[{tag}] {ExpertName(layer, role, w)} is {type}, and the loaded tensorsharp_dsv4_kernels module " +
+                        $"was built from kernel source older than its {type} expert decoder (a committed PTX baseline not " +
                         "yet regenerated). Rebuild TensorSharp.Backends.Cuda with a CUDA 13 nvcc on PATH, or run this model with " +
                         "--backend ggml_cuda.");
                 }
@@ -191,15 +234,10 @@ namespace TensorSharp.Cuda
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
-            bool perSlot = nt <= perSlotMaxRows;
-            // HasMoeMma: from the committed compute_75 PTX the tensor-core kernel compiles to an
-            // empty body and would leave ffnOut unwritten; the staged route serves those builds.
-            bool mma = !perSlot && dk.HasMoeMma
-                && GroupedSupportsType(guType) && GroupedSupportsType(downType)
-                && e % Dsv4Kernels.MoeMmaK == 0 && ff % Dsv4Kernels.MoeMmaK == 0;
-            bool staged = !perSlot && !mma
-                && GroupedSupportsType(guType) && GroupedSupportsType(downType)
-                && Dsv4Kernels.StagedSupports(e) && Dsv4Kernels.StagedSupports(ff);
+            ExpertRoute route = SelectRoute(nt, perSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, guType, downType, e, ff);
+            bool perSlot = route == ExpertRoute.PerSlot;
+            bool mma = route == ExpertRoute.TensorCore;
+            bool staged = route == ExpertRoute.Staged;
             if (staged)
                 QuantizeQ81Split(kernels, cur, s.SplitQsA, s.SplitDA, e, nt, stream);
             else if (!mma)

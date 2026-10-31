@@ -56,14 +56,16 @@ internal static class Qwen4ExpSyntheticModelBuilder
     /// consumed as F32; a matrix norm preserves the ordinary flat scale values.
     /// Optional expert counts exercise router reductions at the trained model's width.
     /// <paramref name="q4kxlExperts"/> stores them as the UD-Q4_K_XL file does: Q4_K gate/up over Q5_1 down;
-    /// <paramref name="expertDownType"/> then overrides every layer's down projection, and
+    /// <paramref name="expertGateUpType"/> and <paramref name="expertDownType"/> then override every layer's
+    /// gate/up and down projections, and
     /// <paramref name="expertDownGain"/> scales the routed down projection's update (a quarter by default,
-    /// as every block's output projection).</summary>
+    /// as every block's output projection). <paramref name="expertFf"/> widens the experts (a multiple of
+    /// 256 lets the down projection take a 256-value block format).</summary>
     public static string Write(string path, int indexerTopK = 16, int contextLength = 4096, bool q2kxlExperts = false,
         GgmlType pleConvType = GgmlType.F32, GgmlType ssmConvType = GgmlType.F32,
         GgmlType? matrixNormType = null, bool qsa = true, int expertCount = Experts, int expertUsedCount = ExpertsUsed,
         int hiddenSize = Hidden, bool q4kxlExperts = false, bool tiedOutput = false, GgmlType? expertDownType = null,
-        float expertDownGain = 0.25f)
+        float expertDownGain = 0.25f, GgmlType? expertGateUpType = null, int expertFf = ExpertFf)
     {
         if (expertCount < 1 || expertUsedCount < 1 || expertUsedCount > expertCount)
             throw new System.ArgumentOutOfRangeException(nameof(expertUsedCount), "Expert counts must be positive, and selected experts cannot exceed total experts.");
@@ -196,12 +198,14 @@ internal static class Qwen4ExpSyntheticModelBuilder
                 gateUp = GgmlType.Q4_K;
                 down = GgmlType.Q5_1;
             }
+            if (expertGateUpType is { } gateUpOverride)
+                gateUp = gateUpOverride;
             if (expertDownType is { } downOverride)
                 down = downOverride;
             t.Add(Proj(p + "ffn_gate_inp.weight", hiddenSize, expertCount, GgmlType.F32));
-            t.Add(Experts3(p + "ffn_gate_exps.weight", hiddenSize, ExpertFf, gateUp));
-            t.Add(Experts3(p + "ffn_up_exps.weight", hiddenSize, ExpertFf, gateUp));
-            t.Add(Experts3(p + "ffn_down_exps.weight", ExpertFf, hiddenSize, down, gain: expertDownGain));
+            t.Add(Experts3(p + "ffn_gate_exps.weight", hiddenSize, expertFf, gateUp));
+            t.Add(Experts3(p + "ffn_up_exps.weight", hiddenSize, expertFf, gateUp));
+            t.Add(Experts3(p + "ffn_down_exps.weight", expertFf, hiddenSize, down, gain: expertDownGain));
             t.Add(Gen(p + "ffn_gate_inp_shexp.weight", 1.5f / System.MathF.Sqrt(hiddenSize), hiddenSize));
             t.Add(Proj(p + "ffn_gate_shexp.weight", hiddenSize, SharedFf));
             t.Add(Proj(p + "ffn_up_shexp.weight", hiddenSize, SharedFf));
@@ -229,7 +233,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
             new U32 { Key = a + "expert_used_count", V = (uint)expertUsedCount },
             new U32 { Key = a + "attention.key_length", V = HeadDim },
             new U32 { Key = a + "attention.value_length", V = HeadDim },
-            new U32 { Key = a + "expert_feed_forward_length", V = ExpertFf },
+            new U32 { Key = a + "expert_feed_forward_length", V = (uint)expertFf },
             new U32 { Key = a + "expert_shared_feed_forward_length", V = SharedFf },
             new U32 { Key = a + "ssm.conv_kernel", V = (uint)ssmConvKernel },
             new U32 { Key = a + "ssm.state_size", V = StateSize },

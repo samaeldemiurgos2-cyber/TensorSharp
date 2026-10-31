@@ -34,91 +34,53 @@ namespace TensorSharp.Cuda
 {
     public sealed unsafe partial class Dsv4CudaEngine
     {
-        /// <summary>What the boundary into one device carries (V4.1).</summary>
-        private sealed class Boundary
-        {
-            /// <summary>KV-source layers whose caches layers on this device read.</summary>
-            public readonly List<int> KvGroups = new List<int>();
-            /// <summary>A compressed layer here attends over a selection published before the boundary.</summary>
-            public bool Selection;
-            /// <summary>An index source here or later prunes with the mask published before the boundary.</summary>
-            public bool CandidateMask;
-        }
-
-        // Indexed by the device a boundary leads INTO; null for device 0 and for V4.
-        private Boundary[] _boundaries;
-        // Per KV-source layer: the device of the last layer reading its caches.
+        // What the boundary into each GLOBAL device carries (Dsv4BoundaryLayout, shared with the cross-node
+        // boundary); null for device 0, for a device whose first layer is layer 0, and for V4.
+        private Dsv4BoundaryLayout[] _layouts;
+        // Per KV-source layer: the global device of the last layer reading its caches.
         private int[] _groupLastDevice;
         // Cache blocks each spanning group's source committed in the current forward.
         private readonly List<(int Source, Slot Slot, int FirstBlock, int Count)> _committed =
             new List<(int, Slot, int, int)>();
 
-        /// <summary>Work out what each boundary carries, from the layer map. V4.1 only.</summary>
-        private void PlanBoundaries(ModelDesc m, int[] assignment)
+        /// <summary>Work out what each boundary carries, from the global layer map. V4.1 only. A single-process
+        /// engine's global devices are its local ones; a stage of a distributed run plans every boundary of
+        /// the run, its own local ones and the network ones on either side.</summary>
+        private void PlanBoundaries(ModelDesc m, int[] globalDevice, int globalDevices)
         {
-            if (!m.V41 || _devs.Length < 2)
+            if (!m.V41 || globalDevices < 2)
                 return;
-            int n = m.NLayer;
-            _groupLastDevice = new int[n];
-            for (int il = 0; il < n; il++)
-                _groupLastDevice[il] = -1;
-            for (int il = 0; il < n; il++)
+            var topology = Dsv4Topology.From(m);
+            _groupLastDevice = topology.GroupLastDevice(globalDevice);
+            _layouts = new Dsv4BoundaryLayout[globalDevices];
+            for (int g = 1; g < globalDevices; g++)
             {
-                int source = m.Layers[il].Ratio != 0 ? m.Layers[il].KvSource : -1;
-                if (source >= 0)
-                    _groupLastDevice[source] = Math.Max(_groupLastDevice[source], assignment[il]);
+                // A device the split left without layers receives nothing, and one whose first layer is
+                // layer 0 follows only the embedding: neither has state to take over.
+                if (Array.IndexOf(globalDevice, g) > 0)
+                    _layouts[g] = Dsv4BoundaryLayout.Create(topology, globalDevice, g);
             }
 
-            _boundaries = new Boundary[_devs.Length];
-            for (int d = 1; d < _devs.Length; d++)
-            {
-                int first = Array.IndexOf(assignment, d);
-                if (first < 0)
-                    continue;
-                var b = new Boundary();
-                for (int s = 0; s < n; s++)
-                {
-                    if (_groupLastDevice[s] >= d && assignment[s] < d)
-                        b.KvGroups.Add(s);
-                }
-                for (int il = first; il < n && assignment[il] == d; il++)
-                {
-                    var L = m.Layers[il];
-                    if (L.Ratio != 0 && L.IndexSource >= 0 && L.IndexSource < first)
-                        b.Selection = true;
-                }
-                if (m.CandidateSource >= 0 && m.CandidateSource < first)
-                {
-                    for (int il = first; il < n; il++)
-                    {
-                        if (m.Layers[il].IndexSource == il && il > m.CandidateSource)
-                        {
-                            b.CandidateMask = true;
-                            break;
-                        }
-                    }
-                }
-                _boundaries[d] = b;
-            }
-
-            // Pinned staging on each sending device: the one that holds the layer before the
-            // boundary (a device the split left without layers sends nothing, and the embedding
-            // device sends into a first layer placed past it).
+            // Pinned staging on each sending device of a LOCAL boundary: the one that holds the layer
+            // before the boundary. (The network boundaries have their own staging; see
+            // Dsv4CudaEngine.Distributed.cs.)
             long rowBytes = ((long)m.HeadDim + m.IdxHeadSize) * 2;
             long maskWidth = Math.Max(_compRowsCsa, _compRowsHca);
             for (int d = 1; d < _devs.Length; d++)
             {
-                Boundary b = _boundaries[d];
+                Dsv4BoundaryLayout b = _layouts[_firstGlobal + d];
                 if (b == null)
                     continue;
-                int first = Array.IndexOf(assignment, d);
+                int srcLocal = globalDevice[b.FirstLayer - 1] - _firstGlobal;
+                if ((uint)srcLocal >= (uint)_devs.Length)
+                    continue;
                 long bytes = (long)m.NUbatch * HC * 4;                                      // delayed gates
-                bytes += b.KvGroups.Count * ((long)m.NUbatch + 1) * rowBytes;               // committed cache rows
+                bytes += b.KvGroups.Length * ((long)m.NUbatch + 1) * rowBytes;              // committed cache rows
                 if (b.Selection)
                     bytes += (long)m.NUbatch * (Math.Max(m.IdxTopK, 1) + 1) * 4;             // selection + counts
                 if (b.CandidateMask)
                     bytes += (long)m.NUbatch * maskWidth;                                   // candidate mask
-                Dev src = _devs[first > 0 ? assignment[first - 1] : 0];
+                Dev src = _devs[srcLocal];
                 src.MakeCurrent();
                 CudaDriverApi.cuMemHostAlloc(out IntPtr pinned, new UIntPtr((ulong)bytes), 0x1 /*PORTABLE*/).ThrowOnError();
                 src.StatePinned = pinned;
@@ -126,10 +88,11 @@ namespace TensorSharp.Cuda
             }
         }
 
-        /// <summary>Whether a group's caches have replicas (its readers span devices).</summary>
-        private bool Replicated(int source) => _groupLastDevice != null && _groupLastDevice[source] > _layers[source].Device;
+        /// <summary>Whether a group's caches have replicas (its readers span devices, or nodes).</summary>
+        private bool Replicated(int source) => _groupLastDevice != null && _groupLastDevice[source] > _globalDev[source];
 
-        /// <summary>The replicas of a V4.1 source layer's caches on the later devices that read them.</summary>
+        /// <summary>The replicas of a V4.1 source layer's caches on the later LOCAL devices that read them.
+        /// The source may be another node's layer: its committed rows then arrive with the boundary payload.</summary>
         private void AllocReplicas(Slot s, SlotLayer c, int source)
         {
             if (!Replicated(source))
@@ -137,25 +100,31 @@ namespace TensorSharp.Cuda
             int rows = V41Rows(_layers[source].Ratio);
             c.CompKOn = new Tensor[_devs.Length];
             c.LidKOn = new Tensor[_devs.Length];
-            for (int d = _layers[source].Device + 1; d <= _groupLastDevice[source]; d++)
+            for (int g = _globalDev[source] + 1; g <= _groupLastDevice[source]; g++)
             {
+                int d = g - _firstGlobal;
+                if ((uint)d >= (uint)_devs.Length)
+                    continue;
                 c.CompKOn[d] = SlotTensor(s, _devs[d], DType.Float16, rows, _m.HeadDim);
                 c.LidKOn[d] = SlotTensor(s, _devs[d], DType.Float16, rows, _m.IdxHeadSize);
             }
         }
 
+        private static InvalidOperationException MissingReplica(int source, Dev dev) => new InvalidOperationException(
+            $"[dsv4-cuda] no replica of layer {source}'s caches on device {dev.Ordinal}: the boundary plan and the slot disagree");
+
         /// <summary>The compressed cache of <paramref name="source"/>'s group as seen from <paramref name="dev"/>.</summary>
         private Tensor CompKOn(Slot s, int source, Dev dev)
         {
             SlotLayer c = s.Layers[source];
-            return dev.Ordinal == _layers[source].Device ? c.CompK : c.CompKOn[dev.Ordinal];
+            return dev.Ordinal == _layers[source].Device ? c.CompK : c.CompKOn?[dev.Ordinal] ?? throw MissingReplica(source, dev);
         }
 
         /// <summary>The indexer cache of <paramref name="source"/>'s group as seen from <paramref name="dev"/>.</summary>
         private Tensor LidKOn(Slot s, int source, Dev dev)
         {
             SlotLayer c = s.Layers[source];
-            return dev.Ordinal == _layers[source].Device ? c.LidK : c.LidKOn[dev.Ordinal];
+            return dev.Ordinal == _layers[source].Device ? c.LidK : c.LidKOn?[dev.Ordinal] ?? throw MissingReplica(source, dev);
         }
 
         /// <summary>Note blocks a spanning group's source committed, for the boundaries after it.</summary>
@@ -168,14 +137,22 @@ namespace TensorSharp.Cuda
         /// <summary>
         /// Queue, on <paramref name="src"/>'s stream, the copies of everything the layers after the
         /// boundary into <paramref name="dst"/> read besides the hidden streams; returns the pinned
-        /// bytes used and the transfers to replay on <paramref name="dst"/>'s stream.
+        /// bytes used and the transfers to replay on <paramref name="dst"/>'s stream. What is handed over
+        /// is checked first (<see cref="Dsv4BoundaryLayout.ValidateHandOver"/>): exactly the blocks the
+        /// ubatch at [<paramref name="p0"/>, p0 + nt) -- or each row of <paramref name="batch"/> -- closes in
+        /// every group the layers past the boundary read, whether this process committed them or received
+        /// them from the previous stage, and an active candidate mask whenever they prune with it.
         /// </summary>
-        private List<(long Offset, IntPtr Dst, long Bytes)> StageBoundaryState(Dev src, Dev dst, int nt)
+        private List<(long Offset, IntPtr Dst, long Bytes)> StageBoundaryState(Dev src, Dev dst, int nt, int p0,
+            DecodeBatch batch)
         {
             var replay = new List<(long, IntPtr, long)>();
-            Boundary b = _boundaries?[dst.Ordinal];
+            Dsv4BoundaryLayout b = _layouts?[_firstGlobal + dst.Ordinal];
             if (b == null)
                 return replay;
+            b.ValidateHandOver(_committed, _active, p0, nt, batch?.Rows, batch?.Positions, _v41CandActive);
+            Dsv4BoundaryStats st = BoundaryStats;
+            st.LocalHandOvers++;
             long offset = 0;
             void Stage(IntPtr from, IntPtr to, long bytes)
             {
@@ -202,6 +179,8 @@ namespace TensorSharp.Cuda
                         At(CompKOn(entry.Slot, source, dst), entry.FirstBlock * kBytes), entry.Count * kBytes);
                     Stage(At(LidKOn(entry.Slot, source, src), entry.FirstBlock * iBytes),
                         At(LidKOn(entry.Slot, source, dst), entry.FirstBlock * iBytes), entry.Count * iBytes);
+                    st.LocalRowsHandedOver += entry.Count;
+                    st.LocalRowsBySource[source] = st.LocalRowsBySource.GetValueOrDefault(source) + entry.Count;
                 }
             }
             if (b.Selection)
@@ -209,11 +188,13 @@ namespace TensorSharp.Cuda
                 int k = Math.Max(m.IdxTopK, 1);
                 Stage(Ptr(src.TopkIdx), Ptr(dst.TopkIdx), (long)nt * k * 4);
                 Stage(Ptr(src.TopkCnt), Ptr(dst.TopkCnt), (long)nt * 4);
+                st.LocalSelectionsHandedOver++;
             }
             if (b.CandidateMask && _v41CandActive)
             {
                 long width = src.CandMask.Sizes[1];
                 Stage(Ptr(src.CandMask), Ptr(dst.CandMask), nt * width);
+                st.LocalMasksHandedOver++;
             }
             return replay;
         }

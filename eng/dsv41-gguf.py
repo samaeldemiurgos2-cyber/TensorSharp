@@ -103,7 +103,11 @@ def load_engram(weights):
         return int(fields[key].contents())
 
     source = candidate_value("candidate_source_layer", candidate)
-    topk = candidate_value("candidate_top_k", 2048) if source >= 0 else 0
+    # Unsloth's 1017 GGUFs spell the budget candidate_top_k_blocks; TensorSharp's own files
+    # candidate_top_k. A file with both must not let them disagree (as the native loader).
+    topk = candidate_value("candidate_top_k_blocks", candidate_value("candidate_top_k", 2048)) if source >= 0 else 0
+    if source >= 0 and candidate_value("candidate_top_k", topk) != topk:
+        raise ValueError("deepseek41.attention.indexer.candidate_top_k_blocks disagrees with candidate_top_k")
     block = candidate_value("candidate_block_size", 8) if source >= 0 else 0
     if source < -1 or source >= layers or source >= 0 and (source not in index_sources or not 1 <= topk <= 2**31 - 1 or not 1 <= block <= 2**31 - 1):
         raise ValueError("Invalid GGUF candidate indexer geometry")

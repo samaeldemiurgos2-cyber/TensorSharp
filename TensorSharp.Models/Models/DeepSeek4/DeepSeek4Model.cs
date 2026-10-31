@@ -140,7 +140,7 @@ namespace TensorSharp.Models
                 maxContext = Math.Min(maxContext, 65536);
             _maxContextLength = maxContext;
 
-            int nUbatch = ResolveNativeUbatch(isV41, backend, Environment.GetEnvironmentVariable("TS_DSV4_UBATCH"),
+            int nUbatch = ResolveNativeUbatch(isV41, backend, ExecutionVariable("TS_DSV4_UBATCH"),
                 out string ubatchWarning);
             if (ubatchWarning != null)
                 Console.Error.WriteLine(ubatchWarning);
@@ -155,9 +155,30 @@ namespace TensorSharp.Models
                 Console.WriteLine($"Model: {arch} (direct-CUDA whole-model executor), Layers={Config.NumLayers}, " +
                     $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}" +
                     (dspark != null ? ", DSpark drafter" : string.Empty));
-                _cudaExec = new DeepSeek4CudaExecutor(ggufPath, maxContext, nUbatch, nGpu, dspark, ResolveCpuMoeLayers());
-                _slotExecutor = _cudaExec;
-                _truncateAlign = _cudaExec.TruncateAlign;
+                if (IsDistributedNativeLayerSplit)
+                {
+                    // One stage of a cross-node layer split. Like the ggml stages, it serves the one mirrored
+                    // sequence: no slots, truncation or prefix reuse (the scheduler resets and re-prefills).
+                    try
+                    {
+                        _cudaExec = LoadDistributedCudaStage(ggufPath, arch, isV41, maxContext, nUbatch, dspark);
+                    }
+                    catch
+                    {
+                        // As for the refusals above: nobody disposes an object whose constructor threw, and
+                        // the GGUF mapping and the group (so the peers stop waiting) must not outlive it.
+                        base.Dispose();
+                        throw;
+                    }
+                    _slotExecutor = null;
+                    _truncateAlign = 0;
+                }
+                else
+                {
+                    _cudaExec = new DeepSeek4CudaExecutor(ggufPath, maxContext, nUbatch, nGpu, dspark, ResolveCpuMoeLayers());
+                    _slotExecutor = _cudaExec;
+                    _truncateAlign = _cudaExec.TruncateAlign;
+                }
             }
             else if (_backend == BackendType.Cpu)
             {
@@ -270,6 +291,118 @@ namespace TensorSharp.Models
                 // per-sequence fallback with reset/re-prefill between requests.
                 _truncateAlign = NativeDistributedGroup?.NodeCount > 1 ? 0 : GgmlDeepSeek4Native.TruncateAlign(_handle);
                 _slotExecutor = NativeDistributedGroup?.NodeCount > 1 ? null : new NativeDsv4Slots(_handle);
+            }
+        }
+
+        /// <summary>The direct-CUDA executor (tests read its engine's boundary counters).</summary>
+        internal DeepSeek4CudaExecutor CudaExecutor => _cudaExec;
+
+        /// <summary>
+        /// Tests only: one node's value of an execution variable, for an in-process multi-node test where every
+        /// node shares the process environment. Null (always, outside tests) reads the environment.
+        /// </summary>
+        internal static Func<int, string, string> DistributedEnvironmentForTests { get; set; }
+
+        /// <summary>An execution variable as this node sees it.</summary>
+        private string ExecutionVariable(string name)
+            => LayerSplitGroup is { NodeCount: > 1 } group && DistributedEnvironmentForTests is { } read
+                ? read(group.NodeId, name)
+                : Environment.GetEnvironmentVariable(name);
+
+        /// <summary>
+        /// This node's stage of a cross-node layer split on the direct-CUDA engine. Every node digests the
+        /// checkpoint header and every setting that changes what the engine computes (TS_DSV4_UBATCH, the dense
+        /// matmul routing, where the Engram tables live, ...) and refuses to load unless all agree; then the
+        /// placement, which each node computes from the shards' bytes, and the kernel module's decoders. The
+        /// driver (node 0) runs the last stage, so the head is local to it and logits never cross the network.
+        /// </summary>
+        private DeepSeek4CudaExecutor LoadDistributedCudaStage(string ggufPath, string arch, bool isV41, int maxContext,
+            int nUbatch, string dspark)
+        {
+            if (!isV41)
+                throw new NotSupportedException("--backend cuda distributed layer split runs DeepSeek V4.1 only.");
+            if (dspark != null)
+                throw new NotSupportedException("Distributed layer split does not mirror DSpark operations; omit --draft-model.");
+            if (ResolveCpuMoeLayers() != 0)
+                throw new NotSupportedException("--backend cuda distributed layer split keeps every routed expert in VRAM; " +
+                    "remove --n-cpu-moe / --cpu-moe (or use --backend ggml_cuda).");
+            bool driverLast = LayerSplitPlan.DriverRunsLastStageFromEnvironment();
+            if (!driverLast)
+                throw new NotSupportedException($"--backend cuda distributed layer split runs the driver (node 0) as the LAST " +
+                    $"stage, so the full-vocabulary logits never cross the network; {LayerSplitPlan.DriverStageVariable}=first " +
+                    "is not supported on cuda. Unset it, or use --backend ggml_cuda.");
+            ILayerSplitGroup group = LayerSplitGroup;
+            int nodes = group.NodeCount, local = group.Degree;
+            int stage = LayerSplitPlan.StageOf(group.NodeId, nodes, driverLast);
+            string headerIdentity = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                ReadModelHeaderForIdentity(ggufPath)));
+            string configuration =
+                $"layer|exec=cuda|{arch}|header={headerIdentity}|layers={Config.NumLayers}|hidden={Config.HiddenSize}" +
+                $"|vocab={Config.VocabSize}|nodes={nodes}|local={local}|ctx={maxContext}|driverLast={driverLast}" +
+                $"|ubatch={(nUbatch > 0 ? nUbatch : 1024)}|cpu_moe=0" +
+                DeepSeek41Architecture.DirectCudaNumericalOptions(ExecutionVariable);
+            DeepSeek41Architecture.ValidateDistributedExecutionConfig(group, configuration);
+            Console.WriteLine($"  Distributed direct-CUDA layer split: node {group.NodeId} runs stage {stage} of {nodes} " +
+                $"on {local} GPU(s); the driver runs the last stage and the head.");
+            var link = new LayerSplitStageLink(group,
+                stage > 0 ? LayerSplitPlan.NodeOfStage(stage - 1, nodes, driverLast) : -1,
+                stage < nodes - 1 ? LayerSplitPlan.NodeOfStage(stage + 1, nodes, driverLast) : -1);
+            return new DeepSeek4CudaExecutor(ggufPath, maxContext, nUbatch, new DeepSeek4CudaExecutor.DistributedStage
+            {
+                Nodes = nodes,
+                NodeId = group.NodeId,
+                LocalDevices = local,
+                DriverRunsLastStage = driverLast,
+                Link = link,
+                Agree = identity => DeepSeek41Architecture.ValidateDistributedExecutionConfig(group, configuration + "|" + identity),
+                Build = DirectCudaBuildIdentity,
+            });
+        }
+
+        /// <summary>The build a direct-CUDA stage runs, for the module agreement: this assembly's informational version
+        /// (the release and the source revision it was built from). The CUDA backend assembly carries no version of its
+        /// own, and the two always ship together.</summary>
+        internal static string DirectCudaBuildIdentity { get; } =
+            System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(
+                typeof(DeepSeek4Model).Assembly)?.InformationalVersion
+            ?? typeof(DeepSeek4Model).Assembly.GetName().Version?.ToString() ?? "unknown";
+
+        /// <summary>
+        /// The direct-CUDA engine's stage link over the node pipeline: the engine's pinned payload moves as
+        /// lossless 32-bit words (it pads every payload to 4 bytes). A transport fault throws out of the engine's
+        /// forward, which fails the request, and the model then aborts the mesh so no peer waits on it.
+        /// </summary>
+        private sealed unsafe class LayerSplitStageLink(ILayerSplitGroup group, int previousNode, int nextNode)
+            : TensorSharp.Cuda.IDsv4StageLink
+        {
+            private float[] _words = Array.Empty<float>();
+
+            public void SendNext(IntPtr data, int bytes) => Move(nextNode, data, bytes, send: true);
+
+            public void ReceivePrevious(IntPtr data, int bytes) => Move(previousNode, data, bytes, send: false);
+
+            private void Move(int peer, IntPtr data, int bytes, bool send)
+            {
+                if (peer < 0)
+                    throw new InvalidOperationException("This pipeline stage has no neighbour in that direction.");
+                if (bytes < 0 || (bytes & 3) != 0)
+                    throw new ArgumentException($"A stage payload must be a whole number of 32-bit words, got {bytes} bytes.");
+                int words = bytes / 4;
+                if (_words.Length < words)
+                    _words = new float[words];   // grows to the largest payload once
+                fixed (float* w = _words)
+                {
+                    if (send)
+                    {
+                        Buffer.MemoryCopy((void*)data, w, (long)_words.Length * 4, bytes);
+                        group.Send(_words, words, peer);
+                    }
+                    else
+                    {
+                        group.Receive(_words, words, peer);
+                        Buffer.MemoryCopy(w, (void*)data, bytes, bytes);
+                    }
+                }
             }
         }
 
